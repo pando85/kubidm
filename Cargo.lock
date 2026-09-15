@@ -1121,7 +1121,7 @@ dependencies = [
  "cexpr",
  "clang-sys",
  "log",
- "prettyplease 0.3.0",
+ "prettyplease",
  "proc-macro2",
  "quote",
  "regex",
@@ -7188,7 +7188,7 @@ version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "acf9f7ddcfd31f0558b246d6ddc4a34fb4550668f364a09dd51f28409157e754"
 dependencies = [
- "bindgen",
+ "bindgen 0.72.1",
  "cc",
  "dunce",
  "walkdir",
@@ -8383,7 +8383,7 @@ version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a7f972672926a3d3d18ecc04524720e4d20b7d1664a3fb73dbf7d4274196dbd9"
 dependencies = [
- "bindgen",
+ "bindgen 0.72.1",
  "pkg-config",
  "target-lexicon",
 ]
