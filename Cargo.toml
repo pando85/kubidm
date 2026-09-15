@@ -322,7 +322,7 @@ utoipa = { version = "5.5.0", features = ["url", "uuid"] }
 utoipa-swagger-ui = { version = "9.0.2", default-features = false, features = [
     "vendored",
 ] }
-uuid = "^1.23.2"
+uuid = "1.26.1"
 webauthn-authenticator-rs = { version = "0.6.1-dev", default-features = false }
 webauthn-rs = { version = "0.6.1-dev", features = ["preview-features"] }
 webauthn-rs-core = "0.6.1-dev"
