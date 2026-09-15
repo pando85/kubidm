@@ -9,7 +9,6 @@ use concread::arcache::{ARCache, ARCacheBuilder, ARCacheReadTxn, ARCacheWriteTxn
 use concread::cowcell::*;
 use hashbrown::HashMap;
 use idlset::v2::IDLBitRange;
-use idlset::AndNot;
 use kubidm_proto::internal::{ConsistencyError, OperationError};
 use tracing::trace;
 use uuid::Uuid;
@@ -350,11 +349,15 @@ macro_rules! verify {
                         admin_warn!("Inconsistent ALLIDS compression state");
                         r.push(Err(ConsistencyError::BackendAllIdsSync))
                     }
-                    if db_allids != (*($self).allids) {
+                    let allids_match = db_allids.len() == (*($self).allids).len()
+                        && {
+                            let db_vec: Vec<u64> = db_allids.into_iter().collect();
+                            let mem_vec: Vec<u64> = (*($self).allids).into_iter().collect();
+                            db_vec == mem_vec
+                        };
+                    if !allids_match {
                         // might want to redo how large key-values are formatted considering what this could look like
                         admin_warn!(
-                            db_allids = ?(&db_allids).andnot(&($self).allids),
-                            arc_allids = ?(&(*($self).allids)).andnot(&db_allids),
                             "Inconsistent ALLIDS set"
                         );
                         r.push(Err(ConsistencyError::BackendAllIdsSync))
