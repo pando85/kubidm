@@ -136,7 +136,6 @@ codegen-units = 256
 # webauthn-rs-proto = { path = "../webauthn-rs/webauthn-rs-proto" }
 # sshkey-attest = { path = "../webauthn-rs/sshkey-attest" }
 
-aws-runtime = { path = "patches/aws-runtime-1.7.2" }
 
 [workspace.dependencies]
 kubidmd_core = { path = "./server/core", version = "=1.12.0-dev" }

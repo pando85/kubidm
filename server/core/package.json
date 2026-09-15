@@ -15,7 +15,7 @@
   "homepage": "https://github.com/pando85/kubidm",
   "devDependencies": {
     "@eslint/js": "^10.0.1",
-    "@playwright/test": "1.62.1",
+    "@playwright/test": "1.63.0",
     "eslint": "^10.3.0",
     "globals": "^17.6.0",
     "prettier": "^3.8.3"
