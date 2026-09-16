@@ -36,6 +36,8 @@ RUN \
     export SCCACHE_DIR=/sccache; \
     export RUSTC_WRAPPER=/usr/bin/sccache; \
     export CC="/usr/bin/clang"; \
+    cargo fetch --locked && \
+    export CARGO_NET_OFFLINE=true; \
     cargo auditable build --locked -p kubidm_tools ${KUBIDM_BUILD_OPTIONS} \
         --target-dir="/usr/src/kubidm/target/" \
         --features="${KUBIDM_FEATURES}" \
@@ -52,6 +54,7 @@ RUN \
         --target-dir="/usr/src/kubidm/target/" \
         --features="${KUBIDM_FEATURES}" \
         --release && \
+    unset CARGO_NET_OFFLINE && \
     cargo auditable install \
         --git https://github.com/kanidm/webauthn-rs.git \
         --rev 2ac5ff0e20f323cd904856a38a15899adf13fa5b \
