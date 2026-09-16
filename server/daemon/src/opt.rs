@@ -16,6 +16,26 @@ struct RestoreOpt {
     path: PathBuf,
 }
 
+#[derive(Debug, Default, Clone, Copy, clap::ValueEnum)]
+enum VerifyBackupLevel {
+    /// Validate backup format, structure, and version compatibility
+    Structural,
+    /// Full restore into a temporary backend with semantic consistency checks
+    #[default]
+    Full,
+}
+
+#[derive(Debug, Args)]
+struct VerifyBackupOpt {
+    #[clap(value_parser)]
+    /// Path to the backup artifact to verify.
+    path: PathBuf,
+
+    /// Verification level: 'structural' (format/checksum only) or 'full' (restore + consistency).
+    #[clap(short, long, value_enum, default_value_t = VerifyBackupLevel::Full)]
+    level: VerifyBackupLevel,
+}
+
 #[derive(Debug, Args)]
 struct PitrRecoverOpt {
     /// Target time for recovery (RFC3339 format, e.g., "2024-01-15T10:30:00Z")
@@ -73,6 +93,9 @@ enum DbCommands {
     #[clap(name = "verify")]
     /// Verify database and entity consistency.
     Verify,
+    #[clap(name = "verify-backup")]
+    /// Verify a backup artifact for restorability and consistency.
+    VerifyBackup(VerifyBackupOpt),
     #[clap(name = "reindex")]
     /// Reindex the database (offline)
     Reindex,

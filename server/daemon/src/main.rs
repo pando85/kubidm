@@ -37,7 +37,7 @@ use kubidmd_core::{
     dbscan_list_id2entry_core, dbscan_list_index_analysis_core, dbscan_list_index_core,
     dbscan_list_indexes_core, dbscan_list_quarantined_core, dbscan_quarantine_id2entry_core,
     dbscan_restore_quarantined_core, domain_rename_core, reindex_server_core, restore_server_core,
-    vacuum_server_core, verify_server_core, CoreAction,
+    vacuum_server_core, verify_backup_server_core, verify_server_core, CoreAction,
 };
 use serde::Serialize;
 use sketching::pipeline::TracingPipelineGuard;
@@ -991,6 +991,16 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
         } => {
             info!("Running in db verification mode ...");
             verify_server_core(&config).await;
+        }
+        KubidmdOpt::Database {
+            commands: DbCommands::VerifyBackup(vbopt),
+        } => {
+            info!("Running in backup verification mode ...");
+            let full = matches!(vbopt.level, VerifyBackupLevel::Full);
+            let success = verify_backup_server_core(&config, &vbopt.path, full).await;
+            if !success {
+                return ExitCode::FAILURE;
+            }
         }
         KubidmdOpt::ShowReplicationCertificate => {
             info!("Running show replication certificate ...");

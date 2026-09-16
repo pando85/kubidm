@@ -220,7 +220,7 @@ http = "1.4.1"
 http-body-util = "0.1"
 hyper = { version = "1.10.1" }
 hyper-util = { version = "0.1.20", features = ["server", "tokio"] }
-idlset = "^0.2.5"
+idlset = { path = "idlset" }
 image = { version = "0.25.9", default-features = false, features = [
     "gif",
     "jpeg",
