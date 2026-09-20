@@ -133,6 +133,90 @@ impl IdxMeta {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct BackupVerificationResult {
+    pub structural_valid: bool,
+    pub version_compatible: bool,
+    pub entry_count: usize,
+    pub version: Option<String>,
+    pub errors: Vec<String>,
+}
+
+impl BackupVerificationResult {
+    pub fn is_fully_valid(&self) -> bool {
+        self.structural_valid && self.version_compatible && self.errors.is_empty()
+    }
+}
+
+pub fn parse_and_validate_backup<IN>(
+    input: IN,
+    compression: kubidm_proto::backup::BackupCompression,
+) -> Result<BackupVerificationResult, OperationError>
+where
+    IN: std::io::Read,
+{
+    let dbbak_option: Result<DbBackup, serde_json::Error> = match compression {
+        kubidm_proto::backup::BackupCompression::NoCompression => serde_json::from_reader(input),
+        kubidm_proto::backup::BackupCompression::Gzip => {
+            let decoder = flate2::read::GzDecoder::new(input);
+            serde_json::from_reader(decoder)
+        }
+    };
+
+    let dbbak = dbbak_option.map_err(|err| {
+        error!(
+            ?err,
+            "Backup structural validation failed: JSON deserialization error"
+        );
+        OperationError::SerdeJsonError
+    })?;
+
+    let mut result = BackupVerificationResult {
+        structural_valid: true,
+        version_compatible: false,
+        entry_count: 0,
+        version: None,
+        errors: Vec::new(),
+    };
+
+    let (entries, maybe_version) = match &dbbak {
+        DbBackup::V1(entries) => (entries.len(), None),
+        DbBackup::V2 { entries, .. } => (entries.len(), None),
+        DbBackup::V3 { entries, .. } => (entries.len(), None),
+        DbBackup::V4 { entries, .. } => (entries.len(), None),
+        DbBackup::V5 {
+            version, entries, ..
+        } => (entries.len(), Some(version.clone())),
+    };
+
+    result.entry_count = entries;
+    result.version = maybe_version.clone();
+
+    if let Some(version) = maybe_version {
+        if version == env!("KUBIDM_PKG_SERIES") {
+            result.version_compatible = true;
+        } else {
+            result.version_compatible = false;
+            result.errors.push(format!(
+                "Backup version '{}' is incompatible with this server version '{}'",
+                version,
+                env!("KUBIDM_PKG_SERIES")
+            ));
+        }
+    } else {
+        result.errors.push(
+            "Backup is from an older server version and version compatibility cannot be determined"
+                .to_string(),
+        );
+    }
+
+    if entries == 0 {
+        result.errors.push("Backup contains no entries".to_string());
+    }
+
+    Ok(result)
+}
+
 #[derive(Clone)]
 pub struct BackendConfig {
     path: PathBuf,
@@ -1114,6 +1198,17 @@ impl BackendReadTransaction<'_> {
 
     pub fn list_quarantined(&mut self) -> Result<Vec<(u64, String)>, OperationError> {
         self.get_idlayer().list_quarantined()
+    }
+
+    pub fn verify_backup<IN>(
+        &mut self,
+        input: IN,
+        compression: BackupCompression,
+    ) -> Result<BackupVerificationResult, OperationError>
+    where
+        IN: std::io::Read,
+    {
+        parse_and_validate_backup(input, compression)
     }
 }
 
