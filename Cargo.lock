@@ -1495,7 +1495,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df92276dad9974530bd01a54740e0cdeac37c0d17d391ea635529f7d708f7bfe"
 dependencies = [
  "base64 0.22.1",
- "crypto-glue 0.2.0",
+ "crypto-glue 0.2.1",
  "hex",
  "kanidm-hsm-crypto",
  "serde",
@@ -1837,9 +1837,9 @@ dependencies = [
 
 [[package]]
 name = "crypto-glue"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "80b53f10d17547cef66961450704071881ec1e6cbc0f26d416f9e8061b0ab487"
+checksum = "44ba7765531ec7cadc5a301ee66f2c48aae8477ee961f6dd3b5ce3beb7d90a38"
 dependencies = [
  "aes 0.9.3",
  "aes-gcm 0.11.1",
@@ -1850,6 +1850,7 @@ dependencies = [
  "cipher 0.5.2",
  "const-oid 0.10.2",
  "crypto-common 0.2.2",
+ "cts",
  "der 0.8.1",
  "digest 0.11.3",
  "ecdsa 0.17.0",
@@ -1859,6 +1860,7 @@ dependencies = [
  "hmac 0.13.0",
  "hybrid-array",
  "kbkdf",
+ "md5",
  "p256 0.14.0",
  "p384 0.14.0",
  "p521 0.14.0",
@@ -1870,6 +1872,7 @@ dependencies = [
  "serde",
  "sha1 0.11.0",
  "sha2 0.11.0",
+ "signature 3.0.0",
  "spki 0.8.0",
  "subtle",
  "tracing",
@@ -1923,6 +1926,15 @@ name = "ctr"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "baaca1c4b237092596f64d571e9db6ce4109c4ef9742e27590f1709594461f21"
+dependencies = [
+ "cipher 0.5.2",
+]
+
+[[package]]
+name = "cts"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e6ae47d18aa4f3701bc9b644cf9a74a45e6eace39feabeab15864728aa1e45a9"
 dependencies = [
  "cipher 0.5.2",
 ]
@@ -4329,7 +4341,7 @@ version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c43150dbe23367186bb3374b2a1a1548f83531ecd60456f0dbe3463423e7ef02"
 dependencies = [
- "crypto-glue 0.2.0",
+ "crypto-glue 0.2.1",
  "serde",
  "tracing",
  "tss-esapi",
@@ -4513,7 +4525,7 @@ version = "1.12.0-dev"
 dependencies = [
  "base64 0.23.1",
  "base64urlsafedata",
- "crypto-glue 0.2.0",
+ "crypto-glue 0.2.1",
  "hex",
  "kanidm-hsm-crypto",
  "md-5",
@@ -4542,7 +4554,7 @@ dependencies = [
  "base64 0.23.1",
  "chrono",
  "clap",
- "crypto-glue 0.2.0",
+ "crypto-glue 0.2.1",
  "enum-iterator",
  "kubidm_build_profiles",
  "num_enum",
@@ -4632,7 +4644,7 @@ dependencies = [
  "cidr",
  "compact_jwt",
  "cron",
- "crypto-glue 0.2.0",
+ "crypto-glue 0.2.1",
  "filetime",
  "futures",
  "futures-util",
@@ -4693,7 +4705,7 @@ dependencies = [
  "chrono",
  "compact_jwt",
  "concread",
- "crypto-glue 0.2.0",
+ "crypto-glue 0.2.1",
  "dhat",
  "dyn-clone",
  "flate2",
@@ -5106,6 +5118,12 @@ checksum = "bd76fb0fd6b2e4be62a73f8e0858ca97f81babcb1af322dcaca196f735f17f80"
 dependencies = [
  "digest 0.11.3",
 ]
+
+[[package]]
+name = "md5"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7ebb8d8732c6a6df3d8f032a82911cfc747e00efb95cc46e8d0acd5b5b88570c"
 
 [[package]]
 name = "memchr"
@@ -7675,6 +7693,8 @@ checksum = "1d9efca8738c78ee9484207732f728b1ef517bbb1833d6fc0879ca898a522f6f"
 dependencies = [
  "base64ct",
  "der 0.8.1",
+ "digest 0.11.3",
+ "sha2 0.11.0",
 ]
 
 [[package]]
