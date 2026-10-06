@@ -220,14 +220,14 @@ http = "1.4.1"
 http-body-util = "0.1"
 hyper = { version = "1.10.1" }
 hyper-util = { version = "0.1.20", features = ["server", "tokio"] }
-idlset = { path = "idlset" }
+idlset = "^0.2.5"
 image = { version = "0.25.9", default-features = false, features = [
     "gif",
     "jpeg",
     "webp",
 ] }
 itertools = "0.15.0"
-jsonschema = "0.52.0"
+jsonschema = "0.56.0"
 ldap3_client = "^0.8.0"
 ldap3_proto = { version = "^0.8.0", features = ["serde"] }
 lettre = { version = "0.11.22", default-features = false }
@@ -322,7 +322,7 @@ utoipa = { version = "5.5.0", features = ["url", "uuid"] }
 utoipa-swagger-ui = { version = "9.0.2", default-features = false, features = [
     "vendored",
 ] }
-uuid = "^1.23.2"
+uuid = "1.26.1"
 webauthn-authenticator-rs = { version = "0.6.1-dev", default-features = false }
 webauthn-rs = { version = "0.6.1-dev", features = ["preview-features"] }
 webauthn-rs-core = "0.6.1-dev"

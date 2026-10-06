@@ -37,6 +37,8 @@ RUN --mount=type=cache,id=cargo,target=/cargo \
     export SCCACHE_DIR=/sccache && \
     export RUSTC_WRAPPER=/usr/bin/sccache && \
     export CC="/usr/bin/clang" && \
+    cargo fetch --locked && \
+    export CARGO_NET_OFFLINE=true && \
     cargo auditable build --locked -p daemon ${KUBIDM_BUILD_OPTIONS} \
         --target-dir="/usr/src/kubidm/target/" \
         --features="${KUBIDM_FEATURES}" \
