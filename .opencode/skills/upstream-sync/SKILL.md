@@ -237,11 +237,22 @@ git push -u origin sync/upstream-YYYY-MM-DD
 gh pr create --draft --base master --title "sync: merge upstream kanidm/kanidm master (YYYY-MM-DD)" --body-file pr.md
 gh pr checks <n>      # ~1.5h on this repo's runners; rust_build_next (beta/nightly) is continue-on-error
 gh pr ready <n>
+gh pr merge <n> --merge   # when approved: MERGE COMMIT ONLY, never --squash or --rebase
 ```
+
+**Merge strategy: always "Create a merge commit".** The sync commit has upstream master as its
+second parent; that link is what makes upstream's commits ancestors of the fork's master and lets
+the next sync's merge base advance. Squash or rebase rewrites it into a one-parent commit: the
+content lands, but the next sync re-conflicts on every upstream commit again. The repo allows all
+three methods, so the GitHub button default can bite. Put this reminder in the PR body, and END YOUR
+FINAL REPORT TO THE USER WITH IT, for example: "Please remember to merge this PR with the merge
+commit strategy, not squash or rebase, so upstream parentage is kept." If follow-up commits need
+tidying, squash them into each other, never into the merge commit.
 
 PR body sections that reviewers expect: Summary (base, tip, counts), Upstream changes absorbed
 (security first), Fork decisions made during the merge (UUIDs, policy, deps), Known follow-ups,
-Verification, and a note for any behavior change in access control.
+Verification, a note for any behavior change in access control, and a closing line asking for a
+merge commit.
 
 ## Build environment (this workstation)
 
@@ -266,6 +277,8 @@ Verification, and a note for any behavior change in access control.
 - [ ] Workspace dependency keys consistent between root and member `Cargo.toml` files; both lock
       files regenerated
 - [ ] PR opened as draft, body filled, CI green, then `gh pr ready`
+- [ ] PR body and the final report both remind the user to merge with a merge commit (no squash, no
+      rebase)
 - [ ] Known follow-ups listed in the PR (currently: unused `x509-cert` dep; stale
       `server/daemon/insecure_server.toml` and `server/daemon/run_insecure_dev_server.sh` copies of
       the `scripts/` versions)
