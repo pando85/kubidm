@@ -52,7 +52,23 @@ jobs:
           du -shc target/*
           rm -rf target/*
 
+      - name: "Start the S3 mock for the backup tests"
+        run: |
+          docker run -d --name s3mock -p 9090:9090 adobe/s3mock:latest
+          for _ in $(seq 1 60); do
+            if curl -sf http://127.0.0.1:9090/ > /dev/null; then
+              echo "s3mock is ready"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "s3mock did not become ready in time"
+          docker logs s3mock
+          exit 1
       - name: "Run cargo test"
+        env:
+          KUBIDM_TEST_S3_ENDPOINT: http://127.0.0.1:9090
+          KUBIDM_TEST_S3_BUCKET: kubidm-test
         run: cargo test
       - name: "Check disk space at the end"
         run: du -shc *
