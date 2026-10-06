@@ -1,6 +1,7 @@
 mod apidocs;
 mod authorization_test;
 mod backup_verify_test;
+mod database_verify_test;
 mod delegation;
 mod domain;
 mod group;

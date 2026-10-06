@@ -762,55 +762,9 @@ pub async fn domain_rename_core(config: &Configuration) {
     };
 }
 
-pub async fn verify_server_core(config: &Configuration) {
-    let curtime = duration_from_epoch_now();
-    // setup the qs - without initialise!
-    let schema_mem = match Schema::new() {
-        Ok(sc) => sc,
-        Err(e) => {
-            error!("Failed to setup in memory schema: {:?}", e);
-            return;
-        }
-    };
-    // Setup the be
-    let be = match setup_backend(config, &schema_mem) {
-        Ok(be) => be,
-        Err(e) => {
-            error!("Failed to setup BE: {:?}", e);
-            return;
-        }
-    };
-
-    let server = match QueryServer::new(be, schema_mem, config.domain.clone(), curtime) {
-        Ok(qs) => qs,
-        Err(err) => {
-            error!(?err, "Failed to setup query server");
-            return;
-        }
-    };
-
-    // Run verifications.
-    let r = server.verify().await;
-
-    if r.is_empty() {
-        eprintln!("Verification passed!");
-        std::process::exit(0);
-    } else {
-        for er in r {
-            error!("{:?}", er);
-        }
-        std::process::exit(1);
-    }
-
-    // Now add IDM server verifications?
-}
-
-/// Boot the database described by `config` exactly as a server start would, including
-/// the startup migrations, then run the full consistency verification on it. Returns the
-/// consistency errors found, which is empty for a healthy database.
-pub async fn verify_booted_database(
-    config: &Configuration,
-) -> Result<Vec<ConsistencyError>, OperationError> {
+/// Open the in-memory schema and the backend described by `config` without starting a
+/// server. This is the common first step of the offline database tools.
+fn open_schema_and_backend(config: &Configuration) -> Result<(Schema, Backend), OperationError> {
     let schema = Schema::new().inspect_err(|err| {
         error!(?err, "Failed to setup in memory schema");
     })?;
@@ -819,16 +773,68 @@ pub async fn verify_booted_database(
         error!(?err, "Failed to setup BE");
     })?;
 
+    Ok((schema, be))
+}
+
+/// Collect the consistency errors reported by a query server.
+fn collect_consistency_errors(results: Vec<Result<(), ConsistencyError>>) -> Vec<ConsistencyError> {
+    results.into_iter().filter_map(Result::err).collect()
+}
+
+/// Run the full consistency verification on the database described by `config` without
+/// booting a server: no migrations are run and the stored entries are not modified. This
+/// is the implementation of `kubidmd database verify`. Returns the consistency errors
+/// found, which is empty for a healthy database.
+pub async fn verify_database(
+    config: &Configuration,
+) -> Result<Vec<ConsistencyError>, OperationError> {
+    let curtime = duration_from_epoch_now();
+    // setup the qs - without initialise!
+    let (schema_mem, be) = open_schema_and_backend(config)?;
+
+    let server =
+        QueryServer::new(be, schema_mem, config.domain.clone(), curtime).inspect_err(|err| {
+            error!(?err, "Failed to setup query server");
+        })?;
+
+    // Run verifications.
+    Ok(collect_consistency_errors(server.verify().await))
+
+    // Now add IDM server verifications?
+}
+
+pub async fn verify_server_core(config: &Configuration) {
+    match verify_database(config).await {
+        Ok(errors) if errors.is_empty() => {
+            eprintln!("Verification passed!");
+            std::process::exit(0);
+        }
+        Ok(errors) => {
+            for err in errors {
+                error!("{:?}", err);
+            }
+            std::process::exit(1);
+        }
+        Err(err) => {
+            error!(?err, "Unable to verify the database");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Boot the database described by `config` exactly as a server start would, including
+/// the startup migrations, then run the full consistency verification on it. Returns the
+/// consistency errors found, which is empty for a healthy database.
+pub async fn verify_booted_database(
+    config: &Configuration,
+) -> Result<Vec<ConsistencyError>, OperationError> {
+    let (schema, be) = open_schema_and_backend(config)?;
+
     let server = setup_qs(be, schema, config).await.inspect_err(|err| {
         error!(?err, "Failed to start query server");
     })?;
 
-    Ok(server
-        .verify()
-        .await
-        .into_iter()
-        .filter_map(Result::err)
-        .collect())
+    Ok(collect_consistency_errors(server.verify().await))
 }
 
 pub fn cert_generate_core(config: &Configuration) {
