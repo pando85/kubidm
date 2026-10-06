@@ -68,16 +68,20 @@ pub struct S3ClientWrapper {
 impl S3ClientWrapper {
     pub async fn new(config: S3Config) -> Result<Self, S3BackupError> {
         let sdk_config = Self::build_sdk_config(&config).await?;
-        // Custom endpoints (MinIO, Ceph RGW, s3mock, ...) are addressed as
-        // `<endpoint>/<bucket>/<key>`. The SDK default of virtual-hosted-style
-        // addressing (`<bucket>.<endpoint>`) requires wildcard DNS that such
-        // deployments usually lack, so path-style addressing is forced whenever an
-        // endpoint is configured. AWS itself keeps the default.
-        let s3_config = aws_sdk_s3::config::Builder::from(&sdk_config)
-            .force_path_style(config.endpoint.is_some())
-            .build();
-        let client = S3Client::from_conf(s3_config);
+        let client = Self::build_client(&sdk_config, config.endpoint.is_some());
         Ok(Self { client, config })
+    }
+
+    /// Build the SDK client. Custom endpoints (MinIO, Ceph RGW, s3mock, ...) are
+    /// addressed as `<endpoint>/<bucket>/<key>`. The SDK default of virtual-hosted-style
+    /// addressing (`<bucket>.<endpoint>`) requires wildcard DNS that such deployments
+    /// usually lack, so path-style addressing is forced whenever an endpoint is
+    /// configured (`custom_endpoint`). AWS itself keeps the default.
+    fn build_client(sdk_config: &SdkConfig, custom_endpoint: bool) -> S3Client {
+        let s3_config = aws_sdk_s3::config::Builder::from(sdk_config)
+            .force_path_style(custom_endpoint)
+            .build();
+        S3Client::from_conf(s3_config)
     }
 
     async fn build_sdk_config(config: &S3Config) -> Result<SdkConfig, S3BackupError> {
@@ -324,19 +328,7 @@ impl S3ClientWrapper {
     ) -> Result<(Vec<u8>, S3BackupMetadata), S3BackupError> {
         let object_key = self.build_object_key(key);
         let metadata = self.download_metadata(&object_key).await?;
-
-        let output = self
-            .client
-            .get_object()
-            .bucket(&self.config.bucket)
-            .key(&object_key)
-            .send()
-            .await
-            .map_err(|e| {
-                S3BackupError::DownloadError(format!("Failed to download backup: {}", e))
-            })?;
-
-        let data = self.collect_stream(output).await?;
+        let data = self.download_object(&object_key).await?;
 
         let actual_checksum = hex_encode(Sha256::digest(&data));
         if actual_checksum != metadata.checksum_sha256 {
@@ -348,6 +340,22 @@ impl S3ClientWrapper {
 
         info!("Downloaded and verified backup from S3: {}", object_key);
         Ok((data, metadata))
+    }
+
+    /// Download the whole object at `object_key` (a full key, prefix included).
+    async fn download_object(&self, object_key: &str) -> Result<Vec<u8>, S3BackupError> {
+        let output = self
+            .client
+            .get_object()
+            .bucket(&self.config.bucket)
+            .key(object_key)
+            .send()
+            .await
+            .map_err(|e| {
+                S3BackupError::DownloadError(format!("Failed to download backup: {}", e))
+            })?;
+
+        self.collect_stream(output).await
     }
 
     /// Fetch the metadata sidecar (`<key>.metadata.json`) of a backup without downloading
@@ -388,30 +396,35 @@ impl S3ClientWrapper {
         Ok(body.into_bytes().to_vec())
     }
 
+    /// List every object under the configured prefix except metadata sidecars, with the
+    /// prefix stripped. All pages of the listing are collected.
     pub async fn list_backups(&self) -> Result<Vec<String>, S3BackupError> {
         let prefix = self.config.path_prefix.clone().unwrap_or_default();
 
-        let output = self
+        let mut pages = self
             .client
             .list_objects_v2()
             .bucket(&self.config.bucket)
             .prefix(&prefix)
-            .send()
-            .await
-            .map_err(|e| S3BackupError::SdkError(format!("Failed to list objects: {}", e)))?;
+            .into_paginator()
+            .send();
 
         let mut backups = Vec::new();
-        for obj in output.contents() {
-            if let Some(key) = obj.key() {
-                if !key.ends_with(".metadata.json") {
-                    let display_key = if let Some(prefix) = &self.config.path_prefix {
-                        key.strip_prefix(prefix)
-                            .map(|s: &str| s.trim_start_matches('/').to_string())
-                            .unwrap_or_else(|| key.to_string())
-                    } else {
-                        key.to_string()
-                    };
-                    backups.push(display_key);
+        while let Some(page) = pages.next().await {
+            let page = page
+                .map_err(|e| S3BackupError::SdkError(format!("Failed to list objects: {}", e)))?;
+            for obj in page.contents() {
+                if let Some(key) = obj.key() {
+                    if !key.ends_with(".metadata.json") {
+                        let display_key = if let Some(prefix) = &self.config.path_prefix {
+                            key.strip_prefix(prefix)
+                                .map(|s: &str| s.trim_start_matches('/').to_string())
+                                .unwrap_or_else(|| key.to_string())
+                        } else {
+                            key.to_string()
+                        };
+                        backups.push(display_key);
+                    }
                 }
             }
         }
@@ -446,9 +459,10 @@ impl S3ClientWrapper {
     /// Verify that the stored backup object still matches its metadata sidecar.
     ///
     /// The object size reported by S3 is compared with `size_bytes` first as a cheap
-    /// pre-check, then the object is downloaded and its SHA-256 is compared with
-    /// `checksum_sha256`. Returns `Ok(false)` when either does not match, and `Err` when
-    /// the object or its metadata could not be retrieved at all.
+    /// pre-check (skipped when the service reports no content length), then the object
+    /// is downloaded and its SHA-256 is compared with `checksum_sha256`. Returns
+    /// `Ok(false)` when either does not match, and `Err` when the object or its metadata
+    /// could not be retrieved at all.
     pub async fn verify_backup(&self, key: &str) -> Result<bool, S3BackupError> {
         let object_key = self.build_object_key(key);
         let metadata = self.download_metadata(&object_key).await?;
@@ -462,27 +476,32 @@ impl S3ClientWrapper {
             .await
             .map_err(|e| S3BackupError::SdkError(format!("Failed to head object: {}", e)))?;
 
-        let actual_size = head.content_length().unwrap_or(0) as u64;
+        match head.content_length() {
+            Some(actual_size) if actual_size as u64 != metadata.size_bytes => {
+                warn!(
+                    "Backup size mismatch for {}: expected {}, got {}",
+                    object_key, metadata.size_bytes, actual_size
+                );
+                return Ok(false);
+            }
+            Some(_) => {}
+            None => debug!(
+                "No content length reported for {}, skipping the size pre-check",
+                object_key
+            ),
+        }
 
-        if actual_size != metadata.size_bytes {
+        let data = self.download_object(&object_key).await?;
+        let actual_checksum = hex_encode(Sha256::digest(&data));
+        if actual_checksum != metadata.checksum_sha256 {
             warn!(
-                "Backup size mismatch: expected {}, got {}",
-                metadata.size_bytes, actual_size
+                "Backup checksum mismatch for {}: expected {}, got {}",
+                object_key, metadata.checksum_sha256, actual_checksum
             );
             return Ok(false);
         }
 
-        match self.download_backup(key).await {
-            Ok(_) => Ok(true),
-            Err(S3BackupError::InvalidChecksum { expected, actual }) => {
-                warn!(
-                    "Backup checksum mismatch for {}: expected {}, got {}",
-                    object_key, expected, actual
-                );
-                Ok(false)
-            }
-            Err(e) => Err(e),
-        }
+        Ok(true)
     }
 
     pub async fn replicate_backup(
@@ -520,7 +539,7 @@ impl S3ClientWrapper {
         region_config: &ReplicationRegionConfig,
     ) -> Result<S3ClientWrapper, S3BackupError> {
         let sdk_config = Self::build_region_sdk_config(region_config).await?;
-        let client = S3Client::new(&sdk_config);
+        let client = Self::build_client(&sdk_config, region_config.endpoint.is_some());
 
         let s3_config = kubidm_proto::backup::S3Config {
             bucket: region_config.bucket.clone(),
