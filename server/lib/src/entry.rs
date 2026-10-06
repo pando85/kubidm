@@ -62,6 +62,7 @@ use ldap3_proto::simple::{LdapPartialAttribute, LdapSearchResultEntry};
 use std::{
     cmp::Ordering,
     collections::{BTreeMap as Map, BTreeMap, BTreeSet},
+    fmt,
     sync::Arc,
 };
 use time::OffsetDateTime;
@@ -172,6 +173,52 @@ pub struct EntryReduced {
 // One day this is going to be Map<Attribute, ValueSet> - @yaleman
 // Today is that day - @firstyear
 pub type Eattrs = Map<Attribute, ValueSet>;
+
+/// Why a stored entry could not be loaded by [`Entry::from_dbentry`].
+#[derive(Debug, PartialEq)]
+pub enum DbEntryLoadReason {
+    /// The stored value set of `attribute` could not be converted into a value set.
+    InvalidValueSet {
+        attribute: Attribute,
+        error: OperationError,
+    },
+    /// The entry has no single, valid uuid attribute.
+    MissingUuid,
+}
+
+/// A stored entry that could not be loaded, together with the identity that could be
+/// recovered from its raw attributes. The row id alone does not let an operator find the
+/// entry in a backup or in the database, the uuid and name do.
+#[derive(Debug, PartialEq)]
+pub struct DbEntryLoadError {
+    pub entry_id: u64,
+    pub entry_uuid: Option<Uuid>,
+    pub entry_name: Option<String>,
+    pub reason: DbEntryLoadReason,
+}
+
+impl fmt::Display for DbEntryLoadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "entry id {}", self.entry_id)?;
+        match &self.entry_uuid {
+            Some(uuid) => write!(f, " uuid {uuid}")?,
+            None => write!(f, " uuid <unknown>")?,
+        }
+        match &self.entry_name {
+            Some(name) => write!(f, " name {name}")?,
+            None => write!(f, " name <unknown>")?,
+        }
+        match &self.reason {
+            DbEntryLoadReason::InvalidValueSet { attribute, error } => {
+                write!(
+                    f,
+                    ": attribute {attribute} has an invalid stored value set ({error:?})"
+                )
+            }
+            DbEntryLoadReason::MissingUuid => write!(f, ": entry has no valid uuid"),
+        }
+    }
+}
 
 pub trait GetUuid {
     fn get_uuid(&self) -> Uuid;
@@ -1886,36 +1933,75 @@ impl Entry<EntrySealed, EntryCommitted> {
         }
     }
 
-    pub fn from_dbentry(db_e: DbEntry, id: u64) -> Option<Self> {
-        // Convert attrs from db format to value
+    /// Load a stored entry. On failure the returned error carries the row id and the
+    /// uuid and name recovered from the raw attributes, and names the attribute that
+    /// could not be loaded, so that the entry can be identified by an operator.
+    pub fn from_dbentry(db_e: DbEntry, id: u64) -> Result<Self, Box<DbEntryLoadError>> {
+        // Recover the identity of the entry up front so that any failure below can be
+        // reported against it. Only identifiers are taken, never attribute values.
+        let entry_uuid = db_e.stored_uuid();
+        let entry_name = db_e.stored_name().map(str::to_string);
 
+        // Convert attrs from db format to value
         let (attrs, ecstate) = match db_e.ent {
             DbEntryVers::V3 { changestate, attrs } => {
                 let ecstate = EntryChangeState::from_db_changestate(changestate);
 
-                let r_attrs = attrs
-                    .into_iter()
+                let mut r_attrs = Eattrs::default();
+                for (k, dbvs) in attrs {
                     // Skip anything empty as new VS can't deal with it.
-                    .filter(|(_k, vs)| !vs.is_empty())
-                    .map(|(k, dbvs)| {
-                        valueset::from_db_valueset_v2(dbvs)
-                            .map(|vs: ValueSet| (k, vs))
-                            .map_err(|e| {
-                                error!(?e, "from_dbentry failed");
-                            })
-                    })
-                    .collect::<Result<Eattrs, ()>>()
-                    .ok()?;
+                    if dbvs.is_empty() {
+                        continue;
+                    }
+                    match valueset::from_db_valueset_v2(dbvs) {
+                        Ok(vs) => {
+                            r_attrs.insert(k, vs);
+                        }
+                        Err(error) => {
+                            error!(
+                                entry_id = id,
+                                ?entry_uuid,
+                                ?entry_name,
+                                attribute = %k,
+                                ?error,
+                                "from_dbentry failed: stored value set could not be loaded"
+                            );
+                            return Err(Box::new(DbEntryLoadError {
+                                entry_id: id,
+                                entry_uuid,
+                                entry_name,
+                                reason: DbEntryLoadReason::InvalidValueSet {
+                                    attribute: k,
+                                    error,
+                                },
+                            }));
+                        }
+                    }
+                }
 
                 (r_attrs, ecstate)
             }
         };
 
-        let uuid = attrs
+        let Some(uuid) = attrs
             .get(&Attribute::Uuid)
-            .and_then(|vs| vs.to_uuid_single())?;
+            .and_then(|vs| vs.to_uuid_single())
+        else {
+            error!(
+                entry_id = id,
+                ?entry_uuid,
+                ?entry_name,
+                "from_dbentry failed: entry has no valid uuid"
+            );
+            return Err(Box::new(DbEntryLoadError {
+                entry_id: id,
+                entry_uuid,
+                entry_name,
+                reason: DbEntryLoadReason::MissingUuid,
+            }));
+        };
 
-        Some(Entry {
+        Ok(Entry {
             valid: EntrySealed { uuid, ecstate },
             state: EntryCommitted { id },
             attrs,
@@ -3444,6 +3530,105 @@ mod tests {
         modify::{Modify, ModifyList},
         value::{IndexType, PartialValue, Value},
     };
+
+    #[test]
+    fn test_from_dbentry_reports_invalid_attribute() {
+        use crate::be::dbentry::{DbEntry, DbEntryVers};
+        use crate::be::dbrepl::DbEntryChangeState;
+        use crate::be::dbvalue::{DbCidV1, DbValueSetV2};
+        use crate::entry::DbEntryLoadReason;
+        use std::collections::BTreeMap;
+        use std::time::Duration;
+
+        let entry_uuid = Uuid::new_v4();
+        let cid = DbCidV1 {
+            timestamp: Duration::from_secs(1),
+            server_id: Uuid::new_v4(),
+        };
+
+        let mut attrs = BTreeMap::new();
+        attrs.insert(Attribute::Uuid, DbValueSetV2::Uuid(vec![entry_uuid]));
+        attrs.insert(
+            Attribute::Name,
+            DbValueSetV2::Iname(vec!["broken_entry".to_string()]),
+        );
+        // A date time that can not be parsed makes the value set conversion fail.
+        attrs.insert(
+            Attribute::AccountExpire,
+            DbValueSetV2::DateTime(vec!["not a date".to_string()]),
+        );
+
+        let db_e = DbEntry {
+            ent: DbEntryVers::V3 {
+                changestate: DbEntryChangeState::V1Live {
+                    at: cid,
+                    changes: BTreeMap::new(),
+                },
+                attrs,
+            },
+        };
+
+        let err = Entry::from_dbentry(db_e, 42).expect_err("invalid value set must be rejected");
+
+        assert_eq!(err.entry_id, 42);
+        assert_eq!(err.entry_uuid, Some(entry_uuid));
+        assert_eq!(err.entry_name.as_deref(), Some("broken_entry"));
+        assert_eq!(
+            err.reason,
+            DbEntryLoadReason::InvalidValueSet {
+                attribute: Attribute::AccountExpire,
+                error: OperationError::InvalidValueState,
+            }
+        );
+
+        // The rendered message must let an operator find the entry and the attribute.
+        let rendered = err.to_string();
+        assert!(rendered.contains("42"));
+        assert!(rendered.contains(&entry_uuid.to_string()));
+        assert!(rendered.contains("broken_entry"));
+        assert!(rendered.contains(Attribute::AccountExpire.as_str()));
+        // Values are never part of the message.
+        assert!(!rendered.contains("not a date"));
+    }
+
+    #[test]
+    fn test_from_dbentry_reports_missing_uuid() {
+        use crate::be::dbentry::{DbEntry, DbEntryVers};
+        use crate::be::dbrepl::DbEntryChangeState;
+        use crate::be::dbvalue::{DbCidV1, DbValueSetV2};
+        use crate::entry::DbEntryLoadReason;
+        use std::collections::BTreeMap;
+        use std::time::Duration;
+
+        let cid = DbCidV1 {
+            timestamp: Duration::from_secs(1),
+            server_id: Uuid::new_v4(),
+        };
+
+        let mut attrs = BTreeMap::new();
+        attrs.insert(
+            Attribute::Name,
+            DbValueSetV2::Iname(vec!["no_uuid_entry".to_string()]),
+        );
+
+        let db_e = DbEntry {
+            ent: DbEntryVers::V3 {
+                changestate: DbEntryChangeState::V1Live {
+                    at: cid,
+                    changes: BTreeMap::new(),
+                },
+                attrs,
+            },
+        };
+
+        let err = Entry::from_dbentry(db_e, 7).expect_err("entry without uuid must be rejected");
+
+        assert_eq!(err.entry_id, 7);
+        assert_eq!(err.entry_uuid, None);
+        assert_eq!(err.entry_name.as_deref(), Some("no_uuid_entry"));
+        assert_eq!(err.reason, DbEntryLoadReason::MissingUuid);
+        assert!(err.to_string().contains("no_uuid_entry"));
+    }
 
     #[test]
     fn test_entry_basic() {
