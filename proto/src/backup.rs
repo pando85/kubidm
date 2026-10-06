@@ -400,6 +400,24 @@ fn default_s3_storage_class() -> String {
     "STANDARD".to_string()
 }
 
+impl S3Config {
+    /// A minimal configuration for `bucket` with every optional setting unset and the
+    /// default storage class. Credentials and region then come from the SDK's default
+    /// provider chain (environment, profile, instance role).
+    pub fn with_bucket(bucket: String) -> Self {
+        Self {
+            bucket,
+            region: None,
+            endpoint: None,
+            path_prefix: None,
+            credentials: None,
+            server_side_encryption: None,
+            storage_class: default_s3_storage_class(),
+            replication: None,
+        }
+    }
+}
+
 impl Display for S3Config {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(

@@ -44,6 +44,7 @@ mod utils;
 use crate::{
     actors::{QueryServerReadV1, QueryServerWriteV1},
     admin::AdminActor,
+    backup::{is_backup_artifact_name, S3BackupError, S3ClientWrapper},
     config::{Configuration, ServerRole},
     interval::IntervalActor,
     repl::ReplicationServerHandles,
@@ -54,7 +55,7 @@ use crypto_glue::{
     traits::Digest,
 };
 use kubidm_proto::{
-    backup::BackupCompression,
+    backup::{BackupCompression, S3BackupMetadata, S3Config},
     internal::{ConsistencyError, OperationError},
     scim_v1::client::ScimAssertGeneric,
 };
@@ -73,7 +74,9 @@ use std::{
     fmt::{Display, Formatter},
     path::{Path, PathBuf},
     sync::{Arc, LazyLock},
+    time::SystemTime,
 };
+use time::format_description::well_known::Rfc3339;
 use tokio::{sync::broadcast, task};
 use tokio_rustls::TlsAcceptor;
 
@@ -596,6 +599,337 @@ fn pass_fail(ok: bool) -> &'static str {
     } else {
         "FAIL"
     }
+}
+
+/// Resolve the S3 configuration an offline recovery command (`restore-s3`, `verify-s3`)
+/// uses: the `[online_backup.s3]` section of the server configuration with `bucket`,
+/// `region` and `endpoint` replaced by any command line override. Without a configured
+/// section, `bucket` must be given; credentials and region then come from the SDK's
+/// default provider chain.
+pub fn s3_config_for_cli(
+    config: &Configuration,
+    bucket: Option<String>,
+    region: Option<String>,
+    endpoint: Option<String>,
+) -> Result<S3Config, OperationError> {
+    let configured = config
+        .online_backup
+        .as_ref()
+        .and_then(|backup| backup.s3.clone());
+
+    let mut s3_config = match (configured, bucket) {
+        (Some(mut s3_config), bucket) => {
+            if let Some(bucket) = bucket {
+                s3_config.bucket = bucket;
+            }
+            s3_config
+        }
+        (None, Some(bucket)) => S3Config::with_bucket(bucket),
+        (None, None) => {
+            error!(
+                "No [online_backup.s3] section is present in the configuration and no \
+                 --bucket was given. Unable to locate the S3 backups."
+            );
+            return Err(OperationError::InvalidState);
+        }
+    };
+
+    if let Some(region) = region {
+        s3_config.region = Some(region);
+    }
+    if let Some(endpoint) = endpoint {
+        s3_config.endpoint = Some(endpoint);
+    }
+
+    Ok(s3_config)
+}
+
+/// A backup downloaded from S3 into a temporary directory. The directory, and with it the
+/// downloaded artifact, is removed when this value is dropped.
+struct FetchedS3Backup {
+    _scratch_dir: tempfile::TempDir,
+    path: PathBuf,
+    metadata: S3BackupMetadata,
+}
+
+/// Download the backup `key` from S3, verifying its SHA-256 against the metadata sidecar,
+/// into a temporary file. The file is named so that `BackupCompression::identify_file`
+/// recognises the compression recorded in the metadata, which lets the local restore and
+/// verification paths treat it exactly like a local artifact.
+async fn fetch_s3_backup(s3_config: S3Config, key: &str) -> Result<FetchedS3Backup, S3BackupError> {
+    let client = S3ClientWrapper::new(s3_config).await?;
+    let (data, metadata) = client.download_backup(key).await?;
+
+    let scratch_dir = tempfile::tempdir()?;
+    let path = scratch_dir
+        .path()
+        .join(format!("backup.json{}", metadata.compression.suffix()));
+    std::fs::write(&path, &data)?;
+
+    info!(
+        key,
+        size_bytes = metadata.size_bytes,
+        checksum_sha256 = %metadata.checksum_sha256,
+        timestamp = %metadata.timestamp,
+        "Downloaded S3 backup to {}",
+        path.display()
+    );
+
+    Ok(FetchedS3Backup {
+        _scratch_dir: scratch_dir,
+        path,
+        metadata,
+    })
+}
+
+/// Restore the backup stored under `key` in S3 into the database described by `config`.
+/// The artifact is downloaded, its SHA-256 is checked against the metadata sidecar, and it
+/// is then restored through `restore_database`. The database is not touched when the
+/// download or the checksum check fails.
+pub async fn restore_s3_database(
+    config: &Configuration,
+    s3_config: S3Config,
+    key: &str,
+) -> Result<(), OperationError> {
+    let fetched = fetch_s3_backup(s3_config, key).await.map_err(|err| {
+        error!(%err, "Unable to download backup {key} from S3");
+        OperationError::InvalidState
+    })?;
+
+    info!(
+        "Restoring S3 backup {key} ({} bytes, sha256 {})",
+        fetched.metadata.size_bytes, fetched.metadata.checksum_sha256
+    );
+
+    restore_database(config, &fetched.path).await
+    // `fetched` is dropped here, removing the downloaded artifact.
+}
+
+/// Verify the backup stored under `key` in S3. The SHA-256 of the stored object is checked
+/// against its metadata sidecar first; when it matches, the downloaded artifact goes
+/// through `verify_backup_server_core` at the requested level. Returns true when every
+/// check passed. The database referenced by `config` is never opened.
+pub async fn verify_s3_backup_server_core(
+    config: &Configuration,
+    s3_config: S3Config,
+    key: &str,
+    level: BackupVerifyLevel,
+) -> bool {
+    let fetched = match fetch_s3_backup(s3_config, key).await {
+        Ok(fetched) => fetched,
+        Err(S3BackupError::InvalidChecksum { expected, actual }) => {
+            eprintln!("S3 checksum verification: FAIL");
+            eprintln!("  - {key}: expected sha256 {expected}, got {actual}");
+            return false;
+        }
+        Err(err) => {
+            eprintln!("S3 checksum verification: FAIL");
+            eprintln!("  - unable to download {key}: {err}");
+            return false;
+        }
+    };
+
+    eprintln!("S3 checksum verification: PASS");
+    eprintln!("  Key: {key}");
+    eprintln!("  Size: {} bytes", fetched.metadata.size_bytes);
+    eprintln!("  SHA-256: {}", fetched.metadata.checksum_sha256);
+    eprintln!("  Uploaded: {}", fetched.metadata.timestamp);
+
+    verify_backup_server_core(config, &fetched.path, level).await
+}
+
+/// List the backups in the configured locations: the local online backup directory and the
+/// S3 prefix. A location that is not configured is reported as such. Returns false only when
+/// a configured location could not be read.
+pub async fn list_backups_server_core(
+    config: &Configuration,
+    local_only: bool,
+    s3_only: bool,
+) -> bool {
+    let mut ok = true;
+
+    if !s3_only {
+        ok &= list_local_backups(config);
+    }
+
+    if !local_only {
+        if !s3_only {
+            println!();
+        }
+        ok &= list_s3_backups(config).await;
+    }
+
+    ok
+}
+
+fn list_local_backups(config: &Configuration) -> bool {
+    let Some(path) = config
+        .online_backup
+        .as_ref()
+        .and_then(|backup| backup.path.as_ref())
+    else {
+        println!("Local backups: none configured");
+        return true;
+    };
+
+    println!("Local backups in {}:", path.display());
+
+    let entries = match std::fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(err) => {
+            error!(?err, "Unable to read backup directory {}", path.display());
+            println!("  error: unable to read {}: {err}", path.display());
+            return false;
+        }
+    };
+
+    let mut rows: Vec<(String, u64, String)> = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                error!(?err, "Unable to read backup directory {}", path.display());
+                println!("  error: unable to read {}: {err}", path.display());
+                return false;
+            }
+        };
+
+        let entry_path = entry.path();
+        let Some(name) = entry_path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !entry_path.is_file() || !is_backup_artifact_name(name) {
+            continue;
+        }
+
+        let (size, modified) = match entry.metadata() {
+            Ok(metadata) => (
+                metadata.len(),
+                metadata
+                    .modified()
+                    .map(format_system_time)
+                    .unwrap_or_else(|_| "unknown".to_string()),
+            ),
+            Err(err) => {
+                error!(?err, "Unable to read metadata of {}", entry_path.display());
+                println!("  error: unable to read {}: {err}", entry_path.display());
+                return false;
+            }
+        };
+        rows.push((name.to_string(), size, modified));
+    }
+
+    if rows.is_empty() {
+        println!("  (no backups)");
+        return true;
+    }
+
+    rows.sort();
+    let name_width = rows
+        .iter()
+        .map(|(name, _, _)| name.len())
+        .max()
+        .unwrap_or(0);
+    println!("  {:<name_width$}  {:>12}  MODIFIED", "NAME", "SIZE_BYTES");
+    for (name, size, modified) in rows {
+        println!("  {name:<name_width$}  {size:>12}  {modified}");
+    }
+
+    true
+}
+
+async fn list_s3_backups(config: &Configuration) -> bool {
+    let Some(s3_config) = config
+        .online_backup
+        .as_ref()
+        .and_then(|backup| backup.s3.clone())
+    else {
+        println!("S3 backups: none configured");
+        return true;
+    };
+
+    let location = match &s3_config.path_prefix {
+        Some(prefix) => format!("s3://{}/{}", s3_config.bucket, prefix.trim_end_matches('/')),
+        None => format!("s3://{}", s3_config.bucket),
+    };
+    println!("S3 backups in {location}:");
+
+    let client = match S3ClientWrapper::new(s3_config).await {
+        Ok(client) => client,
+        Err(err) => {
+            error!(%err, "Unable to create the S3 client");
+            println!("  error: unable to create the S3 client: {err}");
+            return false;
+        }
+    };
+
+    let mut keys: Vec<String> = match client.list_backups().await {
+        Ok(keys) => keys
+            .into_iter()
+            .filter(|key| is_backup_artifact_name(key))
+            .collect(),
+        Err(err) => {
+            error!(%err, "Unable to list S3 backups");
+            println!("  error: unable to list {location}: {err}");
+            return false;
+        }
+    };
+
+    if keys.is_empty() {
+        println!("  (no backups)");
+        return true;
+    }
+
+    keys.sort();
+
+    // Fetch every sidecar first so that the columns can be sized to the content.
+    let mut ok = true;
+    let mut rows: Vec<(String, Result<S3BackupMetadata, S3BackupError>)> = Vec::new();
+    for key in keys {
+        let metadata = client.get_backup_metadata(&key).await;
+        if let Err(err) = &metadata {
+            error!(%err, "Unable to read the metadata of S3 backup {key}");
+            ok = false;
+        }
+        rows.push((key, metadata));
+    }
+
+    let key_width = rows.iter().map(|(key, _)| key.len()).max().unwrap_or(0);
+    let time_width = rows
+        .iter()
+        .filter_map(|(_, metadata)| metadata.as_ref().ok())
+        .map(|metadata| metadata.timestamp.len())
+        .max()
+        .unwrap_or(0)
+        .max("UPLOADED".len());
+    println!(
+        "  {:<key_width$}  {:>12}  {:<time_width$}  SHA256",
+        "KEY", "SIZE_BYTES", "UPLOADED"
+    );
+    for (key, metadata) in rows {
+        match metadata {
+            Ok(metadata) => {
+                let short_checksum: String = metadata.checksum_sha256.chars().take(12).collect();
+                println!(
+                    "  {key:<key_width$}  {:>12}  {:<time_width$}  {short_checksum}",
+                    metadata.size_bytes, metadata.timestamp
+                );
+            }
+            Err(err) => println!("  {key:<key_width$}  metadata unavailable: {err}"),
+        }
+    }
+
+    ok
+}
+
+/// Format a file modification time as an RFC3339 UTC timestamp with second precision.
+fn format_system_time(time: SystemTime) -> String {
+    let datetime = time::OffsetDateTime::from(time);
+    datetime
+        .replace_nanosecond(0)
+        .unwrap_or(datetime)
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| "unknown".to_string())
 }
 
 pub async fn reindex_server_core(config: &Configuration) {
@@ -1173,6 +1507,31 @@ impl CoreHandle {
                 versions,
                 compression,
                 None,
+            )
+            .await
+    }
+
+    /// Run an online backup to S3 now, through the same code path the scheduled S3 backup
+    /// uses, including retention of `versions` backups under the configured prefix. This
+    /// exists so tests can exercise the production S3 backup path on demand.
+    pub async fn trigger_s3_backup(
+        &self,
+        s3_config: S3Config,
+        versions: usize,
+        compression: BackupCompression,
+    ) -> Result<(), OperationError> {
+        let client = S3ClientWrapper::new(s3_config).await.map_err(|err| {
+            error!(%err, "Unable to create the S3 client");
+            OperationError::InvalidState
+        })?;
+
+        self.server_read_ref
+            .handle_online_backup(
+                kubidmd_lib::event::OnlineBackupEvent::new(),
+                Path::new("s3://backup"),
+                versions,
+                compression,
+                Some(client),
             )
             .await
     }
