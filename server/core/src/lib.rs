@@ -660,6 +660,13 @@ async fn fetch_s3_backup(s3_config: S3Config, key: &str) -> Result<FetchedS3Back
     let client = S3ClientWrapper::new(s3_config).await?;
     let (data, metadata) = client.download_backup(key).await?;
 
+    if metadata.encrypted {
+        return Err(S3BackupError::DownloadError(format!(
+            "backup {key} is marked encrypted; decryption on restore is not supported in \
+             this release"
+        )));
+    }
+
     let scratch_dir = tempfile::tempdir()?;
     let path = scratch_dir
         .path()
@@ -723,8 +730,7 @@ pub async fn verify_s3_backup_server_core(
             return false;
         }
         Err(err) => {
-            eprintln!("S3 checksum verification: FAIL");
-            eprintln!("  - unable to download {key}: {err}");
+            eprintln!("S3 download: FAIL - {err}");
             return false;
         }
     };
