@@ -310,7 +310,16 @@ impl IdRawEntry {
             OperationError::SerdeJsonError
         })?;
         // let id = u64::try_from(self.id).map_err(|_| OperationError::InvalidEntryId)?;
-        Entry::from_dbentry(db_e, self.id).ok_or(OperationError::CorruptedEntry(self.id))
+        Entry::from_dbentry(db_e, self.id).map_err(|err| {
+            admin_error!(
+                entry_id = self.id,
+                entry_uuid = ?err.entry_uuid,
+                entry_name = ?err.entry_name,
+                reason = %err,
+                "Unable to load entry from the database, it is corrupted"
+            );
+            OperationError::CorruptedEntry(self.id)
+        })
     }
 }
 
@@ -1071,13 +1080,13 @@ pub trait BackendTransaction {
             let validation_entry: DbEntry = serde_json::from_slice(id_ent.data.as_slice())
                 .map_err(|_| OperationError::SerdeJsonError)?;
 
-            if Entry::from_dbentry(validation_entry, id_ent.id).is_none() {
-                // Log the problematic entry for debugging
-                let db_entry: DbEntry = serde_json::from_slice(id_ent.data.as_slice())
-                    .map_err(|_| OperationError::SerdeJsonError)?;
+            if let Err(err) = Entry::from_dbentry(validation_entry, id_ent.id) {
+                // Identify the problematic entry so that an operator can find it.
                 admin_error!(
-                    id = id_ent.id,
-                    entry = %db_entry,
+                    entry_id = id_ent.id,
+                    entry_uuid = ?err.entry_uuid,
+                    entry_name = ?err.entry_name,
+                    reason = %err,
                     "Backup semantic validation failed: entry deserialized but Entry::from_dbentry rejected it"
                 );
                 return Err(OperationError::DB0005BackupEntrySemanticInvalid {

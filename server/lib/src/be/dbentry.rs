@@ -77,6 +77,34 @@ pub enum DbBackup {
     V1(Vec<DbEntry>),
 }
 
+impl DbEntry {
+    /// The uuid stored in the raw attributes of this entry, if it is present and well
+    /// formed. This does not convert the entry and can be used to identify an entry that
+    /// fails to load.
+    pub fn stored_uuid(&self) -> Option<Uuid> {
+        match &self.ent {
+            DbEntryVers::V3 { attrs, .. } => match attrs.get(&Attribute::Uuid) {
+                Some(DbValueSetV2::Uuid(uuids)) => uuids.first().copied(),
+                _ => None,
+            },
+        }
+    }
+
+    /// The name stored in the raw attributes of this entry, if it is present and stored
+    /// as a string value. This does not convert the entry and can be used to identify an
+    /// entry that fails to load.
+    pub fn stored_name(&self) -> Option<&str> {
+        match &self.ent {
+            DbEntryVers::V3 { attrs, .. } => match attrs.get(&Attribute::Name) {
+                Some(DbValueSetV2::Iname(names))
+                | Some(DbValueSetV2::Iutf8(names))
+                | Some(DbValueSetV2::Utf8(names)) => names.first().map(String::as_str),
+                _ => None,
+            },
+        }
+    }
+}
+
 impl std::fmt::Debug for DbEntry {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match &self.ent {
@@ -189,6 +217,49 @@ mod tests {
                 attrs: BTreeMap::new(),
             },
         }
+    }
+
+    #[test]
+    fn test_dbentry_stored_identity() {
+        let entry = make_live_entry();
+        let expected_uuid = match &entry.ent {
+            DbEntryVers::V3 { attrs, .. } => match attrs.get(&Attribute::Uuid) {
+                Some(DbValueSetV2::Uuid(uuids)) => uuids[0],
+                _ => panic!("sample entry has no uuid"),
+            },
+        };
+
+        assert_eq!(entry.stored_uuid(), Some(expected_uuid));
+        assert_eq!(entry.stored_name(), Some("testuser"));
+    }
+
+    #[test]
+    fn test_dbentry_stored_identity_absent_or_malformed() {
+        // A tombstone carries no attributes at all.
+        let tombstone = make_tombstone_entry();
+        assert_eq!(tombstone.stored_uuid(), None);
+        assert_eq!(tombstone.stored_name(), None);
+
+        // Attributes present but stored with an unexpected value type must not be
+        // misreported as an identity.
+        let sid = Uuid::new_v4();
+        let mut attrs = BTreeMap::new();
+        attrs.insert(
+            Attribute::Uuid,
+            DbValueSetV2::Utf8(vec!["not-a-uuid".to_string()]),
+        );
+        attrs.insert(Attribute::Name, DbValueSetV2::Uint32(vec![1]));
+        let malformed = DbEntry {
+            ent: DbEntryVers::V3 {
+                changestate: DbEntryChangeState::V1Live {
+                    at: make_cid(sid, 0),
+                    changes: BTreeMap::new(),
+                },
+                attrs,
+            },
+        };
+        assert_eq!(malformed.stored_uuid(), None);
+        assert_eq!(malformed.stored_name(), None);
     }
 
     #[test]
