@@ -1455,6 +1455,17 @@ pub static SCHEMA_CLASS_KEY_OBJECT_JWE_A128GCM_DL6: LazyLock<SchemaClass> =
         uuid: UUID_SCHEMA_CLASS_KEY_OBJECT_JWE_A128GCM,
         name: EntryClass::KeyObjectJweA128GCM.into(),
         description:
+            "A marker class indicating that this keyobject must provide jwe aes-128-gcm capability."
+                .to_string(),
+        systemsupplements: vec![EntryClass::KeyObject.into()],
+        ..Default::default()
+    });
+
+pub static SCHEMA_CLASS_KEY_OBJECT_JWE_A256GCM: LazyLock<SchemaClass> =
+    LazyLock::new(|| SchemaClass {
+        uuid: UUID_SCHEMA_CLASS_KEY_OBJECT_JWE_A256GCM,
+        name: EntryClass::KeyObjectJweA256GCM.into(),
+        description:
             "A marker class indicating that this keyobject must provide jwe aes-256-gcm capability."
                 .to_string(),
         systemsupplements: vec![EntryClass::KeyObject.into()],
@@ -1570,6 +1581,11 @@ pub static SCHEMA_CLASS_ACCOUNT_SIGNUP_REQUEST: LazyLock<SchemaClass> =
         name: EntryClass::AccountSignupRequest.into(),
         description: "A pending account signup request that is pending review and/or verification"
             .to_string(),
-        systemmust: vec![Attribute::Name, Attribute::DisplayName, Attribute::Mail],
+        systemmust: vec![
+            Attribute::Name,
+            Attribute::DisplayName,
+            Attribute::Mail,
+            Attribute::DeleteAfter,
+        ],
         ..Default::default()
     });

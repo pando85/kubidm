@@ -1,7 +1,6 @@
-use crate::OpType;
 use crate::{
     handle_client_error, handle_group_account_policy_error, GroupAccountPolicyOpt,
-    KubidmClientParser,
+    KubidmClientParser, OpType,
 };
 
 impl GroupAccountPolicyOpt {

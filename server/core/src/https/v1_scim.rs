@@ -1,24 +1,29 @@
-use super::apidocs::response_schema::{ApiResponseWithout200, DefaultApiResponse};
-use super::errors::WebError;
-use super::middleware::KOpId;
-use super::v1::{
-    json_rest_event_get, json_rest_event_get_id, json_rest_event_get_id_attr, json_rest_event_post,
-    json_rest_event_put_attr,
+use super::{
+    apidocs::response_schema::{ApiResponseWithout200, DefaultApiResponse},
+    errors::WebError,
+    middleware::KOpId,
+    v1::{
+        json_rest_event_get, json_rest_event_get_id, json_rest_event_get_id_attr,
+        json_rest_event_post, json_rest_event_put_attr,
+    },
+    ServerState,
 };
-use super::ServerState;
 use crate::https::extractors::VerifiedClientInformation;
-use axum::extract::{rejection::JsonRejection, DefaultBodyLimit, Path, Query, State};
-use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{delete, get, post};
-use axum::{Extension, Json, Router};
-use kubidm_proto::scim_v1::ScimEntry;
-use kubidm_proto::scim_v1::{
-    client::{ScimEntryPostGeneric, ScimEntryPutGeneric},
-    server::{ScimEntryKubidm, ScimListResponse},
-    ScimApplicationPassword, ScimApplicationPasswordCreate, ScimEntryGetQuery, ScimSyncRequest,
-    ScimSyncState,
+use axum::{
+    extract::{rejection::JsonRejection, DefaultBodyLimit, Path, Query, State},
+    response::{Html, IntoResponse, Response},
+    routing::{delete, get, post},
+    Extension, Json, Router,
 };
-use kubidm_proto::v1::Entry as ProtoEntry;
+use kubidm_proto::{
+    scim_v1::{
+        client::{ScimEntryPostGeneric, ScimEntryPutGeneric},
+        server::{ScimEntryKubidm, ScimListResponse},
+        ScimApplicationPassword, ScimApplicationPasswordCreate, ScimEntry, ScimEntryGetQuery,
+        ScimSyncRequest, ScimSyncState,
+    },
+    v1::Entry as ProtoEntry,
+};
 use kubidmd_lib::prelude::*;
 
 const DEFAULT_SCIM_SYNC_BYTES: usize = 1024 * 1024 * 32;

@@ -1,5 +1,4 @@
-use crate::OpType;
-use crate::{handle_client_error, KubidmClientParser, RecycleOpt};
+use crate::{handle_client_error, KubidmClientParser, OpType, RecycleOpt};
 
 impl RecycleOpt {
     pub async fn exec(&self, opt: KubidmClientParser) {

@@ -46,12 +46,12 @@ config:
 .PHONY: run
 run: ## Run the test/dev server
 run:
-	cd server/daemon && ./run_insecure_dev_server.sh
+	scripts/run_insecure_dev_server.sh
 
 .PHONY: run_htmx
 run_htmx: ## Run in HTMX mode
 run_htmx:
-	cd server/daemon && KANI_CARGO_OPTS="--features kubidmd_core/ui_htmx" ./run_insecure_dev_server.sh
+	KANI_CARGO_OPTS="--features kubidmd_core/ui_htmx" scripts/run_insecure_dev_server.sh
 
 .PHONY: buildx/kubidmd
 buildx/kubidmd: ## Build multiarch kubidm server images and push to docker hub

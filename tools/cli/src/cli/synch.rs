@@ -1,5 +1,4 @@
-use crate::OpType;
-use crate::{handle_client_error, KubidmClientParser, SynchOpt};
+use crate::{handle_client_error, KubidmClientParser, OpType, SynchOpt};
 use dialoguer::Confirm;
 
 impl SynchOpt {

@@ -1,10 +1,9 @@
-use crate::OpType;
-use crate::{handle_client_error, Oauth2Opt, OutputMode};
-use crate::{KubidmClientParser, Oauth2ClaimMapJoin};
+use crate::{
+    handle_client_error, KubidmClientParser, Oauth2ClaimMapJoin, Oauth2Opt, OpType, OutputMode,
+};
 use anyhow::{Context, Error};
 use kubidm_proto::internal::{ImageValue, Oauth2ClaimMapJoin as ProtoOauth2ClaimMapJoin};
-use std::fs::read;
-use std::process::exit;
+use std::{fs::read, process::exit};
 
 impl Oauth2Opt {
     pub async fn exec(&self, opt: KubidmClientParser) {

@@ -1,9 +1,10 @@
-use crate::idm::server::IdmServerProxyWriteTransaction;
-use crate::prelude::*;
+use crate::{idm::server::IdmServerProxyWriteTransaction, prelude::*};
 use kubidm_proto::oauth2::OidcDiscoveryResponse;
-use std::collections::{BTreeMap, BTreeSet};
-use std::fmt;
-use std::sync::Arc;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    sync::Arc,
+};
 use tokio::sync::RwLock;
 
 pub const OAUTH2_CLIENT_AUTHORISATION_RESPONSE_PATH: &str = "/ui/login/oauth2_landing";

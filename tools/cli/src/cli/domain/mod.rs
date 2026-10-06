@@ -1,5 +1,4 @@
-use crate::OpType;
-use crate::{handle_client_error, DomainOpt, KubidmClientParser};
+use crate::{handle_client_error, DomainOpt, KubidmClientParser, OpType};
 use anyhow::{Context, Error};
 use kubidm_proto::internal::ImageValue;
 use std::fs::read;

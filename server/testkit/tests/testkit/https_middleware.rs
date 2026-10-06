@@ -1,5 +1,4 @@
-use kubidm_client::http::header;
-use kubidm_client::KubidmClient;
+use kubidm_client::{http::header, KubidmClient};
 use kubidmd_core::config::ServerRole;
 
 #[kubidmd_testkit::test(role = ServerRole::WriteReplica)]

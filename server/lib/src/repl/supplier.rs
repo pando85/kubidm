@@ -1,48 +1,29 @@
-use super::proto::{
-    ReplEntryV1, ReplIncrementalContext, ReplIncrementalEntryV1, ReplRefreshContext, ReplRuvRange,
+use super::{
+    proto::{
+        ReplEntryV1, ReplIncrementalContext, ReplIncrementalEntryV1, ReplRefreshContext,
+        ReplRuvRange,
+    },
+    ruv::{RangeDiffStatus, ReplicationUpdateVector, ReplicationUpdateVectorTransaction},
 };
-use super::ruv::{RangeDiffStatus, ReplicationUpdateVector, ReplicationUpdateVectorTransaction};
-use crate::be::keystorage::{KeyHandle, KeyHandleId};
-use crate::be::BackendTransaction;
-use crate::prelude::*;
+use crate::{
+    be::{
+        keystorage::{KeyHandle, KeyHandleId},
+        BackendTransaction,
+    },
+    prelude::*,
+};
 use crypto_glue::{
     der::SecretDocument,
     ecdsa_p256::{self, EcdsaP256DerSignature, EcdsaP256SigningKey, EcdsaP256VerifyingKey},
     traits::Pkcs8EncodePrivateKey,
     x509::{
-        self, oiddb, Builder, Certificate, CertificateBuilder, ExtendedKeyUsage, GeneralName,
+        self, profile::cabf::tls::*, Builder, Certificate, CertificateBuilder, GeneralName,
         GeneralizedTime, Ia5String, OctetString, SubjectAltName, SubjectPublicKeyInfoOwned,
+        Validity,
     },
 };
 use rustls::pki_types::{IpAddr, ServerName};
 use std::str::FromStr;
-use x509_cert::builder::profile::BuilderProfile;
-use x509_cert::certificate::TbsCertificate;
-use x509_cert::ext::Extension;
-use x509_cert::spki::SubjectPublicKeyInfoRef;
-
-struct ManualProfile {
-    subject: x509::Name,
-}
-
-impl BuilderProfile for ManualProfile {
-    fn get_issuer(&self, subject: &x509::Name) -> x509::Name {
-        subject.clone()
-    }
-
-    fn get_subject(&self) -> x509::Name {
-        self.subject.clone()
-    }
-
-    fn build_extensions(
-        &self,
-        _spk: SubjectPublicKeyInfoRef<'_>,
-        _issuer_spk: SubjectPublicKeyInfoRef<'_>,
-        _tbs: &TbsCertificate,
-    ) -> x509_cert::builder::Result<Vec<Extension>> {
-        Ok(Vec::new())
-    }
-}
 
 impl QueryServerWriteTransaction<'_> {
     fn supplier_generate_key_cert(
@@ -61,17 +42,6 @@ impl QueryServerWriteTransaction<'_> {
             OperationError::CryptographyError
         })?;
 
-        let serial_number = x509::uuid_to_serial(s_uuid);
-        let subject =
-            x509::Name::from_str(&format!("O=Kubidm Replication,CN={s_uuid}")).map_err(|err| {
-                error!(?err, "Unable to parse subject dn");
-                OperationError::CryptographyError
-            })?;
-
-        let profile = ManualProfile {
-            subject: subject.clone(),
-        };
-
         let not_before = GeneralizedTime::from_unix_duration(self.get_curtime())
             .map(x509::Time::from)
             .map_err(|err| {
@@ -87,24 +57,14 @@ impl QueryServerWriteTransaction<'_> {
             OperationError::CryptographyError
         })?;
 
-        let validity = x509::Validity::new(not_before, not_after);
+        let validity = Validity::new(not_before, not_after);
 
-        let mut x509_builder = CertificateBuilder::new(profile, serial_number, validity, pub_key)
-            .map_err(|err| {
-            error!(?err, "Unable to construct certificate builder");
-            OperationError::CryptographyError
-        })?;
-
-        // Key Usage (server + client )
-        let eku_extension = ExtendedKeyUsage(vec![
-            oiddb::rfc5280::ID_KP_CLIENT_AUTH,
-            oiddb::rfc5280::ID_KP_SERVER_AUTH,
-        ]);
-
-        x509_builder.add_extension(&eku_extension).map_err(|err| {
-            error!(?err, "Unable to add extended key usage extension");
-            OperationError::CryptographyError
-        })?;
+        let serial_number = x509::uuid_to_serial(s_uuid);
+        let subject =
+            x509::Name::from_str(&format!("CN={s_uuid},O=Kubidm Replication")).map_err(|err| {
+                error!(?err, "Unable to parse subject dn");
+                OperationError::CryptographyError
+            })?;
 
         // Subject Alt Name
         // We need to understand how rustls treats this to issue the correct SAN value.
@@ -114,31 +74,53 @@ impl QueryServerWriteTransaction<'_> {
             return Err(OperationError::CryptographyError);
         };
 
-        let subject_alt_name = match server_name {
+        let names = match server_name {
             ServerName::DnsName(_) => {
                 let alt_name = Ia5String::new(domain_name).map_err(|err| {
                     error!(?err, "Invalid subject alt name");
                     OperationError::CryptographyError
                 })?;
-                SubjectAltName(vec![GeneralName::DnsName(alt_name)])
+                vec![GeneralName::DnsName(alt_name)]
             }
             ServerName::IpAddress(IpAddr::V4(ipv4_addr)) => {
-                let ip_address = OctetString::new(ipv4_addr.as_ref().to_vec()).map_err(|err| {
+                let ip_address = OctetString::new(*ipv4_addr.as_ref()).map_err(|err| {
                     error!(?err, "Unable to convert ipv4 address to octet string");
                     OperationError::CryptographyError
                 })?;
-                SubjectAltName(vec![GeneralName::IpAddress(ip_address)])
+                vec![GeneralName::IpAddress(ip_address)]
             }
             ServerName::IpAddress(IpAddr::V6(ipv6_addr)) => {
-                let ip_address = OctetString::new(ipv6_addr.as_ref().to_vec()).map_err(|err| {
+                let ip_address = OctetString::new(*ipv6_addr.as_ref()).map_err(|err| {
                     error!(?err, "Unable to convert ipv6 address to octet string");
                     OperationError::CryptographyError
                 })?;
-                SubjectAltName(vec![GeneralName::IpAddress(ip_address)])
+                vec![GeneralName::IpAddress(ip_address)]
             }
 
             _ => return Err(OperationError::CryptographyError),
         };
+
+        let subject_alt_name = SubjectAltName(names.clone());
+
+        let certificate_type =
+            CertificateType::domain_validated(subject.clone(), names).map_err(|err| {
+                error!(?err, "Unable to construct certificate type");
+                OperationError::CryptographyError
+            })?;
+
+        let profile = Subscriber {
+            certificate_type,
+            issuer: subject,
+            client_auth: true,
+            tls12_options: Default::default(),
+            enable_data_encipherment: Default::default(),
+        };
+
+        let mut x509_builder = CertificateBuilder::new(profile, serial_number, validity, pub_key)
+            .map_err(|err| {
+            error!(?err, "Unable to construct certificate builder");
+            OperationError::CryptographyError
+        })?;
 
         x509_builder
             .add_extension(&subject_alt_name)

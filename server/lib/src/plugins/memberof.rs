@@ -10,15 +10,19 @@
 // As a result, we first need to run refint to clean up all dangling references, then memberof
 // fixes the graph of memberships
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
-use crate::entry::{Entry, EntryCommitted, EntrySealed};
-use crate::event::{CreateEvent, DeleteEvent, ModifyEvent};
-use crate::plugins::Plugin;
-use crate::prelude::*;
-use crate::schema::SchemaTransaction;
-use crate::value::{PartialValue, TimeBoundedMember};
+use crate::{
+    entry::{Entry, EntryCommitted, EntrySealed},
+    event::{CreateEvent, DeleteEvent, ModifyEvent},
+    plugins::Plugin,
+    prelude::*,
+    schema::SchemaTransaction,
+    value::{PartialValue, TimeBoundedMember},
+};
 use time::OffsetDateTime;
 
 pub struct MemberOf;

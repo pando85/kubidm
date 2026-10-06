@@ -1,9 +1,10 @@
-use self::extractors::ClientConnInfo;
-use self::javascript::*;
-use crate::actors::{QueryServerReadV1, QueryServerWriteV1};
-use crate::config::{AddressSet, Configuration, ServerRole, TcpAddressInfo};
-use crate::tcp::process_client_addr;
-use crate::CoreAction;
+use self::{extractors::ClientConnInfo, javascript::*};
+use crate::{
+    actors::{QueryServerReadV1, QueryServerWriteV1},
+    config::{AddressSet, Configuration, HttpVersions, ServerRole, TcpAddressInfo},
+    tcp::process_client_addr,
+    CoreAction,
+};
 use axum::{
     body::Body,
     extract::connect_info::IntoMakeServiceWithConnectInfo,
@@ -26,12 +27,10 @@ use kubidm_proto::{constants::KSESSIONID, internal::COOKIE_AUTH_SESSION_ID};
 use kubidmd_lib::{idm::authentication::ClientCertInfo, status::StatusActor};
 use serde::de::DeserializeOwned;
 use sketching::*;
-use std::fmt::Write;
-use std::io::ErrorKind;
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Duration;
-use std::{net::SocketAddr, str::FromStr};
+use std::{
+    fmt::Write, io::ErrorKind, net::SocketAddr, path::PathBuf, str::FromStr, sync::Arc,
+    time::Duration,
+};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite},
     net::{TcpListener, TcpStream},
@@ -66,6 +65,11 @@ mod v1_oauth2;
 mod v1_oauth2_federation;
 mod v1_scim;
 mod views;
+
+struct ServerContext {
+    trusted_tcp_info_ips: TcpAddressInfo,
+    http_server_versions: HttpVersions,
+}
 
 #[derive(Clone)]
 pub struct ServerState {
@@ -218,7 +222,7 @@ pub async fn create_https_server(
     let csp_header = format!(
         concat!(
             "default-src 'self'; ",
-            "base-uri 'self' https:; ",
+            "base-uri 'none'; ",
             "form-action 'self'; ",
             "frame-ancestors 'none'; ",
             "img-src 'self' data:; ",
@@ -242,7 +246,7 @@ pub async fn create_https_server(
     let csp_header_no_form_action = format!(
         concat!(
             "default-src 'self'; ",
-            "base-uri 'self' https:; ",
+            "base-uri 'none'; ",
             "frame-ancestors 'none'; ",
             "img-src 'self' data:; ",
             "worker-src 'none'; ",
@@ -258,6 +262,8 @@ pub async fn create_https_server(
                 "Unable to generate content security policy with no form action"
             );
         })?;
+
+    let http_server_versions = config.http_server_versions;
 
     let trust_x_forward_for_ips = config
         .http_client_address_info
@@ -361,10 +367,7 @@ pub async fn create_https_server(
             state.clone(),
             middleware::security_headers::security_headers_layer,
         ))
-        .layer(from_fn(middleware::version_middleware))
-        .layer(from_fn(
-            middleware::hsts_header::strict_transport_security_layer,
-        ));
+        .layer(from_fn(middleware::version_middleware));
 
     // layer which checks the responses have a content-type of JSON when we're in debug mode
     #[cfg(any(test, debug_assertions))]
@@ -417,6 +420,11 @@ pub async fn create_https_server(
 
     info!("Starting the web server...");
 
+    let server_ctx = Arc::new(ServerContext {
+        trusted_tcp_info_ips,
+        http_server_versions,
+    });
+
     let mut listener_handles = Vec::with_capacity(addrs.len());
     for addr in addrs {
         let listener = match TcpListener::bind(addr).await {
@@ -429,7 +437,7 @@ pub async fn create_https_server(
 
         let app = app.clone();
         let rx = server_message_tx.subscribe();
-        let trusted_tcp_info_ips = trusted_tcp_info_ips.clone();
+        let server_ctx = server_ctx.clone();
 
         let handle = match &maybe_tls_acceptor {
             Some(tls_acceptor) => {
@@ -444,15 +452,10 @@ pub async fn create_https_server(
                     rx,
                     server_message_tx,
                     tls_acceptor_reload_rx,
-                    trusted_tcp_info_ips,
+                    server_ctx,
                 ))
             }
-            None => task::spawn(server_plaintext_loop(
-                listener,
-                app,
-                rx,
-                trusted_tcp_info_ips,
-            )),
+            None => task::spawn(server_plaintext_loop(listener, app, rx, server_ctx)),
         };
 
         listener_handles.push(handle);
@@ -468,7 +471,7 @@ async fn server_tls_loop(
     mut rx: broadcast::Receiver<CoreAction>,
     server_message_tx: broadcast::Sender<CoreAction>,
     mut tls_acceptor_reload_rx: broadcast::Receiver<TlsAcceptor>,
-    trusted_tcp_info_ips: Arc<TcpAddressInfo>,
+    server_ctx: Arc<ServerContext>,
 ) {
     pin_mut!(listener);
 
@@ -485,7 +488,7 @@ async fn server_tls_loop(
                     Ok((stream, addr)) => {
                         let tls_acceptor = tls_acceptor.clone();
                         let app = app.clone();
-                        task::spawn(handle_tls_conn(tls_acceptor, stream, app, addr, trusted_tcp_info_ips.clone()));
+                        task::spawn(handle_tls_conn(tls_acceptor, stream, app, addr, server_ctx.clone()));
                     }
                     Err(err) => {
                         error!("Web server exited with {:?}", err);
@@ -510,7 +513,7 @@ async fn server_plaintext_loop(
     listener: TcpListener,
     app: IntoMakeServiceWithConnectInfo<Router, ClientConnInfo>,
     mut rx: broadcast::Receiver<CoreAction>,
-    trusted_tcp_info_ips: Arc<TcpAddressInfo>,
+    server_ctx: Arc<ServerContext>,
 ) {
     pin_mut!(listener);
 
@@ -526,7 +529,7 @@ async fn server_plaintext_loop(
                 match accept {
                     Ok((stream, addr)) => {
                         let app = app.clone();
-                        task::spawn(handle_conn(stream, app, addr, trusted_tcp_info_ips.clone()));
+                        task::spawn(handle_conn(stream, app, addr, server_ctx.clone()));
                     }
                     Err(err) => {
                         error!("Web server exited with {:?}", err);
@@ -541,17 +544,17 @@ async fn server_plaintext_loop(
 }
 
 /// This handles an individual connection.
-pub(crate) async fn handle_conn(
+async fn handle_conn(
     stream: TcpStream,
     app: IntoMakeServiceWithConnectInfo<Router, ClientConnInfo>,
     connection_addr: SocketAddr,
-    trusted_tcp_info_ips: Arc<TcpAddressInfo>,
+    server_ctx: Arc<ServerContext>,
 ) -> Result<(), std::io::Error> {
     let (stream, client_addr) = process_client_addr(
         stream,
         connection_addr,
         HTTPS_CLIENT_CONN_TIMEOUT,
-        trusted_tcp_info_ips,
+        &server_ctx.trusted_tcp_info_ips,
     )
     .await?;
 
@@ -567,22 +570,22 @@ pub(crate) async fn handle_conn(
     // `TokioIo` converts between them.
     let stream = TokioIo::new(stream);
 
-    process_client_hyper(stream, app, client_conn_info).await
+    process_client_hyper(stream, app, client_conn_info, server_ctx).await
 }
 
 /// This handles an individual connection.
-pub(crate) async fn handle_tls_conn(
+async fn handle_tls_conn(
     acceptor: TlsAcceptor,
     stream: TcpStream,
     app: IntoMakeServiceWithConnectInfo<Router, ClientConnInfo>,
     connection_addr: SocketAddr,
-    trusted_tcp_info_ips: Arc<TcpAddressInfo>,
+    server_ctx: Arc<ServerContext>,
 ) -> Result<(), std::io::Error> {
     let (stream, client_addr) = process_client_addr(
         stream,
         connection_addr,
         HTTPS_CLIENT_CONN_TIMEOUT,
-        trusted_tcp_info_ips,
+        &server_ctx.trusted_tcp_info_ips,
     )
     .await?;
 
@@ -657,13 +660,15 @@ pub(crate) async fn handle_tls_conn(
     // `TokioIo` converts between them.
     let stream = TokioIo::new(tls_stream);
 
-    process_client_hyper(stream, app, client_conn_info).await
+    process_client_hyper(stream, app, client_conn_info, server_ctx).await
 }
 
 async fn process_client_hyper<T>(
     mut stream: TokioIo<T>,
     mut app: IntoMakeServiceWithConnectInfo<Router, ClientConnInfo>,
     client_conn_info: ClientConnInfo,
+    // http_server_versions: HttpVersions,
+    server_ctx: Arc<ServerContext>,
 ) -> Result<(), std::io::Error>
 where
     T: AsyncRead + AsyncWrite + std::marker::Unpin + std::marker::Send + 'static,
@@ -714,16 +719,26 @@ where
 
     let mut builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
 
-    builder
-        .http1()
-        .timer(TokioTimer::new())
-        .header_read_timeout(HTTPS_CLIENT_IO_TIMEOUT);
+    match server_ctx.http_server_versions {
+        HttpVersions::All | HttpVersions::V1_1 => {
+            builder
+                .http1()
+                .timer(TokioTimer::new())
+                .header_read_timeout(HTTPS_CLIENT_IO_TIMEOUT);
+        }
+        _ => {}
+    }
 
-    builder
-        .http2()
-        .timer(TokioTimer::new())
-        .keep_alive_timeout(HTTPS_CLIENT_IO_TIMEOUT)
-        .keep_alive_interval(HTTPS_CLIENT_IO_TIMEOUT);
+    match server_ctx.http_server_versions {
+        HttpVersions::All | HttpVersions::V2_0 => {
+            builder
+                .http2()
+                .timer(TokioTimer::new())
+                .keep_alive_timeout(HTTPS_CLIENT_IO_TIMEOUT)
+                .keep_alive_interval(HTTPS_CLIENT_IO_TIMEOUT);
+        }
+        _ => {}
+    }
 
     builder
         .serve_connection_with_upgrades(stream, hyper_service)

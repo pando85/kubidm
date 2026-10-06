@@ -1,6 +1,5 @@
-use crate::entry::EntryInitNew;
-use crate::prelude::*;
-use crate::value::CredentialType;
+use crate::{entry::EntryInitNew, prelude::*, value::CredentialType};
+
 use kubidm_proto::internal::{Filter, OperationError, UiHint};
 use std::sync::LazyLock;
 

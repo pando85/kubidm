@@ -1,5 +1,4 @@
-use crate::OpType;
-use crate::{handle_client_error, GroupOpt, GroupPosix, KubidmClientParser, OutputMode};
+use crate::{handle_client_error, GroupOpt, GroupPosix, KubidmClientParser, OpType, OutputMode};
 use kubidm_proto::constants::ATTR_GIDNUMBER;
 
 mod account_policy;

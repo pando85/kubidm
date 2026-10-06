@@ -1,9 +1,7 @@
 use compact_jwt::{traits::JwsVerifiable, JwsCompact, JwsEs256Verifier, JwsVerifier};
 use kubidm_client::KubidmClient;
-use kubidm_proto::internal::ScimSyncToken;
-use kubidm_proto::scim_v1::ScimEntryGetQuery;
-use kubidmd_lib::constants::NAME_IDM_ADMINS;
-use kubidmd_lib::prelude::Attribute;
+use kubidm_proto::{internal::ScimSyncToken, scim_v1::ScimEntryGetQuery};
+use kubidmd_lib::{constants::NAME_IDM_ADMINS, prelude::Attribute};
 use kubidmd_testkit::{ADMIN_TEST_PASSWORD, ADMIN_TEST_USER};
 use std::str::FromStr;
 use url::Url;
