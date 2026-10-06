@@ -757,10 +757,12 @@ mod tests {
     }
 
     #[test]
-    fn test_modify_ident_test_migration_grants() {
+    fn test_modify_ident_test_migration_ignores() {
+        // Migration is not unilaterally granted. It is constrained by the
+        // migration class/attribute rules in modify_migration_attrs.
         let ident = Identity::migration();
         let result = modify_ident_test(&ident);
-        assert!(matches!(result, AccessBasicResult::Grant));
+        assert!(matches!(result, AccessBasicResult::Ignore));
     }
 
     #[test]
@@ -915,6 +917,51 @@ mod tests {
         let sync_agreements = HashMap::new();
         let result = apply_modify_access(&ident, &acps, &sync_agreements, &entry);
         assert!(matches!(result, ModifyResult::Grant));
+    }
+
+    #[test]
+    fn test_apply_modify_access_migration_constrained_to_migration_attrs() {
+        let ident = Identity::migration();
+        let entry = make_sealed_entry_two_classes(
+            "object",
+            "group",
+            uuid::uuid!("00000000-0000-0000-0001-000000000002"),
+        );
+        let acps: Vec<AccessControlModifyResolved> = vec![];
+        let sync_agreements = HashMap::new();
+        let result = apply_modify_access(&ident, &acps, &sync_agreements, &entry);
+        match result {
+            ModifyResult::Allow {
+                pres,
+                rem,
+                pres_cls,
+                rem_cls,
+            } => {
+                let (expect_attrs, expect_cls) =
+                    migration_entry_attrs(&btreeset!["object".to_string(), "group".to_string()]);
+                assert_eq!(pres, expect_attrs);
+                assert_eq!(rem, expect_attrs);
+                assert_eq!(pres_cls, expect_cls);
+                assert_eq!(rem_cls, expect_cls);
+                assert!(pres.contains(&Attribute::Member));
+                assert!(!pres.contains(&Attribute::Mail));
+            }
+            _ => panic!("Expected Allow constrained to migration attrs"),
+        }
+    }
+
+    #[test]
+    fn test_apply_modify_access_migration_non_migration_class_denied() {
+        let ident = Identity::migration();
+        let entry = make_sealed_entry_two_classes(
+            "object",
+            "system_config",
+            uuid::uuid!("00000000-0000-0000-0001-000000000003"),
+        );
+        let acps: Vec<AccessControlModifyResolved> = vec![];
+        let sync_agreements = HashMap::new();
+        let result = apply_modify_access(&ident, &acps, &sync_agreements, &entry);
+        assert!(matches!(result, ModifyResult::Deny));
     }
 
     #[test]
