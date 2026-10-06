@@ -1,278 +1,271 @@
 ---
 name: upstream-sync
-description: Use when syncing changes from the upstream kanidm/kanidm repository into this kubidm fork. Use ONLY when the user asks to sync, rebase, merge, or bring changes from upstream/kanidm. Covers fetching upstream, identifying new commits, merging/rebasing, and resolving rename conflicts (kanidm -> kubidm).
+description: Use when syncing changes from the upstream kanidm/kanidm repository into this kubidm fork. Use ONLY when the user asks to sync, rebase, merge, or bring changes from upstream/kanidm. Covers fetching upstream, triaging conflicts with a rebranded 3-way merge, splitting resolution across agents, resolving rename conflicts (kanidm -> kubidm), verifying, and opening the PR.
 ---
 
 # Upstream Sync: kanidm -> kubidm
 
-This skill handles syncing changes from the upstream `kanidm/kanidm` repository into the `pando85/kubidm` (kubidm) fork.
+This skill handles syncing changes from the upstream `kanidm/kanidm` repository into the
+`pando85/kubidm` fork.
+
+Last run: 2026-10-06, PR #445 (43 upstream commits, 345 files, 172 conflicts, ~3h wall clock with 5
+parallel agents).
 
 ## Repository Context
 
-- **origin**: `git@github.com:pando85/kubidm.git` (this fork)
-- **upstream**: `git@github.com:kanidm/kanidm.git` (original)
+- **origin**: `git@github.com:pando85/kubidm.git` (this fork; the remote may still be named
+  `kanidm.git`, that is fine)
+- **upstream**: `git@github.com:kanidm/kanidm.git`
 - **Main branch**: `master`
-- **Fork-specific branch**: `master-fork` (contains fork-only history)
+- Sync branches: `sync/upstream-YYYY-MM-DD`. PR title:
+  `sync: merge upstream kanidm/kanidm master (YYYY-MM-DD)`.
+- Some past syncs were done by cherry-pick "parity" PRs (e.g. #389) rather than merges. The merge
+  base can therefore be older than the last absorbed upstream commit, and several upstream commits
+  will show up as "already present". That is expected; they merge trivially.
 
-## Key Renames (kanidm -> kubidm)
+## Branding Map
 
-The fork has renamed branding from `kanidm` to `kubidm` across many files. When syncing upstream changes, conflicts in these renamed files are expected. Key rename patterns:
+Apply to the UPSTREAM side only. The fork side is already branded.
 
-- `kanidm` -> `kubidm` in crate names, binary names, documentation
-- `kubidmd` -> `kubidmd` in daemon/service files
-- `pykanidm` -> `pykubidm` in Python SDK
-- Container images: `kanidm/server` -> `kubidm/server`, etc.
-- Configuration files, service files, and docs reference `kubidm` branding
+| upstream                                                                                                                                                                                                   | fork                                                                                                    |
+| ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| `kanidmd`                                                                                                                                                                                                  | `kubidmd`                                                                                               |
+| `kanidm` / `Kanidm` / `KANIDM`                                                                                                                                                                             | `kubidm` / `Kubidm` / `KUBIDM`                                                                          |
+| `kanidm_client`, `kanidm_proto`, `kanidmd_core`, `kanidmd_lib`, `kanidmd_lib_macros`, `kanidmd_testkit`, `kanidm_build_profiles`, `kanidm_lib_crypto`, `kanidm_lib_file_permissions`, `kanidm_utils_users` | same with `kubidm` / `kubidmd` prefix (workspace key AND package name)                                  |
+| `KanidmClient`, `KanidmClientBuilder`, `KanidmProvider`, `ProviderOrigin::Kanidm`, `KANIDM_PKG_VERSION`                                                                                                    | `KubidmClient`, `KubidmClientBuilder`, `KubidmProvider`, `ProviderOrigin::Kubidm`, `KUBIDM_PKG_VERSION` |
+| `pykanidm`, PyPI package `kanidm`                                                                                                                                                                          | `pykubidm`, package `kubidm`                                                                            |
+| orca module `kani` (`mod kani`, `kani::`)                                                                                                                                                                  | `kubidm` (`tools/orca/src/kubidm.rs`)                                                                   |
+| container images `kanidm/server` etc.                                                                                                                                                                      | `kubidm/server` etc.                                                                                    |
 
-### Namespaces that must NOT be renamed
+### Names that must stay `kanidm` (restore them after any blanket sed)
 
-These are external crate names or upstream directory names that stay as `kanidm`:
-- `kanidm-hsm-crypto` - external Rust crate, do NOT rename to `kanidm-hsm-crypto`
-- Directory names under `unix_integration/` that upstream created: `resolver_kanidm/`, `nss_kanidm/`, `pam_kanidm/`, `rlm_kanidm/`
-- `platform/` directory files
-- `examples/` directory files (some)
-- Debian packaging: `server/daemon/debian/kubidmd.service`
+- External crate `kanidm-hsm-crypto` / `kanidm_hsm_crypto`.
+- Directory and crate names upstream created: `rlm_kanidm/`, `resolver_kanidm/`, `nss_kanidm/`,
+  `pam_kanidm/`, `pam_kanidm_common`, `rlm_kanidm.so`, and the RADIUS module internals
+  (`kanidm_shared`, `kanidm_rerror`, `kanidm_rinfo`, `kanidm_rdebug`, `kanidm_module`,
+  `kanidm_authorise`, `kanidm_instantiate`, `kanidm_radiusd`, `MODULE_NAME = c"kanidm"`).
+- NSS exported symbols `_nss_kanidm_*`, `kanidm_getpwnam_r` etc.; unixd service names
+  `kanidm-unixd`, `kanidm-unixd.service`, `kanidm-unixd-tasks.service`.
+- URLs and git deps: `github.com/kanidm/...`, `kanidm/webauthn-rs.git`, `kanidm/ldap3.git`,
+  `kanidm_ppa_automation`.
+- Things that genuinely refer to upstream: the FreeBSD port `security/kanidm`, "Kanidm ldap3 client"
+  in examples.
+- Debian packaging under `server/daemon/debian/` and `platform/` files.
 
-### Internal crate references that MUST be renamed
+When unsure, check what the fork's HEAD uses: `git grep -n '<name>' HEAD -- '*.rs' '*.toml'`.
 
-These workspace dependency keys and crate names were renamed by the fork:
-- `kubidm_client` -> `kubidm_client` (both workspace key AND package name)
-- `kubidm_proto` -> `kubidm_proto`
-- `kubidm_core` -> `kubidm_core`
-- `kubidmd_core` -> `kubidmd_core`
-- `kubidmd_lib` -> `kubidmd_lib`
-- `kubidmd_lib_macros` -> `kubidmd_lib_macros`
-- `kubidmd_testkit` -> `kubidmd_testkit`
-- `kubidm_build_profiles` -> `kubidm_build_profiles`
-- `kubidm_lib_crypto` -> `kubidm_lib_crypto`
-- `kubidm_lib_file_permissions` -> `kubidm_lib_file_permissions`
-- `kubidm_utils_users` -> `kubidm_utils_users`
-- `KubidmClient` -> `KubidmClient` (Rust struct name)
-- `KubidmClientBuilder` -> `KubidmClientBuilder` (Rust struct name)
+## Fork-Specific Code (must survive the merge)
 
-## Fork-Specific Code Additions
+- **Approval workflows**: `UUID_SCHEMA_ATTR_APPROVAL_*`, `UUID_SCHEMA_CLASS_APPROVAL_*`,
+  `UUID_IDM_APPROVAL_ADMINS`, approval API routes in `server/core/src/https/v1.rs`, `ApprovalOpt` in
+  `tools/cli/src/opt/kubidm.rs`, `DelayedAction::ApprovalTimeoutCheck` / `ApprovalEscalationCheck`.
+- **Time-bounded grants**: `UUID_SCHEMA_ATTR_MEMBER_VALID_FROM/UNTIL`,
+  `UUID_SCHEMA_ATTR_MAX_GRANT_DURATION`, `SyntaxType::TimeBoundedMember`,
+  `ValueSetTimeBoundedMember`, `check_time_restriction` in `access/*.rs`, `plugins/memberof.rs` time
+  handling, dl14 migration data.
+- **Access control**: `AccessResult::ReauthRequired`, `Delegated` receivers, `access/create.rs` fork
+  rules; the fork restructured `modify_allow_operation` / `batch_modify_allow_operation` (both call
+  `apply_modify_access`).
+- **OAuth2 federation**: `server/core/src/https/v1_oauth2_federation.rs`,
+  `UUID_SCHEMA_ATTR_OAUTH2_ISSUER`, `UUID_SCHEMA_ATTR_OAUTH2_JWKS_URI`, `OidcDiscoveryResponse` in
+  `idm/oauth2_client.rs`.
+- **S3 backup / PITR**: `server/core/src/backup/` (directory), `proto/src/backup.rs`, `config.rs` S3
+  and WAL config, `interval.rs` scheduling, `DbCommands::Recover` / `PitrList` in
+  `server/daemon/src/main.rs`, deps `aws-config`, `aws-credential-types`, `aws-sdk-s3`, and the
+  `patches/aws-runtime-1.7.2` workspace exclude.
+- **ServerRole**: `proto/src/config.rs` (`pub use kubidm_proto::config::ServerRole` in
+  `server/core/src/config.rs`; upstream has its own local `ServerRole` enum, drop upstream's copy).
+- **proto**: `proto/src/internal/{authorization,pip}.rs` re-exported from `internal/mod.rs`.
+- **Tests**: the fork uses the `AuthenticatorBackend` / `perform_register` webauthn test API, not
+  upstream's `WebauthnAuthenticator` / `do_registration`.
 
-The fork has significant code additions beyond branding renames:
-- **Approval workflows**: constants like `UUID_SCHEMA_ATTR_APPROVAL_*`, `UUID_SCHEMA_CLASS_APPROVAL_*`
-- **Time-bounded grants**: `UUID_SCHEMA_ATTR_MEMBER_VALID_FROM`, `UUID_SCHEMA_ATTR_MEMBER_VALID_UNTIL`, `UUID_SCHEMA_ATTR_MAX_GRANT_DURATION`, `UUID_SCHEMA_CLASS_TIME_BOUNDED_GRANT`
-- **OAuth2 enhancements**: `UUID_SCHEMA_ATTR_OAUTH2_ISSUER`, `UUID_SCHEMA_ATTR_OAUTH2_JWKS_URI`, etc.
-- **AWS S3 integration**: `aws-config`, `aws-credential-types`, `aws-sdk-s3` dependencies
+## Policy Decisions (already made, keep applying them)
 
-When accepting upstream files, these fork additions get lost. You MUST check for and re-add them.
+- **UUID collisions**: upstream allocates new UUIDs in ranges the fork already uses. In
+  `server/lib/src/constants/uuids.rs`, keep the fork value for anything the fork already shipped,
+  and relocate upstream's NEW constant into the fork's custom range with a comment. Known:
+  `UUID_ACCOUNT_SIGNUP_FEATURE` stays `...000000000063` (upstream `...0059` is the fork's
+  `UUID_IDM_APPROVAL_ADMINS`); `UUID_SCHEMA_CLASS_KEY_OBJECT_JWE_A256GCM` lives at `ffff00000305`
+  (upstream `ffff00000229` is the fork's `UUID_SCHEMA_ATTR_OAUTH2_ISSUER`). Upstream's next numbers
+  (`ffff00000230+`) are already taken; expect this every sync. Always finish with a duplicate check
+  (script below).
+- **SECURITY.md**: the fork removed AI-content restrictions (commit f6b16569f). Do not adopt
+  upstream's "AI Usage in Vulnerability Reports" section.
+- **Dependencies**: accept upstream bumps, but keep the fork's version when it is newer (renovate
+  keeps the fork ahead; e.g. jsonschema, md-5, rand, cc). Never downgrade to match upstream's
+  lockfile.
+- **Migration identity**: upstream `049d2fbee` makes `InternalRole::Migration` return
+  `AccessBasicResult::Ignore` and constrains it to `migration_entry_attrs`. The fork follows that;
+  `Delegated` profiles only resolve for user identities.
 
 ## Sync Workflow
 
-### Step 1: Assess Current State
+### Step 1: Assess
 
 ```bash
 git fetch upstream
-git log --oneline $(git merge-base HEAD upstream/master)..upstream/master | wc -l
-git log --oneline $(git merge-base HEAD upstream/master)..upstream/master
+MB=$(git merge-base HEAD upstream/master)
+git log --oneline $MB..upstream/master | wc -l
+git log --format='%h %ad %s' --date=short $MB..upstream/master
+git diff --stat $MB upstream/master | tail -1
 ```
 
-### Step 2: Plan the Sync Strategy
+Classify commits: security fixes (grep "Security", "CVE"), schema/migration changes, Cargo.toml
+changes, directory restructures, "Fmt"/clippy passes (pure noise, but they cause most conflicts),
+deps, docs, UI. Present a summary.
 
-Before merging, review the new commits to identify:
-- **High-risk changes**: large refactorings, file renames, Cargo.toml changes, build system changes
-- **Security fixes**: prioritize these
-- **Dependency updates**: usually safe to merge
-- **Breaking changes**: API changes, schema changes, config format changes
-- **Directory restructuring**: upstream may restructure directories (e.g., `resolver/` -> `resolver_common/` + `resolver_kanidm/`)
-
-Present a summary to the user with:
-1. Number of new commits
-2. Key categories (security, features, deps, refactoring)
-3. Recommended approach (merge vs rebase)
-4. Risk assessment
-
-### Step 3: Create a Sync Branch
+### Step 2: Branch and merge
 
 ```bash
-git checkout master
-git checkout -b sync/upstream-YYYY-MM-DD
+git checkout master && git pull origin master
+git checkout -b sync/upstream-$(date +%F)
+git merge upstream/master --no-commit --no-ff
+git diff --name-only --diff-filter=U | sort > /tmp/conflicts.txt
 ```
 
-### Step 4: Perform the Merge
+### Step 3: Triage with a rebranded 3-way merge (the big time saver)
+
+Most conflicts exist only because upstream's side says `kanidm` and the fork's side says `kubidm`,
+plus upstream's import-reordering commits. Rebrand upstream's base and theirs blobs, then let
+`git merge-file` redo the merge:
 
 ```bash
-git merge upstream/master --no-commit
+rebrand() { sed -e 's/kanidmd/kubidmd/g' -e 's/kanidm/kubidm/g' -e 's/Kanidm/Kubidm/g' -e 's/KANIDM/KUBIDM/g' \
+  -e 's/kubidm-hsm-crypto/kanidm-hsm-crypto/g' -e 's/kubidm_hsm_crypto/kanidm_hsm_crypto/g' \
+  -e 's#rlm_kubidm#rlm_kanidm#g' -e 's#resolver_kubidm#resolver_kanidm#g' -e 's#nss_kubidm#nss_kanidm#g' \
+  -e 's#pam_kubidm#pam_kanidm#g' -e 's#github.com/kubidm/#github.com/kanidm/#g' -e 's/kubidm-unixd/kanidm-unixd/g'; }
+threeway() { f="$1"; d=$(mktemp -d); git show ":1:$f" | rebrand > $d/base; git show ":2:$f" > $d/ours;
+  git show ":3:$f" | rebrand > $d/theirs; git merge-file -p -L fork -L base -L upstream $d/ours $d/base $d/theirs; }
+
+: > /tmp/clean.txt; : > /tmp/dirty.txt
+while read f; do
+  case "$f" in Cargo.lock|pykubidm/uv.lock) echo "$f" >> /tmp/dirty.txt; continue;; esac
+  if threeway "$f" > /tmp/out 2>/dev/null; then echo "$f" >> /tmp/clean.txt
+  else echo "$(grep -c '^<<<<<<<' /tmp/out) $f" >> /tmp/dirty.txt; fi
+done < /tmp/conflicts.txt
+wc -l /tmp/clean.txt /tmp/dirty.txt; sort -rn /tmp/dirty.txt
 ```
 
-### Step 5: Resolve Conflicts
+On 2026-10-06 this turned 172 conflicts into 124 mechanical files and 48 real ones (mostly 1-2 hunks
+each). Note `rebrand()` must NOT map `KubidmProvider` or `ProviderOrigin::Kubidm` back to `Kanidm`;
+those are fork names. After writing a mechanical file, diff it against `git show :2:$f` and eyeball
+every changed line containing `kubidm` for names from the must-stay-kanidm list.
 
-#### Strategy for large merges (50+ conflicting files)
+### Step 4: Resolve in parallel
 
-1. **Accept upstream for entire directories** that were restructured by upstream (e.g., `unix_integration/`). Then re-apply branding with sed.
+Split the dirty list by area and hand each to an agent (server/core; server/lib
+server+storage+access; server/lib idm + small crates; Cargo.toml + lock files; mechanical list).
+Rules that made this work:
 
-2. **For code files**: Accept upstream version, then re-apply kubidm branding:
-   ```bash
-   git checkout --theirs <file>
-   # Apply branding
-   sed -i 's/kubidmd/kubidmd/g' <file>
-   sed -i 's/kanidm/kubidm/g' <file>
-   # Then FIX: restore external crate names that must not be renamed
-   sed -i 's/kanidm-hsm-crypto/kanidm-hsm-crypto/g' <file>
-   sed -i 's/kanidm_hsm_crypto/kanidm_hsm_crypto/g' <file>
-   ```
+- Each agent only touches its own files and only WRITES to the working tree. No
+  `git add/commit/checkout/stash/reset`, no `cargo build/check/test` (the tree has markers
+  elsewhere; the orchestrator stages and builds).
+- Agents start from `threeway "$f"` output, then resolve remaining hunks using
+  `git log -p $MB..upstream/master -- "$f"` (upstream intent) and `git diff $MB HEAD -- "$f"` (fork
+  net delta). Rule: take upstream's change AND keep fork additions. Integrate, never pick a side.
+- Each agent reports "follow-up risks" (call sites outside its files); collect them for the build
+  loop.
+- The orchestrator must never put a mutating git command inside a diagnostic one-liner. A stray
+  `git stash` once silently dropped `MERGE_HEAD` and reset the tree; later checks ran against plain
+  master for 20 minutes. Recovery:
+  `git stash pop --index && git rev-parse upstream/master > .git/MERGE_HEAD`.
 
-3. **For Cargo.toml**: Accept upstream's version as the base, then:
-   - Rename internal workspace dependency keys (kanidm_* -> kubidm_*, kubidmd_* -> kubidmd_*)
-   - Add back fork-specific workspace dependencies (aws-*, etc.)
-   - Do NOT rename external crate names (kanidm-hsm-crypto, etc.)
-   - Add `kubidm_unix_common` as an alias for `sparkle_unix_common` (fork's pam_kubidm needs it)
+#### Resolution patterns
 
-4. **For files with fork-specific code additions** (constants, types, enums):
-   - DO NOT blindly accept upstream. Instead, manually merge.
-   - Extract fork additions from `git show HEAD:<file>` and apply on top of upstream's version.
-   - Key files to watch: `server/lib/src/constants/uuids.rs`, `proto/src/attribute.rs`, `proto/src/constants.rs`
+- **Import-block conflicts** (from upstream "Fmt" commits): take upstream's nested `use a::{b, c}`
+  layout and add the fork's extra items back into it.
+- **Cargo.toml**: upstream's version as base; rename internal crate keys to kubidm; keep fork deps
+  and the aws patch exclude; keep newer fork versions; check every `[workspace] members` path exists
+  and no key is duplicated.
+- **Cargo.lock**: take upstream's lock, then `cargo update --workspace` (offline usually fails on
+  new crates); then `cargo update --precise` to restore fork pins that upstream's lock would
+  downgrade. Verify with `cargo metadata --locked --no-deps`.
+- **pykubidm/uv.lock**: take upstream's, rename package `kanidm` -> `kubidm`, run `uv lock` in
+  `pykubidm/`.
+- **Files with large fork additions** (uuids.rs, access/mod.rs, v1.rs, config.rs, daemon
+  main.rs/opt.rs): keep the fork's structure and graft upstream's new pieces in. Only fall back to
+  `git show HEAD:<file> > <file>` plus rebrand when the 3-way output is hopeless.
+- **crypto-glue / cert code** (`server/core/src/crypto.rs`, `server/lib/src/repl/supplier.rs`): the
+  fork's custom x509 profiles were replaced by upstream's crypto-glue 0.2.1 code; take upstream.
+  `x509-cert` is now an unused dependency.
+- **Templates**: keep the fork's `github.com/pando85/kubidm` link and `KUBIDM_PKG_VERSION`.
+- **Directory restructures**: accept upstream's layout, delete the fork's orphaned directories,
+  re-apply branding.
 
-5. **Handle directory restructuring carefully**:
-   - Remove fork's orphaned directories (e.g., `nss_kubidm/` superseded by upstream's `nss_kanidm/`)
-   - Restore upstream directories that were deleted during merge (e.g., `nss_kanidm/`, `pam_kanidm/`)
-   - Rename binary source files in `resolver_kanidm/src/bin/` to match Cargo.toml expectations
-
-6. **Check for leftover diff markers** after resolution:
-   ```bash
-   grep -rl "<<<<<<" --include="*.rs" .
-   ```
-
-#### Common conflict resolution patterns
-
-1. **Branding conflicts**: Always prefer `kubidm` branding over `kanidm`.
-2. **Cargo.toml conflicts**: Accept upstream's dependency versions, add fork-specific deps back.
-3. **Lock file conflicts**: Accept upstream's Cargo.lock, regenerate after all Cargo.toml files are fixed.
-4. **Documentation conflicts**: Keep kubidm branding but accept upstream content changes.
-5. **Code conflicts**: Accept upstream code changes, then re-apply branding.
-6. **Fork-specific additions**: Extract from `git show HEAD:<file>` and re-apply on top of upstream.
-
-### Step 6: Re-apply Branding
-
-After accepting upstream files, systematically re-apply branding:
+### Step 5: Stage, build, fix loop
 
 ```bash
-# Fix all .rs files (be careful with external crate names!)
-for f in $(grep -rl "kubidm_proto\|kubidm_client\|KubidmClient" --include="*.rs" . | grep -v target/); do
-  sed -i 's/KubidmClient/KubidmClient/g' "$f"
-  sed -i 's/kubidm_proto/kubidm_proto/g' "$f"
-  sed -i 's/kubidm_client/kubidm_client/g' "$f"
-  # Restore external crate names
-  sed -i 's/kanidm_hsm_crypto/kanidm_hsm_crypto/g' "$f"
-done
-
-# Fix all Cargo.toml files
-for f in $(find . -name "Cargo.toml" -not -path "./target/*" -not -path "./Cargo.lock"); do
-  sed -i 's/^kubidmd_/kubidmd_/g' "$f"
-  sed -i 's/^kubidm_build_profiles/kubidm_build_profiles/' "$f"
-  sed -i 's/^kubidm_client/kubidm_client/' "$f"
-  # ... etc for each internal dep key
-done
-```
-
-### Step 7: Verify
-
-```bash
-cargo check --workspace
-cargo test --workspace  # if time permits
-rg "kanidm" --glob "*.toml" --glob "*.rs" -l | grep -v "Cargo.lock" | head -20
-```
-
-### Step 8: Commit and Push
-
-```bash
+grep -rlE '^(<<<<<<<|>>>>>>>) ' --include='*.rs' --include='*.toml' --include='*.html' --include='*.md' . | grep -v target
 git add -A
-git commit -m "sync: merge upstream kanidm/kanidm master (YYYY-MM-DD)"
-git push origin sync/upstream-YYYY-MM-DD
+cargo check --workspace --all-targets
 ```
 
-## Critical Lessons Learned
+Fix by category (missing constants, then types/enum variants, then imports, then signatures). Also
+sweep auto-merged files for stray branding: new upstream files merge without conflict and still say
+`kanidm` (`git diff --cached --name-only --diff-filter=AM | xargs grep -nE 'kanidm|Kanidm|KANIDM'`
+minus the allow-list).
 
-### 1. The fork has SUBSTANTIVE code additions, not just renames
+### Step 6: Verify
 
-The fork adds approval workflows, time-bounded grants, OAuth2 enhancements, S3 backup integration, and more. Key files with fork-specific code:
+- `cargo fmt --all -- --check`, then `cargo clippy --workspace --all-targets` (default features; CI
+  runs `cargo clippy --quiet --lib --bins --examples`). `--all-features` needs FreeRADIUS and
+  SELinux headers and fails locally. Pre-existing clippy items on master as of 2026-10: dead-code
+  field in `libs/profiles`, `assert_eq!(body, true)` in
+  `server/testkit/tests/testkit/health_endpoints.rs`. Use `--keep-going` so one of them does not
+  hide others.
+- `cargo test --workspace --no-fail-fast`. See "Build environment" below before running it.
+- `uvx codespell` with the Makefile's arguments if `codespell` is not installed.
+- `make doc/format` flags ~136 pre-existing files; only check the markdown files the merge touched
+  (`git diff --cached --name-only | grep '\.md$' | xargs deno fmt --check`).
+- `make test/pykubidm`: a few tests need DNS or a running server and fail locally on master too; CI
+  is authoritative.
+- **Independent audit** (worth it): a read-only agent takes each substantive upstream commit,
+  rebrands its added lines, and greps them in the merged tree; reports LANDED / PARTIAL / MISSING
+  with file:line. It also runs the UUID duplicate check and the marker check. This caught nothing
+  missing in 2026-10 but did catch the stash accident.
 
-**Files that should generally be restored from fork** (fork has significant additions beyond upstream):
-- `server/lib/src/constants/uuids.rs` - 49+ fork-specific UUID constants
-- `server/lib/src/schema.rs` - SyntaxType::TimeBoundedMember, new methods
-- `server/lib/src/server/access/mod.rs` - ReauthRequired, Delegated variants
-- `server/lib/src/server/access/create.rs` - fork-specific access control
-- `server/lib/src/migration_data/dl14/mod.rs` - fork schema migrations
-- `server/core/src/https/v1.rs` - approval API routes
-- `server/core/src/https/v1_oauth2_federation.rs` - OAuth2 federation routes
-- `server/core/src/https/authorization.rs` - authorization middleware
-- `server/core/src/actors/v1_write.rs` - approval handler methods
-- `server/core/src/config.rs` - S3 backup config, ServerRole
-- `server/core/src/interval.rs` - S3 backup scheduling
-- `server/core/src/backup/` - entire S3 backup module (directory)
-- `server/daemon/src/main.rs` - fork-specific CLI commands (DbCommands::Recover, PitrList, etc.)
-- `server/daemon/src/opt.rs` - KubidmdOpt variants
-- `tools/cli/src/opt/kubidm.rs` - ApprovalOpt, SystemOpt::Approval
-- `proto/src/config.rs` - ServerRole enum (deleted by upstream)
-- `proto/src/backup.rs` - S3Config, WalArchiveConfig, PitrManifest
-- `proto/src/cli.rs` - role field in KubidmdCli
-
-**Strategy**: For these files, restore fork's version (`git show HEAD:<file> > <file>`), then apply branding renames with sed.
-
-### 2. Restore-fork-then-rebrand is the correct strategy
-
-Instead of accepting upstream and trying to add back fork code, the correct strategy for files with significant fork additions is:
 ```bash
-git show HEAD:<file> > <file>
-sed -i 's/kubidmd/kubidmd/g' <file>
-sed -i 's/kanidm/kubidm/g' <file>
-# Then restore external crate names
-sed -i 's/kanidm-hsm-crypto/kanidm-hsm-crypto/g' <file>
-sed -i 's/kanidm_hsm_crypto/kanidm_hsm_crypto/g' <file>
+# duplicate UUID check
+grep -oE 'uuid!\("[0-9a-f-]+"\)' server/lib/src/constants/uuids.rs | sort | uniq -d
 ```
 
-Then selectively integrate upstream's new additions (new methods, new imports) on top.
+### Step 7: Commit, PR, CI
 
-### 3. sed kanidm->kubidm needs follow-up restores
+```bash
+git commit -m "sync: merge upstream kanidm/kanidm master (YYYY-MM-DD)"   # pre-commit hook runs cargo fmt --check
+git push -u origin sync/upstream-YYYY-MM-DD
+gh pr create --draft --base master --title "sync: merge upstream kanidm/kanidm master (YYYY-MM-DD)" --body-file pr.md
+gh pr checks <n>      # ~1.5h on this repo's runners; rust_build_next (beta/nightly) is continue-on-error
+gh pr ready <n>
+```
 
-After `sed 's/kanidm/kubidm/g'`, ALWAYS restore:
-- `kanidm-hsm-crypto` / `kanidm_hsm_crypto` (external crate)
-- `ProviderOrigin::Kanidm` (enum variant - stays Kanidm, not Kubidm)
-- `KanidmProvider` where the struct is actually named KanidmProvider in code
-- `kanidm_flavour` when the lib crate name in Cargo.toml is `kubidm_flavour`
-- Environment variables like `KANIDM_*` may or may not need renaming (check context)
+PR body sections that reviewers expect: Summary (base, tip, counts), Upstream changes absorbed
+(security first), Fork decisions made during the merge (UUIDs, policy, deps), Known follow-ups,
+Verification, and a note for any behavior change in access control.
 
-### 4. Two-phase approach for large merges
+## Build environment (this workstation)
 
-Phase 1: Accept upstream for most files, resolve structural conflicts (directory renames, etc.)
-Phase 2: Restore fork-specific files from `git show HEAD:<file>`, then selectively integrate upstream's new code additions.
-
-This is faster and more reliable than trying to manually merge each conflict.
-
-### 5. Common post-merge fix patterns
-
-After the merge, expect to fix these categories iteratively:
-1. **Missing fork constants/types** - restore fork's version of the file
-2. **Missing fork API routes** - restore fork's v1.rs, add route_setup calls
-3. **Missing fork CLI commands** - restore fork's opt.rs files
-4. **Struct field mismatches** - add new upstream fields to fork code with defaults
-5. **Enum variant mismatches** - add new upstream variants to fork's enums
-6. **Method signature changes** - update call sites for upstream's new parameters
-7. **Module visibility** - add `pub use` re-exports for types used across crates
-8. **Directory-as-module conflicts** - backup.rs vs backup/ directory, remove .rs file
-
-### 6. Build verification loop
-
-After each batch of fixes, run `cargo check --workspace` and categorize remaining errors. Fix by category (constants first, then types, then imports, then patterns). This converges quickly.
-
-## Security Notes
-
-- Always review security-related commits carefully (look for "Security", "CVE", "vulnerability" in commit messages)
-- Security fixes should be prioritized and synced ASAP
-- The upstream may have security fixes that need careful backporting
+- `CARGO_TARGET_DIR=/dev/shm` is a 32 GB tmpfs. A full workspace test build does not fit (deps alone
+  reach 22 GB): lld dies with `Bus error` and rustc with `Disk quota exceeded`. These are not code
+  errors. For workspace-wide test or clippy runs use
+  `CARGO_TARGET_DIR=/home/agil/.cache/kubidm-sync-target CARGO_INCREMENTAL=0`.
+- With the tmpfs full, RAM is tight; `cargo test --workspace -j 4 RUST_TEST_THREADS=8` avoids the
+  OOM killer (it killed rustc on `kubidmd_lib (lib test)` at `-j 32`).
+- `cargo check` passes without linking, so a green check does not prove the test binaries link.
 
 ## Post-Sync Checklist
 
-- [ ] All conflicts resolved (no diff markers remaining)
-- [ ] `cargo check --workspace` passes
-- [ ] Fork-specific code additions preserved (constants, types, enums)
-- [ ] No unintended kanidm->kubidm or kubidm->kanidm regressions
-- [ ] External crate names preserved (kanidm-hsm-crypto, etc.)
-- [ ] Workspace dependency keys consistent between root and individual Cargo.toml files
-- [ ] Documentation references are consistent
-- [ ] Docker image references are correct
-- [ ] No orphaned directories from fork's old structure
-- [ ] Create PR for review
+- [ ] No conflict markers; `MERGE_HEAD` was present at commit time (`git log -1 --format=%p` shows
+      two parents)
+- [ ] `cargo check --workspace --all-targets`, `cargo test --workspace`, clippy, fmt, codespell pass
+- [ ] Fork-specific code preserved (see list above); fork tests updated only where upstream
+      intentionally changed semantics
+- [ ] No duplicate UUIDs; new upstream UUIDs that collide were relocated
+- [ ] External crate names, RADIUS/NSS internals, service names and upstream URLs still say `kanidm`
+- [ ] Auto-merged new files rebranded; SECURITY.md AI section not adopted
+- [ ] Workspace dependency keys consistent between root and member `Cargo.toml` files; both lock
+      files regenerated
+- [ ] PR opened as draft, body filled, CI green, then `gh pr ready`
+- [ ] Known follow-ups listed in the PR (currently: unused `x509-cert` dep; stale
+      `server/daemon/insecure_server.toml` and `server/daemon/run_insecure_dev_server.sh` copies of
+      the `scripts/` versions)
