@@ -54,7 +54,7 @@ jobs:
 
       - name: "Start the S3 mock for the backup tests"
         run: |
-          docker run -d --name s3mock -p 9090:9090 adobe/s3mock:latest
+          docker run -d --name s3mock -p 9090:9090 adobe/s3mock:5.2.3
           for _ in $(seq 1 60); do
             if curl -sf http://127.0.0.1:9090/ > /dev/null; then
               echo "s3mock is ready"

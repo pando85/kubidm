@@ -2,11 +2,12 @@
 //!
 //! The test needs an S3-compatible service and is skipped unless `KUBIDM_TEST_S3_ENDPOINT`
 //! is set, so that a plain `cargo test` stays green without Docker. CI runs it against
-//! `adobe/s3mock`:
+//! `adobe/s3mock`, which can be reproduced locally with:
 //!
 //! ```text
-//! docker run -d --rm --name kubidm-s3mock -p 9090:9090 adobe/s3mock:latest
-//! KUBIDM_TEST_S3_ENDPOINT=http://127.0.0.1:9090 cargo test -p kubidmd_testkit --test integration_test s3_recovery
+//! docker run -d --name s3mock -p 9090:9090 adobe/s3mock:5.2.3
+//! KUBIDM_TEST_S3_ENDPOINT=http://127.0.0.1:9090 \
+//!     cargo test -p kubidmd_testkit --test integration_test s3_recovery
 //! ```
 //!
 //! The bucket is taken from `KUBIDM_TEST_S3_BUCKET` (default `kubidm-test`) and created when
