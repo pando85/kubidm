@@ -4768,6 +4768,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sketching",
+ "tempfile",
  "testkit-macros",
  "time",
  "tokio",

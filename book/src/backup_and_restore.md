@@ -231,6 +231,41 @@ without restoring using:
 kubidmd database verify-s3 -c /data/server.toml backup-2024-01-01T22:00:00Z.json.gz
 ```
 
+## Verifying That a Backup Can Be Restored
+
+A backup that was written successfully is not necessarily a backup that can be restored. Kubidm therefore offers two
+different kinds of verification:
+
+- **Storage integrity**: `kubidmd database verify-s3` checks the SHA-256 checksum of an artifact stored in S3. It proves
+  the bytes in S3 are the bytes that were uploaded, but says nothing about their content.
+- **Restorability**: `kubidmd database verify-backup` inspects the content of a local backup artifact. It has two
+  levels, described below.
+
+### Structural Verification
+
+Parses the artifact and checks that it is a Kubidm backup, that it contains entries and that it was written by a server
+of the same version. It never opens a database, so it is fast enough to run after every backup, but it can not detect
+corrupted entries.
+
+```bash
+kubidmd database verify-backup -c /data/server.toml --level structural /backup/backup-2024-01-01T22:00:00Z.json
+```
+
+### Full Verification
+
+Runs the structural checks, then restores the artifact into a temporary database using the same restore and reindex code
+as `kubidmd database restore`, boots that database as a server start would, and runs the same consistency checks as
+`kubidmd database verify` (schema, indexes, entries, replication metadata and plugins). This is the strongest guarantee
+that a backup is restorable. The temporary database is removed afterwards and the server's own database is not opened.
+
+```bash
+kubidmd database verify-backup -c /data/server.toml /backup/backup-2024-01-01T22:00:00Z.json
+```
+
+Full verification is the default level. It loads the whole backup into a temporary database, so it needs disk space and
+time proportional to the size of the backup. The command exits non-zero and prints the reasons when verification fails,
+which makes it suitable for backup automation.
+
 ## Method 2 - Manual Backup
 
 This method uses the same process as the automatic process, but is manually invoked. This can be useful for pre-upgrade

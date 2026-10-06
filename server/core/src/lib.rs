@@ -54,10 +54,12 @@ use crypto_glue::{
     traits::Digest,
 };
 use kubidm_proto::{
-    backup::BackupCompression, internal::OperationError, scim_v1::client::ScimAssertGeneric,
+    backup::BackupCompression,
+    internal::{ConsistencyError, OperationError},
+    scim_v1::client::ScimAssertGeneric,
 };
 use kubidmd_lib::{
-    be::{Backend, BackendConfig, BackendTransaction},
+    be::{verify_backup_structure, Backend, BackendConfig, BackendTransaction},
     idm::ldap::LdapServer,
     prelude::*,
     schema::Schema,
@@ -429,62 +431,171 @@ pub fn backup_server_core(config: &Configuration, dst_path: Option<&Path>) {
 }
 
 pub async fn restore_server_core(config: &Configuration, dst_path: &Path) {
+    if restore_database(config, dst_path).await.is_err() {
+        std::process::exit(1);
+    }
+
+    info!("✅ Restore Success!");
+}
+
+/// Restore the backup at `src_path` into the database described by `config` and
+/// reindex it. This is the production restore path. Backup verification shares it so
+/// that a verified backup has been exercised exactly as a real restore would.
+pub async fn restore_database(
+    config: &Configuration,
+    src_path: &Path,
+) -> Result<(), OperationError> {
     // If it's an in memory database, we don't need to touch anything
     if let Some(db_path) = config.db_path.as_ref() {
         touch_file_or_quit(db_path);
     }
 
     // First, we provide the in-memory schema so that core attrs are indexed correctly.
-    let schema = match Schema::new() {
-        Ok(s) => s,
-        Err(e) => {
-            error!("Failed to setup in memory schema: {:?}", e);
-            std::process::exit(1);
-        }
-    };
+    let schema = Schema::new().inspect_err(|err| {
+        error!(?err, "Failed to setup in memory schema");
+    })?;
 
-    let be = match setup_backend(config, &schema) {
-        Ok(be) => be,
-        Err(e) => {
-            error!("Failed to setup backend: {:?}", e);
-            return;
-        }
-    };
+    let be = setup_backend(config, &schema).inspect_err(|err| {
+        error!(?err, "Failed to setup backend");
+    })?;
 
-    let mut be_wr_txn = match be.write() {
-        Ok(txn) => txn,
-        Err(err) => {
-            error!(
-                ?err,
-                "Unable to proceed, backend write transaction failure."
-            );
-            return;
-        }
-    };
+    let mut be_wr_txn = be.write().inspect_err(|err| {
+        error!(
+            ?err,
+            "Unable to proceed, backend write transaction failure."
+        );
+    })?;
 
-    let compression = BackupCompression::identify_file(dst_path);
+    let compression = BackupCompression::identify_file(src_path);
 
-    let input = match std::fs::File::open(dst_path) {
-        Ok(output) => output,
-        Err(err) => {
-            error!(?err, "File::open error reading {}", dst_path.display());
-            return;
-        }
-    };
+    let input = std::fs::File::open(src_path).map_err(|err| {
+        error!(?err, "File::open error reading {}", src_path.display());
+        OperationError::FsError
+    })?;
 
-    let r = be_wr_txn
+    be_wr_txn
         .restore(input, compression)
-        .and_then(|_| be_wr_txn.commit());
-
-    if r.is_err() {
-        error!("Failed to restore database: {:?}", r);
-        std::process::exit(1);
-    }
+        .and_then(|_| be_wr_txn.commit())
+        .inspect_err(|err| {
+            error!(?err, "Failed to restore database");
+        })?;
     info!("Database loaded successfully");
 
-    reindex_inner(be, schema, config).await;
+    reindex_inner(be, schema, config).await
+}
 
-    info!("✅ Restore Success!");
+/// How deeply `verify_backup_server_core` inspects a backup artifact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackupVerifyLevel {
+    /// Parse the artifact and check its format, entry count and server version. This
+    /// never opens a database and can not prove that the backup is restorable.
+    Structural,
+    /// Everything in `Structural`, then restore the artifact into a scratch database
+    /// through the production restore path, re-open that database as a server start
+    /// would and run the full database consistency verification on it.
+    Full,
+}
+
+/// Verify a backup artifact. Returns true when the backup passed every check of the
+/// requested level. The database referenced by `config` is never opened: full
+/// verification restores into a temporary directory that is removed afterwards.
+pub async fn verify_backup_server_core(
+    config: &Configuration,
+    backup_path: &Path,
+    level: BackupVerifyLevel,
+) -> bool {
+    let compression = BackupCompression::identify_file(backup_path);
+
+    let input = match std::fs::File::open(backup_path) {
+        Ok(file) => file,
+        Err(err) => {
+            error!(?err, "Unable to open backup {}", backup_path.display());
+            eprintln!("Backup structural verification: FAIL");
+            eprintln!("  - unable to open {}: {err}", backup_path.display());
+            return false;
+        }
+    };
+
+    let report = match verify_backup_structure(input, compression) {
+        Ok(report) => report,
+        Err(err) => {
+            eprintln!("Backup structural verification: FAIL");
+            eprintln!("  - artifact could not be parsed as a kubidm backup: {err:?}");
+            return false;
+        }
+    };
+
+    eprintln!(
+        "Backup structural verification: {}",
+        pass_fail(report.is_valid())
+    );
+    eprintln!("  Entries: {}", report.entry_count);
+    eprintln!(
+        "  Written by server version: {}",
+        report.version.as_deref().unwrap_or("unknown")
+    );
+    for issue in &report.errors {
+        eprintln!("  - {issue}");
+    }
+
+    if !report.is_valid() || level == BackupVerifyLevel::Structural {
+        return report.is_valid();
+    }
+
+    let scratch_dir = match tempfile::tempdir() {
+        Ok(dir) => dir,
+        Err(err) => {
+            error!(?err, "Unable to create a scratch directory");
+            eprintln!("Backup restore verification: FAIL");
+            eprintln!("  - unable to create a scratch directory: {err}");
+            return false;
+        }
+    };
+
+    let mut scratch_config = config.clone();
+    scratch_config.db_path = Some(scratch_dir.path().join("verify.db"));
+
+    info!(
+        "Restoring backup into scratch database in {}",
+        scratch_dir.path().display()
+    );
+
+    if let Err(err) = restore_database(&scratch_config, backup_path).await {
+        eprintln!("Backup restore verification: FAIL");
+        eprintln!("  - restore failed: {err:?}");
+        return false;
+    }
+
+    // Boot the restored database from scratch exactly as a server start would. The
+    // restore above ran in this process, so its backend still carries in-memory state
+    // from before the restore (such as the RUV). A fresh boot is what proves the
+    // database starts into a consistent state.
+    let consistency_errors = match verify_booted_database(&scratch_config).await {
+        Ok(errors) => errors,
+        Err(err) => {
+            eprintln!("Backup restore verification: FAIL");
+            eprintln!("  - restored database could not be opened: {err:?}");
+            return false;
+        }
+    };
+
+    eprintln!(
+        "Backup restore verification: {}",
+        pass_fail(consistency_errors.is_empty())
+    );
+    for err in &consistency_errors {
+        eprintln!("  - {err:?}");
+    }
+
+    consistency_errors.is_empty()
+}
+
+fn pass_fail(ok: bool) -> &'static str {
+    if ok {
+        "PASS"
+    } else {
+        "FAIL"
+    }
 }
 
 pub async fn reindex_server_core(config: &Configuration) {
@@ -505,60 +616,62 @@ pub async fn reindex_server_core(config: &Configuration) {
         }
     };
 
-    reindex_inner(be, schema, config).await;
+    if reindex_inner(be, schema, config).await.is_err() {
+        std::process::exit(1);
+    }
 
     info!("✅ Reindex Success!");
 }
 
-async fn reindex_inner(be: Backend, schema: Schema, config: &Configuration) {
+async fn reindex_inner(
+    be: Backend,
+    schema: Schema,
+    config: &Configuration,
+) -> Result<(), OperationError> {
     info!("Start Index Phase 1 ...");
     // Reindex only the core schema attributes to bootstrap the process.
-    let mut be_wr_txn = match be.write() {
-        Ok(txn) => txn,
-        Err(err) => {
-            error!(
-                ?err,
-                "Unable to proceed, backend write transaction failure."
-            );
-            return;
-        }
-    };
+    let mut be_wr_txn = be.write().inspect_err(|err| {
+        error!(
+            ?err,
+            "Unable to proceed, backend write transaction failure."
+        );
+    })?;
 
-    let r = be_wr_txn.reindex(true).and_then(|_| be_wr_txn.commit());
-
-    // Now that's done, setup a minimal qs and reindex from that.
-    if r.is_err() {
-        error!("Failed to reindex database: {:?}", r);
-        std::process::exit(1);
-    }
+    be_wr_txn
+        .reindex(true)
+        .and_then(|_| be_wr_txn.commit())
+        .inspect_err(|err| {
+            error!(?err, "Failed to reindex database");
+        })?;
     info!("Index Phase 1 Success!");
 
+    // Now that's done, setup a minimal qs and reindex from that.
     debug!("Attempting to init query server ...");
 
-    let (qs, _idms, _idms_delayed, _idms_audit) = match setup_qs_idms(be, schema, config).await {
-        Ok(t) => t,
-        Err(e) => {
-            error!("Unable to setup query server or idm server -> {:?}", e);
-            return;
-        }
-    };
+    let (qs, _idms, _idms_delayed, _idms_audit) =
+        setup_qs_idms(be, schema, config).await.inspect_err(|err| {
+            error!(?err, "Unable to setup query server or idm server");
+        })?;
     debug!("Init Query Server Success!");
 
     info!("Start Index Phase 2 ...");
 
-    let Ok(mut qs_write) = qs.write(duration_from_epoch_now()).await else {
-        error!("Unable to acquire write transaction");
-        return;
-    };
-    let r = qs_write.reindex(true).and_then(|_| qs_write.commit());
+    let mut qs_write = qs
+        .write(duration_from_epoch_now())
+        .await
+        .inspect_err(|err| {
+            error!(?err, "Unable to acquire write transaction");
+        })?;
 
-    match r {
-        Ok(_) => info!("Index Phase 2 Success!"),
-        Err(e) => {
-            error!("Reindex failed: {:?}", e);
-            std::process::exit(1);
-        }
-    };
+    qs_write
+        .reindex(true)
+        .and_then(|_| qs_write.commit())
+        .inspect_err(|err| {
+            error!(?err, "Reindex failed");
+        })?;
+    info!("Index Phase 2 Success!");
+
+    Ok(())
 }
 
 pub fn vacuum_server_core(config: &Configuration) {
@@ -690,6 +803,32 @@ pub async fn verify_server_core(config: &Configuration) {
     }
 
     // Now add IDM server verifications?
+}
+
+/// Boot the database described by `config` exactly as a server start would, including
+/// the startup migrations, then run the full consistency verification on it. Returns the
+/// consistency errors found, which is empty for a healthy database.
+pub async fn verify_booted_database(
+    config: &Configuration,
+) -> Result<Vec<ConsistencyError>, OperationError> {
+    let schema = Schema::new().inspect_err(|err| {
+        error!(?err, "Failed to setup in memory schema");
+    })?;
+
+    let be = setup_backend(config, &schema).inspect_err(|err| {
+        error!(?err, "Failed to setup BE");
+    })?;
+
+    let server = setup_qs(be, schema, config).await.inspect_err(|err| {
+        error!(?err, "Failed to start query server");
+    })?;
+
+    Ok(server
+        .verify()
+        .await
+        .into_iter()
+        .filter_map(Result::err)
+        .collect())
 }
 
 pub fn cert_generate_core(config: &Configuration) {
@@ -987,6 +1126,7 @@ pub struct CoreHandle {
     tx: broadcast::Sender<CoreAction>,
     /// This stores a name for the handle, and the handle itself so we can tell which failed/succeeded at the end.
     handles: Vec<(TaskName, task::JoinHandle<()>)>,
+    server_read_ref: &'static QueryServerReadV1,
 }
 
 impl CoreHandle {
@@ -1015,6 +1155,26 @@ impl CoreHandle {
         if self.tx.send(CoreAction::Reload).is_err() {
             eprintln!("No receivers acked reload request.");
         }
+    }
+
+    /// Run an online backup now, through the same code path the scheduled online backup
+    /// uses. `versions` is the number of backups to keep in `outpath`. This exists so
+    /// tests can exercise the production backup path on demand.
+    pub async fn trigger_online_backup(
+        &self,
+        outpath: &Path,
+        versions: usize,
+        compression: BackupCompression,
+    ) -> Result<(), OperationError> {
+        self.server_read_ref
+            .handle_online_backup(
+                kubidmd_lib::event::OnlineBackupEvent::new(),
+                outpath,
+                versions,
+                compression,
+                None,
+            )
+            .await
     }
 }
 
@@ -1205,6 +1365,7 @@ pub async fn create_server_core(
         clean_shutdown: false,
         tx: broadcast_tx,
         handles,
+        server_read_ref,
     };
 
     if startup_success.is_ok() {

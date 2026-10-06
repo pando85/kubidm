@@ -141,6 +141,87 @@ impl IdxMeta {
     }
 }
 
+/// The outcome of a structural check of a backup artifact.
+///
+/// A structural check only proves that the artifact parses as a backup, carries entries
+/// and was written by a server of this version. It does not prove the backup can be
+/// restored. That requires restoring it into a scratch database and verifying the result.
+#[derive(Debug, Clone)]
+pub struct BackupStructuralReport {
+    /// Number of entries the artifact carries.
+    pub entry_count: usize,
+    /// Server version that wrote the artifact, when the backup format records it.
+    pub version: Option<String>,
+    /// Human readable reasons the artifact can not be restored by this server.
+    pub errors: Vec<String>,
+}
+
+impl BackupStructuralReport {
+    pub fn is_valid(&self) -> bool {
+        self.errors.is_empty()
+    }
+}
+
+/// Parse a backup artifact and check its format, entry count and server version
+/// without touching any database.
+pub fn verify_backup_structure<IN>(
+    input: IN,
+    compression: BackupCompression,
+) -> Result<BackupStructuralReport, OperationError>
+where
+    IN: std::io::Read,
+{
+    let dbbak_option: Result<DbBackup, serde_json::Error> = match compression {
+        BackupCompression::NoCompression => serde_json::from_reader(input),
+        BackupCompression::Gzip => {
+            let decoder = flate2::read::GzDecoder::new(input);
+            serde_json::from_reader(decoder)
+        }
+    };
+
+    let dbbak = dbbak_option.map_err(|err| {
+        error!(?err, "Backup artifact could not be parsed");
+        OperationError::SerdeJsonError
+    })?;
+
+    let (entry_count, version) = match &dbbak {
+        DbBackup::V1(entries) => (entries.len(), None),
+        DbBackup::V2 { entries, .. }
+        | DbBackup::V3 { entries, .. }
+        | DbBackup::V4 { entries, .. } => (entries.len(), None),
+        DbBackup::V5 {
+            version, entries, ..
+        } => (entries.len(), Some(version.clone())),
+    };
+
+    let mut errors = Vec::new();
+
+    // Mirror the checks that `restore` applies, so that a structurally valid backup
+    // is at least one that `restore` will accept.
+    match version.as_deref() {
+        Some(env!("KUBIDM_PKG_SERIES")) => {}
+        Some(version) => errors.push(format!(
+            "Backup was written by server version {} and can not be restored on version {}",
+            version,
+            env!("KUBIDM_PKG_SERIES")
+        )),
+        None => errors.push(
+            "Backup was written by an older server version that records no version and can not be restored"
+                .to_string(),
+        ),
+    }
+
+    if entry_count == 0 {
+        errors.push("Backup contains no entries".to_string());
+    }
+
+    Ok(BackupStructuralReport {
+        entry_count,
+        version,
+        errors,
+    })
+}
+
 #[derive(Clone)]
 pub struct BackendConfig {
     path: PathBuf,

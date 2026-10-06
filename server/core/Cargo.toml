@@ -70,6 +70,7 @@ serde_urlencoded = { workspace = true }
 sketching = { workspace = true }
 sshkeys = { workspace = true }
 sshkey-attest = { workspace = true }
+tempfile = { workspace = true }
 time = { workspace = true, features = ["serde", "std", "local-offset"] }
 tokio = { workspace = true, features = ["net", "sync", "io-util", "macros"] }
 tokio-rustls = { workspace = true }
@@ -107,7 +108,6 @@ webauthn-rs = { workspace = true, features = [
 
 [dev-dependencies]
 walkdir = { workspace = true }
-tempfile = { workspace = true }
 kubidmd_lib = { workspace = true, features = ["test"] }
 
 [build-dependencies]
