@@ -565,7 +565,7 @@ dependencies = [
  "hmac 0.13.0",
  "http",
  "http-body",
- "lru 0.18.4",
+ "lru 0.18.5",
  "percent-encoding",
  "regex-lite",
  "sha2 0.11.0",
@@ -5013,9 +5013,9 @@ dependencies = [
 
 [[package]]
 name = "lru"
-version = "0.18.4"
+version = "0.18.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff9840bcc50b71349309900da0ce7279aa336ae71d73250b07998932c7d97c25"
+checksum = "ef9ac18847474e638e3702b76c65d4eb93428471a74778ef0f1be711717f89b5"
 dependencies = [
  "hashbrown 0.17.1",
 ]
@@ -7624,7 +7624,7 @@ dependencies = [
  "kubidmd_core",
  "kubidmd_testkit",
  "libc",
- "lru 0.18.4",
+ "lru 0.18.5",
  "nix",
  "notify-debouncer-full",
  "prctl",
