@@ -39,7 +39,6 @@ use kubidmd_lib::{
     prelude::*,
 };
 use ldap3_proto::simple::*;
-use regex::Regex;
 use std::{
     convert::TryFrom,
     fs,
@@ -51,7 +50,7 @@ use tracing::{error, info, instrument, trace};
 use uuid::Uuid;
 
 use super::QueryServerReadV1;
-use crate::backup::S3ClientWrapper;
+use crate::backup::{is_backup_artifact_name, select_backups_to_delete, S3ClientWrapper};
 
 // ===========================================================
 
@@ -220,7 +219,7 @@ impl QueryServerReadV1 {
         // Handle S3 backup
         if let Some(s3) = s3_client {
             return self
-                .handle_s3_backup(&msg, &timestamp, compression, s3)
+                .handle_s3_backup(&msg, &timestamp, versions, compression, s3)
                 .await;
         }
 
@@ -262,16 +261,6 @@ impl QueryServerReadV1 {
 
         // TODO: make the file rotation a separate function
 
-        // pattern to find automatically generated backup files
-        let re = Regex::new(r"^backup-\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?Z\.json")
-            .map_err(|error| {
-                error!(
-                    "Failed to parse regexp for online backup files: {:?}",
-                    error
-                );
-                OperationError::InvalidState
-            })?;
-
         // cleanup of maximum backup versions to keep
         let mut backup_file_list: Vec<PathBuf> = Vec::new();
         // get a list of backup files
@@ -297,7 +286,7 @@ impl QueryServerReadV1 {
                         OperationError::InvalidState
                     })?;
                     // check for a online backup file
-                    if re.is_match(file_name) {
+                    if is_backup_artifact_name(file_name) {
                         backup_file_list.push(pb.clone());
                     }
                 }
@@ -360,6 +349,7 @@ impl QueryServerReadV1 {
         &self,
         msg: &OnlineBackupEvent,
         timestamp: &str,
+        versions: usize,
         compression: BackupCompression,
         s3_client: S3ClientWrapper,
     ) -> Result<(), OperationError> {
@@ -391,6 +381,41 @@ impl QueryServerReadV1 {
             })?;
 
         info!("S3 backup uploaded successfully: {}", object_key);
+
+        // Retention: the backup itself has succeeded at this point, so a failure to prune
+        // older backups is logged but never turns a successful backup into a failure.
+        // Only automatically generated backup artifacts are ever deleted; metadata
+        // sidecars, the PITR manifest and any other object under the prefix are kept.
+        let existing = match s3_client.list_backups().await {
+            Ok(existing) => existing,
+            Err(e) => {
+                error!("S3 backup cleanup failed to list backups: {}", e);
+                return Ok(());
+            }
+        };
+
+        let to_delete = select_backups_to_delete(&existing, versions);
+        if to_delete.is_empty() {
+            debug!("S3 backup cleanup had no backups to remove");
+        } else {
+            info!(
+                "S3 backup cleanup found {} backups, should keep {}, will remove {}",
+                existing
+                    .iter()
+                    .filter(|key| is_backup_artifact_name(key))
+                    .count(),
+                versions,
+                to_delete.len()
+            );
+        }
+
+        for key in to_delete {
+            match s3_client.delete_backup(&key).await {
+                Ok(()) => info!("S3 backup cleanup removed {}", key),
+                Err(e) => error!("S3 backup cleanup failed to remove {}: {}", key, e),
+            }
+        }
+
         Ok(())
     }
 
