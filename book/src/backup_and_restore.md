@@ -71,6 +71,29 @@ secret_access_key = "your-secret-key"
 2. **IAM Role Authentication**: Omit the `credentials` section - the server will use IAM roles when running on EC2/EKS
 3. **Environment Variables**: Set `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and optionally `AWS_SESSION_TOKEN`
 
+#### Retention
+
+`versions` applies independently to each location: the local directory keeps the newest `versions` backups, and the S3
+prefix keeps the newest `versions` backups. After every successful upload the server lists the objects under
+`path_prefix` and deletes the oldest automatically generated backups (`backup-<timestamp>.json[.gz]` together with their
+`.metadata.json` object) beyond that number. No other object under the prefix is ever deleted.
+
+#### Custom Endpoints
+
+When `endpoint` is set, objects are addressed in path style (`<endpoint>/<bucket>/<key>`), as MinIO, Ceph RGW and most
+other S3-compatible services expect. A `region` is still required for request signing; any value such as `us-east-1`
+works for services that do not use regions.
+
+#### Listing Backups
+
+`kubidmd database list-backups` prints the backups in the local directory and under the S3 prefix with their size, time
+and the first characters of the recorded SHA-256. `--local-only` and `--s3-only` restrict the output to one location.
+The command does not open the database, so it can run while the server is running.
+
+```bash
+kubidmd database list-backups -c /data/server.toml
+```
+
 ### Features Not Yet Available
 
 The following backup features are planned but are not implemented in this release:
@@ -88,9 +111,10 @@ A backup that was written successfully is not necessarily a backup that can be r
 different kinds of verification:
 
 - **Storage integrity**: Each backup uploaded to S3 is stored next to a `<key>.metadata.json` object that records the
-  `checksum_sha256`, `timestamp`, `compression` and `size_bytes` of the artifact. To restore or verify an S3 artifact,
-  first download it with your S3 tooling (for example `aws s3 cp`), optionally compare its SHA-256 against the metadata
-  object, and then use `kubidmd database restore` or `kubidmd database verify-backup` on the downloaded file.
+  `checksum_sha256`, `timestamp`, `compression` and `size_bytes` of the artifact. Every download Kubidm performs
+  (`restore-s3`, `verify-s3`) recomputes the SHA-256 of the object and refuses it when it does not match the metadata.
+  `kubidmd database verify-s3` checks this without restoring anything, see
+  [Verifying S3 Backups](#verifying-s3-backups).
 - **Restorability**: `kubidmd database verify-backup` inspects the content of a local backup artifact. It has two
   levels, described below.
 
@@ -119,6 +143,22 @@ Full verification is the default level. It loads the whole backup into a tempora
 time proportional to the size of the backup. The command exits non-zero and prints the reasons when verification fails,
 which makes it suitable for backup automation.
 
+### Verifying S3 Backups
+
+`kubidmd database verify-s3` downloads a backup from the bucket configured in `[online_backup.s3]`, compares its SHA-256
+with the `checksum_sha256` recorded in the metadata object and, when it matches, runs the same structural or full
+verification as `verify-backup` on the downloaded artifact. The artifact is kept in a temporary directory that is
+removed afterwards, and the server's own database is not opened.
+
+```bash
+kubidmd database verify-s3 -c /data/server.toml --key backup-2024-01-01T22:00:00Z.json.gz
+kubidmd database verify-s3 -c /data/server.toml --level structural --key backup-2024-01-01T22:00:00Z.json.gz
+```
+
+`--key` is relative to the configured `path_prefix`. `--bucket`, `--region` and `--endpoint` override the corresponding
+settings of the configuration, and `--bucket` is required when the configuration has no `[online_backup.s3]` section.
+The command exits non-zero when the checksum does not match or when verification at the requested level fails.
+
 ## Method 2 - Manual Backup
 
 This method uses the same process as the automatic process, but is manually invoked. This can be useful for pre-upgrade
@@ -145,6 +185,25 @@ docker run --rm -i -t -v kubidmd:/data -v kubidmd_backups:/backup \
     /backup/kubidm.backup.json
 docker start <container name>
 ```
+
+### Restoring from S3
+
+`kubidmd database restore-s3` downloads a backup from the bucket configured in `[online_backup.s3]`, verifies its
+SHA-256 against the metadata object and restores it with the same code as `restore`. Like `restore`, it must run while
+the server is stopped:
+
+```bash
+docker stop <container name>
+docker run --rm -i -t -v kubidmd:/data \
+    kubidm/server:latest /sbin/kubidmd database restore-s3 -c /data/server.toml \
+    --key backup-2024-01-01T22:00:00Z.json.gz
+docker start <container name>
+```
+
+The key is relative to the configured `path_prefix`; `kubidmd database list-backups` shows the available keys. The
+database is left untouched when the download or the checksum check fails. `--bucket`, `--region` and `--endpoint`
+override the configuration, which allows restoring on a host whose `server.toml` has no `[online_backup.s3]` section
+(credentials then come from the AWS environment variables or the instance role).
 
 ## Method 3 - Manual Database Copy
 
