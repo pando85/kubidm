@@ -39,6 +39,52 @@ struct VerifyBackupOpt {
 }
 
 #[derive(Debug, Args)]
+struct RestoreS3Opt {
+    /// Key of the backup to restore, relative to the configured path prefix, for example
+    /// "backup-2024-01-01T22:00:00Z.json.gz". Use "list-backups" to see the available keys.
+    #[clap(long)]
+    key: String,
+
+    /// Override the bucket of the [online_backup.s3] section. Required when the section
+    /// is absent from the configuration.
+    #[clap(long)]
+    bucket: Option<String>,
+
+    /// Override the region of the [online_backup.s3] section.
+    #[clap(long)]
+    region: Option<String>,
+
+    /// Override the endpoint of the [online_backup.s3] section, for S3-compatible services.
+    #[clap(long)]
+    endpoint: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct VerifyS3Opt {
+    /// Key of the backup to verify, relative to the configured path prefix, for example
+    /// "backup-2024-01-01T22:00:00Z.json.gz". Use "list-backups" to see the available keys.
+    #[clap(long)]
+    key: String,
+
+    /// Override the bucket of the [online_backup.s3] section. Required when the section
+    /// is absent from the configuration.
+    #[clap(long)]
+    bucket: Option<String>,
+
+    /// Override the region of the [online_backup.s3] section.
+    #[clap(long)]
+    region: Option<String>,
+
+    /// Override the endpoint of the [online_backup.s3] section, for S3-compatible services.
+    #[clap(long)]
+    endpoint: Option<String>,
+
+    /// How deeply to verify the backup once its checksum has been confirmed.
+    #[clap(short, long, value_enum, default_value_t = VerifyBackupLevel::Full)]
+    level: VerifyBackupLevel,
+}
+
+#[derive(Debug, Args)]
 struct PitrRecoverOpt {
     /// Target time for recovery (RFC3339 format, e.g., "2024-01-15T10:30:00Z")
     #[clap(long)]
@@ -98,6 +144,26 @@ enum DbCommands {
     #[clap(name = "verify-backup")]
     /// Verify a backup artifact for restorability and consistency.
     VerifyBackup(VerifyBackupOpt),
+    #[clap(name = "restore-s3")]
+    /// Restore the database from a backup stored in S3 (offline)
+    ///
+    /// Uses the [online_backup.s3] section of the configuration, overridable by the flags.
+    RestoreS3(RestoreS3Opt),
+    #[clap(name = "verify-s3")]
+    /// Verify the checksum, restorability and consistency of a backup stored in S3
+    ///
+    /// Uses the [online_backup.s3] section of the configuration, overridable by the flags.
+    VerifyS3(VerifyS3Opt),
+    #[clap(name = "list-backups")]
+    /// List the backups in the local online backup directory and in S3.
+    ListBackups {
+        /// Only list the local online backup directory.
+        #[clap(long, conflicts_with = "s3_only")]
+        local_only: bool,
+        /// Only list the S3 backups.
+        #[clap(long)]
+        s3_only: bool,
+    },
     #[clap(name = "reindex")]
     /// Reindex the database (offline)
     Reindex,
