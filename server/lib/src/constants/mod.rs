@@ -4,9 +4,7 @@ pub mod entries;
 pub mod uuids;
 pub mod values;
 
-pub use self::entries::*;
-pub use self::uuids::*;
-pub use self::values::*;
+pub use self::{entries::*, uuids::*, values::*};
 
 use std::time::Duration;
 
@@ -138,6 +136,10 @@ pub const PURGE_FREQUENCY: u64 = 600;
 /// The duration for which messages will be retained after their send_after time. Defaults to
 /// 7 days
 pub const DEFAULT_MESSAGE_RETENTION: Duration = Duration::from_secs(86400 * 7);
+
+/// The duration for an account signup request to be processed before it is removed. Defaults
+/// to 1 day
+pub const DEFAULT_ACCOUNT_SIGNUP_RETENTION: Duration = Duration::from_secs(86400);
 
 /// The number of delayed actions to consider per write transaction. Higher
 /// values allow more coalescing to occur, but may consume more ram and cause

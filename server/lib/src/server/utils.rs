@@ -1,6 +1,8 @@
-use crate::maintenance::{QueryServerMaintenanceWriteFence, ReplicationFence};
-use crate::prelude::*;
-use crate::valueset::{ValueSetDateTime, ValueSetEmailAddress, ValueSetIutf8, ValueSetMessage};
+use crate::{
+    maintenance::{QueryServerMaintenanceWriteFence, ReplicationFence},
+    prelude::*,
+    valueset::{ValueSetDateTime, ValueSetEmailAddress, ValueSetIutf8, ValueSetMessage},
+};
 use kubidm_proto::internal::ConsistencyError;
 use kubidm_proto::v1::OutboundMessage;
 

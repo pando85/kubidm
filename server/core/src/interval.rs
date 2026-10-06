@@ -1,15 +1,15 @@
 //! This contains scheduled tasks/interval tasks that are run inside of the server on a schedule
 //! as background operations.
 
-use std::fs;
-use std::path::Path;
-use std::str::FromStr;
+use std::{fs, path::Path, str::FromStr};
 
 use chrono::Utc;
 use cron::Schedule;
 
-use tokio::sync::broadcast;
-use tokio::time::{interval, sleep, Duration, MissedTickBehavior};
+use tokio::{
+    sync::broadcast,
+    time::{interval, sleep, Duration, MissedTickBehavior},
+};
 
 use crate::backup::S3ClientWrapper;
 use crate::config::OnlineBackup;

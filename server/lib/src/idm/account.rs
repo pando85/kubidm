@@ -1,23 +1,32 @@
-use super::accountpolicy::ResolvedAccountPolicy;
-use super::group::{load_account_policy, load_all_groups_from_account, Group, Unix};
-use crate::constants::UUID_ANONYMOUS;
-use crate::credential::softlock::CredSoftLockPolicy;
-use crate::credential::{apppwd::ApplicationPassword, Credential};
-use crate::entry::{Entry, EntryCommitted, EntryReduced, EntrySealed};
-use crate::event::SearchEvent;
-use crate::idm::application::Application;
-use crate::idm::ldap::{LdapBoundToken, LdapSession};
-use crate::idm::server::{IdmServerProxyReadTransaction, IdmServerProxyWriteTransaction};
-use crate::modify::{ModifyInvalid, ModifyList};
-use crate::prelude::*;
-use crate::schema::SchemaTransaction;
-use crate::value::{IntentTokenState, PartialValue, SessionState, Value};
+use super::{
+    accountpolicy::ResolvedAccountPolicy,
+    group::{load_account_policy, load_all_groups_from_account, Group, Unix},
+};
+use crate::{
+    constants::UUID_ANONYMOUS,
+    credential::{apppwd::ApplicationPassword, softlock::CredSoftLockPolicy, Credential},
+    entry::{Entry, EntryCommitted, EntryReduced, EntrySealed},
+    event::SearchEvent,
+    idm::{
+        application::Application,
+        ldap::{LdapBoundToken, LdapSession},
+        server::{IdmServerProxyReadTransaction, IdmServerProxyWriteTransaction},
+    },
+    modify::{ModifyInvalid, ModifyList},
+    prelude::*,
+    schema::SchemaTransaction,
+    value::{IntentTokenState, PartialValue, SessionState, Value},
+};
 use kubidm_lib_crypto::CryptoPolicy;
-use kubidm_proto::internal::{CredentialStatus, PasskeyDetail, UatPurpose, UiHint, UserAuthToken};
-use kubidm_proto::v1::{UatStatus, UatStatusState, UnixGroupToken, UnixUserToken};
+use kubidm_proto::{
+    internal::{CredentialStatus, PasskeyDetail, UatPurpose, UiHint, UserAuthToken},
+    v1::{UatStatus, UatStatusState, UnixGroupToken, UnixUserToken},
+};
 use sshkey_attest::proto::PublicKey as SshPublicKey;
-use std::collections::{BTreeMap, BTreeSet};
-use std::time::Duration;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Duration,
+};
 use time::OffsetDateTime;
 use uuid::Uuid;
 use webauthn_rs::prelude::{
@@ -1148,8 +1157,7 @@ impl IdmServerProxyReadTransaction<'_> {
 
 #[cfg(test)]
 mod tests {
-    use crate::idm::accountpolicy::ResolvedAccountPolicy;
-    use crate::prelude::*;
+    use crate::{idm::accountpolicy::ResolvedAccountPolicy, prelude::*};
     use kubidm_proto::internal::UiHint;
 
     #[test]

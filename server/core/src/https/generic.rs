@@ -7,9 +7,7 @@ use kubidmd_lib::prelude::APPLICATION_JSON;
 use kubidmd_lib::status::{LivenessStatus, ReadinessStatus, ServingReadiness, StatusRequestEvent};
 use url::Url;
 
-use super::middleware::KOpId;
-use super::views::constants::Urls;
-use super::ServerState;
+use super::{middleware::KOpId, views::constants::Urls, ServerState};
 
 #[utoipa::path(
     get,

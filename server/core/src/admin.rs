@@ -1,6 +1,8 @@
-use crate::actors::{QueryServerReadV1, QueryServerWriteV1};
-use crate::repl::ReplCtrl;
-use crate::CoreAction;
+use crate::{
+    actors::{QueryServerReadV1, QueryServerWriteV1},
+    repl::ReplCtrl,
+    CoreAction,
+};
 use bytes::{BufMut, BytesMut};
 use crypto_glue::x509::x509b64;
 use futures::{SinkExt, StreamExt};

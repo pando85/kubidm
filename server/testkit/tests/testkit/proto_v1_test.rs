@@ -1,28 +1,31 @@
 #![deny(warnings)]
-use compact_jwt::dangernoverify::JwsDangerReleaseWithoutVerify;
-use compact_jwt::{traits::JwsVerifiable, JwsCompact, JwsEs256Verifier, JwsVerifier};
+use compact_jwt::{
+    dangernoverify::JwsDangerReleaseWithoutVerify, traits::JwsVerifiable, JwsCompact,
+    JwsEs256Verifier, JwsVerifier,
+};
 use hyper::header::CONTENT_TYPE;
 use kubidm_client::{ClientError, KubidmClient};
-use kubidm_proto::constants::{ATTR_GIDNUMBER, KSESSIONID};
-use kubidm_proto::internal::{
-    ApiToken, CURegState, Filter, ImageValue, Modify, ModifyList, UatPurpose, UserAuthToken,
-};
-use kubidm_proto::v1::{
-    AuthCredential, AuthIssueSession, AuthMech, AuthRequest, AuthResponse, AuthState, AuthStep,
-    Entry,
+use kubidm_proto::{
+    constants::{ATTR_GIDNUMBER, KSESSIONID},
+    internal::{
+        ApiToken, CURegState, Filter, ImageValue, Modify, ModifyList, UatPurpose, UserAuthToken,
+    },
+    v1::{
+        AuthCredential, AuthIssueSession, AuthMech, AuthRequest, AuthResponse, AuthState, AuthStep,
+        Entry,
+    },
 };
 use kubidmd_core::config::ServerRole;
-use kubidmd_lib::constants::{NAME_IDM_ADMINS, NAME_SYSTEM_ADMINS};
-use kubidmd_lib::credential::totp::Totp;
-use kubidmd_lib::prelude::{Attribute, APPLICATION_JSON};
+use kubidmd_lib::{
+    constants::{NAME_IDM_ADMINS, NAME_SYSTEM_ADMINS},
+    credential::totp::Totp,
+    prelude::{Attribute, APPLICATION_JSON},
+};
 use kubidmd_testkit::{ADMIN_TEST_PASSWORD, ADMIN_TEST_USER};
-use std::path::Path;
-use std::str::FromStr;
-use std::time::SystemTime;
+use std::{path::Path, str::FromStr, time::SystemTime};
 use time::OffsetDateTime;
 use tracing::{debug, trace};
-use webauthn_authenticator_rs::softpasskey::SoftPasskey;
-use webauthn_authenticator_rs::WebauthnAuthenticator;
+use webauthn_authenticator_rs::{softpasskey::SoftPasskey, WebauthnAuthenticator};
 
 const UNIX_TEST_PASSWORD: &str = "unix test user password";
 

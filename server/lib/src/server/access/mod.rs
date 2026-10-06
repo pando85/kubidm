@@ -14,20 +14,18 @@
 //!   requirements (also search).
 
 use hashbrown::HashMap;
-use std::cell::Cell;
-use std::collections::BTreeSet;
-use std::ops::DerefMut;
-use std::sync::Arc;
+use std::{cell::Cell, collections::BTreeSet, ops::DerefMut, sync::Arc};
 
-use concread::arcache::ARCacheBuilder;
-use concread::cowcell::*;
+use concread::{arcache::ARCacheBuilder, cowcell::*};
 use uuid::Uuid;
 
-use crate::entry::{Entry, EntryInit, EntryNew};
-use crate::event::{CreateEvent, DeleteEvent, ModifyEvent, SearchEvent};
-use crate::filter::{Filter, FilterValid, ResolveFilterCache, ResolveFilterCacheReadTxn};
-use crate::modify::Modify;
-use crate::prelude::*;
+use crate::{
+    entry::{Entry, EntryInit, EntryNew},
+    event::{CreateEvent, DeleteEvent, ModifyEvent, SearchEvent},
+    filter::{Filter, FilterValid, ResolveFilterCache, ResolveFilterCacheReadTxn},
+    modify::Modify,
+    prelude::*,
+};
 
 use self::profiles::{
     AccessControlCreate, AccessControlCreateResolved, AccessControlDelete,
@@ -209,6 +207,14 @@ fn resolve_access_conditions(
             scope_filter,
             ..
         } => {
+            // Delegated receivers only ever apply to user identities. Internal roles
+            // (notably Migration, which is constrained to the migration class and
+            // attribute rules) and sync accounts must never gain rights through a
+            // delegated profile, especially one that has no scope group.
+            if !matches!(ident.origin, IdentType::User(_)) {
+                return None;
+            }
+
             let scope_filter_resolved = if let Some(filter) = scope_filter {
                 filter
                     .resolve(ident, None, Some(acp_resolve_filter_cache))
@@ -668,7 +674,10 @@ pub trait AccessControlsTransaction<'a> {
             debug!(entry_id = %e.get_display_id());
 
             match apply_modify_access(&me.ident, related_acp.as_slice(), sync_agmts, e) {
-                ModifyResult::Deny => false,
+                ModifyResult::Deny => {
+                    security_error!("modify access denied.");
+                    false
+                }
                 ModifyResult::Grant => true,
                 ModifyResult::Allow {
                     pres,
@@ -838,7 +847,10 @@ pub trait AccessControlsTransaction<'a> {
             let sync_agmts = self.get_sync_agreements();
 
             match apply_modify_access(&me.ident, related_acp.as_slice(), sync_agmts, e) {
-                ModifyResult::Deny => false,
+                ModifyResult::Deny => {
+                    security_error!("modify access denied.");
+                    false
+                }
                 ModifyResult::Grant => true,
                 ModifyResult::Allow {
                     pres,
@@ -1357,8 +1369,7 @@ impl AccessControls {
 #[cfg(test)]
 mod tests {
     use hashbrown::HashMap;
-    use std::collections::BTreeSet;
-    use std::sync::Arc;
+    use std::{collections::BTreeSet, sync::Arc};
 
     use uuid::uuid;
 
@@ -1369,9 +1380,7 @@ mod tests {
         },
         Access, AccessClass, AccessControls, AccessControlsTransaction, AccessEffectivePermission,
     };
-    use crate::migration_data::BUILTIN_ACCOUNT_ANONYMOUS;
-    use crate::prelude::*;
-    use crate::valueset::ValueSetIname;
+    use crate::{migration_data::BUILTIN_ACCOUNT_ANONYMOUS, prelude::*, valueset::ValueSetIname};
 
     const UUID_TEST_ACCOUNT_1: Uuid = uuid::uuid!("cc8e95b4-c24f-4d68-ba54-8bed76f63930");
     const UUID_TEST_ACCOUNT_2: Uuid = uuid::uuid!("cec0852a-abdf-4ea6-9dae-d3157cb33d3a");
@@ -4868,5 +4877,84 @@ mod tests {
         );
 
         test_acp_search!(&se, vec![acp], data_set, expect);
+    }
+
+    // =========================================================================
+    // Migration Identity Modify Tests
+    // =========================================================================
+
+    #[test]
+    fn test_access_migration_modify_constrained_to_migration_attrs() {
+        sketching::test_init();
+
+        let uuid_group = uuid!("3c1e4f5a-7f0a-4b0e-9a55-2f2a6b7f9c01");
+        let group_entry = Arc::new(
+            entry_init!(
+                (Attribute::Class, EntryClass::Object.to_value()),
+                (Attribute::Class, EntryClass::Group.to_value()),
+                (Attribute::Name, Value::new_iname("migration_test_group")),
+                (Attribute::Uuid, Value::Uuid(uuid_group))
+            )
+            .into_sealed_committed(),
+        );
+        let data_set = vec![group_entry];
+
+        let filter = filter_all!(f_eq(Attribute::Uuid, PartialValue::Uuid(uuid_group)));
+
+        // An attribute that migrations are allowed to manage on groups.
+        let allowed_mods = || {
+            modlist!([
+                m_pres(Attribute::Description, &Value::new_utf8s("migrated")),
+                m_pres(Attribute::Member, &Value::Refer(UUID_TEST_ACCOUNT_1))
+            ])
+        };
+        // An attribute outside of the migration attribute set.
+        let denied_mods = || modlist!([m_pres(Attribute::Mail, &Value::new_utf8s("x"))]);
+
+        // A delegated profile without a scope group must not extend what the
+        // migration identity may modify.
+        let delegated_acp = AccessControlModify::from_delegated_receiver(
+            "test_delegated_no_scope_group",
+            Uuid::new_v4(),
+            None,
+            None,
+            AccessControlTarget::Scope(filter_valid!(f_pres(Attribute::Uuid))),
+            "mail",
+            "mail",
+            "",
+            "",
+        );
+
+        let me_allowed = ModifyEvent::new_impersonate_identity(
+            Identity::migration(),
+            filter.clone(),
+            allowed_mods(),
+        );
+        test_acp_modify!(&me_allowed, vec![], &data_set, true);
+
+        let me_denied =
+            ModifyEvent::new_impersonate_identity(Identity::migration(), filter, denied_mods());
+        test_acp_modify!(&me_denied, vec![], &data_set, false);
+        test_acp_modify!(&me_denied, vec![delegated_acp.clone()], &data_set, false);
+
+        // Batch modify path must apply the same rules.
+        let batch =
+            |modlist: ModifyList<ModifyInvalid>| crate::server::batch_modify::BatchModifyEvent {
+                ident: Identity::migration(),
+                modset: [(uuid_group, modlist.into_valid())].into_iter().collect(),
+            };
+
+        let run_batch = |bme: &crate::server::batch_modify::BatchModifyEvent,
+                         acps: Vec<AccessControlModify>| {
+            let ac = AccessControls::default();
+            let mut acw = ac.write();
+            acw.update_modify(acps).expect("Failed to update");
+            acw.batch_modify_allow_operation(bme, &data_set)
+                .expect("op failed")
+        };
+
+        assert!(run_batch(&batch(allowed_mods()), vec![]));
+        assert!(!run_batch(&batch(denied_mods()), vec![]));
+        assert!(!run_batch(&batch(denied_mods()), vec![delegated_acp]));
     }
 }

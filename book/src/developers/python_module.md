@@ -11,6 +11,8 @@ So far it includes:
 
 TODO: a lot of things.
 
+The fork's Python library package is named `kubidm` and is built from the `pykubidm/` directory.
+
 ## Setting up your dev environment
 
 Setting up a dev environment can be a little complex because of the mono-repo.

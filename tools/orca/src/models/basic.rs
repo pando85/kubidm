@@ -1,16 +1,13 @@
 use crate::model::{self, ActorModel, ActorRole, Transition, TransitionAction, TransitionResult};
 
-use crate::error::Error;
-use crate::run::EventRecord;
-use crate::state::*;
+use crate::{error::Error, run::EventRecord, state::*};
 use kubidm_client::KubidmClient;
 
 use async_trait::async_trait;
 use rand::RngExt;
 use rand_chacha::ChaCha8Rng;
 
-use std::collections::BTreeSet;
-use std::time::Duration;
+use std::{collections::BTreeSet, time::Duration};
 
 enum State {
     Unauthenticated,

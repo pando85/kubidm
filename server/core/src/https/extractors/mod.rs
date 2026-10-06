@@ -7,8 +7,10 @@ use axum_extra::extract::cookie::CookieJar;
 use compact_jwt::JwsCompact;
 use kubidm_proto::internal::COOKIE_BEARER_TOKEN;
 use kubidmd_lib::prelude::{ClientAuthInfo, ClientCertInfo, Source};
-use std::net::{IpAddr, SocketAddr};
-use std::str::FromStr;
+use std::{
+    net::{IpAddr, SocketAddr},
+    str::FromStr,
+};
 
 // Re-export
 pub use kubidmd_lib::idm::server::DomainInfoRead;

@@ -5,11 +5,10 @@ use crypto_glue::{
     hex,
     hmac_s256::HmacSha256,
     rand::{self, RngExt},
-    traits::Mac,
+    traits::{KeyInit, Mac},
 };
 use kubidm_proto::internal::COOKIE_CSRF_NONCE;
 use serde::Deserialize;
-use sha2::digest::KeyInit;
 use std::time::Duration;
 
 const SUBMISSION_WINDOW: Duration = Duration::from_secs(30);
