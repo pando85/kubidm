@@ -1176,17 +1176,32 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
         KubidmdOpt::Database {
             commands: DbCommands::Recover(_),
         } => {
-            info!("Running in database recover mode ...");
+            error!(
+                "The 'database recover' command is not implemented in this release. \
+                 Point-in-time recovery is not yet available. \
+                 See the Backup and Restore chapter of the book for the supported procedures."
+            );
+            return ExitCode::FAILURE;
         }
         KubidmdOpt::Database {
             commands: DbCommands::PitrList,
         } => {
-            info!("Running in PITR list mode ...");
+            error!(
+                "The 'database pitr-list' command is not implemented in this release. \
+                 Point-in-time recovery is not yet available. \
+                 See the Backup and Restore chapter of the book for the supported procedures."
+            );
+            return ExitCode::FAILURE;
         }
         KubidmdOpt::Database {
             commands: DbCommands::ReplicateStatus { .. },
         } => {
-            info!("Running in replicate status mode ...");
+            error!(
+                "The 'database replicate-status' command is not implemented in this release. \
+                 Cross-region backup replication is not yet available. \
+                 See the Backup and Restore chapter of the book for the supported procedures."
+            );
+            return ExitCode::FAILURE;
         }
         KubidmdOpt::Scripting { .. } | KubidmdOpt::Version => {}
     }

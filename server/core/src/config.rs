@@ -112,6 +112,47 @@ impl Default for OnlineBackup {
     }
 }
 
+impl OnlineBackup {
+    /// Reject settings that are parsed but have no effect in this release. Accepting them
+    /// silently would let an operator believe a feature is active when it is not.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.encryption.enabled {
+            return Err(
+                "online_backup.encryption: client-side backup encryption is not available in this release; \
+                 remove or disable this setting"
+                    .to_string(),
+            );
+        }
+
+        if self
+            .wal_archive
+            .as_ref()
+            .is_some_and(|wal_archive| wal_archive.enabled)
+        {
+            return Err(
+                "online_backup.wal_archive: point-in-time recovery (WAL archiving) is not available in this release; \
+                 remove or disable this setting"
+                    .to_string(),
+            );
+        }
+
+        if self
+            .s3
+            .as_ref()
+            .and_then(|s3| s3.replication.as_ref())
+            .is_some_and(|replication| replication.enabled)
+        {
+            return Err(
+                "online_backup.s3.replication: cross-region backup replication is not available in this release; \
+                 remove or disable this setting"
+                    .to_string(),
+            );
+        }
+
+        Ok(())
+    }
+}
+
 fn default_online_backup_enabled() -> bool {
     true
 }
@@ -1088,6 +1129,11 @@ impl ConfigurationBuilder {
         })?;
 
         if let Some(online_backup_ref) = online_backup.as_mut() {
+            if let Err(reason) = online_backup_ref.validate() {
+                eprintln!("ERROR: {reason}");
+                return None;
+            }
+
             if online_backup_ref.path.is_none() {
                 if let Some(db_path) = db_path.as_ref() {
                     if let Some(db_parent_path) = db_path.parent() {
@@ -1138,8 +1184,121 @@ impl ConfigurationBuilder {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use cidr::{IpCidr, Ipv4Cidr, Ipv6Cidr};
     use std::net::{Ipv4Addr, Ipv6Addr};
+
+    const BASE_V2_CONFIG: &str = r#"
+version = "2"
+domain = "idm.example.com"
+origin = "https://idm.example.com"
+db_path = "/var/lib/kubidm/kubidm.db"
+tls_chain = "/etc/kubidm/chain.pem"
+tls_key = "/etc/kubidm/key.pem"
+
+[online_backup]
+path = "/var/lib/kubidm/backups/"
+schedule = "@daily"
+"#;
+
+    fn build_from_toml(contents: &str) -> Option<Configuration> {
+        let values = toml::from_str::<ServerConfigV2>(contents).expect("config must parse");
+        Configuration::build()
+            .add_opt_toml_config(Some(ServerConfigUntagged::Version(
+                ServerConfigVersion::V2 { values },
+            )))
+            .finish()
+    }
+
+    #[test]
+    fn online_backup_without_unavailable_features_is_accepted() {
+        assert!(build_from_toml(BASE_V2_CONFIG).is_some());
+    }
+
+    #[test]
+    fn online_backup_encryption_enabled_is_rejected() {
+        let enabled = format!(
+            "{BASE_V2_CONFIG}
+[online_backup.encryption]
+enabled = true
+"
+        );
+        assert!(build_from_toml(&enabled).is_none());
+
+        let disabled = format!(
+            "{BASE_V2_CONFIG}
+[online_backup.encryption]
+enabled = false
+"
+        );
+        assert!(build_from_toml(&disabled).is_some());
+    }
+
+    #[test]
+    fn online_backup_wal_archive_enabled_is_rejected() {
+        let enabled = format!(
+            "{BASE_V2_CONFIG}
+[online_backup.wal_archive]
+enabled = true
+"
+        );
+        assert!(build_from_toml(&enabled).is_none());
+
+        let disabled = format!(
+            "{BASE_V2_CONFIG}
+[online_backup.wal_archive]
+enabled = false
+"
+        );
+        assert!(build_from_toml(&disabled).is_some());
+    }
+
+    #[test]
+    fn online_backup_s3_replication_enabled_is_rejected() {
+        let s3 = r#"
+[online_backup.s3]
+bucket = "kubidm-backups"
+region = "us-east-1"
+"#;
+        let enabled = format!(
+            "{BASE_V2_CONFIG}{s3}
+[online_backup.s3.replication]
+enabled = true
+regions = []
+"
+        );
+        assert!(build_from_toml(&enabled).is_none());
+
+        let disabled = format!(
+            "{BASE_V2_CONFIG}{s3}
+[online_backup.s3.replication]
+enabled = false
+regions = []
+"
+        );
+        assert!(build_from_toml(&disabled).is_some());
+
+        // An S3 section without any replication block is unaffected.
+        assert!(build_from_toml(&format!("{BASE_V2_CONFIG}{s3}")).is_some());
+    }
+
+    #[test]
+    fn online_backup_validate_reports_the_offending_key() {
+        let mut online_backup = OnlineBackup::default();
+        assert!(online_backup.validate().is_ok());
+
+        online_backup.encryption.enabled = true;
+        let err = online_backup.validate().expect_err("must be rejected");
+        assert!(err.starts_with("online_backup.encryption:"));
+        online_backup.encryption.enabled = false;
+
+        online_backup.wal_archive = Some(WalArchiveConfig {
+            enabled: true,
+            ..WalArchiveConfig::default()
+        });
+        let err = online_backup.validate().expect_err("must be rejected");
+        assert!(err.starts_with("online_backup.wal_archive:"));
+    }
 
     #[test]
     fn assert_cidr_parsing_behaviour() {
