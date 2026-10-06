@@ -231,29 +231,40 @@ without restoring using:
 kubidmd database verify-s3 -c /data/server.toml backup-2024-01-01T22:00:00Z.json.gz
 ```
 
-## Backup Verification
+## Verifying That a Backup Can Be Restored
 
-Kubidm provides two levels of backup verification to ensure your backups are restorable:
+A backup that was written successfully is not necessarily a backup that can be restored. Kubidm therefore offers two
+different kinds of verification:
+
+- **Storage integrity**: `kubidmd database verify-s3` checks the SHA-256 checksum of an artifact stored in S3. It proves
+  the bytes in S3 are the bytes that were uploaded, but says nothing about their content.
+- **Restorability**: `kubidmd database verify-backup` inspects the content of a local backup artifact. It has two
+  levels, described below.
 
 ### Structural Verification
 
-Validates the backup format, JSON structure, and version compatibility without performing a full restore. This is fast and suitable for routine checks after backup creation.
+Parses the artifact and checks that it is a Kubidm backup, that it contains entries and that it was written by a server
+of the same version. It never opens a database, so it is fast enough to run after every backup, but it can not detect
+corrupted entries.
 
 ```bash
-kubidmd database verify-backup -c /data/server.toml --level structural /backup/kubidm.backup.json
+kubidmd database verify-backup -c /data/server.toml --level structural /backup/backup-2024-01-01T22:00:00Z.json
 ```
 
-### Full Restore Verification
+### Full Verification
 
-Performs a complete restore into a temporary backend and runs semantic consistency checks including schema validation, index verification, entry consistency, and RUV reconstruction. This exercises the same code paths as a production restore and is the strongest guarantee that a backup is restorable.
+Runs the structural checks, then restores the artifact into a temporary database using the same restore and reindex code
+as `kubidmd database restore`, boots that database as a server start would, and runs the same consistency checks as
+`kubidmd database verify` (schema, indexes, entries, replication metadata and plugins). This is the strongest guarantee
+that a backup is restorable. The temporary database is removed afterwards and the server's own database is not opened.
 
 ```bash
-kubidmd database verify-backup -c /data/server.toml --level full /backup/kubidm.backup.json
+kubidmd database verify-backup -c /data/server.toml /backup/backup-2024-01-01T22:00:00Z.json
 ```
 
-Full verification is slower but detects issues that structural checks cannot, such as corrupted entries or schema incompatibilities that would prevent a successful restore.
-
-> **Note:** Structural verification checks format and checksums. Full verification proves the backup can be restored into a bootable, consistent server. For critical backups, use full verification.
+Full verification is the default level. It loads the whole backup into a temporary database, so it needs disk space and
+time proportional to the size of the backup. The command exits non-zero and prints the reasons when verification fails,
+which makes it suitable for backup automation.
 
 ## Method 2 - Manual Backup
 

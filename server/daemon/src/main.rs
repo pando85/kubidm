@@ -37,7 +37,8 @@ use kubidmd_core::{
     dbscan_list_id2entry_core, dbscan_list_index_analysis_core, dbscan_list_index_core,
     dbscan_list_indexes_core, dbscan_list_quarantined_core, dbscan_quarantine_id2entry_core,
     dbscan_restore_quarantined_core, domain_rename_core, reindex_server_core, restore_server_core,
-    vacuum_server_core, verify_backup_server_core, verify_server_core, CoreAction,
+    vacuum_server_core, verify_backup_server_core, verify_server_core, BackupVerifyLevel,
+    CoreAction,
 };
 use serde::Serialize;
 use sketching::pipeline::TracingPipelineGuard;
@@ -996,9 +997,11 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
             commands: DbCommands::VerifyBackup(vbopt),
         } => {
             info!("Running in backup verification mode ...");
-            let full = matches!(vbopt.level, VerifyBackupLevel::Full);
-            let success = verify_backup_server_core(&config, &vbopt.path, full).await;
-            if !success {
+            let level = match vbopt.level {
+                VerifyBackupLevel::Structural => BackupVerifyLevel::Structural,
+                VerifyBackupLevel::Full => BackupVerifyLevel::Full,
+            };
+            if !verify_backup_server_core(&config, &vbopt.path, level).await {
                 return ExitCode::FAILURE;
             }
         }

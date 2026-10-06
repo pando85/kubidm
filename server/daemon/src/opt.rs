@@ -18,9 +18,11 @@ struct RestoreOpt {
 
 #[derive(Debug, Default, Clone, Copy, clap::ValueEnum)]
 enum VerifyBackupLevel {
-    /// Validate backup format, structure, and version compatibility
+    /// Check the backup format, entry count and server version only. Fast, but can not
+    /// prove the backup is restorable.
     Structural,
-    /// Full restore into a temporary backend with semantic consistency checks
+    /// Restore the backup into a temporary database through the production restore path
+    /// and run the full database consistency verification on the result.
     #[default]
     Full,
 }
@@ -28,10 +30,10 @@ enum VerifyBackupLevel {
 #[derive(Debug, Args)]
 struct VerifyBackupOpt {
     #[clap(value_parser)]
-    /// Path to the backup artifact to verify.
+    /// Path to the backup to verify. Should be created with "backup".
     path: PathBuf,
 
-    /// Verification level: 'structural' (format/checksum only) or 'full' (restore + consistency).
+    /// How deeply to verify the backup.
     #[clap(short, long, value_enum, default_value_t = VerifyBackupLevel::Full)]
     level: VerifyBackupLevel,
 }
