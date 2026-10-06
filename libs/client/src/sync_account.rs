@@ -1,6 +1,8 @@
 use crate::{ClientError, KubidmClient};
-use kubidm_proto::constants::{ATTR_DESCRIPTION, ATTR_NAME};
-use kubidm_proto::v1::Entry;
+use kubidm_proto::{
+    constants::{ATTR_DESCRIPTION, ATTR_NAME},
+    v1::Entry,
+};
 use std::collections::BTreeMap;
 use url::Url;
 

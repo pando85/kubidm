@@ -5,13 +5,18 @@ use kubidm_proto::scim_v1::{
     ScimApplicationPassword, ScimApplicationPasswordCreate, ScimEntryGetQuery, ScimFilter,
     ScimSyncRequest, ScimSyncState,
 };
-use kubidmd_lib::idm::application::GenerateApplicationPasswordEvent;
-use kubidmd_lib::idm::scim::{
-    GenerateScimSyncTokenEvent, ScimSyncFinaliseEvent, ScimSyncTerminateEvent, ScimSyncUpdateEvent,
+use kubidmd_lib::{
+    idm::{
+        application::GenerateApplicationPasswordEvent,
+        scim::{
+            GenerateScimSyncTokenEvent, ScimSyncFinaliseEvent, ScimSyncTerminateEvent,
+            ScimSyncUpdateEvent,
+        },
+        server::IdmServerTransaction,
+    },
+    prelude::*,
+    server::scim::{ScimCreateEvent, ScimDeleteEvent, ScimEntryPutEvent},
 };
-use kubidmd_lib::idm::server::IdmServerTransaction;
-use kubidmd_lib::prelude::*;
-use kubidmd_lib::server::scim::{ScimCreateEvent, ScimDeleteEvent, ScimEntryPutEvent};
 
 impl QueryServerWriteV1 {
     #[instrument(

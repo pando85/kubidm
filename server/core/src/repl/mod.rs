@@ -18,19 +18,13 @@ use rustls::{
     server::{ServerConfig, WebPkiClientVerifier},
     RootCertStore,
 };
-use std::collections::VecDeque;
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::io::AsyncWriteExt;
-use tokio::sync::broadcast;
-use tokio::sync::mpsc;
-use tokio::sync::oneshot;
-use tokio::sync::{Mutex, MutexGuard};
-use tokio::time::{interval, sleep, timeout};
+use std::{collections::VecDeque, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{
+    io::AsyncWriteExt,
     net::{TcpListener, TcpStream},
+    sync::{broadcast, mpsc, oneshot, Mutex, MutexGuard},
     task::JoinHandle,
+    time::{interval, sleep, timeout},
 };
 use tokio_rustls::{client::TlsStream, TlsAcceptor, TlsConnector};
 use tokio_util::codec::{Framed, FramedRead, FramedWrite};
@@ -1061,7 +1055,12 @@ async fn repl_acceptor(
             Some(TlsAcceptor::from(Arc::new(tls_server_config)))
         };
 
-        loop {
+        // IMPORTANT: We have to drop the retry timeout else the renew
+        // cert times out. This is a HACK until I swap in the new actors
+        // framework.
+        retry_timeout = Duration::from_secs(1);
+
+        'event_inner: loop {
             // This is great to diagnose when spans are entered or present and they capture
             // things incorrectly.
             // eprintln!("🔥 C ---> {:?}", tracing::Span::current());
@@ -1071,7 +1070,7 @@ async fn repl_acceptor(
                 Ok(action) = rx.recv() => {
                     match action {
                         CoreAction::Shutdown => break 'event,
-                        CoreAction::Reload => {}
+                        CoreAction::Reload => continue 'event,
                     }
                 }
                 Some(ctrl_msg) = ctrl_rx.recv() => {
@@ -1085,6 +1084,7 @@ async fn repl_acceptor(
                             } else {
                                 trace!("Sent server certificate via control channel");
                             }
+                            continue 'event_inner
                         }
                         ReplCtrl::RenewCertificate {
                             respond
@@ -1145,6 +1145,7 @@ async fn repl_acceptor(
                             } else {
                                 trace!("Sent refresh comms channel to requester");
                             }
+                            continue 'event_inner
                         }
                     }
                 }
@@ -1177,6 +1178,7 @@ async fn repl_acceptor(
                             error!("replication acceptor error, continuing -> {:?}", e);
                         }
                     }
+                    continue 'event_inner
                 }
             } // end select
               // Continue to poll/loop

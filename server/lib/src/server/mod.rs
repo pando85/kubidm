@@ -1,50 +1,58 @@
 //! `server` contains the query server, which is the main high level construction
 //! to coordinate queries and operations in the server.
 
-use self::access::{
-    profiles::{
-        AccessControlCreate, AccessControlDelete, AccessControlModify, AccessControlSearch,
+use self::{
+    access::{
+        profiles::{
+            AccessControlCreate, AccessControlDelete, AccessControlModify, AccessControlSearch,
+        },
+        AccessControls, AccessControlsReadTransaction, AccessControlsTransaction,
+        AccessControlsWriteTransaction,
     },
-    AccessControls, AccessControlsReadTransaction, AccessControlsTransaction,
-    AccessControlsWriteTransaction,
+    keys::{
+        KeyObject, KeyProvider, KeyProviders, KeyProvidersReadTransaction, KeyProvidersTransaction,
+        KeyProvidersWriteTransaction,
+    },
 };
-use self::keys::{
-    KeyObject, KeyProvider, KeyProviders, KeyProvidersReadTransaction, KeyProvidersTransaction,
-    KeyProvidersWriteTransaction,
+use crate::{
+    be::{Backend, BackendReadTransaction, BackendTransaction, BackendWriteTransaction},
+    filter::{
+        Filter, FilterInvalid, FilterValid, FilterValidResolved, ResolveFilterCache,
+        ResolveFilterCacheReadTxn,
+    },
+    plugins::{
+        self,
+        dyngroup::{DynGroup, DynGroupCache},
+        Plugins,
+    },
+    prelude::*,
+    repl::{cid::Cid, proto::ReplRuvRange, ruv::ReplicationUpdateVectorTransaction},
+    schema::{
+        Schema, SchemaAttribute, SchemaClass, SchemaReadTransaction, SchemaTransaction,
+        SchemaWriteTransaction,
+    },
+    value::{CredentialType, EXTRACT_VAL_DN},
+    valueset::*,
 };
-use crate::be::{Backend, BackendReadTransaction, BackendTransaction, BackendWriteTransaction};
-use crate::filter::{
-    Filter, FilterInvalid, FilterValid, FilterValidResolved, ResolveFilterCache,
-    ResolveFilterCacheReadTxn,
+use concread::{
+    arcache::{ARCacheBuilder, ARCacheReadTxn, ARCacheWriteTxn},
+    cowcell::*,
 };
-use crate::plugins::{
-    self,
-    dyngroup::{DynGroup, DynGroupCache},
-    Plugins,
-};
-use crate::prelude::*;
-use crate::repl::cid::Cid;
-use crate::repl::proto::ReplRuvRange;
-use crate::repl::ruv::ReplicationUpdateVectorTransaction;
-use crate::schema::{
-    Schema, SchemaAttribute, SchemaClass, SchemaReadTransaction, SchemaTransaction,
-    SchemaWriteTransaction,
-};
-use crate::value::{CredentialType, EXTRACT_VAL_DN};
-use crate::valueset::*;
-use concread::arcache::{ARCacheBuilder, ARCacheReadTxn, ARCacheWriteTxn};
-use concread::cowcell::*;
 use crypto_glue::{hmac_s256::HmacSha256Key, s256::Sha256Output};
 use hashbrown::{HashMap, HashSet};
-use kubidm_proto::internal::{DomainInfo as ProtoDomainInfo, ImageValue, UiHint};
-use kubidm_proto::scim_v1::{
-    server::{ScimListResponse, ScimOAuth2ClaimMap, ScimOAuth2ScopeMap, ScimReference},
-    JsonValue, ScimEntryGetQuery, ScimFilter,
+use kubidm_proto::{
+    internal::{DomainInfo as ProtoDomainInfo, ImageValue, UiHint},
+    scim_v1::{
+        server::{ScimListResponse, ScimOAuth2ClaimMap, ScimOAuth2ScopeMap, ScimReference},
+        JsonValue, ScimEntryGetQuery, ScimFilter,
+    },
 };
-use std::collections::{BTreeMap, BTreeSet};
-use std::num::NonZeroU64;
-use std::str::FromStr;
-use std::sync::Arc;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    num::NonZeroU64,
+    str::FromStr,
+    sync::Arc,
+};
 use time::OffsetDateTime;
 use tokio::sync::{Semaphore, SemaphorePermit};
 use tracing::trace;
@@ -2271,70 +2279,86 @@ impl<'a> QueryServerWriteTransaction<'a> {
 
     #[instrument(level = "debug", skip_all)]
     pub(crate) fn reload_schema(&mut self) -> Result<(), OperationError> {
-        if self.get_domain_version() < DOMAIN_LEVEL_1_11 {
-            // supply entries to the writable schema to reload from.
-            // find all attributes.
-            let filt = filter!(f_eq(Attribute::Class, EntryClass::AttributeType.into()));
-            let res = self.internal_search(filt).map_err(|e| {
-                error!("reload schema internal search failed {:?}", e);
-                e
-            })?;
-            // load them.
-            let attributetypes: Result<Vec<_>, _> =
-                res.iter().map(|e| SchemaAttribute::try_from(e)).collect();
+        match self.get_domain_version() {
+            /*
+            0 => {
+                // server is being brought up, so the schema was already set by a caller.
+            }
+            */
+            level if level < DOMAIN_LEVEL_1_11 => {
+                // supply entries to the writable schema to reload from.
+                // find all attributes.
+                let filt = filter!(f_eq(Attribute::Class, EntryClass::AttributeType.into()));
+                let res = self.internal_search(filt).map_err(|e| {
+                    error!("reload schema internal search failed {:?}", e);
+                    e
+                })?;
+                // load them.
+                let attributetypes: Result<Vec<_>, _> =
+                    res.iter().map(|e| SchemaAttribute::try_from(e)).collect();
 
-            let attributetypes = attributetypes.map_err(|e| {
-                error!("reload schema attributetypes {:?}", e);
-                e
-            })?;
-
-            self.schema
-                .update_attributes(attributetypes.into_iter())
-                .map_err(|e| {
-                    error!("reload schema update attributetypes {:?}", e);
+                let attributetypes = attributetypes.map_err(|e| {
+                    error!("reload schema attributetypes {:?}", e);
                     e
                 })?;
 
-            // find all classes
-            let filt = filter!(f_eq(Attribute::Class, EntryClass::ClassType.into()));
-            let res = self.internal_search(filt).map_err(|e| {
-                error!("reload schema internal search failed {:?}", e);
-                e
-            })?;
-            // load them.
-            let classtypes: Result<Vec<_>, _> =
-                res.iter().map(|e| SchemaClass::try_from(e)).collect();
-            let classtypes = classtypes.map_err(|e| {
-                error!("reload schema classtypes {:?}", e);
-                e
-            })?;
+                // IMPORTANT: If attribute types is empty, it's because we are in "in memory schema"
+                // mode only. This is a horrid hack but it's needed for backwards compat for now.
+                //
+                // The reason it's needed is that at this phase in bootstrap, domain_version is 0
+                // but the on-disk schema mode relies on that to trigger a read from the DB. We can't
+                // gate on version == 0 because that breaks the older versions. But if we DONT do
+                // anything then this call will nuke the in memory schema that we just setup causing
+                // the server to fail.
+                if attributetypes.is_empty() {
+                    debug!("DB attributes are empty - we are probably in DL_1_11 memory only schema mode.");
+                } else {
+                    self.schema
+                        .update_attributes(attributetypes.into_iter())
+                        .map_err(|e| {
+                            error!("reload schema update attributetypes {:?}", e);
+                            e
+                        })?;
 
-            self.schema
-                .update_classes(classtypes.into_iter())
-                .map_err(|e| {
-                    error!("reload schema update classtypes {:?}", e);
-                    e
-                })?;
+                    // find all classes
+                    let filt = filter!(f_eq(Attribute::Class, EntryClass::ClassType.into()));
+                    let res = self.internal_search(filt).map_err(|e| {
+                        error!("reload schema internal search failed {:?}", e);
+                        e
+                    })?;
+                    // load them.
+                    let classtypes: Result<Vec<_>, _> =
+                        res.iter().map(|e| SchemaClass::try_from(e)).collect();
+                    let classtypes = classtypes.map_err(|e| {
+                        error!("reload schema classtypes {:?}", e);
+                        e
+                    })?;
 
-            // validate.
-            let valid_r = self.schema.validate();
+                    self.schema
+                        .update_classes(classtypes.into_iter())
+                        .map_err(|e| {
+                            error!("reload schema update classtypes {:?}", e);
+                            e
+                        })?;
 
-            // Translate the result.
-            if !valid_r.is_empty() {
-                // Log the failures
-                error!("Schema reload failed -> {:?}", valid_r);
-                return Err(OperationError::ConsistencyError(
-                    valid_r.into_iter().filter_map(|v| v.err()).collect(),
-                ));
-            };
-        } else {
-            match self.get_domain_version() {
-                DOMAIN_LEVEL_1_11 => self.migrate_schema_1_11()?,
-                DOMAIN_LEVEL_1_12 => self.migrate_schema_1_12()?,
-                _ => {
-                    debug_assert!(false, "domain level was not configured in reload_schema");
-                    return Err(OperationError::MG0001InvalidReMigrationLevel);
+                    // validate.
+                    let valid_r = self.schema.validate();
+
+                    // Translate the result.
+                    if !valid_r.is_empty() {
+                        // Log the failures
+                        error!("Schema reload failed -> {:?}", valid_r);
+                        return Err(OperationError::ConsistencyError(
+                            valid_r.into_iter().filter_map(|v| v.err()).collect(),
+                        ));
+                    };
                 }
+            }
+            DOMAIN_LEVEL_1_11 => self.migrate_schema_1_11()?,
+            DOMAIN_LEVEL_1_12 => self.migrate_schema_1_12()?,
+            _ => {
+                debug_assert!(false, "domain level was not configured in reload_schema");
+                return Err(OperationError::MG0001InvalidReMigrationLevel);
             }
         }
 
@@ -2809,13 +2833,22 @@ impl<'a> QueryServerWriteTransaction<'a> {
 
                     std::mem::swap(&mut key, &mut feature_config_txn.hmac_name_history.key);
                 }
+
                 UUID_ACCOUNT_SIGNUP_FEATURE => {
+                    if domain_level < DOMAIN_LEVEL_1_12 {
+                        trace!("Skipping account signup config");
+                        continue;
+                    }
+
                     let new_feature_enabled_state = feature_entry
                         .get_ava_single_bool(Attribute::Enabled)
                         .unwrap_or_default();
 
                     let feature_config_txn = self.feature_config.get_mut();
+
                     feature_config_txn.account_signup.enabled = new_feature_enabled_state;
+
+                    // Probably will add flags here soon?
                 }
                 feature_uuid => {
                     error!(

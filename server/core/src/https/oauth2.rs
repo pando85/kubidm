@@ -1,8 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::errors::WebError;
-use super::middleware::KOpId;
-use super::ServerState;
+use super::{errors::WebError, middleware::KOpId, ServerState};
 use crate::https::extractors::{AuthorisationHeaders, VerifiedClientInformation};
 use axum::{
     body::Body,
@@ -20,21 +18,24 @@ use axum::{
     Extension, Form, Json, Router,
 };
 use axum_macros::debug_handler;
-use kubidm_proto::constants::uri::{
-    OAUTH2_AUTHORISE, OAUTH2_AUTHORISE_PERMIT, OAUTH2_AUTHORISE_REJECT,
+use kubidm_proto::{
+    constants::{
+        uri::{OAUTH2_AUTHORISE, OAUTH2_AUTHORISE_PERMIT, OAUTH2_AUTHORISE_REJECT},
+        APPLICATION_JSON,
+    },
+    oauth2::AuthorisationResponse,
 };
-use kubidm_proto::constants::APPLICATION_JSON;
-use kubidm_proto::oauth2::AuthorisationResponse;
-use kubidmd_lib::idm::oauth2::{
-    AccessTokenIntrospectRequest, AccessTokenRequest, AuthorisationRequest,
-    AuthorisationRequestContext, AuthoriseResponse, ErrorResponse, Oauth2Error, TokenRevokeRequest,
+use kubidmd_lib::{
+    idm::oauth2::{
+        AccessTokenIntrospectRequest, AccessTokenRequest, AuthorisationRequest,
+        AuthorisationRequestContext, AuthoriseResponse, ErrorResponse, Oauth2Error,
+        TokenRevokeRequest,
+    },
+    prelude::{f_eq, *},
+    value::PartialValue,
 };
-use kubidmd_lib::prelude::f_eq;
-use kubidmd_lib::prelude::*;
-use kubidmd_lib::value::PartialValue;
 use serde::{Deserialize, Serialize};
-use serde_with::formats::CommaSeparator;
-use serde_with::{serde_as, StringWithSeparator};
+use serde_with::{formats::CommaSeparator, serde_as, StringWithSeparator};
 
 #[cfg(feature = "dev-oauth2-device-flow")]
 use kubidm_proto::oauth2::DeviceAuthorizationResponse;
@@ -226,6 +227,27 @@ async fn oauth2_authorise(
             let body =
                 Body::from(serde_json::to_string(&AuthorisationResponse::Permitted).unwrap());
             let redirect_uri = success.build_redirect_uri();
+
+            #[allow(clippy::unwrap_used)]
+            Response::builder()
+                .status(StatusCode::FOUND)
+                .header(
+                    LOCATION,
+                    HeaderValue::from_str(redirect_uri.as_str()).unwrap(),
+                )
+                // I think the client server needs this
+                .header(
+                    ACCESS_CONTROL_ALLOW_ORIGIN,
+                    HeaderValue::from_str(&redirect_uri.origin().ascii_serialization()).unwrap(),
+                )
+                .body(body)
+                .unwrap()
+        }
+
+        Ok(AuthoriseResponse::Reject(rejection)) => {
+            #[allow(clippy::unwrap_used)]
+            let body = Body::default();
+            let redirect_uri = rejection.build_redirect_uri();
 
             #[allow(clippy::unwrap_used)]
             Response::builder()

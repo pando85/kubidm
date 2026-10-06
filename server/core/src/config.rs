@@ -12,13 +12,14 @@ use kubidm_proto::internal::FsType;
 use serde::Deserialize;
 use serde_with::{formats::PreferOne, serde_as, OneOrMany};
 use sketching::LogLevel;
-use std::fmt::{self, Display};
-use std::fs::File;
-use std::io::Read;
-use std::net::IpAddr;
-use std::path::{Path, PathBuf};
-use std::str::FromStr;
-use std::sync::Arc;
+use std::{
+    fmt::{self, Display},
+    fs::File,
+    io::Read,
+    net::IpAddr,
+    path::{Path, PathBuf},
+    str::FromStr,
+};
 use url::Url;
 
 use crate::repl::config::ReplicationConfiguration;
@@ -149,12 +150,12 @@ pub enum LdapAddressInfo {
 }
 
 impl LdapAddressInfo {
-    pub fn trusted_tcp_info(&self) -> Arc<TcpAddressInfo> {
-        Arc::new(match self {
+    pub fn trusted_tcp_info(&self) -> TcpAddressInfo {
+        match self {
             LdapAddressInfo::None => TcpAddressInfo::None,
             LdapAddressInfo::ProxyV2(trusted) => TcpAddressInfo::ProxyV2(trusted.clone()),
             LdapAddressInfo::ProxyV1(trusted) => TcpAddressInfo::ProxyV1(trusted.clone()),
-        })
+        }
     }
 }
 
@@ -221,14 +222,14 @@ impl HttpAddressInfo {
         }
     }
 
-    pub fn trusted_tcp_info(&self) -> Arc<TcpAddressInfo> {
-        Arc::new(match self {
+    pub fn trusted_tcp_info(&self) -> TcpAddressInfo {
+        match self {
             Self::ProxyV2(trusted) => TcpAddressInfo::ProxyV2(trusted.clone()),
             Self::ProxyV1(trusted) => TcpAddressInfo::ProxyV1(trusted.clone()),
             Self::None | Self::XForwardFor(_) | Self::XForwardForAllSourcesTrusted => {
                 TcpAddressInfo::None
             }
-        })
+        }
     }
 }
 
@@ -261,6 +262,27 @@ impl Display for HttpAddressInfo {
                 }
                 f.write_str("]")
             }
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, Default, Eq, PartialEq)]
+pub enum HttpVersions {
+    #[serde(rename = "all")]
+    #[default]
+    All,
+    #[serde(rename = "2")]
+    V2_0,
+    #[serde(rename = "1")]
+    V1_1,
+}
+
+impl Display for HttpVersions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::All => f.write_str("http/2 + http/1"),
+            Self::V2_0 => f.write_str("http/2"),
+            Self::V1_1 => f.write_str("http/1"),
         }
     }
 }
@@ -412,6 +434,7 @@ pub struct ServerConfigV2 {
     log_level: Option<LogLevel>,
     online_backup: Option<OnlineBackup>,
 
+    http_server_versions: Option<HttpVersions>,
     http_client_address_info: Option<HttpAddressInfo>,
     ldap_client_address_info: Option<LdapAddressInfo>,
 
@@ -461,6 +484,7 @@ pub struct Configuration {
 
     pub migration_path: Option<PathBuf>,
 
+    pub http_server_versions: HttpVersions,
     pub http_client_address_info: HttpAddressInfo,
     pub ldap_client_address_info: LdapAddressInfo,
 
@@ -496,7 +520,8 @@ impl Configuration {
             db_fs_type: None,
             db_arc_size: None,
             migration_path: None,
-            maximum_request: 256 * 1024,
+            maximum_request: 256 * 1024, // 256k
+            http_server_versions: HttpVersions::default(),
             http_client_address_info: HttpAddressInfo::default(),
             ldap_client_address_info: LdapAddressInfo::default(),
             tls_key: None,
@@ -524,7 +549,8 @@ impl Configuration {
             db_fs_type: None,
             db_arc_size: None,
             migration_path: None,
-            maximum_request: 256 * 1024,
+            maximum_request: 256 * 1024, // 256k
+            http_server_versions: HttpVersions::default(),
             http_client_address_info: HttpAddressInfo::default(),
             ldap_client_address_info: LdapAddressInfo::default(),
             tls_config: None,
@@ -573,6 +599,7 @@ impl fmt::Display for Configuration {
             None => write!(f, "arcsize: AUTO, "),
         }?;
         write!(f, "max request size: {}b, ", self.maximum_request)?;
+        write!(f, "http server versions: {}, ", self.http_server_versions)?;
         write!(
             f,
             "http client address info: {}, ",
@@ -644,6 +671,7 @@ pub struct ConfigurationBuilder {
     db_arc_size: Option<usize>,
     migration_path: Option<PathBuf>,
     maximum_request: usize,
+    http_server_versions: HttpVersions,
     http_client_address_info: HttpAddressInfo,
     ldap_client_address_info: LdapAddressInfo,
     tls_key: Option<PathBuf>,
@@ -971,6 +999,10 @@ impl ConfigurationBuilder {
             self.db_arc_size = config.db_arc_size;
         }
 
+        if let Some(http_server_versions) = config.http_server_versions {
+            self.http_server_versions = http_server_versions
+        }
+
         if let Some(http_client_address_info) = config.http_client_address_info {
             self.http_client_address_info = http_client_address_info
         }
@@ -1017,6 +1049,7 @@ impl ConfigurationBuilder {
             db_arc_size,
             migration_path,
             maximum_request,
+            http_server_versions,
             http_client_address_info,
             ldap_client_address_info,
             tls_key,
@@ -1085,6 +1118,7 @@ impl ConfigurationBuilder {
             db_arc_size,
             migration_path,
             maximum_request,
+            http_server_versions,
             http_client_address_info,
             ldap_client_address_info,
             tls_config,

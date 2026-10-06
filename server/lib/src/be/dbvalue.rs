@@ -1,12 +1,13 @@
 use crate::prelude::JsonValue;
 use hashbrown::HashSet;
-use kubidm_proto::internal::ImageType;
-use kubidm_proto::v1::OutboundMessage;
+use kubidm_proto::{internal::ImageType, v1::OutboundMessage};
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
-use std::collections::{BTreeMap, BTreeSet};
-use std::fmt;
-use std::time::Duration;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    time::Duration,
+};
 use time::OffsetDateTime;
 use url::Url;
 use uuid::Uuid;
@@ -749,6 +750,7 @@ pub enum DbValueKeyUsage {
     JwsHs256,
     JwsRs256,
     JweA128GCM,
+    JweA256GCM,
     HkdfS256,
 }
 

@@ -1,6 +1,8 @@
 use super::QueryServerWriteV1;
-use kubidmd_lib::idm::credupdatesession::CredentialUpdateAccountRecovery;
-use kubidmd_lib::prelude::{duration_from_epoch_now, OperationError};
+use kubidmd_lib::{
+    idm::credupdatesession::CredentialUpdateAccountRecovery,
+    prelude::{duration_from_epoch_now, OperationError},
+};
 use uuid::Uuid;
 
 impl QueryServerWriteV1 {

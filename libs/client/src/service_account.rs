@@ -1,8 +1,10 @@
 use std::collections::BTreeMap;
 
-use kubidm_proto::constants::{ATTR_DISPLAYNAME, ATTR_ENTRY_MANAGED_BY, ATTR_MAIL, ATTR_NAME};
-use kubidm_proto::internal::{ApiToken, CredentialStatus};
-use kubidm_proto::v1::{AccountUnixExtend, ApiTokenGenerate, Entry};
+use kubidm_proto::{
+    constants::{ATTR_DISPLAYNAME, ATTR_ENTRY_MANAGED_BY, ATTR_MAIL, ATTR_NAME},
+    internal::{ApiToken, CredentialStatus},
+    v1::{AccountUnixExtend, ApiTokenGenerate, Entry},
+};
 use time::OffsetDateTime;
 use uuid::Uuid;
 

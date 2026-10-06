@@ -1,8 +1,5 @@
 //! Constant Entries for the IDM
-use crate::constants::uuids::*;
-use crate::entry::EntryInitNew;
-use crate::prelude::EntryClass;
-use crate::value::Value;
+use crate::{constants::uuids::*, entry::EntryInitNew, prelude::EntryClass, value::Value};
 pub use kubidm_proto::attribute::Attribute;
 use kubidm_proto::v1::AccountType;
 

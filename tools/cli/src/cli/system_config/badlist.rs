@@ -1,9 +1,7 @@
-use crate::OpType;
-use crate::{handle_client_error, KubidmClientParser, OutputMode, PwBadlistOpt};
+use crate::{handle_client_error, KubidmClientParser, OpType, OutputMode, PwBadlistOpt};
 
 // use std::thread;
-use std::fs::File;
-use std::io::Read;
+use std::{fs::File, io::Read};
 use tokio::task;
 use zxcvbn::Score;
 

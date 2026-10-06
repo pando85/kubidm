@@ -1,19 +1,22 @@
 #![deny(warnings)]
 use base64::{engine::general_purpose, Engine as _};
 use compact_jwt::{JwkKeySet, JwsEs256Verifier, JwsVerifier, OidcToken, OidcUnverified};
-use kubidm_client::ClientError;
-use kubidm_client::{http::header, KubidmClient, StatusCode};
-use kubidm_proto::constants::uri::{OAUTH2_AUTHORISE, OAUTH2_AUTHORISE_PERMIT};
-use kubidm_proto::constants::*;
-use kubidm_proto::internal::Oauth2ClaimMapJoin;
-use kubidm_proto::oauth2::{
-    AccessTokenIntrospectRequest, AccessTokenIntrospectResponse, AccessTokenRequest,
-    AccessTokenResponse, AccessTokenType, AuthorisationResponse, ClientPostAuth, GrantTypeReq,
-    OidcDiscoveryResponse, TokenRevokeRequest,
+use kubidm_client::{http::header, ClientError, KubidmClient, StatusCode};
+use kubidm_proto::{
+    constants::{
+        uri::{OAUTH2_AUTHORISE, OAUTH2_AUTHORISE_PERMIT},
+        *,
+    },
+    internal::Oauth2ClaimMapJoin,
+    oauth2::{
+        AccessTokenIntrospectRequest, AccessTokenIntrospectResponse, AccessTokenRequest,
+        AccessTokenResponse, AccessTokenType, AuthorisationResponse, ClientPostAuth, GrantTypeReq,
+        OidcDiscoveryResponse, TokenRevokeRequest,
+    },
 };
-use kubidmd_lib::constants::NAME_IDM_ALL_ACCOUNTS;
-use kubidmd_lib::idm::oauth2::PkceS256Secret;
-use kubidmd_lib::prelude::Attribute;
+use kubidmd_lib::{
+    constants::NAME_IDM_ALL_ACCOUNTS, idm::oauth2::PkceS256Secret, prelude::Attribute,
+};
 use kubidmd_testkit::{
     assert_no_cache, ADMIN_TEST_PASSWORD, ADMIN_TEST_USER, NOT_ADMIN_TEST_EMAIL,
     NOT_ADMIN_TEST_PASSWORD, NOT_ADMIN_TEST_USERNAME, TEST_INTEGRATION_RS_DISPLAY,
@@ -21,9 +24,11 @@ use kubidmd_testkit::{
     TEST_INTEGRATION_RS_URL, TEST_INTEGRATION_STATE_VALUE,
 };
 use reqwest::header::{HeaderValue, CONTENT_TYPE};
-use std::collections::{BTreeMap, BTreeSet};
-use std::convert::TryFrom;
-use std::str::FromStr;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    convert::TryFrom,
+    str::FromStr,
+};
 use time::OffsetDateTime;
 use uri::{OAUTH2_TOKEN_ENDPOINT, OAUTH2_TOKEN_INTROSPECT_ENDPOINT, OAUTH2_TOKEN_REVOKE_ENDPOINT};
 use url::{form_urlencoded, Url};

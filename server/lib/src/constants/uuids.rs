@@ -83,6 +83,7 @@ pub const UUID_IDM_MESSAGE_SENDERS: Uuid = uuid!("00000000-0000-0000-0000-000000
 pub const UUID_IDM_OAUTH2_CLIENT_ADMINS: Uuid = uuid!("00000000-0000-0000-0000-000000000056");
 pub const UUID_IDM_OAUTH2_ACCOUNT_ADMINS: Uuid = uuid!("00000000-0000-0000-0000-000000000057");
 pub const UUID_HMAC_NAME_FEATURE: Uuid = uuid!("00000000-0000-0000-0000-000000000058");
+// NOTE (kubidm): upstream uses ...0059 for this, but in kubidm 0059 is UUID_IDM_APPROVAL_ADMINS.
 pub const UUID_ACCOUNT_SIGNUP_FEATURE: Uuid = uuid!("00000000-0000-0000-0000-000000000063");
 
 //
@@ -421,6 +422,10 @@ pub const UUID_SCHEMA_ATTR_OAUTH2_TOKEN_INTROSPECT_ENDPOINT: Uuid =
     uuid!("00000000-0000-0000-0000-ffff00000227");
 pub const UUID_SCHEMA_CLASS_ACCOUNT_SIGNUP_REQUEST: Uuid =
     uuid!("00000000-0000-0000-0000-ffff00000228");
+// NOTE (kubidm): upstream uses ffff00000229 for this, but in kubidm that is
+// UUID_SCHEMA_ATTR_OAUTH2_ISSUER, so it is relocated to the fork's custom range.
+pub const UUID_SCHEMA_CLASS_KEY_OBJECT_JWE_A256GCM: Uuid =
+    uuid!("00000000-0000-0000-0000-ffff00000305");
 
 // Time-bounded access (fork custom - use reserved range ffff000003xx)
 pub const UUID_SCHEMA_ATTR_MEMBER_VALID_FROM: Uuid = uuid!("00000000-0000-0000-0000-ffff00000300");
@@ -630,6 +635,8 @@ pub const UUID_INTERNAL_MIGRATION: Uuid = uuid!("00000000-0000-0000-0000-ffffff0
 pub const UUID_INTERNAL_SESSION_ID: Uuid = uuid!("00000000-0000-0000-0000-ffffff000083");
 pub const UUID_INTERNAL_ACCOUNT_REQUEST: Uuid = uuid!("00000000-0000-0000-0000-ffffff000084");
 pub const UUID_INTERNAL_MESSAGE_QUEUE: Uuid = uuid!("00000000-0000-0000-0000-ffffff000085");
+
+pub const UUID_IDM_ACP_FEATURE_MANAGE: Uuid = uuid!("00000000-0000-0000-0000-ffffff000086");
 
 // End of system ranges
 pub const UUID_DOES_NOT_EXIST: Uuid = uuid!("00000000-0000-0000-0000-fffffffffffe");

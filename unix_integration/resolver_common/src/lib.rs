@@ -27,8 +27,8 @@ pub mod idprovider;
 pub mod resolver;
 
 pub mod check;
-
 pub mod cli;
+pub mod errors;
 pub mod opt;
 
 pub trait SparkleFlavour {

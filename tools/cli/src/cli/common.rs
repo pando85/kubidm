@@ -1,14 +1,16 @@
 use compact_jwt::{traits::JwsVerifiable, JwsCompact, JwsEs256Verifier, JwsVerifier, JwtError};
-use dialoguer::theme::ColorfulTheme;
-use dialoguer::{Confirm, Select};
+use dialoguer::{theme::ColorfulTheme, Confirm, Select};
 use kubidm_client::{KubidmClient, KubidmClientBuilder};
-use kubidm_proto::constants::{DEFAULT_CLIENT_CONFIG_PATH, DEFAULT_CLIENT_CONFIG_PATH_HOME};
-use kubidm_proto::internal::{PrivilegesActive, UserAuthToken};
-use time::format_description::well_known::Rfc3339;
-use time::OffsetDateTime;
+use kubidm_proto::{
+    constants::{DEFAULT_CLIENT_CONFIG_PATH, DEFAULT_CLIENT_CONFIG_PATH_HOME},
+    internal::{PrivilegesActive, UserAuthToken},
+};
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
-use crate::session::{process_auth_state, read_tokens};
-use crate::{KubidmClientParser, LoginOpt};
+use crate::{
+    session::{process_auth_state, read_tokens},
+    KubidmClientParser, LoginOpt,
+};
 
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
@@ -111,6 +113,7 @@ impl KubidmClientParser {
         })
     }
 
+    #[allow(clippy::result_large_err)]
     pub(crate) async fn try_to_client(
         &self,
         optype: OpType,

@@ -1,19 +1,19 @@
-use super::migration::{migration_entry_attrs, MIGRATION_ENTRY_CLASSES, MIGRATION_IGNORE_CLASSES};
-use super::profiles::{
-    AccessControlModify, AccessControlModifyResolved, AccessControlReceiverCondition,
-    AccessControlTargetCondition,
-};
-use super::protected::{
-    LOCKED_ENTRY_CLASSES, PROTECTED_MOD_ENTRY_CLASSES, PROTECTED_MOD_PRES_ENTRY_CLASSES,
-    PROTECTED_MOD_REM_ENTRY_CLASSES,
-};
 use super::utils::check_time_restriction;
-use super::{AccessBasicResult, AccessModResult};
+use super::{
+    migration::{migration_entry_attrs, MIGRATION_ENTRY_CLASSES, MIGRATION_IGNORE_CLASSES},
+    profiles::{
+        AccessControlModify, AccessControlModifyResolved, AccessControlReceiverCondition,
+        AccessControlTargetCondition,
+    },
+    protected::{
+        LOCKED_ENTRY_CLASSES, PROTECTED_MOD_ENTRY_CLASSES, PROTECTED_MOD_PRES_ENTRY_CLASSES,
+        PROTECTED_MOD_REM_ENTRY_CLASSES,
+    },
+    AccessBasicResult, AccessModResult,
+};
 use crate::prelude::*;
 use hashbrown::HashMap;
-use std::collections::BTreeSet;
-use std::ops::Sub;
-use std::sync::Arc;
+use std::{collections::BTreeSet, ops::Sub, sync::Arc};
 
 pub enum ModifyResult<'a> {
     Deny,
@@ -287,14 +287,15 @@ fn modify_ident_test(ident: &Identity) -> AccessBasicResult {
             return AccessBasicResult::Grant;
         }
         IdentType::Internal(InternalRole::Migration) => {
-            return AccessBasicResult::Grant;
+            return AccessBasicResult::Ignore;
         }
         IdentType::Internal(InternalRole::MessageQueue)
         | IdentType::Internal(InternalRole::AccountRequest) => {
+            trace!("Deny internal role from modification");
             return AccessBasicResult::Deny;
         }
         IdentType::Synch(_) => {
-            security_critical!("Blocking sync check");
+            warn!("Blocking sync account from modifying entries.");
             return AccessBasicResult::Deny;
         }
         IdentType::User(_) => {}
@@ -434,6 +435,7 @@ fn modify_protected_entry_attrs<'a>(classes: &BTreeSet<String>) -> AccessModResu
     // First check for the hard-deny rules.
     if !classes.is_disjoint(&LOCKED_ENTRY_CLASSES) {
         // Hard deny attribute modifications to these types.
+        info!("Denying attempt to modify a locked entry class");
         return AccessModResult::Deny;
     }
 
@@ -505,9 +507,14 @@ fn modify_protected_entry_attrs<'a>(classes: &BTreeSet<String>) -> AccessModResu
         ]);
     }
 
+    if classes.contains(EntryClass::Feature.into()) {
+        constrain_attrs.extend([Attribute::Enabled]);
+    }
+
     // If we don't constrain the attributes at all, we have to deny the change
     // from proceeding.
     if constrain_attrs.is_empty() {
+        warn!("Unable to constrain attributes, denying request");
         AccessModResult::Deny
     } else {
         AccessModResult::Constrain {

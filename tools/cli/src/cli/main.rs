@@ -13,12 +13,9 @@
 
 use clap::Parser;
 use kubidm_cli::KubidmClientParser;
-use std::process::ExitCode;
-use std::thread;
+use std::{process::ExitCode, thread};
 use tokio::runtime;
-use tracing_subscriber::filter::LevelFilter;
-use tracing_subscriber::prelude::*;
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::{filter::LevelFilter, fmt, prelude::*, EnvFilter};
 
 #[cfg(target_family = "unix")]
 use tokio::signal::unix::{signal, SignalKind};

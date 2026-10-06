@@ -1,7 +1,9 @@
 use crate::{ClientError, KubidmClient};
-use kubidm_proto::constants::*;
-use kubidm_proto::internal::{CredentialStatus, IdentifyUserRequest, IdentifyUserResponse};
-use kubidm_proto::v1::{AccountUnixExtend, Entry, SingleStringRequest, UatStatus};
+use kubidm_proto::{
+    constants::*,
+    internal::{CredentialStatus, IdentifyUserRequest, IdentifyUserResponse},
+    v1::{AccountUnixExtend, Entry, SingleStringRequest, UatStatus},
+};
 use std::collections::BTreeMap;
 use uuid::Uuid;
 

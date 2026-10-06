@@ -14,20 +14,18 @@
 //!   requirements (also search).
 
 use hashbrown::HashMap;
-use std::cell::Cell;
-use std::collections::BTreeSet;
-use std::ops::DerefMut;
-use std::sync::Arc;
+use std::{cell::Cell, collections::BTreeSet, ops::DerefMut, sync::Arc};
 
-use concread::arcache::ARCacheBuilder;
-use concread::cowcell::*;
+use concread::{arcache::ARCacheBuilder, cowcell::*};
 use uuid::Uuid;
 
-use crate::entry::{Entry, EntryInit, EntryNew};
-use crate::event::{CreateEvent, DeleteEvent, ModifyEvent, SearchEvent};
-use crate::filter::{Filter, FilterValid, ResolveFilterCache, ResolveFilterCacheReadTxn};
-use crate::modify::Modify;
-use crate::prelude::*;
+use crate::{
+    entry::{Entry, EntryInit, EntryNew},
+    event::{CreateEvent, DeleteEvent, ModifyEvent, SearchEvent},
+    filter::{Filter, FilterValid, ResolveFilterCache, ResolveFilterCacheReadTxn},
+    modify::Modify,
+    prelude::*,
+};
 
 use self::profiles::{
     AccessControlCreate, AccessControlCreateResolved, AccessControlDelete,
@@ -668,7 +666,10 @@ pub trait AccessControlsTransaction<'a> {
             debug!(entry_id = %e.get_display_id());
 
             match apply_modify_access(&me.ident, related_acp.as_slice(), sync_agmts, e) {
-                ModifyResult::Deny => false,
+                ModifyResult::Deny => {
+                    security_error!("modify access denied.");
+                    false
+                }
                 ModifyResult::Grant => true,
                 ModifyResult::Allow {
                     pres,
@@ -838,7 +839,10 @@ pub trait AccessControlsTransaction<'a> {
             let sync_agmts = self.get_sync_agreements();
 
             match apply_modify_access(&me.ident, related_acp.as_slice(), sync_agmts, e) {
-                ModifyResult::Deny => false,
+                ModifyResult::Deny => {
+                    security_error!("modify access denied.");
+                    false
+                }
                 ModifyResult::Grant => true,
                 ModifyResult::Allow {
                     pres,
@@ -1357,8 +1361,7 @@ impl AccessControls {
 #[cfg(test)]
 mod tests {
     use hashbrown::HashMap;
-    use std::collections::BTreeSet;
-    use std::sync::Arc;
+    use std::{collections::BTreeSet, sync::Arc};
 
     use uuid::uuid;
 
@@ -1369,9 +1372,7 @@ mod tests {
         },
         Access, AccessClass, AccessControls, AccessControlsTransaction, AccessEffectivePermission,
     };
-    use crate::migration_data::BUILTIN_ACCOUNT_ANONYMOUS;
-    use crate::prelude::*;
-    use crate::valueset::ValueSetIname;
+    use crate::{migration_data::BUILTIN_ACCOUNT_ANONYMOUS, prelude::*, valueset::ValueSetIname};
 
     const UUID_TEST_ACCOUNT_1: Uuid = uuid::uuid!("cc8e95b4-c24f-4d68-ba54-8bed76f63930");
     const UUID_TEST_ACCOUNT_2: Uuid = uuid::uuid!("cec0852a-abdf-4ea6-9dae-d3157cb33d3a");

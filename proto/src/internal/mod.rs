@@ -7,8 +7,7 @@ use crate::constants::{
 };
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
-use std::fmt;
-use std::str::FromStr;
+use std::{fmt, str::FromStr};
 use url::Url;
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -22,12 +21,7 @@ mod pip;
 mod raw;
 mod token;
 
-pub use self::authorization::*;
-pub use self::credupdate::*;
-pub use self::error::*;
-pub use self::pip::*;
-pub use self::raw::*;
-pub use self::token::*;
+pub use self::{authorization::*, credupdate::*, error::*, pip::*, raw::*, token::*};
 
 pub const COOKIE_CSRF_NONCE: &str = "csrf-nonce";
 pub const COOKIE_AUTH_SESSION_ID: &str = "auth-session-id";

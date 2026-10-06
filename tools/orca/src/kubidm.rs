@@ -1,7 +1,6 @@
 use kubidm_client::{KubidmClient, KubidmClientBuilder};
 
-use crate::error::Error;
-use crate::profile::Profile;
+use crate::{error::Error, profile::Profile};
 
 // This client contains our admin and idm_admin connections that are
 // pre-authenticated for use against the kubidm server. In addition,
