@@ -68,7 +68,15 @@ pub struct S3ClientWrapper {
 impl S3ClientWrapper {
     pub async fn new(config: S3Config) -> Result<Self, S3BackupError> {
         let sdk_config = Self::build_sdk_config(&config).await?;
-        let client = S3Client::new(&sdk_config);
+        // Custom endpoints (MinIO, Ceph RGW, s3mock, ...) are addressed as
+        // `<endpoint>/<bucket>/<key>`. The SDK default of virtual-hosted-style
+        // addressing (`<bucket>.<endpoint>`) requires wildcard DNS that such
+        // deployments usually lack, so path-style addressing is forced whenever an
+        // endpoint is configured. AWS itself keeps the default.
+        let s3_config = aws_sdk_s3::config::Builder::from(&sdk_config)
+            .force_path_style(config.endpoint.is_some())
+            .build();
+        let client = S3Client::from_conf(s3_config);
         Ok(Self { client, config })
     }
 
@@ -342,6 +350,13 @@ impl S3ClientWrapper {
         Ok((data, metadata))
     }
 
+    /// Fetch the metadata sidecar (`<key>.metadata.json`) of a backup without downloading
+    /// the backup itself. `key` is relative to the configured `path_prefix`.
+    pub async fn get_backup_metadata(&self, key: &str) -> Result<S3BackupMetadata, S3BackupError> {
+        let object_key = self.build_object_key(key);
+        self.download_metadata(&object_key).await
+    }
+
     async fn download_metadata(&self, backup_key: &str) -> Result<S3BackupMetadata, S3BackupError> {
         let metadata_key = format!("{}.metadata.json", backup_key);
 
@@ -428,6 +443,12 @@ impl S3ClientWrapper {
         Ok(())
     }
 
+    /// Verify that the stored backup object still matches its metadata sidecar.
+    ///
+    /// The object size reported by S3 is compared with `size_bytes` first as a cheap
+    /// pre-check, then the object is downloaded and its SHA-256 is compared with
+    /// `checksum_sha256`. Returns `Ok(false)` when either does not match, and `Err` when
+    /// the object or its metadata could not be retrieved at all.
     pub async fn verify_backup(&self, key: &str) -> Result<bool, S3BackupError> {
         let object_key = self.build_object_key(key);
         let metadata = self.download_metadata(&object_key).await?;
@@ -451,7 +472,17 @@ impl S3ClientWrapper {
             return Ok(false);
         }
 
-        Ok(true)
+        match self.download_backup(key).await {
+            Ok(_) => Ok(true),
+            Err(S3BackupError::InvalidChecksum { expected, actual }) => {
+                warn!(
+                    "Backup checksum mismatch for {}: expected {}, got {}",
+                    object_key, expected, actual
+                );
+                Ok(false)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     pub async fn replicate_backup(

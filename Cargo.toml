@@ -159,6 +159,7 @@ sketching = { path = "./libs/sketching", version = "=1.12.0-dev" }
 kanidm-hsm-crypto = { version = "^0.4.0" }
 
 aws-config = { version = "1.5.13", default-features = false, features = [
+    "default-https-client",
     "rt-tokio",
     "sso",
 ] }
