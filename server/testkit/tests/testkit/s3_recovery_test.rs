@@ -108,11 +108,14 @@ async fn ensure_bucket(sdk: &SdkClient, bucket: &str) {
     if sdk.head_bucket().bucket(bucket).send().await.is_ok() {
         return;
     }
-    sdk.create_bucket()
-        .bucket(bucket)
-        .send()
-        .await
-        .expect("Failed to create the test bucket");
+    // The S3 tests run concurrently and share this bucket: losing the creation race against
+    // another test is fine as long as the bucket exists afterwards.
+    if let Err(err) = sdk.create_bucket().bucket(bucket).send().await {
+        assert!(
+            sdk.head_bucket().bucket(bucket).send().await.is_ok(),
+            "Failed to create the test bucket {bucket}: {err:?}"
+        );
+    }
 }
 
 /// Every object key below `prefix`, with the prefix stripped, sorted.
