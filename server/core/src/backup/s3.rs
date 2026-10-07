@@ -138,19 +138,34 @@ impl S3ClientWrapper {
         Self::build_object_key_with_prefix(self.config.path_prefix.as_deref(), key)
     }
 
+    /// Upload `data`, a complete backup artifact, as `key` under the configured prefix,
+    /// followed by its `<key>.metadata.json` sidecar. `compression` is the compression of
+    /// the backup and `encryption_key_identifier` the identifier of the key the artifact
+    /// was encrypted with, if it is encrypted; both are recorded in the sidecar.
     pub async fn upload_backup(
         &self,
         data: Vec<u8>,
         key: &str,
         timestamp: &str,
         compression: BackupCompression,
+        encryption_key_identifier: Option<&str>,
     ) -> Result<S3BackupMetadata, S3BackupError> {
         let size = data.len() as u64;
         let checksum = hex_encode(Sha256::digest(&data));
         let object_key = self.build_object_key(key);
 
-        let metadata =
-            S3BackupMetadata::new(checksum.clone(), timestamp.to_string(), compression, size);
+        let metadata = match encryption_key_identifier {
+            Some(key_identifier) => S3BackupMetadata::new_encrypted(
+                checksum.clone(),
+                timestamp.to_string(),
+                compression,
+                size,
+                key_identifier.to_string(),
+            ),
+            None => {
+                S3BackupMetadata::new(checksum.clone(), timestamp.to_string(), compression, size)
+            }
+        };
 
         if size > MULTIPART_THRESHOLD {
             self.upload_multipart(&data, &object_key, &metadata).await?;

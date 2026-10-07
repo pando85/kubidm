@@ -141,6 +141,7 @@ impl IntervalActor {
         }
 
         let backup_compression = online_backup_config.compression;
+        let encryption = online_backup_config.encryption.clone();
         let s3_config = online_backup_config.s3.clone();
         let wal_archive_config = online_backup_config.wal_archive.clone();
 
@@ -171,6 +172,7 @@ impl IntervalActor {
                                     path,
                                     versions,
                                     backup_compression,
+                                    &encryption,
                                     None,
                                 )
                                 .await
@@ -198,6 +200,7 @@ impl IntervalActor {
                                             &std::path::PathBuf::from("s3://backup"),
                                             versions,
                                             backup_compression,
+                                            &encryption,
                                             Some(s3_client),
                                         )
                                         .await
@@ -265,6 +268,7 @@ async fn update_pitr_manifest(
             manifest_key,
             backup_timestamp,
             kubidm_proto::backup::BackupCompression::NoCompression,
+            None,
         )
         .await
         .map_err(|e| format!("Failed to upload PITR manifest: {}", e))?;

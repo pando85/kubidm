@@ -51,9 +51,10 @@ use uuid::Uuid;
 
 use super::QueryServerReadV1;
 use crate::backup::{
-    finalize_local_backup, is_backup_artifact_name, select_backups_to_delete, verify_backup_output,
-    S3ClientWrapper,
+    backup_artifact_name, finalize_local_backup, is_backup_artifact_name, seal_backup,
+    select_backups_to_delete, verify_backup_output, BackupEncryptor, S3ClientWrapper,
 };
+use kubidm_proto::backup::BackupEncryptionConfig;
 
 // ===========================================================
 
@@ -208,6 +209,7 @@ impl QueryServerReadV1 {
         outpath: &Path,
         versions: usize,
         compression: BackupCompression,
+        encryption: &BackupEncryptionConfig,
         s3_client: Option<S3ClientWrapper>,
     ) -> Result<(), OperationError> {
         trace!(eventid = ?msg.eventid, "Begin online backup event");
@@ -219,15 +221,35 @@ impl QueryServerReadV1 {
         #[allow(clippy::unwrap_used)]
         let timestamp = now.format(&Rfc3339).unwrap();
 
+        // The key is obtained once per run, before any backup is produced, so that an
+        // unavailable key fails the run without leaving a half written artifact behind.
+        let encryptor = BackupEncryptor::from_config(encryption)
+            .await
+            .map_err(|err| {
+                error!(%err, "Online backup can not obtain the backup encryption key");
+                OperationError::InvalidState
+            })?;
+
         // Handle S3 backup
         if let Some(s3) = s3_client {
             return self
-                .handle_s3_backup(&msg, &timestamp, versions, compression, s3)
+                .handle_s3_backup(
+                    &msg,
+                    &timestamp,
+                    versions,
+                    compression,
+                    encryptor.as_ref(),
+                    s3,
+                )
                 .await;
         }
 
         // Handle local file backup
-        let dest_file = outpath.join(format!("backup-{timestamp}.json{}", compression.suffix()));
+        let dest_file = outpath.join(backup_artifact_name(
+            &timestamp,
+            compression,
+            encryptor.is_some(),
+        ));
 
         if dest_file.exists() {
             error!(
@@ -237,30 +259,23 @@ impl QueryServerReadV1 {
             return Err(OperationError::InvalidState);
         }
 
-        let output = std::fs::File::create(&dest_file).map_err(|err| {
-            error!(?err, "File::create error creating {}", dest_file.display());
+        let artifact = self
+            .produce_backup_artifact(compression, encryptor.as_ref())
+            .await
+            .inspect_err(|err| {
+                error!(
+                    ?err,
+                    "Online backup failed to create {}",
+                    dest_file.display()
+                );
+            })?;
+
+        std::fs::write(&dest_file, &artifact).map_err(|err| {
+            error!(?err, "Unable to write {}", dest_file.display());
             OperationError::FsError
         })?;
-
-        // Scope to limit the read txn.
-        {
-            let mut idms_prox_read = self.idms.proxy_read().await?;
-            idms_prox_read
-                .qs_read
-                .get_be_txn()
-                .backup(output, compression)
-                .map(|()| {
-                    debug!("Online backup written to {}", dest_file.display());
-                })
-                .map_err(|e| {
-                    error!(
-                        "Online backup failed to create {}: {:?}",
-                        dest_file.display(),
-                        e
-                    );
-                    OperationError::InvalidState
-                })?;
-        }
+        drop(artifact);
+        debug!("Online backup written to {}", dest_file.display());
 
         // Never announce, retain or prune on the strength of a backup that can not be
         // read back. A rejected artifact is kept under an `.invalid` suffix, which the
@@ -269,18 +284,20 @@ impl QueryServerReadV1 {
         // Should the rename itself fail, the rejected file keeps a retention-matching name
         // and the next run may count it as a backup; the loud error below, which carries
         // the rename failure in `reasons`, is the mitigation.
-        let report = finalize_local_backup(&dest_file, compression).map_err(|err| {
-            error!(
-                reasons = ?err.reasons,
-                quarantined_to = ?err.quarantined_to,
-                "Online backup {} failed verification",
-                dest_file.display()
-            );
-            OperationError::InvalidState
-        })?;
+        let report =
+            finalize_local_backup(&dest_file, compression, encryptor.as_ref()).map_err(|err| {
+                error!(
+                    reasons = ?err.reasons,
+                    quarantined_to = ?err.quarantined_to,
+                    "Online backup {} failed verification",
+                    dest_file.display()
+                );
+                OperationError::InvalidState
+            })?;
         info!(
             entries = report.entry_count,
             version = ?report.version,
+            encryption_key = encryptor.as_ref().map(BackupEncryptor::key_identifier),
             "Online backup verified"
         );
 
@@ -364,22 +381,14 @@ impl QueryServerReadV1 {
         Ok(())
     }
 
-    #[instrument(
-        level = "info",
-        name = "s3_backup",
-        skip_all,
-        fields(uuid = ?msg.eventid)
-    )]
-    async fn handle_s3_backup(
+    /// Produce the complete backup artifact in memory: the backend serialises and
+    /// compresses the database inside a read transaction, and the result is encrypted
+    /// when an `encryptor` is given.
+    async fn produce_backup_artifact(
         &self,
-        msg: &OnlineBackupEvent,
-        timestamp: &str,
-        versions: usize,
         compression: BackupCompression,
-        s3_client: S3ClientWrapper,
-    ) -> Result<(), OperationError> {
-        trace!(eventid = ?msg.eventid, "Begin S3 backup event");
-
+        encryptor: Option<&BackupEncryptor>,
+    ) -> Result<Vec<u8>, OperationError> {
         let mut backup_data = Vec::new();
 
         // Scope to limit the read txn and collect backup data
@@ -395,11 +404,37 @@ impl QueryServerReadV1 {
                 })?;
         }
 
-        let object_key = format!("backup-{timestamp}.json{}", compression.suffix());
+        seal_backup(backup_data, compression, encryptor).map_err(|err| {
+            error!(%err, "Online backup failed to encrypt the backup");
+            OperationError::CryptographyError
+        })
+    }
+
+    #[instrument(
+        level = "info",
+        name = "s3_backup",
+        skip_all,
+        fields(uuid = ?msg.eventid)
+    )]
+    async fn handle_s3_backup(
+        &self,
+        msg: &OnlineBackupEvent,
+        timestamp: &str,
+        versions: usize,
+        compression: BackupCompression,
+        encryptor: Option<&BackupEncryptor>,
+        s3_client: S3ClientWrapper,
+    ) -> Result<(), OperationError> {
+        trace!(eventid = ?msg.eventid, "Begin S3 backup event");
+
+        let backup_data = self.produce_backup_artifact(compression, encryptor).await?;
+
+        let object_key = backup_artifact_name(timestamp, compression, encryptor.is_some());
 
         // A backup that can not be read back is never uploaded, so the bucket only ever
-        // holds artifacts that passed the same structural checks as `verify-backup`.
-        let report = verify_backup_output(&backup_data[..], compression).map_err(|err| {
+        // holds artifacts that passed the same structural checks as `verify-backup`. An
+        // encrypted artifact is decrypted for this, which proves the key opens it.
+        let report = verify_backup_output(&backup_data, compression, encryptor).map_err(|err| {
             error!(
                 reasons = ?err.reasons,
                 "S3 backup {} failed verification and was not uploaded",
@@ -410,11 +445,18 @@ impl QueryServerReadV1 {
         info!(
             entries = report.entry_count,
             version = ?report.version,
+            encryption_key = encryptor.map(BackupEncryptor::key_identifier),
             "Online backup verified"
         );
 
         s3_client
-            .upload_backup(backup_data, &object_key, timestamp, compression)
+            .upload_backup(
+                backup_data,
+                &object_key,
+                timestamp,
+                compression,
+                encryptor.map(BackupEncryptor::key_identifier),
+            )
             .await
             .map_err(|e| {
                 error!("S3 backup upload failed: {}", e);
