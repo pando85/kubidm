@@ -109,11 +109,33 @@ impl S3ClientWrapper {
         Ok(config_builder.load().await)
     }
 
-    fn build_object_key(&self, key: &str) -> String {
-        match &self.config.path_prefix {
-            Some(prefix) => format!("{}/{}", prefix.trim_end_matches('/'), key),
-            None => key.to_string(),
+    /// The configured `path_prefix` normalised for use as an object key prefix: empty when
+    /// no prefix (or an empty or `/`-only one) is configured, otherwise ending in exactly
+    /// one `/`.
+    ///
+    /// Every key the server writes is `<listing_prefix><name>` and the listing asks S3 for
+    /// exactly this prefix. Passing the bare `path_prefix` to ListObjectsV2 would also match
+    /// sibling prefixes (`prod` matches `production/...`), whose keys the display strip would
+    /// then mangle to `uction/backup-...`.
+    fn listing_prefix(path_prefix: Option<&str>) -> String {
+        match path_prefix.map(|prefix| prefix.trim_end_matches('/')) {
+            Some(prefix) if !prefix.is_empty() => format!("{prefix}/"),
+            _ => String::new(),
         }
+    }
+
+    /// The display key of a listed object: `key` with the listing prefix removed, or None
+    /// when the object does not live under the prefix.
+    fn strip_listing_prefix<'a>(listing_prefix: &str, key: &'a str) -> Option<&'a str> {
+        key.strip_prefix(listing_prefix)
+    }
+
+    fn build_object_key_with_prefix(path_prefix: Option<&str>, key: &str) -> String {
+        format!("{}{}", Self::listing_prefix(path_prefix), key)
+    }
+
+    fn build_object_key(&self, key: &str) -> String {
+        Self::build_object_key_with_prefix(self.config.path_prefix.as_deref(), key)
     }
 
     pub async fn upload_backup(
@@ -398,8 +420,12 @@ impl S3ClientWrapper {
 
     /// List every object under the configured prefix except metadata sidecars, with the
     /// prefix stripped. All pages of the listing are collected.
+    ///
+    /// The listing uses the `/`-terminated prefix of [`Self::listing_prefix`], so objects
+    /// under a sibling prefix that merely starts with the same characters are never
+    /// returned.
     pub async fn list_backups(&self) -> Result<Vec<String>, S3BackupError> {
-        let prefix = self.config.path_prefix.clone().unwrap_or_default();
+        let prefix = Self::listing_prefix(self.config.path_prefix.as_deref());
 
         let mut pages = self
             .client
@@ -414,17 +440,16 @@ impl S3ClientWrapper {
             let page = page
                 .map_err(|e| S3BackupError::SdkError(format!("Failed to list objects: {}", e)))?;
             for obj in page.contents() {
-                if let Some(key) = obj.key() {
-                    if !key.ends_with(".metadata.json") {
-                        let display_key = if let Some(prefix) = &self.config.path_prefix {
-                            key.strip_prefix(prefix)
-                                .map(|s: &str| s.trim_start_matches('/').to_string())
-                                .unwrap_or_else(|| key.to_string())
-                        } else {
-                            key.to_string()
-                        };
-                        backups.push(display_key);
-                    }
+                let Some(key) = obj.key() else {
+                    continue;
+                };
+                if key.ends_with(".metadata.json") {
+                    continue;
+                }
+                // S3 only returns keys starting with the requested prefix; anything else
+                // is not ours and is skipped rather than mangled.
+                if let Some(display_key) = Self::strip_listing_prefix(&prefix, key) {
+                    backups.push(display_key.to_string());
                 }
             }
         }
@@ -584,10 +609,7 @@ impl S3ClientWrapper {
     }
 
     fn build_region_object_key(region_config: &ReplicationRegionConfig, key: &str) -> String {
-        match &region_config.path_prefix {
-            Some(prefix) => format!("{}/{}", prefix.trim_end_matches('/'), key),
-            None => key.to_string(),
-        }
+        Self::build_object_key_with_prefix(region_config.path_prefix.as_deref(), key)
     }
 
     pub async fn check_region_replication_status(
@@ -1023,10 +1045,112 @@ mod tests {
     }
 
     fn build_test_object_key(prefix: Option<&str>, key: &str) -> String {
-        match prefix {
-            Some(p) => format!("{}/{}", p.trim_end_matches('/'), key),
-            None => key.to_string(),
+        S3ClientWrapper::build_object_key_with_prefix(prefix, key)
+    }
+
+    #[test]
+    fn test_build_object_key_with_empty_prefix() {
+        assert_eq!(
+            build_test_object_key(Some(""), "backup.tar.gz"),
+            "backup.tar.gz"
+        );
+        assert_eq!(
+            build_test_object_key(Some("/"), "backup.tar.gz"),
+            "backup.tar.gz"
+        );
+    }
+
+    #[test]
+    fn test_listing_prefix_empty() {
+        assert_eq!(S3ClientWrapper::listing_prefix(None), "");
+        assert_eq!(S3ClientWrapper::listing_prefix(Some("")), "");
+        assert_eq!(S3ClientWrapper::listing_prefix(Some("/")), "");
+    }
+
+    #[test]
+    fn test_listing_prefix_without_trailing_slash() {
+        assert_eq!(S3ClientWrapper::listing_prefix(Some("prod")), "prod/");
+        assert_eq!(
+            S3ClientWrapper::listing_prefix(Some("kubidm/backups")),
+            "kubidm/backups/"
+        );
+    }
+
+    #[test]
+    fn test_listing_prefix_with_trailing_slash() {
+        assert_eq!(S3ClientWrapper::listing_prefix(Some("prod/")), "prod/");
+        assert_eq!(S3ClientWrapper::listing_prefix(Some("prod//")), "prod/");
+    }
+
+    /// The listing prefix and the object keys written by the server must agree, so that
+    /// listing and retention find exactly what was uploaded.
+    #[test]
+    fn test_listing_prefix_matches_built_keys() {
+        for prefix in [None, Some(""), Some("prod"), Some("prod/"), Some("a/b/c")] {
+            let listing = S3ClientWrapper::listing_prefix(prefix);
+            let key = build_test_object_key(prefix, "backup-2024-01-01T22:00:00Z.json.gz");
+            assert_eq!(
+                S3ClientWrapper::strip_listing_prefix(&listing, &key),
+                Some("backup-2024-01-01T22:00:00Z.json.gz"),
+                "prefix {prefix:?}"
+            );
+            assert_eq!(
+                S3ClientWrapper::strip_listing_prefix(&listing, &format!("{key}.metadata.json")),
+                Some("backup-2024-01-01T22:00:00Z.json.gz.metadata.json"),
+                "prefix {prefix:?}"
+            );
         }
+    }
+
+    #[test]
+    fn test_strip_listing_prefix_empty_prefix() {
+        assert_eq!(
+            S3ClientWrapper::strip_listing_prefix("", "backup-2024-01-01T22:00:00Z.json.gz"),
+            Some("backup-2024-01-01T22:00:00Z.json.gz")
+        );
+        assert_eq!(
+            S3ClientWrapper::strip_listing_prefix("", "production/backup.json.gz"),
+            Some("production/backup.json.gz")
+        );
+    }
+
+    #[test]
+    fn test_strip_listing_prefix_strips_only_own_prefix() {
+        let listing = S3ClientWrapper::listing_prefix(Some("prod"));
+        assert_eq!(
+            S3ClientWrapper::strip_listing_prefix(
+                &listing,
+                "prod/backup-2024-01-01T22:00:00Z.json.gz"
+            ),
+            Some("backup-2024-01-01T22:00:00Z.json.gz")
+        );
+        assert_eq!(
+            S3ClientWrapper::strip_listing_prefix(&listing, "prod/nested/backup.json.gz"),
+            Some("nested/backup.json.gz")
+        );
+    }
+
+    /// Issue #459: an object under the sibling prefix `production/` must neither be treated
+    /// as ours nor be mangled into `uction/backup-...`.
+    #[test]
+    fn test_strip_listing_prefix_rejects_sibling_prefix() {
+        let listing = S3ClientWrapper::listing_prefix(Some("prod"));
+        assert_eq!(listing, "prod/");
+        assert_eq!(
+            S3ClientWrapper::strip_listing_prefix(
+                &listing,
+                "production/backup-2024-01-01T22:00:00Z.json.gz"
+            ),
+            None
+        );
+        assert_eq!(
+            S3ClientWrapper::strip_listing_prefix(&listing, "prod"),
+            None
+        );
+        assert_eq!(
+            S3ClientWrapper::strip_listing_prefix(&listing, "other/backup.json.gz"),
+            None
+        );
     }
 
     #[test]
