@@ -23,6 +23,12 @@ This means:
 If a backup fails due to semantic validation, the database contains entries that cannot be loaded. This requires
 investigation and potentially manual intervention to resolve the underlying data issue.
 
+In addition, every online and manual backup is structurally verified immediately after it is written, with the same
+checks as `kubidmd database verify-backup --level structural`: the artifact is read back, parsed, and checked for
+entries and for the server version that wrote it. A local artifact that fails this check is renamed with an `.invalid`
+suffix so that it is kept for inspection but is neither counted nor deleted by retention, and the backup is reported as
+an error without pruning any older backup. An S3 artifact that fails this check is never uploaded.
+
 ## Method 1 - Automatic Backup
 
 Automatic backups can be generated online by a `kubidmd server` instance by including the `[online_backup]` section in
