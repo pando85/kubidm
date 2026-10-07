@@ -1479,6 +1479,7 @@ pub(crate) enum TaskName {
     AdminSocket,
     AuditdActor,
     BackupActor,
+    BackupReplicationMonitor,
     DelayedActionActor,
     HttpsServer,
     IntervalActor,
@@ -1497,6 +1498,7 @@ impl Display for TaskName {
                 TaskName::AdminSocket => "Admin Socket",
                 TaskName::AuditdActor => "Auditd Actor",
                 TaskName::BackupActor => "Backup Actor",
+                TaskName::BackupReplicationMonitor => "Backup Replication Monitor",
                 TaskName::DelayedActionActor => "Delayed Action Actor",
                 TaskName::HttpsServer => "HTTPS Server",
                 TaskName::IntervalActor => "Interval Actor",
@@ -1899,12 +1901,12 @@ async fn launch_server_tasks(
         match &config.online_backup {
             Some(online_backup_config) => {
                 if online_backup_config.enabled {
-                    let backup_handle = IntervalActor::start_online_backup(
+                    let backup_handles = IntervalActor::start_online_backup(
                         server_read_ref,
                         online_backup_config,
                         broadcast_tx.subscribe(),
                     )?;
-                    handles.push((TaskName::BackupActor, backup_handle));
+                    handles.extend(backup_handles);
                 } else {
                     debug!("Backups disabled");
                 }

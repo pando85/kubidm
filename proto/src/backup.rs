@@ -343,10 +343,96 @@ fn test_replication_region_status() {
         lag_seconds: Some(60),
         bytes_replicated: 1024,
         backups_replicated: 5,
+        pending_backups: 0,
         last_error: None,
     };
     assert!(status.last_error.is_none());
     assert_eq!(status.lag_seconds, Some(60));
+    assert!(status.to_string().contains("pending: 0"));
+}
+
+#[test]
+fn test_replication_region_config_to_s3_config() {
+    let region = ReplicationRegionConfig {
+        region: "eu-west-1".to_string(),
+        endpoint: Some("https://s3.eu-west-1.example.com".to_string()),
+        bucket: "kubidm-backups-eu".to_string(),
+        path_prefix: Some("dr".to_string()),
+        credentials: Some(S3Credentials {
+            access_key_id: "eu-key".to_string(),
+            secret_access_key: "eu-secret".to_string(),
+            session_token: None,
+        }),
+        server_side_encryption: None,
+        storage_class: "STANDARD_IA".to_string(),
+        kms_key_id: None,
+    };
+
+    let s3 = region.to_s3_config();
+    assert_eq!(s3.bucket, "kubidm-backups-eu");
+    assert_eq!(s3.region.as_deref(), Some("eu-west-1"));
+    assert_eq!(
+        s3.endpoint.as_deref(),
+        Some("https://s3.eu-west-1.example.com")
+    );
+    assert_eq!(s3.path_prefix.as_deref(), Some("dr"));
+    assert_eq!(s3.credentials, region.credentials);
+    assert_eq!(s3.server_side_encryption, None);
+    assert_eq!(s3.storage_class, "STANDARD_IA");
+    assert!(
+        s3.replication.is_none(),
+        "a replica never replicates further"
+    );
+}
+
+#[test]
+fn test_replication_region_config_to_s3_config_kms_shorthand() {
+    let mut region = ReplicationRegionConfig {
+        region: "eu-west-1".to_string(),
+        endpoint: None,
+        bucket: "kubidm-backups-eu".to_string(),
+        path_prefix: None,
+        credentials: None,
+        server_side_encryption: None,
+        storage_class: "STANDARD".to_string(),
+        kms_key_id: Some("arn:aws:kms:eu-west-1:1:key/eu".to_string()),
+    };
+
+    // The shorthand alone selects aws:kms with that key.
+    assert_eq!(
+        region.to_s3_config().server_side_encryption,
+        Some(S3ServerSideEncryption {
+            algorithm: Some(S3EncryptionAlgorithm::AwsKms),
+            kms_key_id: Some("arn:aws:kms:eu-west-1:1:key/eu".to_string()),
+        })
+    );
+
+    // An explicit block without a key borrows the shorthand key.
+    region.server_side_encryption = Some(S3ServerSideEncryption {
+        algorithm: Some(S3EncryptionAlgorithm::AwsKms),
+        kms_key_id: None,
+    });
+    assert_eq!(
+        region
+            .to_s3_config()
+            .server_side_encryption
+            .and_then(|sse| sse.kms_key_id)
+            .as_deref(),
+        Some("arn:aws:kms:eu-west-1:1:key/eu")
+    );
+
+    // An explicit block with its own key wins.
+    region.server_side_encryption = Some(S3ServerSideEncryption {
+        algorithm: Some(S3EncryptionAlgorithm::Aes256),
+        kms_key_id: Some("explicit".to_string()),
+    });
+    assert_eq!(
+        region.to_s3_config().server_side_encryption,
+        Some(S3ServerSideEncryption {
+            algorithm: Some(S3EncryptionAlgorithm::Aes256),
+            kms_key_id: Some("explicit".to_string()),
+        })
+    );
 }
 
 #[test]
@@ -486,6 +572,41 @@ pub struct ReplicationRegionConfig {
     pub kms_key_id: Option<String>,
 }
 
+impl ReplicationRegionConfig {
+    /// The S3 configuration of this replica: the region's bucket, endpoint, prefix,
+    /// credentials, encryption and storage class, with `region` as the signing region.
+    /// Everything the server does against the primary bucket (upload, listing, retention,
+    /// download, verification) works against the replica through this configuration.
+    ///
+    /// A region level `kms_key_id` is a shorthand for `aws:kms` server-side encryption
+    /// with that key. An explicit `server_side_encryption` block wins when both are set
+    /// and only fills its missing `kms_key_id` from the shorthand.
+    pub fn to_s3_config(&self) -> S3Config {
+        let server_side_encryption = match (&self.server_side_encryption, &self.kms_key_id) {
+            (Some(sse), kms_key_id) => Some(S3ServerSideEncryption {
+                algorithm: sse.algorithm.clone(),
+                kms_key_id: sse.kms_key_id.clone().or_else(|| kms_key_id.clone()),
+            }),
+            (None, Some(kms_key_id)) => Some(S3ServerSideEncryption {
+                algorithm: Some(S3EncryptionAlgorithm::AwsKms),
+                kms_key_id: Some(kms_key_id.clone()),
+            }),
+            (None, None) => None,
+        };
+
+        S3Config {
+            bucket: self.bucket.clone(),
+            region: Some(self.region.clone()),
+            endpoint: self.endpoint.clone(),
+            path_prefix: self.path_prefix.clone(),
+            credentials: self.credentials.clone(),
+            server_side_encryption,
+            storage_class: self.storage_class.clone(),
+            replication: None,
+        }
+    }
+}
+
 impl Display for ReplicationRegionConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -577,11 +698,19 @@ pub struct ReplicationRegionStatus {
     pub region: String,
     pub bucket: String,
     pub status: ReplicationStatus,
+    /// Timestamp recorded in the metadata of the newest backup present in the region.
     pub last_sync_timestamp: Option<String>,
+    /// Key of the newest backup present in the region.
     pub last_sync_backup_id: Option<String>,
+    /// Age of the region relative to the primary: the seconds between the newest primary
+    /// backup and the newest backup present in the region. Zero when the region holds the
+    /// newest primary backup, None when the region holds none of the primary backups.
     pub lag_seconds: Option<u64>,
     pub bytes_replicated: u64,
+    /// Primary backups found intact in the region.
     pub backups_replicated: u64,
+    /// Primary backups missing from the region or differing from the primary copy.
+    pub pending_backups: u64,
     pub last_error: Option<String>,
 }
 
@@ -589,12 +718,13 @@ impl Display for ReplicationRegionStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Region {} (bucket: {}): {} - lag: {}s, backups: {}, bytes: {}",
+            "Region {} (bucket: {}): {} - lag: {}s, backups: {}, pending: {}, bytes: {}",
             self.region,
             self.bucket,
             self.status,
             self.lag_seconds.unwrap_or(0),
             self.backups_replicated,
+            self.pending_backups,
             self.bytes_replicated
         )
     }

@@ -2,6 +2,7 @@ use std::io::{Read, Write};
 
 use aws_config::{BehaviorVersion, Region, SdkConfig};
 use aws_credential_types::Credentials;
+use aws_sdk_s3::error::DisplayErrorContext;
 use aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput;
 use aws_sdk_s3::operation::get_object::GetObjectOutput;
 use aws_sdk_s3::primitives::ByteStream;
@@ -9,6 +10,7 @@ use aws_sdk_s3::types::{
     CompletedMultipartUpload, CompletedPart, ServerSideEncryption, StorageClass,
 };
 use aws_sdk_s3::Client as S3Client;
+use chrono::DateTime;
 use hex::encode as hex_encode;
 use kubidm_proto::backup::{
     BackupCompression, ReplicationConfig, ReplicationHealthCheck, ReplicationLagMetrics,
@@ -16,9 +18,26 @@ use kubidm_proto::backup::{
     S3Config, S3EncryptionAlgorithm,
 };
 use sha2::{Digest, Sha256};
+use tokio::time::{sleep, Duration};
+
+use super::retention::is_backup_artifact_name;
 
 const MULTIPART_THRESHOLD: u64 = 100 * 1024 * 1024;
 const MULTIPART_CHUNK_SIZE: usize = 10 * 1024 * 1024;
+
+/// How many per-backup problems a degraded region status message spells out before it
+/// is cut short.
+const REGION_PROBLEMS_IN_MESSAGE: usize = 3;
+
+/// The `s3://bucket[/prefix]` location a configuration points at, for log lines and
+/// command output.
+pub fn s3_location(config: &S3Config) -> String {
+    let prefix = S3ClientWrapper::listing_prefix(config.path_prefix.as_deref());
+    match prefix.strip_suffix('/') {
+        Some(prefix) if !prefix.is_empty() => format!("s3://{}/{}", config.bucket, prefix),
+        _ => format!("s3://{}", config.bucket),
+    }
+}
 
 #[derive(Debug)]
 pub enum S3BackupError {
@@ -138,29 +157,69 @@ impl S3ClientWrapper {
         Self::build_object_key_with_prefix(self.config.path_prefix.as_deref(), key)
     }
 
+    /// The configuration this client was built from.
+    pub fn config(&self) -> &S3Config {
+        &self.config
+    }
+
+    /// The `s3://bucket[/prefix]` location this client writes to.
+    pub fn location(&self) -> String {
+        s3_location(&self.config)
+    }
+
+    /// The replication configuration of this client, when replication is enabled.
+    pub fn replication_config(&self) -> Option<&ReplicationConfig> {
+        self.config
+            .replication
+            .as_ref()
+            .filter(|replication| replication.enabled)
+    }
+
+    /// A client for a replication region. The region's bucket, endpoint, prefix,
+    /// credentials, encryption and storage class are used exactly as the primary's are,
+    /// so keys, listings and retention behave identically in both locations.
+    pub async fn for_region(
+        region_config: &ReplicationRegionConfig,
+    ) -> Result<Self, S3BackupError> {
+        Self::new(region_config.to_s3_config()).await
+    }
+
+    /// Upload `data` as the backup `key` (relative to the configured prefix) together
+    /// with its `<key>.metadata.json` sidecar, and return the metadata written to it.
     pub async fn upload_backup(
         &self,
-        data: Vec<u8>,
+        data: &[u8],
         key: &str,
         timestamp: &str,
         compression: BackupCompression,
     ) -> Result<S3BackupMetadata, S3BackupError> {
         let size = data.len() as u64;
-        let checksum = hex_encode(Sha256::digest(&data));
-        let object_key = self.build_object_key(key);
+        let checksum = hex_encode(Sha256::digest(data));
+        let metadata = S3BackupMetadata::new(checksum, timestamp.to_string(), compression, size);
 
-        let metadata =
-            S3BackupMetadata::new(checksum.clone(), timestamp.to_string(), compression, size);
-
-        if size > MULTIPART_THRESHOLD {
-            self.upload_multipart(&data, &object_key, &metadata).await?;
-        } else {
-            self.upload_single(&data, &object_key, &metadata).await?;
-        }
-
-        self.upload_metadata(&object_key, &metadata).await?;
+        self.upload_with_metadata(data, key, &metadata).await?;
 
         Ok(metadata)
+    }
+
+    /// Upload `data` under `key` (relative to the configured prefix) with the given,
+    /// already computed, metadata sidecar. Shared by the primary upload and by
+    /// replication, so a replica carries the very same sidecar as the primary.
+    async fn upload_with_metadata(
+        &self,
+        data: &[u8],
+        key: &str,
+        metadata: &S3BackupMetadata,
+    ) -> Result<(), S3BackupError> {
+        let object_key = self.build_object_key(key);
+
+        if data.len() as u64 > MULTIPART_THRESHOLD {
+            self.upload_multipart(data, &object_key, metadata).await?;
+        } else {
+            self.upload_single(data, &object_key, metadata).await?;
+        }
+
+        self.upload_metadata(&object_key, metadata).await
     }
 
     async fn upload_single(
@@ -182,10 +241,12 @@ impl S3ClientWrapper {
 
         builder = self.apply_encryption(builder);
 
-        builder
-            .send()
-            .await
-            .map_err(|e| S3BackupError::UploadError(format!("Failed to upload backup: {}", e)))?;
+        builder.send().await.map_err(|e| {
+            S3BackupError::UploadError(format!(
+                "Failed to upload backup: {}",
+                DisplayErrorContext(&e)
+            ))
+        })?;
 
         info!("Uploaded backup to S3: {}", key);
         Ok(())
@@ -236,7 +297,10 @@ impl S3ClientWrapper {
         builder = self.apply_encryption_multipart(builder);
 
         builder.send().await.map_err(|e| {
-            S3BackupError::UploadError(format!("Failed to create multipart upload: {}", e))
+            S3BackupError::UploadError(format!(
+                "Failed to create multipart upload: {}",
+                DisplayErrorContext(&e)
+            ))
         })
     }
 
@@ -280,7 +344,10 @@ impl S3ClientWrapper {
             .send()
             .await
             .map_err(|e| {
-                S3BackupError::UploadError(format!("Failed to complete multipart upload: {}", e))
+                S3BackupError::UploadError(format!(
+                    "Failed to complete multipart upload: {}",
+                    DisplayErrorContext(&e)
+                ))
             })?;
 
         Ok(())
@@ -293,7 +360,10 @@ impl S3ClientWrapper {
     ) -> Result<(), S3BackupError> {
         let metadata_key = format!("{}.metadata.json", backup_key);
         let metadata_json = serde_json::to_string(metadata).map_err(|e| {
-            S3BackupError::UploadError(format!("Failed to serialize metadata: {}", e))
+            S3BackupError::UploadError(format!(
+                "Failed to serialize metadata: {}",
+                DisplayErrorContext(&e)
+            ))
         })?;
 
         self.client
@@ -304,7 +374,12 @@ impl S3ClientWrapper {
             .content_type("application/json")
             .send()
             .await
-            .map_err(|e| S3BackupError::UploadError(format!("Failed to upload metadata: {}", e)))?;
+            .map_err(|e| {
+                S3BackupError::UploadError(format!(
+                    "Failed to upload metadata: {}",
+                    DisplayErrorContext(&e)
+                ))
+            })?;
 
         Ok(())
     }
@@ -374,7 +449,10 @@ impl S3ClientWrapper {
             .send()
             .await
             .map_err(|e| {
-                S3BackupError::DownloadError(format!("Failed to download backup: {}", e))
+                S3BackupError::DownloadError(format!(
+                    "Failed to download backup: {}",
+                    DisplayErrorContext(&e)
+                ))
             })?;
 
         self.collect_stream(output).await
@@ -398,23 +476,27 @@ impl S3ClientWrapper {
             .send()
             .await
             .map_err(|e| {
-                S3BackupError::DownloadError(format!("Failed to download metadata: {}", e))
+                S3BackupError::DownloadError(format!(
+                    "Failed to download metadata: {}",
+                    DisplayErrorContext(&e)
+                ))
             })?;
 
         let data = self.collect_stream(output).await?;
         let metadata: S3BackupMetadata = serde_json::from_slice(&data).map_err(|e| {
-            S3BackupError::DownloadError(format!("Failed to parse metadata: {}", e))
+            S3BackupError::DownloadError(format!(
+                "Failed to parse metadata: {}",
+                DisplayErrorContext(&e)
+            ))
         })?;
 
         Ok(metadata)
     }
 
     async fn collect_stream(&self, output: GetObjectOutput) -> Result<Vec<u8>, S3BackupError> {
-        let body = output
-            .body
-            .collect()
-            .await
-            .map_err(|e| S3BackupError::DownloadError(format!("Stream error: {}", e)))?;
+        let body = output.body.collect().await.map_err(|e| {
+            S3BackupError::DownloadError(format!("Stream error: {}", DisplayErrorContext(&e)))
+        })?;
         Ok(body.into_bytes().to_vec())
     }
 
@@ -437,8 +519,12 @@ impl S3ClientWrapper {
 
         let mut backups = Vec::new();
         while let Some(page) = pages.next().await {
-            let page = page
-                .map_err(|e| S3BackupError::SdkError(format!("Failed to list objects: {}", e)))?;
+            let page = page.map_err(|e| {
+                S3BackupError::SdkError(format!(
+                    "Failed to list objects: {}",
+                    DisplayErrorContext(&e)
+                ))
+            })?;
             for obj in page.contents() {
                 let Some(key) = obj.key() else {
                     continue;
@@ -467,7 +553,12 @@ impl S3ClientWrapper {
             .key(&object_key)
             .send()
             .await
-            .map_err(|e| S3BackupError::SdkError(format!("Failed to delete backup: {}", e)))?;
+            .map_err(|e| {
+                S3BackupError::SdkError(format!(
+                    "Failed to delete backup: {}",
+                    DisplayErrorContext(&e)
+                ))
+            })?;
 
         self.client
             .delete_object()
@@ -475,7 +566,12 @@ impl S3ClientWrapper {
             .key(&metadata_key)
             .send()
             .await
-            .map_err(|e| S3BackupError::SdkError(format!("Failed to delete metadata: {}", e)))?;
+            .map_err(|e| {
+                S3BackupError::SdkError(format!(
+                    "Failed to delete metadata: {}",
+                    DisplayErrorContext(&e)
+                ))
+            })?;
 
         info!("Deleted backup from S3: {}", object_key);
         Ok(())
@@ -492,17 +588,8 @@ impl S3ClientWrapper {
         let object_key = self.build_object_key(key);
         let metadata = self.download_metadata(&object_key).await?;
 
-        let head = self
-            .client
-            .head_object()
-            .bucket(&self.config.bucket)
-            .key(&object_key)
-            .send()
-            .await
-            .map_err(|e| S3BackupError::SdkError(format!("Failed to head object: {}", e)))?;
-
-        match head.content_length() {
-            Some(actual_size) if actual_size as u64 != metadata.size_bytes => {
+        match self.head_object_size(&object_key).await? {
+            Some(actual_size) if actual_size != metadata.size_bytes => {
                 warn!(
                     "Backup size mismatch for {}: expected {}, got {}",
                     object_key, metadata.size_bytes, actual_size
@@ -529,98 +616,135 @@ impl S3ClientWrapper {
         Ok(true)
     }
 
+    /// The size S3 reports for `object_key` (a full key, prefix included), or None when
+    /// the service reports no content length.
+    async fn head_object_size(&self, object_key: &str) -> Result<Option<u64>, S3BackupError> {
+        let head = self
+            .client
+            .head_object()
+            .bucket(&self.config.bucket)
+            .key(object_key)
+            .send()
+            .await
+            .map_err(|e| {
+                S3BackupError::SdkError(format!(
+                    "Failed to head object: {}",
+                    DisplayErrorContext(&e)
+                ))
+            })?;
+
+        Ok(head.content_length().map(|size| size as u64))
+    }
+
+    /// The prefix-relative keys of the automatically generated backups under the
+    /// configured prefix, sorted oldest first. Sidecars, the PITR manifest and manual
+    /// objects are left out, so this is exactly the set replication has to mirror.
+    pub async fn list_backup_artifacts(&self) -> Result<Vec<String>, S3BackupError> {
+        let mut backups: Vec<String> = self
+            .list_backups()
+            .await?
+            .into_iter()
+            .filter(|key| is_backup_artifact_name(key))
+            .collect();
+        backups.sort();
+        Ok(backups)
+    }
+
+    /// Copy the backup `backup_key` (relative to the primary prefix), already uploaded to
+    /// the primary bucket with `metadata`, together with an identical metadata sidecar,
+    /// to the bucket of `region_config` under that region's own prefix. The copy keeps
+    /// the primary's checksum, timestamp and size, so `verify-s3 --region` and
+    /// `restore-s3 --region` treat it exactly like the primary object.
     pub async fn replicate_backup(
         &self,
         backup_key: &str,
-        backup_data: Vec<u8>,
+        backup_data: &[u8],
         metadata: &S3BackupMetadata,
         region_config: &ReplicationRegionConfig,
     ) -> Result<(), S3BackupError> {
-        let region_wrapper = Self::create_region_wrapper(region_config).await?;
-        let object_key = Self::build_region_object_key(region_config, backup_key);
+        let region = Self::for_region(region_config).await?;
 
-        if backup_data.len() as u64 > MULTIPART_THRESHOLD {
-            region_wrapper
-                .upload_multipart(&backup_data, &object_key, metadata)
-                .await?;
-        } else {
-            region_wrapper
-                .upload_single(&backup_data, &object_key, metadata)
-                .await?;
-        }
-
-        region_wrapper
-            .upload_metadata(&object_key, metadata)
+        region
+            .upload_with_metadata(backup_data, backup_key, metadata)
             .await?;
 
         info!(
-            "Replicated backup {} to region {} bucket {}",
-            backup_key, region_config.region, region_config.bucket
+            "Replicated backup {} to region {} ({})",
+            backup_key,
+            region_config.region,
+            region.location()
         );
         Ok(())
     }
 
-    async fn create_region_wrapper(
+    /// `replicate_backup` with the retry policy of `replication_config`: up to
+    /// `max_retries` further attempts, `retry_delay_seconds` apart. Every failed attempt
+    /// is logged; the error of the last attempt is returned.
+    pub async fn replicate_backup_with_retries(
+        &self,
+        backup_key: &str,
+        backup_data: &[u8],
+        metadata: &S3BackupMetadata,
         region_config: &ReplicationRegionConfig,
-    ) -> Result<S3ClientWrapper, S3BackupError> {
-        let sdk_config = Self::build_region_sdk_config(region_config).await?;
-        let client = Self::build_client(&sdk_config, region_config.endpoint.is_some());
-
-        let s3_config = kubidm_proto::backup::S3Config {
-            bucket: region_config.bucket.clone(),
-            region: Some(region_config.region.clone()),
-            endpoint: region_config.endpoint.clone(),
-            path_prefix: region_config.path_prefix.clone(),
-            credentials: region_config.credentials.clone(),
-            server_side_encryption: region_config.server_side_encryption.clone(),
-            storage_class: region_config.storage_class.clone(),
-            replication: None,
-        };
-
-        Ok(S3ClientWrapper {
-            client,
-            config: s3_config,
-        })
-    }
-
-    async fn build_region_sdk_config(
-        region_config: &ReplicationRegionConfig,
-    ) -> Result<SdkConfig, S3BackupError> {
-        let mut config_builder = aws_config::defaults(BehaviorVersion::latest());
-
-        if let Some(endpoint) = &region_config.endpoint {
-            config_builder = config_builder.endpoint_url(endpoint);
+        replication_config: &ReplicationConfig,
+    ) -> Result<(), S3BackupError> {
+        let attempts = replication_config.max_retries.saturating_add(1);
+        let mut attempt = 1;
+        loop {
+            match self
+                .replicate_backup(backup_key, backup_data, metadata, region_config)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(err) if attempt < attempts => {
+                    warn!(
+                        "Replication of {} to region {} failed (attempt {} of {}): {}",
+                        backup_key, region_config.region, attempt, attempts, err
+                    );
+                    sleep(Duration::from_secs(replication_config.retry_delay_seconds)).await;
+                    attempt += 1;
+                }
+                Err(err) => return Err(err),
+            }
         }
-
-        config_builder = config_builder.region(Region::new(region_config.region.clone()));
-
-        if let Some(credentials) = &region_config.credentials {
-            let creds = Credentials::new(
-                credentials.access_key_id.clone(),
-                credentials.secret_access_key.clone(),
-                credentials.session_token.clone(),
-                None,
-                "kubidm-backup-replication",
-            );
-            config_builder = config_builder.credentials_provider(creds);
-        }
-
-        Ok(config_builder.load().await)
     }
 
-    fn build_region_object_key(region_config: &ReplicationRegionConfig, key: &str) -> String {
-        Self::build_object_key_with_prefix(region_config.path_prefix.as_deref(), key)
+    /// Compare the primary's copy of `backup_key` with the one in `region`, without
+    /// downloading either. The sidecars must agree on checksum and size, and the size S3
+    /// reports for the replica must match the sidecar. Returns the primary metadata and
+    /// the reason the replica differs, if it does.
+    ///
+    /// This catches a missing, truncated, replaced or re-uploaded replica cheaply enough
+    /// to run on every health check; a replica whose bytes were corrupted without changing
+    /// its size is only caught by `verify-s3 --region`, which downloads it.
+    async fn compare_replica(
+        &self,
+        region: &S3ClientWrapper,
+        backup_key: &str,
+    ) -> Result<(S3BackupMetadata, Option<String>), S3BackupError> {
+        let primary = self.get_backup_metadata(backup_key).await?;
+        let replica = region.get_backup_metadata(backup_key).await?;
+        let replica_size = region
+            .head_object_size(&region.build_object_key(backup_key))
+            .await?;
+
+        let mismatch = replica_mismatch(&primary, &replica, replica_size);
+        Ok((primary, mismatch))
     }
 
+    /// The replication status of one region: which of the primary's backup artifacts
+    /// `source_backups` (prefix-relative keys, as returned by `list_backup_artifacts`) are
+    /// present and intact in the region, and how far the region lags behind the primary.
+    ///
+    /// A region that can not be reached is reported as `Failed`, one that misses or
+    /// disagrees on any backup as `Degraded`, and one that holds every backup as
+    /// `Completed`. This never fails on its own: problems are carried in the status.
     pub async fn check_region_replication_status(
         &self,
         region_config: &ReplicationRegionConfig,
         source_backups: &[String],
-    ) -> Result<ReplicationRegionStatus, S3BackupError> {
-        let region_wrapper = Self::create_region_wrapper(region_config).await?;
-
-        let replicated_backups = region_wrapper.list_backups().await?;
-
+    ) -> ReplicationRegionStatus {
+        let total = source_backups.len() as u64;
         let mut status = ReplicationRegionStatus {
             region: region_config.region.clone(),
             bucket: region_config.bucket.clone(),
@@ -630,128 +754,239 @@ impl S3ClientWrapper {
             lag_seconds: None,
             bytes_replicated: 0,
             backups_replicated: 0,
+            pending_backups: 0,
             last_error: None,
         };
 
-        for backup_key in source_backups {
-            if replicated_backups.contains(backup_key) {
-                status.backups_replicated += 1;
-                let object_key = Self::build_region_object_key(region_config, backup_key);
-                let (_, metadata) = region_wrapper.download_backup(&object_key).await?;
-                status.bytes_replicated += metadata.size_bytes;
-                status.last_sync_backup_id = Some(backup_key.clone());
-                status.last_sync_timestamp = Some(metadata.timestamp.clone());
-            } else {
-                if status.status == ReplicationStatus::Completed {
-                    status.status = ReplicationStatus::Degraded {
-                        message: format!("Missing backup: {}", backup_key),
-                    };
+        let region = match Self::for_region(region_config).await {
+            Ok(region) => region,
+            Err(err) => return region_unreachable(status, total, &err),
+        };
+        let replicated = match region.list_backup_artifacts().await {
+            Ok(replicated) => replicated,
+            Err(err) => return region_unreachable(status, total, &err),
+        };
+
+        // Oldest first, so the last intact backup is the newest one.
+        let mut source: Vec<&String> = source_backups.iter().collect();
+        source.sort();
+
+        // The lag is measured against the newest primary backup whether or not the region
+        // holds it; a region that misses exactly the newest backup lags by one interval.
+        let newest_primary_timestamp = match source.last() {
+            Some(newest) => match self.get_backup_metadata(newest).await {
+                Ok(primary) => Some(primary.timestamp),
+                Err(err) => {
+                    warn!(
+                        "Unable to read the metadata of the newest primary backup {}: {}",
+                        newest, err
+                    );
+                    None
                 }
+            },
+            None => None,
+        };
+
+        let mut problems = Vec::new();
+        for backup_key in source {
+            if !replicated.contains(backup_key) {
+                problems.push(format!("{backup_key} is missing"));
+                continue;
+            }
+            match self.compare_replica(&region, backup_key).await {
+                Ok((primary, None)) => {
+                    status.backups_replicated += 1;
+                    status.bytes_replicated += primary.size_bytes;
+                    status.last_sync_backup_id = Some(backup_key.clone());
+                    status.last_sync_timestamp = Some(primary.timestamp);
+                }
+                Ok((_, Some(reason))) => problems.push(format!("{backup_key} {reason}")),
+                Err(err) => problems.push(format!("{backup_key} could not be checked: {err}")),
             }
         }
 
-        if let Some(last_sync_ts) = &status.last_sync_timestamp {
-            if chrono::DateTime::parse_from_rfc3339(last_sync_ts).is_ok() {
-                status.lag_seconds = Some(0);
-            }
+        status.pending_backups = problems.len() as u64;
+        status.lag_seconds = match (&newest_primary_timestamp, &status.last_sync_timestamp) {
+            (Some(primary), Some(replica)) => lag_seconds(primary, replica),
+            _ => None,
+        };
+        if !problems.is_empty() {
+            status.status = ReplicationStatus::Degraded {
+                message: degraded_message(&problems, total),
+            };
         }
 
-        Ok(status)
+        status
     }
 
+    /// The replication health of every region of `replication_config` against the backups
+    /// currently in the primary bucket. Fails only when the primary bucket itself can not
+    /// be listed; an unreachable region is reported in its status instead.
     pub async fn check_replication_health(
         &self,
         replication_config: &ReplicationConfig,
         current_timestamp: Option<&str>,
     ) -> Result<ReplicationHealthCheck, S3BackupError> {
-        let source_backups = self.list_backups().await?;
+        let source_backups = self.list_backup_artifacts().await?;
 
-        let mut regions = Vec::new();
-        let mut max_lag = 0u64;
-        let mut total_lag = 0u64;
-        let mut healthy = 0usize;
-        let mut unhealthy = 0usize;
-
+        let mut regions = Vec::with_capacity(replication_config.regions.len());
         for region_config in &replication_config.regions {
-            let region_status = self
-                .check_region_replication_status(region_config, &source_backups)
-                .await?;
-
-            if let Some(lag) = region_status.lag_seconds {
-                total_lag += lag;
-                if lag > max_lag {
-                    max_lag = lag;
-                }
-            }
-
-            match &region_status.status {
-                ReplicationStatus::Completed => healthy += 1,
-                ReplicationStatus::Degraded { .. } | ReplicationStatus::Failed { .. } => {
-                    unhealthy += 1
-                }
-                _ => {}
-            }
-
-            regions.push(region_status);
+            regions.push(
+                self.check_region_replication_status(region_config, &source_backups)
+                    .await,
+            );
         }
 
-        let overall_status = if unhealthy > 0 {
-            if healthy == 0 {
-                ReplicationStatus::Failed {
-                    error: "All regions unhealthy".to_string(),
-                }
-            } else {
-                ReplicationStatus::Degraded {
-                    message: format!("{} regions unhealthy", unhealthy),
-                }
-            }
-        } else if healthy > 0 {
-            ReplicationStatus::Completed
-        } else {
-            ReplicationStatus::NotConfigured
-        };
-
-        let last_check_timestamp = current_timestamp.map(|s| s.to_string()).unwrap_or_default();
-
-        Ok(ReplicationHealthCheck {
-            overall_status,
-            regions,
-            total_lag_seconds: total_lag,
-            max_lag_seconds: max_lag,
-            healthy_regions: healthy,
-            unhealthy_regions: unhealthy,
-            last_check_timestamp,
-        })
+        Ok(summarise_health(regions, current_timestamp))
     }
 
+    /// The lag metrics of every region, computed from a fresh health check. When a health
+    /// check is already at hand, `lag_metrics_from_health` avoids repeating the requests.
     pub async fn get_replication_lag_metrics(
         &self,
         replication_config: &ReplicationConfig,
     ) -> Result<Vec<ReplicationLagMetrics>, S3BackupError> {
-        let source_backups = self.list_backups().await?;
-        let mut metrics = Vec::new();
-
-        for region_config in &replication_config.regions {
-            let region_status = self
-                .check_region_replication_status(region_config, &source_backups)
-                .await?;
-
-            let pending = source_backups
-                .iter()
-                .filter(|b| region_status.last_sync_backup_id.as_ref() != Some(b))
-                .count();
-
-            metrics.push(ReplicationLagMetrics {
-                region: region_config.region.clone(),
-                lag_seconds: region_status.lag_seconds.unwrap_or(0),
-                pending_backups: pending,
-                last_backup_timestamp: region_status.last_sync_timestamp.clone(),
-                replication_delay_seconds: replication_config.sync_interval_seconds,
-            });
-        }
-
-        Ok(metrics)
+        let health = self
+            .check_replication_health(replication_config, None)
+            .await?;
+        Ok(lag_metrics_from_health(&health, replication_config))
     }
+}
+
+/// Whether a region is healthy for the purpose of monitoring and the exit code of
+/// `replicate-status`: it holds every primary backup intact.
+pub fn region_is_healthy(status: &ReplicationRegionStatus) -> bool {
+    status.status == ReplicationStatus::Completed
+}
+
+/// Why a replica differs from the primary, or None when sidecars and reported size agree.
+fn replica_mismatch(
+    primary: &S3BackupMetadata,
+    replica: &S3BackupMetadata,
+    replica_size: Option<u64>,
+) -> Option<String> {
+    if replica.checksum_sha256 != primary.checksum_sha256 {
+        return Some(format!(
+            "has checksum {} but the primary has {}",
+            replica.checksum_sha256, primary.checksum_sha256
+        ));
+    }
+    if replica.size_bytes != primary.size_bytes {
+        return Some(format!(
+            "records {} bytes but the primary records {}",
+            replica.size_bytes, primary.size_bytes
+        ));
+    }
+    match replica_size {
+        Some(size) if size != primary.size_bytes => Some(format!(
+            "is {} bytes in the region but {} bytes are expected",
+            size, primary.size_bytes
+        )),
+        _ => None,
+    }
+}
+
+/// The seconds the newest replicated backup (`replica`) lags behind the newest primary
+/// backup (`primary`), both RFC3339 timestamps. Zero when the replica is as new as, or
+/// newer than, the primary; None when a timestamp can not be parsed.
+fn lag_seconds(primary: &str, replica: &str) -> Option<u64> {
+    let primary = DateTime::parse_from_rfc3339(primary).ok()?;
+    let replica = DateTime::parse_from_rfc3339(replica).ok()?;
+    Some((primary - replica).num_seconds().max(0) as u64)
+}
+
+fn degraded_message(problems: &[String], total: u64) -> String {
+    let shown = problems
+        .iter()
+        .take(REGION_PROBLEMS_IN_MESSAGE)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("; ");
+    let more = problems.len().saturating_sub(REGION_PROBLEMS_IN_MESSAGE);
+    if more > 0 {
+        format!(
+            "{} of {} backups not replicated: {}; and {} more",
+            problems.len(),
+            total,
+            shown,
+            more
+        )
+    } else {
+        format!(
+            "{} of {} backups not replicated: {}",
+            problems.len(),
+            total,
+            shown
+        )
+    }
+}
+
+fn region_unreachable(
+    mut status: ReplicationRegionStatus,
+    total: u64,
+    err: &S3BackupError,
+) -> ReplicationRegionStatus {
+    let error = err.to_string();
+    status.pending_backups = total;
+    status.last_error = Some(error.clone());
+    status.status = ReplicationStatus::Failed { error };
+    status
+}
+
+/// Aggregate per-region statuses into the overall health report.
+fn summarise_health(
+    regions: Vec<ReplicationRegionStatus>,
+    current_timestamp: Option<&str>,
+) -> ReplicationHealthCheck {
+    let healthy = regions.iter().filter(|r| region_is_healthy(r)).count();
+    let unhealthy = regions.len() - healthy;
+    let lags = regions.iter().filter_map(|r| r.lag_seconds);
+    let total_lag_seconds = lags.clone().sum();
+    let max_lag_seconds = lags.max().unwrap_or(0);
+
+    let overall_status = if unhealthy > 0 {
+        if healthy == 0 {
+            ReplicationStatus::Failed {
+                error: format!("all {} regions unhealthy", unhealthy),
+            }
+        } else {
+            ReplicationStatus::Degraded {
+                message: format!("{} of {} regions unhealthy", unhealthy, regions.len()),
+            }
+        }
+    } else if healthy > 0 {
+        ReplicationStatus::Completed
+    } else {
+        ReplicationStatus::NotConfigured
+    };
+
+    ReplicationHealthCheck {
+        overall_status,
+        regions,
+        total_lag_seconds,
+        max_lag_seconds,
+        healthy_regions: healthy,
+        unhealthy_regions: unhealthy,
+        last_check_timestamp: current_timestamp.map(str::to_string).unwrap_or_default(),
+    }
+}
+
+/// The lag metrics of every region of an existing health check.
+pub fn lag_metrics_from_health(
+    health: &ReplicationHealthCheck,
+    replication_config: &ReplicationConfig,
+) -> Vec<ReplicationLagMetrics> {
+    health
+        .regions
+        .iter()
+        .map(|region| ReplicationLagMetrics {
+            region: region.region.clone(),
+            lag_seconds: region.lag_seconds.unwrap_or(0),
+            pending_backups: region.pending_backups as usize,
+            last_backup_timestamp: region.last_sync_timestamp.clone(),
+            replication_delay_seconds: replication_config.sync_interval_seconds,
+        })
+        .collect()
 }
 
 pub struct ChecksumWriter<W> {
@@ -1355,6 +1590,7 @@ mod tests {
             lag_seconds: Some(30),
             bytes_replicated: 1024000,
             backups_replicated: 10,
+            pending_backups: 0,
             last_error: None,
         };
 
@@ -1367,38 +1603,278 @@ mod tests {
         assert!(display.contains("bytes: 1024000"));
     }
 
-    #[test]
-    fn test_build_region_object_key() {
-        let region_config = ReplicationRegionConfig {
+    fn region_config(path_prefix: Option<&str>) -> ReplicationRegionConfig {
+        ReplicationRegionConfig {
             region: "eu-west-1".to_string(),
             bucket: "eu-backup".to_string(),
-            endpoint: None,
-            path_prefix: Some("replica/kubidm".to_string()),
+            endpoint: Some("https://s3.eu.example.com".to_string()),
+            path_prefix: path_prefix.map(str::to_string),
             credentials: None,
             server_side_encryption: None,
             storage_class: "STANDARD".to_string(),
             kms_key_id: None,
-        };
+        }
+    }
 
-        let key = S3ClientWrapper::build_region_object_key(&region_config, "backup.tar.gz");
-        assert_eq!(key, "replica/kubidm/backup.tar.gz");
+    /// Region keys are built through the same prefix handling as primary keys, so a
+    /// region prefix with or without a trailing slash yields the same object key and the
+    /// region listing strips exactly that prefix again.
+    #[test]
+    fn test_region_keys_behave_like_primary_keys() {
+        for (prefix, expected) in [
+            (None, "backup.tar.gz"),
+            (Some(""), "backup.tar.gz"),
+            (Some("replica/kubidm"), "replica/kubidm/backup.tar.gz"),
+            (Some("replica/kubidm/"), "replica/kubidm/backup.tar.gz"),
+        ] {
+            let s3_config = region_config(prefix).to_s3_config();
+            let key = S3ClientWrapper::build_object_key_with_prefix(
+                s3_config.path_prefix.as_deref(),
+                "backup.tar.gz",
+            );
+            assert_eq!(key, expected, "prefix {prefix:?}");
+
+            let listing = S3ClientWrapper::listing_prefix(s3_config.path_prefix.as_deref());
+            assert_eq!(
+                S3ClientWrapper::strip_listing_prefix(&listing, &key),
+                Some("backup.tar.gz"),
+                "prefix {prefix:?}"
+            );
+        }
     }
 
     #[test]
-    fn test_build_region_object_key_no_prefix() {
-        let region_config = ReplicationRegionConfig {
-            region: "eu-west-1".to_string(),
-            bucket: "eu-backup".to_string(),
-            endpoint: None,
-            path_prefix: None,
-            credentials: None,
-            server_side_encryption: None,
-            storage_class: "STANDARD".to_string(),
-            kms_key_id: None,
+    fn test_s3_location() {
+        let mut config = S3Config::with_bucket("kubidm-backups".to_string());
+        assert_eq!(s3_location(&config), "s3://kubidm-backups");
+        config.path_prefix = Some("".to_string());
+        assert_eq!(s3_location(&config), "s3://kubidm-backups");
+        config.path_prefix = Some("prod".to_string());
+        assert_eq!(s3_location(&config), "s3://kubidm-backups/prod");
+        config.path_prefix = Some("prod/kubidm/".to_string());
+        assert_eq!(s3_location(&config), "s3://kubidm-backups/prod/kubidm");
+
+        let region = region_config(Some("dr/")).to_s3_config();
+        assert_eq!(s3_location(&region), "s3://eu-backup/dr");
+    }
+
+    fn metadata(checksum: &str, timestamp: &str, size: u64) -> S3BackupMetadata {
+        S3BackupMetadata::new(
+            checksum.to_string(),
+            timestamp.to_string(),
+            BackupCompression::Gzip,
+            size,
+        )
+    }
+
+    #[test]
+    fn test_replica_mismatch_agrees() {
+        let primary = metadata("abc", "2024-01-01T22:00:00Z", 100);
+        assert_eq!(replica_mismatch(&primary, &primary, Some(100)), None);
+        // A service that reports no content length can not fail the size check.
+        assert_eq!(replica_mismatch(&primary, &primary, None), None);
+    }
+
+    #[test]
+    fn test_replica_mismatch_detects_divergence() {
+        let primary = metadata("abc", "2024-01-01T22:00:00Z", 100);
+
+        let other_checksum = metadata("def", "2024-01-01T22:00:00Z", 100);
+        let reason = replica_mismatch(&primary, &other_checksum, Some(100)).expect("mismatch");
+        assert!(reason.contains("checksum def"), "{reason}");
+
+        let other_size = metadata("abc", "2024-01-01T22:00:00Z", 90);
+        let reason = replica_mismatch(&primary, &other_size, Some(90)).expect("mismatch");
+        assert!(reason.contains("records 90 bytes"), "{reason}");
+
+        // Same sidecar, but the object in the region was truncated or replaced.
+        let reason = replica_mismatch(&primary, &primary, Some(42)).expect("mismatch");
+        assert!(reason.contains("is 42 bytes in the region"), "{reason}");
+    }
+
+    #[test]
+    fn test_lag_seconds() {
+        assert_eq!(
+            lag_seconds("2024-01-01T22:00:00Z", "2024-01-01T22:00:00Z"),
+            Some(0)
+        );
+        assert_eq!(
+            lag_seconds("2024-01-02T22:00:00Z", "2024-01-01T22:00:00Z"),
+            Some(86400)
+        );
+        // Offsets are honoured.
+        assert_eq!(
+            lag_seconds("2024-01-01T23:00:00+01:00", "2024-01-01T22:00:00Z"),
+            Some(0)
+        );
+        // A replica newer than the primary is not behind.
+        assert_eq!(
+            lag_seconds("2024-01-01T22:00:00Z", "2024-01-02T22:00:00Z"),
+            Some(0)
+        );
+        assert_eq!(lag_seconds("yesterday", "2024-01-01T22:00:00Z"), None);
+        assert_eq!(lag_seconds("2024-01-01T22:00:00Z", ""), None);
+    }
+
+    #[test]
+    fn test_degraded_message() {
+        let problems: Vec<String> = (1..=2).map(|i| format!("backup-{i} is missing")).collect();
+        assert_eq!(
+            degraded_message(&problems, 5),
+            "2 of 5 backups not replicated: backup-1 is missing; backup-2 is missing"
+        );
+
+        let problems: Vec<String> = (1..=5).map(|i| format!("backup-{i} is missing")).collect();
+        let message = degraded_message(&problems, 7);
+        assert!(message.starts_with("5 of 7 backups not replicated: backup-1 is missing; "));
+        assert!(message.ends_with("; and 2 more"), "{message}");
+        assert!(!message.contains("backup-4"), "{message}");
+    }
+
+    fn region_status(
+        region: &str,
+        status: ReplicationStatus,
+        lag: Option<u64>,
+    ) -> ReplicationRegionStatus {
+        ReplicationRegionStatus {
+            region: region.to_string(),
+            bucket: format!("{region}-bucket"),
+            status,
+            last_sync_timestamp: Some("2024-01-01T22:00:00Z".to_string()),
+            last_sync_backup_id: Some("backup-2024-01-01T22:00:00Z.json.gz".to_string()),
+            lag_seconds: lag,
+            bytes_replicated: 10,
+            backups_replicated: 1,
+            pending_backups: 0,
+            last_error: None,
+        }
+    }
+
+    #[test]
+    fn test_region_unreachable_is_failed_with_everything_pending() {
+        let status = region_unreachable(
+            region_status("eu", ReplicationStatus::Completed, None),
+            4,
+            &S3BackupError::SdkError("connection refused".to_string()),
+        );
+        assert!(!region_is_healthy(&status));
+        assert_eq!(status.pending_backups, 4);
+        assert_eq!(
+            status.status,
+            ReplicationStatus::Failed {
+                error: "AWS SDK error: connection refused".to_string()
+            }
+        );
+        assert_eq!(
+            status.last_error.as_deref(),
+            Some("AWS SDK error: connection refused")
+        );
+    }
+
+    #[test]
+    fn test_summarise_health_no_regions() {
+        let health = summarise_health(vec![], Some("2024-01-01T22:00:00Z"));
+        assert_eq!(health.overall_status, ReplicationStatus::NotConfigured);
+        assert_eq!(health.healthy_regions, 0);
+        assert_eq!(health.unhealthy_regions, 0);
+        assert_eq!(health.max_lag_seconds, 0);
+        assert_eq!(health.last_check_timestamp, "2024-01-01T22:00:00Z");
+    }
+
+    #[test]
+    fn test_summarise_health_all_healthy() {
+        let health = summarise_health(
+            vec![
+                region_status("eu", ReplicationStatus::Completed, Some(0)),
+                region_status("ap", ReplicationStatus::Completed, Some(120)),
+            ],
+            None,
+        );
+        assert_eq!(health.overall_status, ReplicationStatus::Completed);
+        assert_eq!(health.healthy_regions, 2);
+        assert_eq!(health.unhealthy_regions, 0);
+        assert_eq!(health.total_lag_seconds, 120);
+        assert_eq!(health.max_lag_seconds, 120);
+        assert_eq!(health.last_check_timestamp, "");
+    }
+
+    #[test]
+    fn test_summarise_health_degraded_and_failed() {
+        let degraded = ReplicationStatus::Degraded {
+            message: "1 of 3 backups not replicated".to_string(),
+        };
+        let health = summarise_health(
+            vec![
+                region_status("eu", ReplicationStatus::Completed, Some(0)),
+                region_status("ap", degraded.clone(), Some(3600)),
+            ],
+            None,
+        );
+        assert_eq!(
+            health.overall_status,
+            ReplicationStatus::Degraded {
+                message: "1 of 2 regions unhealthy".to_string()
+            }
+        );
+        assert_eq!(health.healthy_regions, 1);
+        assert_eq!(health.unhealthy_regions, 1);
+        assert_eq!(health.max_lag_seconds, 3600);
+
+        let failed = ReplicationStatus::Failed {
+            error: "unreachable".to_string(),
+        };
+        let health = summarise_health(
+            vec![
+                region_status("eu", degraded, None),
+                region_status("ap", failed, None),
+            ],
+            None,
+        );
+        assert_eq!(
+            health.overall_status,
+            ReplicationStatus::Failed {
+                error: "all 2 regions unhealthy".to_string()
+            }
+        );
+        assert_eq!(health.healthy_regions, 0);
+        assert_eq!(health.unhealthy_regions, 2);
+    }
+
+    #[test]
+    fn test_lag_metrics_from_health() {
+        let mut lagging = region_status(
+            "ap",
+            ReplicationStatus::Degraded {
+                message: "2 of 3 backups not replicated".to_string(),
+            },
+            Some(900),
+        );
+        lagging.pending_backups = 2;
+        let health = summarise_health(
+            vec![
+                region_status("eu", ReplicationStatus::Completed, Some(0)),
+                lagging,
+            ],
+            None,
+        );
+        let replication = ReplicationConfig {
+            sync_interval_seconds: 600,
+            ..ReplicationConfig::default()
         };
 
-        let key = S3ClientWrapper::build_region_object_key(&region_config, "backup.tar.gz");
-        assert_eq!(key, "backup.tar.gz");
+        let metrics = lag_metrics_from_health(&health, &replication);
+        assert_eq!(metrics.len(), 2);
+        assert_eq!(metrics[0].region, "eu");
+        assert_eq!(metrics[0].lag_seconds, 0);
+        assert_eq!(metrics[0].pending_backups, 0);
+        assert_eq!(metrics[0].replication_delay_seconds, 600);
+        assert_eq!(metrics[1].region, "ap");
+        assert_eq!(metrics[1].lag_seconds, 900);
+        assert_eq!(metrics[1].pending_backups, 2);
+        assert_eq!(
+            metrics[1].last_backup_timestamp.as_deref(),
+            Some("2024-01-01T22:00:00Z")
+        );
     }
 
     #[test]
