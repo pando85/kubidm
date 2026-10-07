@@ -72,7 +72,7 @@ impl S3ClientWrapper {
         Ok(Self { client, config })
     }
 
-    /// Build the SDK client. Custom endpoints (MinIO, Ceph RGW, s3mock, ...) are
+    /// Build the SDK client. Custom endpoints (MinIO, Silo, Ceph RGW, ...) are
     /// addressed as `<endpoint>/<bucket>/<key>`. The SDK default of virtual-hosted-style
     /// addressing (`<bucket>.<endpoint>`) requires wildcard DNS that such deployments
     /// usually lack, so path-style addressing is forced whenever an endpoint is

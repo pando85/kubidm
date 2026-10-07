@@ -52,23 +52,30 @@ jobs:
           du -shc target/*
           rm -rf target/*
 
-      - name: "Start the S3 mock for the backup tests"
+      - name: "Start Silo (S3-compatible storage) for the backup tests"
+        env:
+          MINIO_ROOT_USER: kubidm-test
+          MINIO_ROOT_PASSWORD: kubidm-test-secret
         run: |
-          docker run -d --name s3mock -p 9090:9090 adobe/s3mock:5.2.3
+          docker run -d --name silo -p 9000:9000 \
+            -e MINIO_ROOT_USER -e MINIO_ROOT_PASSWORD \
+            pgsty/silo:RELEASE.2026-09-16T00-00-00Z server /data
           for _ in $(seq 1 60); do
-            if curl -sf http://127.0.0.1:9090/ > /dev/null; then
-              echo "s3mock is ready"
+            if curl -sf http://127.0.0.1:9000/minio/health/live > /dev/null; then
+              echo "silo is ready"
               exit 0
             fi
             sleep 1
           done
-          echo "s3mock did not become ready in time"
-          docker logs s3mock
+          echo "silo did not become ready in time"
+          docker logs silo
           exit 1
       - name: "Run cargo test"
         env:
-          KUBIDM_TEST_S3_ENDPOINT: http://127.0.0.1:9090
+          KUBIDM_TEST_S3_ENDPOINT: http://127.0.0.1:9000
           KUBIDM_TEST_S3_BUCKET: kubidm-test
+          KUBIDM_TEST_S3_ACCESS_KEY: kubidm-test
+          KUBIDM_TEST_S3_SECRET_KEY: kubidm-test-secret
         run: cargo test
       - name: "Check disk space at the end"
         run: du -shc *

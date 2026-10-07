@@ -2,16 +2,22 @@
 //!
 //! The test needs an S3-compatible service and is skipped unless `KUBIDM_TEST_S3_ENDPOINT`
 //! is set, so that a plain `cargo test` stays green without Docker. CI runs it against
-//! `adobe/s3mock`, which can be reproduced locally with:
+//! [Silo](https://github.com/pgsty/silo), a MinIO fork, which can be reproduced locally
+//! with:
 //!
 //! ```text
-//! docker run -d --name s3mock -p 9090:9090 adobe/s3mock:5.2.3
-//! KUBIDM_TEST_S3_ENDPOINT=http://127.0.0.1:9090 \
+//! docker run -d --name silo -p 9000:9000 \
+//!     -e MINIO_ROOT_USER=kubidm-test -e MINIO_ROOT_PASSWORD=kubidm-test-secret \
+//!     pgsty/silo:RELEASE.2026-09-16T00-00-00Z server /data
+//! KUBIDM_TEST_S3_ENDPOINT=http://127.0.0.1:9000 \
 //!     cargo test -p kubidmd_testkit --test integration_test s3_recovery
 //! ```
 //!
-//! The bucket is taken from `KUBIDM_TEST_S3_BUCKET` (default `kubidm-test`) and created when
-//! it does not exist. Every run uses its own `path_prefix`, so runs never interfere.
+//! The credentials are taken from `KUBIDM_TEST_S3_ACCESS_KEY` and `KUBIDM_TEST_S3_SECRET_KEY`
+//! (defaults `kubidm-test` / `kubidm-test-secret`; MinIO and Silo require a secret of at
+//! least eight characters). The bucket is taken from `KUBIDM_TEST_S3_BUCKET` (default
+//! `kubidm-test`) and created when it does not exist. Every run uses its own `path_prefix`,
+//! so runs never interfere.
 
 use std::time::Duration;
 
@@ -30,7 +36,11 @@ use super::backup_common::{
 
 const ENDPOINT_ENV: &str = "KUBIDM_TEST_S3_ENDPOINT";
 const BUCKET_ENV: &str = "KUBIDM_TEST_S3_BUCKET";
+const ACCESS_KEY_ENV: &str = "KUBIDM_TEST_S3_ACCESS_KEY";
+const SECRET_KEY_ENV: &str = "KUBIDM_TEST_S3_SECRET_KEY";
 const DEFAULT_BUCKET: &str = "kubidm-test";
+const DEFAULT_ACCESS_KEY: &str = "kubidm-test";
+const DEFAULT_SECRET_KEY: &str = "kubidm-test-secret";
 const REGION: &str = "us-east-1";
 const RETAINED_VERSIONS: usize = 2;
 
@@ -42,6 +52,10 @@ fn test_s3_config() -> Option<S3Config> {
         return None;
     };
     let bucket = std::env::var(BUCKET_ENV).unwrap_or_else(|_| DEFAULT_BUCKET.to_string());
+    let access_key_id =
+        std::env::var(ACCESS_KEY_ENV).unwrap_or_else(|_| DEFAULT_ACCESS_KEY.to_string());
+    let secret_access_key =
+        std::env::var(SECRET_KEY_ENV).unwrap_or_else(|_| DEFAULT_SECRET_KEY.to_string());
 
     Some(S3Config {
         bucket,
@@ -49,8 +63,8 @@ fn test_s3_config() -> Option<S3Config> {
         endpoint: Some(endpoint),
         path_prefix: Some(format!("s3-recovery-test/{}", Uuid::new_v4())),
         credentials: Some(S3Credentials {
-            access_key_id: "test".to_string(),
-            secret_access_key: "test".to_string(),
+            access_key_id,
+            secret_access_key,
             session_token: None,
         }),
         server_side_encryption: None,
@@ -59,9 +73,13 @@ fn test_s3_config() -> Option<S3Config> {
     })
 }
 
-/// A raw SDK client for the same endpoint, used to prepare the bucket, to inspect the
-/// objects behind the back of `S3ClientWrapper` and to corrupt them.
+/// A raw SDK client for the same endpoint and credentials, used to prepare the bucket, to
+/// inspect the objects behind the back of `S3ClientWrapper` and to corrupt them.
 async fn sdk_client(s3_config: &S3Config) -> SdkClient {
+    let credentials = s3_config
+        .credentials
+        .as_ref()
+        .expect("Test S3 config has no credentials");
     let sdk_config = aws_config::defaults(BehaviorVersion::latest())
         .endpoint_url(
             s3_config
@@ -70,7 +88,13 @@ async fn sdk_client(s3_config: &S3Config) -> SdkClient {
                 .expect("Test S3 config has no endpoint"),
         )
         .region(Region::new(REGION))
-        .credentials_provider(Credentials::new("test", "test", None, None, "kubidm-test"))
+        .credentials_provider(Credentials::new(
+            credentials.access_key_id.clone(),
+            credentials.secret_access_key.clone(),
+            None,
+            None,
+            "kubidm-test",
+        ))
         .load()
         .await;
     SdkClient::from_conf(
