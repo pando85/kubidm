@@ -191,6 +191,33 @@ compression = "gzip"
 # algorithm = "aws:kms"  # or "AES256"
 # kms_key_id = "arn:aws:kms:us-east-1:123456789:key/..."
 #
-#   Cross-region replication ([online_backup.s3.replication]), point-in-time recovery
-#   ([online_backup.wal_archive]) and client-side encryption ([online_backup.encryption])
-#   are not available yet. Enabling any of these keys is rejected at startup.
+#   Client-side backup encryption (optional)
+#   When enabled, every backup made from this configuration (online, S3 and
+#   `kubidmd database backup`) is encrypted with AES-256-GCM under a key derived from the
+#   key source below, and gets the extra file suffix ".enc". `restore`, `verify-backup`,
+#   `restore-s3` and `verify-s3` decrypt with the same settings. Keep the key outside of
+#   the server: a backup can only be restored by whoever holds it.
+#
+# [online_backup.encryption]
+# enabled = true
+#   Where the secret comes from. "Passphrase" reads the KUBIDM_BACKUP_PASSPHRASE
+#   environment variable, or the file named by passphrase_file when set.
+# key_source = "Passphrase"
+# passphrase_file = "/etc/kubidm/backup-passphrase"
+#   Alternatively a key file, used byte for byte (for example 32 random bytes) ...
+# key_source = { File = { path = "/etc/kubidm/backup.key" } }
+#   ... or an HTTPS endpoint whose response body is the key material.
+# key_source = { HttpEndpoint = { url = "https://vault.example.com/v1/kubidm-backup-key" } }
+#   Name recorded in every artifact and in the S3 metadata sidecar so that a restore can
+#   tell which key an artifact needs. Defaults to a fingerprint of the key material.
+# key_identifier = "prod-2026"
+#   Argon2id parameters of the key derivation (memory in KiB, iterations, parallelism).
+#   The defaults are 19 MiB, 2 and 1; m_cost must be between 8192 and 4194304.
+# [online_backup.encryption.key_derivation]
+# m_cost = 19456
+# t_cost = 2
+# p_cost = 1
+#
+#   Cross-region replication ([online_backup.s3.replication]) and point-in-time recovery
+#   ([online_backup.wal_archive]) are not available yet. Enabling either key is rejected
+#   at startup.

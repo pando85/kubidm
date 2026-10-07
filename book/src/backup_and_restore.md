@@ -8,11 +8,11 @@ from.
 
 ## Backup Integrity Guarantees
 
-When Kubidm reports that an online or manual backup completed successfully, that backup is guaranteed to be
-semantically valid. Before finalizing any backup, the server validates every database entry through the same
-conversion path used during normal database loading (`Entry::from_dbentry`). If any entry is syntactically valid
-(deserializes correctly) but semantically invalid (cannot be loaded by the server), the backup will fail with an
-error identifying the problematic entry.
+When Kubidm reports that an online or manual backup completed successfully, that backup is guaranteed to be semantically
+valid. Before finalizing any backup, the server validates every database entry through the same conversion path used
+during normal database loading (`Entry::from_dbentry`). If any entry is syntactically valid (deserializes correctly) but
+semantically invalid (cannot be loaded by the server), the backup will fail with an error identifying the problematic
+entry.
 
 This means:
 
@@ -81,8 +81,9 @@ secret_access_key = "your-secret-key"
 
 `versions` applies independently to each location: the local directory keeps the newest `versions` backups, and the S3
 prefix keeps the newest `versions` backups. After every successful upload the server lists the objects under
-`path_prefix` and deletes the oldest automatically generated backups (`backup-<timestamp>.json[.gz]` together with their
-`.metadata.json` object) beyond that number. No other object under the prefix is ever deleted.
+`path_prefix` and deletes the oldest automatically generated backups (`backup-<timestamp>.json[.gz][.enc]` together with
+their `.metadata.json` object) beyond that number. Plain and encrypted backups count alike. No other object under the
+prefix is ever deleted.
 
 #### Custom Endpoints
 
@@ -92,13 +93,118 @@ works for services that do not use regions.
 
 #### Listing Backups
 
-`kubidmd database list-backups` prints the backups in the local directory and under the S3 prefix with their size, time
-and the first characters of the recorded SHA-256. `--local-only` and `--s3-only` restrict the output to one location.
-The command does not open the database, so it can run while the server is running.
+`kubidmd database list-backups` prints the backups in the local directory and under the S3 prefix with their size, time,
+the first characters of the recorded SHA-256 and whether they are encrypted (with the identifier of the key they need).
+`--local-only` and `--s3-only` restrict the output to one location. The command does not open the database, so it can
+run while the server is running.
 
 ```bash
 kubidmd database list-backups -c /data/server.toml
 ```
+
+### Client-Side Backup Encryption
+
+A backup contains every entry of the directory, including credential hashes and session state, so wherever it is stored
+it deserves the same protection as the database itself. Server-side encryption of the S3 bucket protects the objects at
+rest in S3 but leaves them readable to anyone with access to the bucket. Client-side encryption encrypts every backup
+inside the server before it is written or uploaded, so that a backup can only be restored by whoever holds the key.
+
+Enable it in the `[online_backup.encryption]` section:
+
+```toml
+[online_backup.encryption]
+enabled = true
+key_source = "Passphrase"
+passphrase_file = "/etc/kubidm/backup-passphrase"
+key_identifier = "prod-2026"
+```
+
+When it is enabled, every backup made from this configuration is encrypted: the scheduled online backup, its upload to
+S3, `kubidmd database backup` and `kubidmd scripting backup` (also when it writes to stdout). The backup is serialised
+and compressed as usual and the result is then sealed with AES-256-GCM under a key derived from the configured secret
+with Argon2id and a fresh random salt. The artifact is a self-describing container: a header with the salt, the key
+derivation parameters, the nonce, the key identifier and the compression, followed by the ciphertext. Nothing but the
+secret is needed to open it.
+
+#### Key Sources
+
+`key_source` names where the secret comes from. Whatever the source, the secret is only ever used as input to the key
+derivation and never as the cipher key itself.
+
+- `"Passphrase"` (default): the passphrase is read from the `KUBIDM_BACKUP_PASSPHRASE` environment variable of the
+  `kubidmd` process. When `passphrase_file` is set, the passphrase is read from that file instead (trailing whitespace
+  and newlines are ignored) and the environment variable is not consulted. One of the two must be present, or the server
+  refuses to start.
+- `{ File = { path = "/etc/kubidm/backup.key" } }`: the content of the file is the secret, byte for byte. Generate it
+  with for example `head -c 32 /dev/urandom > /etc/kubidm/backup.key` and keep it readable only by the server user.
+- `{ HttpEndpoint = { url = "https://vault.example.com/v1/kubidm-backup-key" } }`: the response body of a GET request to
+  the URL is the secret. The endpoint is called every time a backup is made or restored, so it has to be reachable from
+  the server and from the host that restores.
+
+At startup, and in `kubidmd configtest`, the key source is checked to be usable: the passphrase file or environment
+variable is present and not empty, the key file exists and is readable, the URL is a well formed `http` or `https` URL
+(it is not fetched at that point). The key derivation parameters (`key_derivation.m_cost` in KiB, `t_cost`, `p_cost`)
+must lie within sane bounds; the defaults are 19 MiB, 2 iterations and no parallelism.
+
+#### Key Identifier
+
+Every artifact records the `key_identifier` of the key it was encrypted with, and so does the `.metadata.json` object in
+S3. When no identifier is configured, a fingerprint of the key material is used, so artifacts made with the same secret
+always carry the same identifier. The identifier is public information: it tells an operator which key a backup needs,
+it is shown by `list-backups`, `verify-backup` and `verify-s3`, and it is named in every error about a key that could
+not be obtained or does not fit.
+
+When a `key_identifier` is configured, a restore refuses an artifact whose header names a different one before trying to
+decrypt it. Without a configured identifier the key is simply tried.
+
+#### Naming and Storage
+
+Encrypted artifacts get the extra suffix `.enc` after the compression suffix: `backup-<timestamp>.json.enc` and
+`backup-<timestamp>.json.gz.enc`. Retention, `list-backups` and the post-write verification treat them as first class
+backups, and a rejected encrypted artifact is quarantined as `...json.gz.enc.invalid` like a plain one. The suffix is
+informational: an encrypted container is recognised by its content, so a renamed artifact still restores.
+
+What is and is not encrypted:
+
+- The backup itself, meaning every entry, is encrypted.
+- The `.metadata.json` sidecar in S3 stays in plaintext. It contains only the SHA-256 checksum and size of the encrypted
+  object, the upload timestamp, the compression, `encrypted = true` and the key identifier. It never contains directory
+  content or the key.
+- The file names and object keys embed only the timestamp.
+
+#### Restoring an Encrypted Backup
+
+`restore`, `verify-backup`, `restore-s3` and `verify-s3` decrypt transparently: they read the
+`[online_backup.encryption]` section of the configuration they are given, obtain the secret from its key source and open
+the artifact with it. A cold restore on a fresh host therefore needs the server configuration file and the secret it
+names: the passphrase (in `KUBIDM_BACKUP_PASSPHRASE` or in the `passphrase_file`), the key file, or access to the key
+endpoint. Nothing from the old host's database or data directory is required.
+
+```bash
+docker stop <container name>
+docker run --rm -i -t -v kubidmd:/data -v kubidmd_backups:/backup \
+    -e KUBIDM_BACKUP_PASSPHRASE \
+    kubidm/server:latest /sbin/kubidmd database restore -c /data/server.toml \
+    /backup/backup-2024-01-01T22:00:00Z.json.gz.enc
+docker start <container name>
+```
+
+The commands fail with a clear message, and leave the target database untouched, when the artifact is encrypted and
+encryption is not enabled in the configuration, when the secret can not be obtained, when the configured
+`key_identifier` differs from the one in the artifact, or when the secret does not decrypt it. Each message names the
+key identifier recorded in the artifact. Plain backups made before encryption was enabled keep restoring with an
+encrypting configuration.
+
+A deployment that has turned encryption on keeps its secret outside of the backups it protects. Store the passphrase or
+key file in a password manager or secret store that survives the loss of the server, and test a restore from it.
+
+#### Key Rotation
+
+Changing the secret only affects the backups made from then on. Every existing artifact stays encrypted with the key it
+was written with and needs that key to be restored; its key identifier says which. When rotating, keep the previous
+secret for as long as backups made with it are retained, and give each key its own `key_identifier` so that
+`list-backups` and the error messages tell the two apart. To restore an artifact made with a previous key, point the
+configuration at that secret (and its identifier, if one was configured) for the duration of the restore.
 
 ### Features Not Yet Available
 
@@ -106,7 +212,6 @@ The following backup features are planned but are not implemented in this releas
 
 - Cross-region backup replication (`online_backup.s3.replication`)
 - Point-in-time recovery and WAL archiving (`online_backup.wal_archive`)
-- Client-side backup encryption (`online_backup.encryption`)
 
 Their configuration keys are still parsed so that existing files load, but enabling any of them is rejected when the
 server starts and by `kubidmd configtest`. Remove or disable these keys until the features ship.
@@ -123,6 +228,9 @@ different kinds of verification:
   [Verifying S3 Backups](#verifying-s3-backups).
 - **Restorability**: `kubidmd database verify-backup` inspects the content of a local backup artifact. It has two
   levels, described below.
+
+Both commands decrypt a client-side encrypted artifact with the key named in the configuration, see
+[Client-Side Backup Encryption](#client-side-backup-encryption), and fail when they can not.
 
 ### Structural Verification
 
@@ -181,6 +289,11 @@ docker start <container name>
 ```
 
 You can then restart your instance. DO NOT modify the backup.json as it may introduce data errors into your instance.
+
+The manual backup uses the `compression` and the `[online_backup.encryption]` settings of the configuration. With
+encryption enabled, the file written is an encrypted container whatever its name; name it with the `.enc` suffix
+(`/backup/kubidm.backup.json.enc`) to keep it recognisable, and keep the key, see
+[Client-Side Backup Encryption](#client-side-backup-encryption).
 
 To restore from the backup:
 
