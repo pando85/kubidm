@@ -44,7 +44,10 @@ mod utils;
 use crate::{
     actors::{QueryServerReadV1, QueryServerWriteV1},
     admin::AdminActor,
-    backup::{is_backup_artifact_name, S3BackupError, S3ClientWrapper},
+    backup::{
+        finalize_local_backup, is_backup_artifact_name, verify_backup_output, BackupVerifyError,
+        S3BackupError, S3ClientWrapper,
+    },
     config::{Configuration, ServerRole},
     interval::IntervalActor,
     repl::ReplicationServerHandles,
@@ -60,7 +63,9 @@ use kubidm_proto::{
     scim_v1::client::ScimAssertGeneric,
 };
 use kubidmd_lib::{
-    be::{verify_backup_structure, Backend, BackendConfig, BackendTransaction},
+    be::{
+        verify_backup_structure, Backend, BackendConfig, BackendTransaction, BackupStructuralReport,
+    },
     idm::ldap::LdapServer,
     prelude::*,
     schema::Schema,
@@ -72,6 +77,7 @@ use sketching::LoggerType;
 use std::{
     collections::BTreeSet,
     fmt::{Display, Formatter},
+    io::Write,
     path::{Path, PathBuf},
     sync::{Arc, LazyLock},
     time::SystemTime,
@@ -412,25 +418,61 @@ pub fn backup_server_core(config: &Configuration, dst_path: Option<&Path>) {
         };
 
         match be_ro_txn.backup(output, compression) {
-            Ok(_) => info!("Backup success!"),
+            Ok(_) => info!("Backup written to {}", dst_path.display()),
             Err(e) => {
                 error!("Backup failed: {:?}", e);
                 std::process::exit(1);
             }
         };
-    } else {
-        // No path set, default to stdout
-        let stdout = std::io::stdout().lock();
 
-        match be_ro_txn.backup(stdout, compression) {
-            Ok(_) => info!("Backup success!"),
-            Err(e) => {
-                error!("Backup failed: {:?}", e);
-                std::process::exit(1);
-            }
-        };
+        // Read the artifact back before announcing it. A rejected artifact is kept under
+        // an `.invalid` suffix for inspection.
+        report_backup_verification(finalize_local_backup(dst_path, compression));
+    } else {
+        // No path set, default to stdout. The backup is produced in memory first so that
+        // only a verified backup is ever emitted.
+        let mut backup_data = Vec::new();
+
+        if let Err(e) = be_ro_txn.backup(&mut backup_data, compression) {
+            error!("Backup failed: {:?}", e);
+            std::process::exit(1);
+        }
+
+        report_backup_verification(verify_backup_output(&backup_data[..], compression));
+
+        let mut stdout = std::io::stdout().lock();
+        if let Err(err) = stdout.write_all(&backup_data).and_then(|()| stdout.flush()) {
+            error!(?err, "Backup failed: unable to write to stdout");
+            std::process::exit(1);
+        }
     };
+    info!("Backup success!");
     // Let the txn abort, even on success.
+}
+
+/// Print the outcome of the post-write verification of a manual backup. A rejected backup
+/// terminates the process with a non-zero exit code, as a failed write does.
+fn report_backup_verification(verified: Result<BackupStructuralReport, BackupVerifyError>) {
+    match verified {
+        Ok(report) => {
+            eprintln!(
+                "Backup verified: {} entries, written by server version {}",
+                report.entry_count,
+                report.version.as_deref().unwrap_or("unknown")
+            );
+        }
+        Err(err) => {
+            error!("Backup failed verification: {err}");
+            eprintln!("Backup verification: FAIL");
+            for reason in &err.reasons {
+                eprintln!("  - {reason}");
+            }
+            if let Some(path) = &err.quarantined_to {
+                eprintln!("  The rejected artifact was kept as {}", path.display());
+            }
+            std::process::exit(1);
+        }
+    }
 }
 
 pub async fn restore_server_core(config: &Configuration, dst_path: &Path) {

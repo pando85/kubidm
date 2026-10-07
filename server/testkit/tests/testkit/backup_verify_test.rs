@@ -8,10 +8,12 @@
 use std::path::{Path, PathBuf};
 
 use kubidm_proto::backup::BackupCompression;
+use kubidmd_core::backup::{is_backup_artifact_name, INVALID_BACKUP_SUFFIX};
 use kubidmd_core::config::Configuration;
 use kubidmd_core::{
     restore_database, verify_backup_server_core, verify_booted_database, BackupVerifyLevel,
 };
+use kubidmd_lib::be::verify_backup_structure;
 use kubidmd_testkit::{
     login_put_admin_idm_admins, AsyncTestEnvironment, NOT_ADMIN_TEST_PASSWORD,
     NOT_ADMIN_TEST_USERNAME, TEST_INTEGRATION_RS_ID,
@@ -51,6 +53,85 @@ async fn populated_backup(workdir: &Path) -> (PathBuf, String) {
     env.core_handle.shutdown().await;
 
     (backup, user_token)
+}
+
+/// The online backup verifies every artifact right after writing it. A backup that passed
+/// keeps its name (a rejected one is renamed with `.invalid`) and reads back with the same
+/// structural checks as `verify-backup --level structural`.
+fn assert_backup_verified_after_write(backup: &Path, compression: BackupCompression) {
+    let file_name = backup
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("Backup has no file name");
+    assert!(
+        !file_name.ends_with(INVALID_BACKUP_SUFFIX),
+        "A backup that passed verification must keep its name: {file_name}"
+    );
+    assert!(
+        is_backup_artifact_name(file_name),
+        "A verified backup must be retained by retention: {file_name}"
+    );
+    assert!(
+        file_name.ends_with(&format!(".json{}", compression.suffix())),
+        "Backup name must carry the compression suffix: {file_name}"
+    );
+
+    let report = verify_backup_structure(
+        std::fs::File::open(backup).expect("Failed to open backup"),
+        compression,
+    )
+    .expect("A verified backup must parse");
+    assert!(
+        report.is_valid(),
+        "A verified backup must pass structural checks: {:?}",
+        report.errors
+    );
+    assert_eq!(report.version.as_deref(), Some(env!("KUBIDM_PKG_SERIES")));
+
+    // The entry count reported by verification is the number of entries in the artifact.
+    let raw = std::fs::read(backup).expect("Failed to read backup");
+    let document: Value = match compression {
+        BackupCompression::NoCompression => serde_json::from_slice(&raw),
+        BackupCompression::Gzip => serde_json::from_reader(flate2::read::GzDecoder::new(&raw[..])),
+    }
+    .expect("Backup is not JSON");
+    let entries = document
+        .get("entries")
+        .and_then(Value::as_array)
+        .expect("Backup has no entries");
+    assert_eq!(report.entry_count, entries.len());
+    assert!(report.entry_count > 0);
+}
+
+#[test]
+fn test_online_backup_is_verified_after_write() {
+    run(async {
+        let workdir = tempfile::tempdir().expect("Failed to create workdir");
+        let mut env = start_server(&workdir.path().join("source.db")).await;
+        populate(&env).await;
+
+        for compression in [BackupCompression::NoCompression, BackupCompression::Gzip] {
+            let backup_dir = workdir
+                .path()
+                .join(format!("backups{}", compression.suffix()));
+            std::fs::create_dir(&backup_dir).expect("Failed to create backup directory");
+
+            env.core_handle
+                .trigger_online_backup(&backup_dir, 1, compression)
+                .await
+                .expect("Online backup failed");
+
+            let artifacts: Vec<PathBuf> = std::fs::read_dir(&backup_dir)
+                .expect("Failed to read backup directory")
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .collect();
+            assert_eq!(artifacts.len(), 1, "Expected exactly one backup artifact");
+            assert_backup_verified_after_write(&artifacts[0], compression);
+        }
+
+        env.core_handle.shutdown().await;
+    });
 }
 
 #[test]

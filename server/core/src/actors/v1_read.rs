@@ -50,7 +50,10 @@ use tracing::{error, info, instrument, trace};
 use uuid::Uuid;
 
 use super::QueryServerReadV1;
-use crate::backup::{is_backup_artifact_name, select_backups_to_delete, S3ClientWrapper};
+use crate::backup::{
+    finalize_local_backup, is_backup_artifact_name, select_backups_to_delete, verify_backup_output,
+    S3ClientWrapper,
+};
 
 // ===========================================================
 
@@ -259,6 +262,25 @@ impl QueryServerReadV1 {
                 })?;
         }
 
+        // Never announce, retain or prune on the strength of a backup that can not be
+        // read back. A rejected artifact is kept under an `.invalid` suffix, which the
+        // retention matcher ignores, and retention below is skipped so that a failed
+        // backup can not cause an older good backup to be removed.
+        let report = finalize_local_backup(&dest_file, compression).map_err(|err| {
+            error!(
+                reasons = ?err.reasons,
+                quarantined_to = ?err.quarantined_to,
+                "Online backup {} failed verification",
+                dest_file.display()
+            );
+            OperationError::InvalidState
+        })?;
+        info!(
+            entries = report.entry_count,
+            version = ?report.version,
+            "Online backup verified"
+        );
+
         // TODO: make the file rotation a separate function
 
         // cleanup of maximum backup versions to keep
@@ -371,6 +393,22 @@ impl QueryServerReadV1 {
         }
 
         let object_key = format!("backup-{timestamp}.json{}", compression.suffix());
+
+        // A backup that can not be read back is never uploaded, so the bucket only ever
+        // holds artifacts that passed the same structural checks as `verify-backup`.
+        let report = verify_backup_output(&backup_data[..], compression).map_err(|err| {
+            error!(
+                reasons = ?err.reasons,
+                "S3 backup {} failed verification and was not uploaded",
+                object_key
+            );
+            OperationError::InvalidState
+        })?;
+        info!(
+            entries = report.entry_count,
+            version = ?report.version,
+            "Online backup verified"
+        );
 
         s3_client
             .upload_backup(backup_data, &object_key, timestamp, compression)
