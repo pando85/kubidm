@@ -191,6 +191,52 @@ compression = "gzip"
 # algorithm = "aws:kms"  # or "AES256"
 # kms_key_id = "arn:aws:kms:us-east-1:123456789:key/..."
 #
-#   Cross-region replication ([online_backup.s3.replication]), point-in-time recovery
-#   ([online_backup.wal_archive]) and client-side encryption ([online_backup.encryption])
-#   are not available yet. Enabling any of these keys is rejected at startup.
+#   Optional: Cross-region replication of the S3 backups.
+#   After every successful upload, the backup object and its .metadata.json sidecar are
+#   copied to every region listed here, and each region keeps its newest `versions`
+#   backups (the same retention as the primary bucket). A region that can not be
+#   written to is logged as an error and skipped; the primary backup still succeeds.
+#   Every `sync_interval_seconds`, the server checks that each region holds all the
+#   primary's backups and logs a warning per region that does not.
+#   `kubidmd database replicate-status` prints the same check on demand, and
+#   `restore-s3`, `verify-s3` and `list-backups` take `--region <name>` to work on a
+#   region's copies instead of the primary bucket.
+#   Requires at least one region, unique region names, a bucket per region and a
+#   positive sync_interval_seconds when enabled.
+#
+# [online_backup.s3.replication]
+# enabled = true
+#   Seconds between two replication health checks (default 300)
+# sync_interval_seconds = 300
+#   Further attempts when copying a backup to a region fails (default 3) ...
+# max_retries = 3
+#   ... and the seconds to wait between attempts (default 30)
+# retry_delay_seconds = 30
+#
+#   One entry per region. `region` names the entry (for replicate-status and --region)
+#   and is the signing region of its requests; `bucket` is required.
+# [[online_backup.s3.replication.regions]]
+# region = "eu-west-1"
+# bucket = "kubidm-backups-eu"
+#   Optional: Custom endpoint for MinIO or other S3-compatible services
+# endpoint = "https://s3.eu-west-1.example.com"
+#   Optional: Path prefix inside the region's bucket (independent from the primary's)
+# path_prefix = "dr"
+#   Optional: Storage class for the copies (default STANDARD)
+# storage_class = "STANDARD_IA"
+#   Optional: Shorthand for aws:kms server-side encryption with this key. An explicit
+#   [online_backup.s3.replication.regions.server_side_encryption] block takes precedence.
+# kms_key_id = "arn:aws:kms:eu-west-1:123456789:key/..."
+#   Optional: Credentials for this region. Omit to use the SDK default provider chain
+#   (environment variables, profile, instance role).
+# [online_backup.s3.replication.regions.credentials]
+# access_key_id = "eu-region-access-key-id"
+# secret_access_key = "eu-region-secret-access-key"
+#
+# [[online_backup.s3.replication.regions]]
+# region = "ap-southeast-1"
+# bucket = "kubidm-backups-ap"
+#
+#   Point-in-time recovery ([online_backup.wal_archive]) and client-side encryption
+#   ([online_backup.encryption]) are not available yet. Enabling either key is rejected
+#   at startup.
