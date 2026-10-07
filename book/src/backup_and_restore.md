@@ -71,173 +71,26 @@ secret_access_key = "your-secret-key"
 2. **IAM Role Authentication**: Omit the `credentials` section - the server will use IAM roles when running on EC2/EKS
 3. **Environment Variables**: Set `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and optionally `AWS_SESSION_TOKEN`
 
-### Cross-Region Backup Replication
+### Features Not Yet Available
 
-For enterprise disaster recovery, Kubidm supports automatic cross-region backup replication to ensure backups are
-available in multiple geographic regions. This provides:
+The following backup features are planned but are not implemented in this release:
 
-- Geographic backup redundancy
-- Cross-region recovery capability
-- Protection against regional outages
-- Compliance with data residency requirements
+- Cross-region backup replication (`online_backup.s3.replication`)
+- Point-in-time recovery and WAL archiving (`online_backup.wal_archive`)
+- Client-side backup encryption (`online_backup.encryption`)
 
-#### Configuration
-
-Add a `replication` section to your S3 configuration:
-
-```toml
-[online_backup.s3.replication]
-enabled = true
-# How often to check replication status (seconds)
-sync_interval_seconds = 300
-# Maximum retry attempts for failed replication
-max_retries = 3
-# Delay between retry attempts (seconds)
-retry_delay_seconds = 30
-
-# Configure secondary regions (multiple regions supported)
-[[online_backup.s3.replication.regions]]
-region = "eu-west-1"
-bucket = "kubidm-backups-eu"
-# Optional: Custom endpoint for non-AWS S3
-# endpoint = "https://s3.eu-west-1.amazonaws.com"
-# Optional: Path prefix
-# path_prefix = "dr-backups"
-# Optional: Storage class
-# storage_class = "STANDARD"
-
-# Optional: Region-specific encryption key
-# kms_key_id = "arn:aws:kms:eu-west-1:123456789:key/..."
-
-# Optional: Region-specific credentials (if different from primary)
-# [online_backup.s3.replication.regions.credentials]
-# access_key_id = "eu-region-key"
-# secret_access_key = "eu-region-secret"
-
-# Add additional regions as needed
-[[online_backup.s3.replication.regions]]
-region = "ap-southeast-1"
-bucket = "kubidm-backups-ap"
-```
-
-#### Region-Specific Encryption Keys
-
-For compliance requirements, you can configure region-specific KMS keys:
-
-```toml
-[[online_backup.s3.replication.regions]]
-region = "eu-west-1"
-bucket = "kubidm-backups-eu"
-kms_key_id = "arn:aws:kms:eu-west-1:123456789:key/eu-key-id"
-
-[online_backup.s3.replication.regions.server_side_encryption]
-algorithm = "aws:kms"
-kms_key_id = "arn:aws:kms:eu-west-1:123456789:key/eu-key-id"
-```
-
-#### Checking Replication Status
-
-Use the `replicate-status` command to check the health of cross-region replication:
-
-```bash
-kubidmd database replicate-status -c /data/server.toml
-```
-
-For detailed output including lag metrics per region:
-
-```bash
-kubidmd database replicate-status -c /data/server.toml --detailed
-```
-
-The output shows:
-- Overall replication status
-- Per-region status (Completed, In Progress, Degraded, Failed)
-- Number of backups replicated
-- Bytes replicated
-- Replication lag in seconds
-- Last successful sync timestamp
-
-#### Recovery from Secondary Region
-
-To recover from a backup stored in a secondary region:
-
-1. **Identify the backup in the secondary region**:
-   ```bash
-   # Use AWS CLI or S3 tools to list backups in the secondary region bucket
-   aws s3 ls s3://kubidm-backups-eu/
-   ```
-
-2. **Restore using the S3 backup key**:
-   ```bash
-   docker stop <container name>
-   docker run --rm -i -t -v kubidmd:/data \
-       kubidm/server:latest /sbin/kubidmd database restore-s3 -c /data/server.toml \
-       --bucket kubidm-backups-eu --key backup-2024-01-01T22:00:00Z.json.gz
-   docker start <container name>
-   ```
-
-#### Monitoring Replication Lag
-
-Replication lag metrics can be integrated with monitoring systems:
-
-- `total_lag_seconds`: Cumulative lag across all regions
-- `max_lag_seconds`: Maximum lag in any region
-- `healthy_regions`: Count of regions with healthy replication
-- `unhealthy_regions`: Count of regions with issues
-
-Set up alerts for:
-- `max_lag_seconds > threshold` (e.g., 3600 for 1 hour lag)
-- `unhealthy_regions > 0`
-- Overall status changing to `Failed` or `Degraded`
-
-#### Disaster Recovery Runbook
-
-**Scenario: Primary Region Outage**
-
-1. Verify secondary region backups are available:
-   ```bash
-   # Check backup availability in secondary region (using S3 tools)
-   aws s3 ls s3://kubidm-backups-eu/ --region eu-west-1
-   ```
-
-2. Deploy Kubidm instance in secondary region:
-   - Configure `server.toml` to use secondary region S3 bucket
-   - Use region-specific encryption keys if configured
-
-3. Restore from secondary region backup:
-   ```bash
-   kubidmd database restore-s3 -c /data/server.toml \
-       --bucket kubidm-backups-eu --key backup-2024-01-01T22:00:00Z.json.gz
-   ```
-
-4. Verify restoration success and start server
-
-5. Update DNS/network configuration to point to new instance
-
-**Important Considerations**
-
-- S3 Cross-Region Replication has eventual consistency - expect RPO based on replication lag
-- Regularly test recovery from secondary regions to validate DR procedures
-- Document region-specific encryption key locations for recovery scenarios
-- Consider immutable storage (S3 Object Lock) for ransomware protection
-- Review compliance requirements for data residency in secondary regions
-
-#### Backup Verification
-
-Each S3 backup includes a SHA-256 checksum that is verified automatically on restore. You can verify backups
-without restoring using:
-
-```bash
-kubidmd database verify-s3 -c /data/server.toml backup-2024-01-01T22:00:00Z.json.gz
-```
+Their configuration keys are still parsed so that existing files load, but enabling any of them is rejected when the
+server starts and by `kubidmd configtest`. Remove or disable these keys until the features ship.
 
 ## Verifying That a Backup Can Be Restored
 
 A backup that was written successfully is not necessarily a backup that can be restored. Kubidm therefore offers two
 different kinds of verification:
 
-- **Storage integrity**: `kubidmd database verify-s3` checks the SHA-256 checksum of an artifact stored in S3. It proves
-  the bytes in S3 are the bytes that were uploaded, but says nothing about their content.
+- **Storage integrity**: Each backup uploaded to S3 is stored next to a `<key>.metadata.json` object that records the
+  `checksum_sha256`, `timestamp`, `compression` and `size_bytes` of the artifact. To restore or verify an S3 artifact,
+  first download it with your S3 tooling (for example `aws s3 cp`), optionally compare its SHA-256 against the metadata
+  object, and then use `kubidmd database restore` or `kubidmd database verify-backup` on the downloaded file.
 - **Restorability**: `kubidmd database verify-backup` inspects the content of a local backup artifact. It has two
   levels, described below.
 
@@ -290,18 +143,6 @@ docker stop <container name>
 docker run --rm -i -t -v kubidmd:/data -v kubidmd_backups:/backup \
     kubidm/server:latest /sbin/kubidmd database restore -c /data/server.toml \
     /backup/kubidm.backup.json
-docker start <container name>
-```
-
-### Restoring from S3
-
-To restore from an S3 backup:
-
-```bash
-docker stop <container name>
-docker run --rm -i -t -v kubidmd:/data \
-    kubidm/server:latest /sbin/kubidmd database restore-s3 -c /data/server.toml \
-    --bucket kubidm-backups --key backup-2024-01-01T22:00:00Z.json.gz
 docker start <container name>
 ```
 

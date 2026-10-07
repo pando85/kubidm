@@ -101,14 +101,15 @@ enum DbCommands {
     #[clap(name = "reindex")]
     /// Reindex the database (offline)
     Reindex,
-    #[clap(name = "recover")]
-    /// Point-in-Time Recovery (PITR) - recover database to a specific point in time
+    #[clap(name = "recover", hide = true)]
+    /// Point-in-Time Recovery (PITR) - recover database to a specific point in time.
+    /// Not yet implemented.
     Recover(PitrRecoverOpt),
-    #[clap(name = "pitr-list")]
-    /// List available recovery points for Point-in-Time Recovery
+    #[clap(name = "pitr-list", hide = true)]
+    /// List available recovery points for Point-in-Time Recovery. Not yet implemented.
     PitrList,
-    #[clap(name = "replicate-status")]
-    /// Check cross-region backup replication status
+    #[clap(name = "replicate-status", hide = true)]
+    /// Check cross-region backup replication status. Not yet implemented.
     ReplicateStatus {
         /// Output detailed lag metrics for each region
         #[clap(long)]

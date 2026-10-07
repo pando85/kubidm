@@ -191,41 +191,6 @@ compression = "gzip"
 # algorithm = "aws:kms"  # or "AES256"
 # kms_key_id = "arn:aws:kms:us-east-1:123456789:key/..."
 #
-#   Cross-region replication (optional)
-#   Enables backup replication to secondary regions for disaster recovery
-# [online_backup.s3.replication]
-# enabled = true
-#   Sync interval in seconds (default: 300)
-# sync_interval_seconds = 300
-#   Maximum retry attempts (default: 3)
-# max_retries = 3
-#   Retry delay in seconds (default: 30)
-# retry_delay_seconds = 30
-#
-#   Configure secondary region
-# [[online_backup.s3.replication.regions]]
-# region = "eu-west-1"
-# bucket = "kubidm-backups-eu"
-#   Optional: Custom endpoint
-# endpoint = "https://s3.eu-west-1.amazonaws.com"
-#   Optional: Path prefix in secondary bucket
-# path_prefix = "dr-backups"
-#   Optional: Storage class
-# storage_class = "STANDARD"
-#   Optional: Region-specific KMS key
-# kms_key_id = "arn:aws:kms:eu-west-1:123456789:key/eu-key-id"
-#
-#   Optional: Region-specific credentials
-# [online_backup.s3.replication.regions.credentials]
-# access_key_id = "eu-access-key-id"
-# secret_access_key = "eu-secret-access-key"
-#
-#   Optional: Region-specific server-side encryption
-# [online_backup.s3.replication.regions.server_side_encryption]
-# algorithm = "aws:kms"
-# kms_key_id = "arn:aws:kms:eu-west-1:123456789:key/eu-key-id"
-#
-#   Add additional regions as needed
-# [[online_backup.s3.replication.regions]]
-# region = "ap-southeast-1"
-# bucket = "kubidm-backups-ap"
+#   Cross-region replication ([online_backup.s3.replication]), point-in-time recovery
+#   ([online_backup.wal_archive]) and client-side encryption ([online_backup.encryption])
+#   are not available yet. Enabling any of these keys is rejected at startup.
