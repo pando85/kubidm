@@ -103,8 +103,13 @@ fn assert_backup_verified_after_write(backup: &Path, compression: BackupCompress
     assert!(report.entry_count > 0);
 }
 
+/// Happy path of the post-write verification of online backups: a production backup, plain
+/// and gzip, keeps its retention-matching name and reads back structurally valid with the
+/// entry count it carries. Fault injection (garbage, compression mismatch, unrestorable
+/// content, quarantine naming) is covered by the `kubidmd_core::backup::finalize` unit
+/// tests, since the backend can not be made to emit a broken artifact from here.
 #[test]
-fn test_online_backup_is_verified_after_write() {
+fn test_online_backup_keeps_verified_artifact_name_and_structure() {
     run(async {
         let workdir = tempfile::tempdir().expect("Failed to create workdir");
         let mut env = start_server(&workdir.path().join("source.db")).await;

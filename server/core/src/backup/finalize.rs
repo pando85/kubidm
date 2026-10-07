@@ -13,7 +13,6 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use kubidm_proto::backup::BackupCompression;
-use kubidm_proto::internal::OperationError;
 use kubidmd_lib::be::{verify_backup_structure, BackupStructuralReport};
 
 /// Suffix appended to the file name of a freshly written local backup that failed
@@ -40,11 +39,8 @@ impl fmt::Display for BackupVerifyError {
     }
 }
 
-impl From<BackupVerifyError> for OperationError {
-    fn from(_: BackupVerifyError) -> Self {
-        OperationError::InvalidState
-    }
-}
+/// Upper bound on the numbered `.invalid.N` quarantine names tried for one path.
+const MAX_QUARANTINE_ATTEMPTS: usize = 1000;
 
 /// The path a rejected backup at `path` is moved to: the same file name with
 /// [`INVALID_BACKUP_SUFFIX`] appended.
@@ -52,6 +48,24 @@ pub fn invalid_backup_path(path: &Path) -> PathBuf {
     let mut name = path.file_name().map(ToOwned::to_owned).unwrap_or_default();
     name.push(INVALID_BACKUP_SUFFIX);
     path.with_file_name(name)
+}
+
+/// A quarantine path for `path` that does not exist yet: [`invalid_backup_path`], or when
+/// an earlier rejected artifact already holds that name (an operator retrying a manual
+/// backup to the same destination), `<name>.invalid.1`, `.2`, ... so that every forensic
+/// copy is kept. `None` when [`MAX_QUARANTINE_ATTEMPTS`] names are all taken.
+fn available_invalid_backup_path(path: &Path) -> Option<PathBuf> {
+    let base = invalid_backup_path(path);
+    if !base.exists() {
+        return Some(base);
+    }
+    (1..MAX_QUARANTINE_ATTEMPTS)
+        .map(|n| {
+            let mut name = base.file_name().map(ToOwned::to_owned).unwrap_or_default();
+            name.push(format!(".{n}"));
+            base.with_file_name(name)
+        })
+        .find(|candidate| !candidate.exists())
 }
 
 /// Structurally verify a backup that has been produced into `input`. This is the check
@@ -93,7 +107,13 @@ pub fn finalize_local_backup(
         .and_then(|file| verify_backup_output(file, compression));
 
     verified.map_err(|mut err| {
-        let invalid = invalid_backup_path(path);
+        let Some(invalid) = available_invalid_backup_path(path) else {
+            err.reasons.push(format!(
+                "unable to quarantine {}: {MAX_QUARANTINE_ATTEMPTS} rejected copies already exist",
+                path.display()
+            ));
+            return err;
+        };
         match std::fs::rename(path, &invalid) {
             Ok(()) => err.quarantined_to = Some(invalid),
             Err(rename_err) => err.reasons.push(format!(
@@ -244,6 +264,30 @@ mod tests {
             err.reasons.len() >= 2,
             "reopen and rename failures are both reported"
         );
+    }
+
+    #[test]
+    fn test_finalize_keeps_every_rejected_copy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("backup-retry.json");
+        let invalid = invalid_backup_path(&path);
+
+        std::fs::write(&path, b"first attempt").expect("write");
+        let first = finalize_local_backup(&path, BackupCompression::NoCompression)
+            .expect_err("garbage must be rejected");
+        assert_eq!(first.quarantined_to.as_deref(), Some(invalid.as_path()));
+
+        // An operator retries the same destination and it fails again: the earlier
+        // forensic copy must not be overwritten.
+        std::fs::write(&path, b"second attempt").expect("write");
+        let second = finalize_local_backup(&path, BackupCompression::NoCompression)
+            .expect_err("garbage must be rejected");
+        let numbered = dir.path().join("backup-retry.json.invalid.1");
+        assert_eq!(second.quarantined_to.as_deref(), Some(numbered.as_path()));
+
+        assert_eq!(std::fs::read(&invalid).expect("read"), b"first attempt");
+        assert_eq!(std::fs::read(&numbered).expect("read"), b"second attempt");
+        assert!(!path.exists());
     }
 
     #[test]

@@ -250,7 +250,7 @@ impl QueryServerReadV1 {
                 .get_be_txn()
                 .backup(output, compression)
                 .map(|()| {
-                    info!("Online backup created {} successfully", dest_file.display());
+                    debug!("Online backup written to {}", dest_file.display());
                 })
                 .map_err(|e| {
                     error!(
@@ -266,6 +266,9 @@ impl QueryServerReadV1 {
         // read back. A rejected artifact is kept under an `.invalid` suffix, which the
         // retention matcher ignores, and retention below is skipped so that a failed
         // backup can not cause an older good backup to be removed.
+        // Should the rename itself fail, the rejected file keeps a retention-matching name
+        // and the next run may count it as a backup; the loud error below, which carries
+        // the rename failure in `reasons`, is the mitigation.
         let report = finalize_local_backup(&dest_file, compression).map_err(|err| {
             error!(
                 reasons = ?err.reasons,

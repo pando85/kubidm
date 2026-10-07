@@ -89,7 +89,7 @@ image = { workspace = true, default-features = false, features = [
     "webp",
 ] }
 svg = { workspace = true }
-flate2 = "1.1.9"
+flate2 = { workspace = true }
 
 [target.'cfg(target_family = "windows")'.dependencies]
 whoami = { workspace = true }
