@@ -4746,6 +4746,7 @@ dependencies = [
  "sshkey-attest",
  "subtle",
  "svg",
+ "tempfile",
  "time",
  "tokio",
  "toml",

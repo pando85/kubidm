@@ -1,5 +1,10 @@
 //! Relates to backup functionality in the Server
-use std::{fmt::Display, path::Path, str::FromStr, time::Duration};
+use std::{
+    fmt::Display,
+    path::{Path, PathBuf},
+    str::FromStr,
+    time::Duration,
+};
 
 use serde::{Deserialize, Serialize};
 use serde_with::DeserializeFromStr;
@@ -827,16 +832,34 @@ impl S3BackupMetadata {
     }
 }
 
+/// Configuration of write-ahead log (WAL) archiving for point-in-time recovery.
+///
+/// When enabled, every committed write transaction appends the full serialised state of
+/// each entry it changed to a local WAL segment. Closed segments are uploaded to S3 when
+/// an S3 configuration is present (this section's, or otherwise the one of
+/// `[online_backup.s3]`) and are otherwise kept in `local_path`.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct WalArchiveConfig {
     #[serde(default = "default_wal_enabled")]
     pub enabled: bool,
+    /// S3 location of the archived segments. Defaults to the `[online_backup.s3]` section.
     #[serde(default)]
     pub s3: Option<S3Config>,
+    /// How long archived segments are kept. A segment is never deleted while it is newer
+    /// than the oldest base backup that is still available, whatever this value.
     #[serde(default = "default_wal_retention_days")]
     pub retention_days: u32,
+    /// A segment is closed once the records it holds reach this size.
     #[serde(default = "default_wal_segment_size")]
     pub segment_size_bytes: u64,
+    /// A segment is also closed once it is this old, so that a quiet server still archives
+    /// its changes regularly. This is also the period of the upload task.
+    #[serde(default = "default_wal_segment_interval_seconds")]
+    pub segment_interval_seconds: u64,
+    /// Directory the server writes segments to before they are uploaded, and where they
+    /// stay when no S3 location is configured. Defaults to `wal` next to the database.
+    #[serde(default)]
+    pub local_path: Option<PathBuf>,
 }
 
 fn default_wal_enabled() -> bool {
@@ -851,6 +874,10 @@ fn default_wal_segment_size() -> u64 {
     16 * 1024 * 1024
 }
 
+fn default_wal_segment_interval_seconds() -> u64 {
+    300
+}
+
 impl Default for WalArchiveConfig {
     fn default() -> Self {
         Self {
@@ -858,7 +885,33 @@ impl Default for WalArchiveConfig {
             s3: None,
             retention_days: default_wal_retention_days(),
             segment_size_bytes: default_wal_segment_size(),
+            segment_interval_seconds: default_wal_segment_interval_seconds(),
+            local_path: None,
         }
+    }
+}
+
+impl WalArchiveConfig {
+    /// Check the numeric settings. Returns the offending key and the reason.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.segment_size_bytes == 0 {
+            return Err("segment_size_bytes must be greater than zero".to_string());
+        }
+        if self.retention_days == 0 {
+            return Err("retention_days must be greater than zero".to_string());
+        }
+        if self.segment_interval_seconds == 0 {
+            return Err("segment_interval_seconds must be greater than zero".to_string());
+        }
+        Ok(())
+    }
+
+    pub fn segment_interval(&self) -> Duration {
+        Duration::from_secs(self.segment_interval_seconds)
+    }
+
+    pub fn retention(&self) -> Duration {
+        Duration::from_secs(u64::from(self.retention_days) * 24 * 60 * 60)
     }
 }
 
@@ -866,44 +919,51 @@ impl Display for WalArchiveConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "WalArchiveConfig {{ enabled: {}, retention_days: {}, segment_size: {} }}",
-            self.enabled, self.retention_days, self.segment_size_bytes
+            "WalArchiveConfig {{ enabled: {}, retention_days: {}, segment_size: {}, segment_interval_seconds: {}, local_path: {:?} }}",
+            self.enabled,
+            self.retention_days,
+            self.segment_size_bytes,
+            self.segment_interval_seconds,
+            self.local_path
         )
     }
 }
 
+/// The name of the PITR manifest, in the WAL directory or under the S3 prefix.
+pub const PITR_MANIFEST_KEY: &str = "pitr-manifest.json";
+/// The S3 key prefix, below the configured `path_prefix`, under which segments are stored.
+pub const WAL_SEGMENT_KEY_PREFIX: &str = "wal/";
+/// Current version of the manifest format.
+pub const PITR_MANIFEST_VERSION: u32 = 1;
+
+/// A closed, archived WAL segment as the manifest describes it.
+///
+/// `start_ts` and `end_ts` are the CID timestamps of the first and last record. All CIDs
+/// of a segment belong to one server (`server_uuid`), and records are ordered by CID.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct WalSegment {
+    /// The file name of the segment. Lexical order is CID order.
     pub segment_id: String,
     pub server_uuid: Uuid,
     pub start_ts: Duration,
     pub end_ts: Duration,
+    pub first_cid: String,
+    pub last_cid: String,
+    pub entry_count: u64,
     pub checksum_sha256: String,
     pub size_bytes: u64,
     pub compression: BackupCompression,
+    /// Server version that wrote the segment. Segments can only be replayed by the same
+    /// version, like backups.
+    pub server_version: String,
+    /// RFC3339 rendering of `end_ts`, for display.
     pub created_at: String,
 }
 
 impl WalSegment {
-    pub fn new(
-        segment_id: String,
-        server_uuid: Uuid,
-        start_ts: Duration,
-        end_ts: Duration,
-        checksum_sha256: String,
-        size_bytes: u64,
-        compression: BackupCompression,
-    ) -> Self {
-        Self {
-            segment_id,
-            server_uuid,
-            start_ts,
-            end_ts,
-            checksum_sha256,
-            size_bytes,
-            compression,
-            created_at: chrono::Utc::now().to_rfc3339(),
-        }
+    /// The S3 key of this segment relative to the configured `path_prefix`.
+    pub fn object_key(&self) -> String {
+        format!("{WAL_SEGMENT_KEY_PREFIX}{}", self.segment_id)
     }
 }
 
@@ -911,33 +971,138 @@ impl Display for WalSegment {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "WalSegment {{ id: {}, server: {}, range: {:?}-{:?}, size: {} }}",
-            self.segment_id, self.server_uuid, self.start_ts, self.end_ts, self.size_bytes
+            "WalSegment {{ id: {}, server: {}, range: {:?}-{:?}, entries: {}, size: {} }}",
+            self.segment_id,
+            self.server_uuid,
+            self.start_ts,
+            self.end_ts,
+            self.entry_count,
+            self.size_bytes
         )
     }
 }
 
+/// A base backup the manifest knows about.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-pub struct WalSegmentMetadata {
-    pub segment: WalSegment,
-    pub entry_count: u64,
-    pub first_cid: String,
-    pub last_cid: String,
+pub struct PitrBaseBackup {
+    /// File name (local) or object key relative to `path_prefix` (S3) of the backup.
+    pub key: String,
+    /// RFC3339 time the backup was taken.
+    pub timestamp: String,
+    /// The CID timestamp watermark of the backup: the timestamp of the last transaction
+    /// the backup contains. WAL records with a CID timestamp above it are not in the
+    /// backup and must be replayed on top of it.
+    pub watermark_ts: Duration,
+    /// Server version that wrote the backup.
+    pub server_version: String,
 }
 
+/// Index of the base backups and WAL segments a server has archived.
+///
+/// The manifest is the source of truth for recovery: it pairs every base backup with its
+/// CID watermark so that the segments that follow it can be selected.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-pub struct WalEntry {
-    pub cid_ts: Duration,
-    pub cid_server: Uuid,
-    pub entry_id: u64,
-    pub operation: WalOperation,
+pub struct PitrManifest {
+    pub version: u32,
+    pub server_uuid: Uuid,
+    /// Ordered by `watermark_ts`.
+    pub base_backups: Vec<PitrBaseBackup>,
+    /// Ordered by `start_ts`.
+    pub segments: Vec<WalSegment>,
+    /// RFC3339 time of the last update, for display.
+    pub updated_at: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-pub enum WalOperation {
-    Create { entry_data: Vec<u8> },
-    Modify { entry_data: Vec<u8> },
-    Delete,
+impl PitrManifest {
+    pub fn new(server_uuid: Uuid) -> Self {
+        Self {
+            version: PITR_MANIFEST_VERSION,
+            server_uuid,
+            base_backups: Vec::new(),
+            segments: Vec::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    /// Record a base backup, replacing any earlier record of the same key.
+    pub fn add_base_backup(&mut self, base: PitrBaseBackup) {
+        self.base_backups
+            .retain(|existing| existing.key != base.key);
+        self.base_backups.push(base);
+        self.base_backups
+            .sort_by(|a, b| a.watermark_ts.cmp(&b.watermark_ts).then(a.key.cmp(&b.key)));
+    }
+
+    /// Record a segment, replacing any earlier record of the same id.
+    pub fn add_segment(&mut self, segment: WalSegment) {
+        self.segments
+            .retain(|existing| existing.segment_id != segment.segment_id);
+        self.segments.push(segment);
+        self.segments.sort_by(|a, b| {
+            a.start_ts
+                .cmp(&b.start_ts)
+                .then(a.segment_id.cmp(&b.segment_id))
+        });
+    }
+
+    /// Drop the base backups whose key is not in `existing` any more, for example because
+    /// backup retention deleted them.
+    pub fn retain_base_backups(&mut self, existing: &[String]) {
+        self.base_backups
+            .retain(|base| existing.iter().any(|key| key == &base.key));
+    }
+
+    pub fn remove_segment(&mut self, segment_id: &str) {
+        self.segments.retain(|s| s.segment_id != segment_id);
+    }
+
+    pub fn oldest_base_backup(&self) -> Option<&PitrBaseBackup> {
+        self.base_backups.first()
+    }
+
+    /// The newest base backup whose watermark is at or before `target_ts`.
+    pub fn base_backup_for(&self, target_ts: Duration) -> Option<&PitrBaseBackup> {
+        self.base_backups
+            .iter()
+            .filter(|base| base.watermark_ts <= target_ts)
+            .next_back()
+    }
+
+    /// The segments that hold records after `watermark_ts` and up to `target_ts`, in CID
+    /// order. A segment that straddles either bound is included; the records themselves
+    /// are filtered at replay time.
+    pub fn segments_between(
+        &self,
+        watermark_ts: Duration,
+        target_ts: Duration,
+    ) -> Vec<&WalSegment> {
+        self.segments
+            .iter()
+            .filter(|segment| segment.end_ts > watermark_ts && segment.start_ts <= target_ts)
+            .collect()
+    }
+
+    /// The latest CID timestamp recovery can reach: the end of the last segment, or the
+    /// watermark of the newest base backup when no segment follows it.
+    pub fn latest_recoverable_ts(&self) -> Option<Duration> {
+        let last_segment = self.segments.iter().map(|s| s.end_ts).max();
+        let last_base = self.base_backups.iter().map(|b| b.watermark_ts).max();
+        match (last_segment, last_base) {
+            (Some(s), Some(b)) => Some(s.max(b)),
+            (Some(s), None) => Some(s),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }
+    }
+
+    /// The recoverable window `(earliest, latest)` in CID timestamps: from the watermark of
+    /// the oldest base backup to [`Self::latest_recoverable_ts`]. None without a base
+    /// backup, since segments alone can not be recovered.
+    pub fn recoverable_window(&self) -> Option<(Duration, Duration)> {
+        let earliest = self.oldest_base_backup()?.watermark_ts;
+        let latest = self.latest_recoverable_ts()?;
+        Some((earliest, latest.max(earliest)))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -991,547 +1156,239 @@ impl Display for RecoveryTarget {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-pub struct PitrManifest {
-    pub server_uuid: Uuid,
-    pub segments: Vec<WalSegment>,
-    pub base_backup_id: String,
-    pub base_backup_timestamp: String,
-    pub earliest_recoverable_time: String,
-    pub latest_recoverable_time: String,
-}
+#[cfg(test)]
+mod wal_tests {
+    use super::*;
 
-impl PitrManifest {
-    pub fn new(server_uuid: Uuid, base_backup_id: String, base_backup_timestamp: String) -> Self {
-        let timestamp = base_backup_timestamp.clone();
-        Self {
-            server_uuid,
-            segments: Vec::new(),
-            base_backup_id,
-            base_backup_timestamp,
-            earliest_recoverable_time: timestamp.clone(),
-            latest_recoverable_time: timestamp,
+    fn segment(id: &str, start: u64, end: u64) -> WalSegment {
+        WalSegment {
+            segment_id: id.to_string(),
+            server_uuid: Uuid::nil(),
+            start_ts: Duration::from_secs(start),
+            end_ts: Duration::from_secs(end),
+            first_cid: String::new(),
+            last_cid: String::new(),
+            entry_count: 1,
+            checksum_sha256: String::new(),
+            size_bytes: 1,
+            compression: BackupCompression::Gzip,
+            server_version: "test".to_string(),
+            created_at: String::new(),
         }
     }
 
-    pub fn add_segment(&mut self, segment: WalSegment) {
-        if self.segments.is_empty() {
-            self.earliest_recoverable_time = segment.created_at.clone();
+    fn base(key: &str, watermark: u64) -> PitrBaseBackup {
+        PitrBaseBackup {
+            key: key.to_string(),
+            timestamp: String::new(),
+            watermark_ts: Duration::from_secs(watermark),
+            server_version: "test".to_string(),
         }
-        self.latest_recoverable_time = segment.created_at.clone();
-        self.segments.push(segment);
     }
-}
 
-#[test]
-fn test_wal_archive_config_default() {
-    let config = WalArchiveConfig::default();
-    assert!(!config.enabled);
-    assert_eq!(config.retention_days, 7);
-    assert_eq!(config.segment_size_bytes, 16 * 1024 * 1024);
-    assert!(config.s3.is_none());
-}
+    #[test]
+    fn test_wal_archive_config_default() {
+        let config = WalArchiveConfig::default();
+        assert!(!config.enabled);
+        assert_eq!(config.retention_days, 7);
+        assert_eq!(config.segment_size_bytes, 16 * 1024 * 1024);
+        assert_eq!(config.segment_interval_seconds, 300);
+        assert!(config.s3.is_none());
+        assert!(config.local_path.is_none());
+        assert!(config.validate().is_ok());
+        assert_eq!(config.retention(), Duration::from_secs(7 * 86400));
+        assert_eq!(config.segment_interval(), Duration::from_secs(300));
+    }
 
-#[test]
-fn test_wal_archive_config_display() {
-    let config = WalArchiveConfig {
-        enabled: true,
-        s3: None,
-        retention_days: 30,
-        segment_size_bytes: 1024,
-    };
-    let display = config.to_string();
-    assert!(display.contains("enabled: true"));
-    assert!(display.contains("retention_days: 30"));
-}
+    #[test]
+    fn test_wal_archive_config_validate() {
+        let zero_size = WalArchiveConfig {
+            segment_size_bytes: 0,
+            ..WalArchiveConfig::default()
+        };
+        assert!(zero_size
+            .validate()
+            .unwrap_err()
+            .contains("segment_size_bytes"));
 
-#[test]
-fn test_wal_segment_creation() {
-    let server_uuid = uuid::Uuid::new_v4();
-    let segment = WalSegment::new(
-        "test-segment-id".to_string(),
-        server_uuid,
-        Duration::from_secs(0),
-        Duration::from_secs(100),
-        "sha256-checksum".to_string(),
-        1024,
-        BackupCompression::Gzip,
-    );
+        let zero_retention = WalArchiveConfig {
+            retention_days: 0,
+            ..WalArchiveConfig::default()
+        };
+        assert!(zero_retention
+            .validate()
+            .unwrap_err()
+            .contains("retention_days"));
 
-    assert_eq!(segment.segment_id, "test-segment-id");
-    assert_eq!(segment.server_uuid, server_uuid);
-    assert_eq!(segment.start_ts, Duration::from_secs(0));
-    assert_eq!(segment.end_ts, Duration::from_secs(100));
-    assert_eq!(segment.checksum_sha256, "sha256-checksum");
-    assert_eq!(segment.size_bytes, 1024);
-    assert_eq!(segment.compression, BackupCompression::Gzip);
-    assert!(!segment.created_at.is_empty());
-}
+        let zero_interval = WalArchiveConfig {
+            segment_interval_seconds: 0,
+            ..WalArchiveConfig::default()
+        };
+        assert!(zero_interval
+            .validate()
+            .unwrap_err()
+            .contains("segment_interval_seconds"));
+    }
 
-#[test]
-fn test_wal_segment_display() {
-    let server_uuid = uuid::Uuid::new_v4();
-    let segment = WalSegment::new(
-        "test-segment".to_string(),
-        server_uuid,
-        Duration::from_secs(0),
-        Duration::from_secs(100),
-        "checksum".to_string(),
-        1024,
-        BackupCompression::NoCompression,
-    );
+    #[test]
+    fn test_wal_archive_config_deserialize_defaults() {
+        let config: WalArchiveConfig = serde_json::from_str(r#"{"enabled": true}"#).unwrap();
+        assert!(config.enabled);
+        assert_eq!(config.segment_interval_seconds, 300);
+        assert_eq!(config.retention_days, 7);
 
-    let display = segment.to_string();
-    assert!(display.contains("WalSegment"));
-    assert!(display.contains("test-segment"));
-    assert!(display.contains(server_uuid.to_string().as_str()));
-}
+        let config: WalArchiveConfig = serde_json::from_str(
+            r#"{"enabled": true, "segment_interval_seconds": 5, "local_path": "/tmp/wal"}"#,
+        )
+        .unwrap();
+        assert_eq!(config.segment_interval_seconds, 5);
+        assert_eq!(config.local_path, Some(PathBuf::from("/tmp/wal")));
+        assert!(config.to_string().contains("segment_interval_seconds: 5"));
+    }
 
-#[test]
-fn test_wal_segment_serialization() {
-    let server_uuid = uuid::Uuid::new_v4();
-    let segment = WalSegment::new(
-        "test-segment".to_string(),
-        server_uuid,
-        Duration::from_secs(0),
-        Duration::from_secs(100),
-        "checksum".to_string(),
-        1024,
-        BackupCompression::Gzip,
-    );
+    #[test]
+    fn test_wal_segment_object_key_and_display() {
+        let s = segment("wal-x.json.gz", 1, 2);
+        assert_eq!(s.object_key(), "wal/wal-x.json.gz");
+        assert!(s.to_string().contains("wal-x.json.gz"));
+        let json = serde_json::to_string(&s).unwrap();
+        let back: WalSegment = serde_json::from_str(&json).unwrap();
+        assert_eq!(s, back);
+    }
 
-    let json = serde_json::to_string(&segment).expect("Failed to serialize");
-    assert!(json.contains("test-segment"));
-    assert!(json.contains(server_uuid.to_string().as_str()));
+    #[test]
+    fn test_pitr_manifest_add_sorts_and_dedups() {
+        let mut manifest = PitrManifest::new(Uuid::nil());
+        manifest.add_segment(segment("b", 20, 30));
+        manifest.add_segment(segment("a", 10, 20));
+        manifest.add_segment(segment("a", 10, 25));
+        assert_eq!(manifest.segments.len(), 2);
+        assert_eq!(manifest.segments[0].segment_id, "a");
+        assert_eq!(manifest.segments[0].end_ts, Duration::from_secs(25));
 
-    let deserialized: WalSegment = serde_json::from_str(&json).expect("Failed to deserialize");
-    assert_eq!(segment.segment_id, deserialized.segment_id);
-    assert_eq!(segment.server_uuid, deserialized.server_uuid);
-}
-
-#[test]
-fn test_wal_entry_creation() {
-    let server_uuid = uuid::Uuid::new_v4();
-    let entry = WalEntry {
-        cid_ts: Duration::from_secs(1000),
-        cid_server: server_uuid,
-        entry_id: 1,
-        operation: WalOperation::Create {
-            entry_data: vec![1, 2, 3],
-        },
-    };
-
-    assert_eq!(entry.cid_ts, Duration::from_secs(1000));
-    assert_eq!(entry.cid_server, server_uuid);
-    assert_eq!(entry.entry_id, 1);
-    assert!(matches!(entry.operation, WalOperation::Create { .. }));
-}
-
-#[test]
-fn test_wal_operation_types() {
-    let create_op = WalOperation::Create {
-        entry_data: vec![1, 2, 3],
-    };
-    let modify_op = WalOperation::Modify {
-        entry_data: vec![4, 5, 6],
-    };
-    let delete_op = WalOperation::Delete;
-
-    assert!(matches!(create_op, WalOperation::Create { .. }));
-    assert!(matches!(modify_op, WalOperation::Modify { .. }));
-    assert!(matches!(delete_op, WalOperation::Delete));
-}
-
-#[test]
-fn test_wal_entry_serialization() {
-    let server_uuid = uuid::Uuid::new_v4();
-    let entry = WalEntry {
-        cid_ts: Duration::from_secs(1000),
-        cid_server: server_uuid,
-        entry_id: 1,
-        operation: WalOperation::Create {
-            entry_data: vec![1, 2, 3],
-        },
-    };
-
-    let json = serde_json::to_string(&entry).expect("Failed to serialize");
-    let deserialized: WalEntry = serde_json::from_str(&json).expect("Failed to deserialize");
-    assert_eq!(entry.entry_id, deserialized.entry_id);
-}
-
-#[test]
-fn test_recovery_target_to_time_valid() {
-    let target = RecoveryTarget::to_time("2024-01-15T10:30:00Z");
-    assert!(target.is_ok());
-    let target = target.unwrap();
-    assert!(matches!(
-        target.target_type,
-        RecoveryTargetType::Time { .. }
-    ));
-}
-
-#[test]
-fn test_recovery_target_to_time_invalid() {
-    let target = RecoveryTarget::to_time("invalid-timestamp");
-    assert!(target.is_err());
-}
-
-#[test]
-fn test_recovery_target_to_time_with_timezone() {
-    let target = RecoveryTarget::to_time("2024-01-15T10:30:00+05:00");
-    assert!(target.is_ok());
-}
-
-#[test]
-fn test_recovery_target_to_time_microseconds() {
-    let target = RecoveryTarget::to_time("2024-01-15T10:30:00.123456Z");
-    assert!(target.is_ok());
-}
-
-#[test]
-fn test_recovery_target_to_transaction_valid() {
-    let target = RecoveryTarget::to_transaction("123456789-uuid");
-    assert!(target.is_ok());
-    let target = target.unwrap();
-    assert!(matches!(
-        target.target_type,
-        RecoveryTargetType::Transaction { .. }
-    ));
-}
-
-#[test]
-fn test_recovery_target_to_transaction_empty() {
-    let target = RecoveryTarget::to_transaction("");
-    assert!(target.is_err());
-}
-
-#[test]
-fn test_recovery_target_latest() {
-    let target = RecoveryTarget::latest();
-    assert!(matches!(target.target_type, RecoveryTargetType::Latest));
-}
-
-#[test]
-fn test_recovery_target_display_time() {
-    let target = RecoveryTarget::to_time("2024-01-15T10:30:00Z").unwrap();
-    let display = target.to_string();
-    assert_eq!(display, "time:2024-01-15T10:30:00Z");
-}
-
-#[test]
-fn test_recovery_target_display_transaction() {
-    let target = RecoveryTarget::to_transaction("test-cid").unwrap();
-    let display = target.to_string();
-    assert_eq!(display, "transaction:test-cid");
-}
-
-#[test]
-fn test_recovery_target_display_latest() {
-    let target = RecoveryTarget::latest();
-    let display = target.to_string();
-    assert_eq!(display, "latest");
-}
-
-#[test]
-fn test_recovery_target_serialization() {
-    let target = RecoveryTarget::to_time("2024-01-15T10:30:00Z").unwrap();
-    let json = serde_json::to_string(&target).expect("Failed to serialize");
-    assert!(json.contains("2024-01-15T10:30:00Z"));
-
-    let deserialized: RecoveryTarget = serde_json::from_str(&json).expect("Failed to deserialize");
-    assert_eq!(target.to_string(), deserialized.to_string());
-}
-
-#[test]
-fn test_recovery_target_type_serialization() {
-    let time_type = RecoveryTargetType::Time {
-        timestamp: "2024-01-15T10:30:00Z".to_string(),
-    };
-    let json = serde_json::to_string(&time_type).expect("Failed to serialize");
-    assert!(json.contains("Time"));
-
-    let transaction_type = RecoveryTargetType::Transaction {
-        cid: "test-cid".to_string(),
-    };
-    let json = serde_json::to_string(&transaction_type).expect("Failed to serialize");
-    assert!(json.contains("Transaction"));
-
-    let latest_type = RecoveryTargetType::Latest;
-    let json = serde_json::to_string(&latest_type).expect("Failed to serialize");
-    assert!(json.contains("Latest"));
-}
-
-#[test]
-fn test_pitr_manifest_creation() {
-    let server_uuid = uuid::Uuid::new_v4();
-    let manifest = PitrManifest::new(
-        server_uuid,
-        "backup-001".to_string(),
-        "2024-01-01T00:00:00Z".to_string(),
-    );
-
-    assert_eq!(manifest.server_uuid, server_uuid);
-    assert_eq!(manifest.base_backup_id, "backup-001");
-    assert_eq!(manifest.base_backup_timestamp, "2024-01-01T00:00:00Z");
-    assert!(manifest.segments.is_empty());
-    assert_eq!(manifest.earliest_recoverable_time, "2024-01-01T00:00:00Z");
-    assert_eq!(manifest.latest_recoverable_time, "2024-01-01T00:00:00Z");
-}
-
-#[test]
-fn test_pitr_manifest_add_segment() {
-    let server_uuid = uuid::Uuid::new_v4();
-    let mut manifest = PitrManifest::new(
-        server_uuid,
-        "backup-001".to_string(),
-        "2024-01-01T00:00:00Z".to_string(),
-    );
-
-    let segment1 = WalSegment::new(
-        "segment-1".to_string(),
-        server_uuid,
-        Duration::from_secs(0),
-        Duration::from_secs(100),
-        "checksum1".to_string(),
-        1024,
-        BackupCompression::Gzip,
-    );
-
-    let segment2 = WalSegment::new(
-        "segment-2".to_string(),
-        server_uuid,
-        Duration::from_secs(100),
-        Duration::from_secs(200),
-        "checksum2".to_string(),
-        2048,
-        BackupCompression::Gzip,
-    );
-
-    manifest.add_segment(segment1.clone());
-    assert_eq!(manifest.segments.len(), 1);
-    assert_eq!(manifest.earliest_recoverable_time, segment1.created_at);
-    assert_eq!(manifest.latest_recoverable_time, segment1.created_at);
-
-    manifest.add_segment(segment2.clone());
-    assert_eq!(manifest.segments.len(), 2);
-    assert_eq!(manifest.earliest_recoverable_time, segment1.created_at);
-    assert_eq!(manifest.latest_recoverable_time, segment2.created_at);
-}
-
-#[test]
-fn test_pitr_manifest_serialization() {
-    let server_uuid = uuid::Uuid::new_v4();
-    let manifest = PitrManifest::new(
-        server_uuid,
-        "backup-001".to_string(),
-        "2024-01-01T00:00:00Z".to_string(),
-    );
-
-    let json = serde_json::to_string(&manifest).expect("Failed to serialize");
-    assert!(json.contains("backup-001"));
-    assert!(json.contains(server_uuid.to_string().as_str()));
-
-    let deserialized: PitrManifest = serde_json::from_str(&json).expect("Failed to deserialize");
-    assert_eq!(manifest.server_uuid, deserialized.server_uuid);
-    assert_eq!(manifest.base_backup_id, deserialized.base_backup_id);
-}
-
-#[test]
-fn test_pitr_manifest_empty_segments() {
-    let server_uuid = uuid::Uuid::new_v4();
-    let manifest = PitrManifest::new(
-        server_uuid,
-        "backup-001".to_string(),
-        "2024-01-01T00:00:00Z".to_string(),
-    );
-
-    assert_eq!(manifest.segments.len(), 0);
-    assert_eq!(
-        manifest.earliest_recoverable_time,
-        manifest.latest_recoverable_time
-    );
-}
-
-#[test]
-fn test_pitr_manifest_multiple_segments() {
-    let server_uuid = uuid::Uuid::new_v4();
-    let mut manifest = PitrManifest::new(
-        server_uuid,
-        "backup-001".to_string(),
-        "2024-01-01T00:00:00Z".to_string(),
-    );
-
-    for i in 0..10 {
-        let segment = WalSegment::new(
-            format!("segment-{}", i),
-            server_uuid,
-            Duration::from_secs(i * 100),
-            Duration::from_secs((i + 1) * 100),
-            format!("checksum-{}", i),
-            1024,
-            BackupCompression::Gzip,
+        manifest.add_base_backup(base("backup-2", 50));
+        manifest.add_base_backup(base("backup-1", 5));
+        manifest.add_base_backup(base("backup-2", 40));
+        assert_eq!(manifest.base_backups.len(), 2);
+        assert_eq!(manifest.oldest_base_backup().unwrap().key, "backup-1");
+        assert_eq!(
+            manifest.base_backups[1].watermark_ts,
+            Duration::from_secs(40)
         );
-        manifest.add_segment(segment);
+
+        manifest.retain_base_backups(&["backup-2".to_string()]);
+        assert_eq!(manifest.base_backups.len(), 1);
+        manifest.remove_segment("a");
+        assert_eq!(manifest.segments.len(), 1);
     }
 
-    assert_eq!(manifest.segments.len(), 10);
-}
+    #[test]
+    fn test_pitr_manifest_base_selection_and_window() {
+        let mut manifest = PitrManifest::new(Uuid::nil());
+        assert!(manifest.recoverable_window().is_none());
+        assert!(manifest.latest_recoverable_ts().is_none());
 
-#[test]
-fn test_wal_segment_metadata_creation() {
-    let server_uuid = uuid::Uuid::new_v4();
-    let segment = WalSegment::new(
-        "segment-1".to_string(),
-        server_uuid,
-        Duration::from_secs(0),
-        Duration::from_secs(100),
-        "checksum".to_string(),
-        1024,
-        BackupCompression::Gzip,
-    );
+        manifest.add_base_backup(base("backup-1", 10));
+        manifest.add_base_backup(base("backup-2", 40));
+        manifest.add_segment(segment("s1", 11, 20));
+        manifest.add_segment(segment("s2", 21, 45));
+        manifest.add_segment(segment("s3", 46, 60));
 
-    let metadata = WalSegmentMetadata {
-        segment,
-        entry_count: 100,
-        first_cid: "cid-1".to_string(),
-        last_cid: "cid-100".to_string(),
-    };
+        assert!(manifest.base_backup_for(Duration::from_secs(9)).is_none());
+        assert_eq!(
+            manifest
+                .base_backup_for(Duration::from_secs(10))
+                .unwrap()
+                .key,
+            "backup-1"
+        );
+        assert_eq!(
+            manifest
+                .base_backup_for(Duration::from_secs(39))
+                .unwrap()
+                .key,
+            "backup-1"
+        );
+        assert_eq!(
+            manifest
+                .base_backup_for(Duration::from_secs(40))
+                .unwrap()
+                .key,
+            "backup-2"
+        );
+        assert_eq!(
+            manifest
+                .base_backup_for(Duration::from_secs(1000))
+                .unwrap()
+                .key,
+            "backup-2"
+        );
 
-    assert_eq!(metadata.entry_count, 100);
-    assert_eq!(metadata.first_cid, "cid-1");
-    assert_eq!(metadata.last_cid, "cid-100");
-}
+        // From backup-2 (watermark 40) to 50: s2 straddles the watermark, s3 the target.
+        let ids: Vec<&str> = manifest
+            .segments_between(Duration::from_secs(40), Duration::from_secs(50))
+            .iter()
+            .map(|s| s.segment_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["s2", "s3"]);
 
-#[test]
-fn test_wal_segment_metadata_serialization() {
-    let server_uuid = uuid::Uuid::new_v4();
-    let segment = WalSegment::new(
-        "segment-1".to_string(),
-        server_uuid,
-        Duration::from_secs(0),
-        Duration::from_secs(100),
-        "checksum".to_string(),
-        1024,
-        BackupCompression::Gzip,
-    );
+        // A segment ending exactly on the watermark holds nothing new.
+        let ids: Vec<&str> = manifest
+            .segments_between(Duration::from_secs(20), Duration::from_secs(20))
+            .iter()
+            .map(|s| s.segment_id.as_str())
+            .collect();
+        assert!(ids.is_empty());
 
-    let metadata = WalSegmentMetadata {
-        segment,
-        entry_count: 100,
-        first_cid: "cid-1".to_string(),
-        last_cid: "cid-100".to_string(),
-    };
+        assert_eq!(
+            manifest.recoverable_window(),
+            Some((Duration::from_secs(10), Duration::from_secs(60)))
+        );
 
-    let json = serde_json::to_string(&metadata).expect("Failed to serialize");
-    assert!(json.contains("entry_count"));
+        // A base newer than every segment extends the window.
+        manifest.add_base_backup(base("backup-3", 70));
+        assert_eq!(
+            manifest.latest_recoverable_ts(),
+            Some(Duration::from_secs(70))
+        );
+    }
 
-    let deserialized: WalSegmentMetadata =
-        serde_json::from_str(&json).expect("Failed to deserialize");
-    assert_eq!(metadata.entry_count, deserialized.entry_count);
-}
+    #[test]
+    fn test_pitr_manifest_serialization() {
+        let mut manifest = PitrManifest::new(Uuid::nil());
+        manifest.add_base_backup(base("backup-1", 10));
+        manifest.add_segment(segment("s1", 11, 20));
+        let json = serde_json::to_string(&manifest).unwrap();
+        let back: PitrManifest = serde_json::from_str(&json).unwrap();
+        assert_eq!(manifest, back);
+        assert_eq!(back.version, PITR_MANIFEST_VERSION);
+    }
 
-#[test]
-fn test_wal_segment_equality() {
-    let server_uuid = uuid::Uuid::new_v4();
-    let segment1 = WalSegment::new(
-        "segment-1".to_string(),
-        server_uuid,
-        Duration::from_secs(0),
-        Duration::from_secs(100),
-        "checksum".to_string(),
-        1024,
-        BackupCompression::Gzip,
-    );
+    #[test]
+    fn test_recovery_target() {
+        assert!(RecoveryTarget::to_time("2024-01-15T10:30:00Z").is_ok());
+        assert!(RecoveryTarget::to_time("2024-01-15T10:30:00+05:00").is_ok());
+        assert!(RecoveryTarget::to_time("2024-01-15T10:30:00.123456Z").is_ok());
+        assert!(RecoveryTarget::to_time("invalid-timestamp").is_err());
+        assert!(RecoveryTarget::to_transaction("").is_err());
 
-    let segment2 = WalSegment::new(
-        "segment-1".to_string(),
-        server_uuid,
-        Duration::from_secs(0),
-        Duration::from_secs(100),
-        "checksum".to_string(),
-        1024,
-        BackupCompression::Gzip,
-    );
+        let time = RecoveryTarget::to_time("2024-01-15T10:30:00Z").unwrap();
+        assert!(matches!(time.target_type, RecoveryTargetType::Time { .. }));
+        assert_eq!(time.to_string(), "time:2024-01-15T10:30:00Z");
 
-    assert_eq!(segment1.segment_id, segment2.segment_id);
-    assert_eq!(segment1.server_uuid, segment2.server_uuid);
-}
+        let txn = RecoveryTarget::to_transaction("123-uuid").unwrap();
+        assert!(matches!(
+            txn.target_type,
+            RecoveryTargetType::Transaction { .. }
+        ));
+        assert_eq!(txn.to_string(), "transaction:123-uuid");
 
-#[test]
-fn test_wal_entry_equality() {
-    let server_uuid = uuid::Uuid::new_v4();
-    let entry1 = WalEntry {
-        cid_ts: Duration::from_secs(1000),
-        cid_server: server_uuid,
-        entry_id: 1,
-        operation: WalOperation::Create {
-            entry_data: vec![1, 2, 3],
-        },
-    };
+        let latest = RecoveryTarget::latest();
+        assert!(matches!(latest.target_type, RecoveryTargetType::Latest));
+        assert_eq!(latest.to_string(), "latest");
 
-    let entry2 = WalEntry {
-        cid_ts: Duration::from_secs(1000),
-        cid_server: server_uuid,
-        entry_id: 1,
-        operation: WalOperation::Create {
-            entry_data: vec![1, 2, 3],
-        },
-    };
-
-    assert_eq!(entry1, entry2);
-}
-
-#[test]
-fn test_recovery_target_equality() {
-    let target1 = RecoveryTarget::to_time("2024-01-15T10:30:00Z").unwrap();
-    let target2 = RecoveryTarget::to_time("2024-01-15T10:30:00Z").unwrap();
-    assert_eq!(target1, target2);
-
-    let target3 = RecoveryTarget::latest();
-    let target4 = RecoveryTarget::latest();
-    assert_eq!(target3, target4);
-}
-
-#[test]
-fn test_pitr_manifest_equality() {
-    let server_uuid = uuid::Uuid::new_v4();
-    let manifest1 = PitrManifest::new(
-        server_uuid,
-        "backup-001".to_string(),
-        "2024-01-01T00:00:00Z".to_string(),
-    );
-
-    let manifest2 = PitrManifest::new(
-        server_uuid,
-        "backup-001".to_string(),
-        "2024-01-01T00:00:00Z".to_string(),
-    );
-
-    assert_eq!(manifest1, manifest2);
-}
-
-#[test]
-fn test_wal_archive_config_with_s3() {
-    let s3_config = S3Config {
-        bucket: "test-bucket".to_string(),
-        region: Some("us-west-2".to_string()),
-        endpoint: None,
-        path_prefix: None,
-        credentials: None,
-        server_side_encryption: None,
-        storage_class: "STANDARD".to_string(),
-        replication: None,
-    };
-
-    let config = WalArchiveConfig {
-        enabled: true,
-        s3: Some(s3_config),
-        retention_days: 30,
-        segment_size_bytes: 32 * 1024 * 1024,
-    };
-
-    assert!(config.enabled);
-    assert!(config.s3.is_some());
-    assert_eq!(config.retention_days, 30);
-    assert_eq!(config.segment_size_bytes, 32 * 1024 * 1024);
+        let json = serde_json::to_string(&time).unwrap();
+        let back: RecoveryTarget = serde_json::from_str(&json).unwrap();
+        assert_eq!(time, back);
+    }
 }
