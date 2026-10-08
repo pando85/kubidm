@@ -130,7 +130,7 @@ pub async fn raw_delete(
     post,
     path = "/v1/raw/search",
     responses(
-        (status = 200, body=SearchResponse, content_type=APPLICATION_JSON),
+        (status = 200, description = "Ok", body=SearchResponse, content_type=APPLICATION_JSON),
         ApiResponseWithout200,
     ),
     request_body=SearchRequest,
@@ -157,7 +157,7 @@ pub async fn raw_search(
     get,
     path = "/v1/self",
     responses(
-        (status = 200, body=WhoamiResponse, content_type=APPLICATION_JSON),
+        (status = 200, description = "Ok", body=WhoamiResponse, content_type=APPLICATION_JSON),
         ApiResponseWithout200,
     ),
     security(("token_jwt" = [])),
@@ -3395,7 +3395,7 @@ pub(crate) fn route_setup(state: ServerState) -> Router<ServerState> {
     get,
     path = "/v1/approval/policy",
     responses(
-        (status = 200, body=Vec<ApprovalPolicy>, content_type=APPLICATION_JSON),
+        (status = 200, description = "Ok", body=Vec<ApprovalPolicy>, content_type=APPLICATION_JSON),
         ApiResponseWithout200,
     ),
     security(("token_jwt" = [])),
@@ -3419,7 +3419,7 @@ pub async fn approval_policy_list(
     get,
     path = "/v1/approval/policy/{name}",
     responses(
-        (status = 200, body=ApprovalPolicy, content_type=APPLICATION_JSON),
+        (status = 200, description = "Ok", body=ApprovalPolicy, content_type=APPLICATION_JSON),
         ApiResponseWithout200,
     ),
     security(("token_jwt" = [])),
@@ -3541,7 +3541,7 @@ pub async fn approval_policy_disable(
     get,
     path = "/v1/approval/request",
     responses(
-        (status = 200, body=Vec<ApprovalRequest>, content_type=APPLICATION_JSON),
+        (status = 200, description = "Ok", body=Vec<ApprovalRequest>, content_type=APPLICATION_JSON),
         ApiResponseWithout200,
     ),
     security(("token_jwt" = [])),
@@ -3565,7 +3565,7 @@ pub async fn approval_request_list(
     get,
     path = "/v1/approval/request/{uuid}",
     responses(
-        (status = 200, body=ApprovalRequest, content_type=APPLICATION_JSON),
+        (status = 200, description = "Ok", body=ApprovalRequest, content_type=APPLICATION_JSON),
         ApiResponseWithout200,
     ),
     security(("token_jwt" = [])),
