@@ -12,6 +12,25 @@ if [ -z "${BUILD_MODE}" ]; then
     BUILD_MODE="--release"
 fi
 
+# Clean up any existing kubidmd processes and data from previous runs
+echo "Cleaning up any existing kubidmd processes..."
+if [ "$(pgrep kubidmd | wc -l)" -gt 0 ]; then
+    kill -9 $(pgrep kubidmd) 2>/dev/null || true
+    sleep 2
+fi
+
+echo "Cleaning up /tmp/kubidm directory..."
+rm -rf /tmp/kubidm
+
+# Set up cleanup trap to ensure resources are freed even if script fails
+cleanup() {
+    echo "Cleaning up kubidmd processes..."
+    if [ "$(pgrep kubidmd | wc -l)" -gt 0 ]; then
+        kill $(pgrep kubidmd) 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT
+
 echo "Building release binaries..."
 # shellcheck disable=SC2086
 cargo build --locked $BUILD_MODE --bin kubidm --bin kubidmd --quiet || {
