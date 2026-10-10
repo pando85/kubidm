@@ -45,8 +45,9 @@ use crate::{
     actors::{QueryServerReadV1, QueryServerWriteV1},
     admin::AdminActor,
     backup::{
-        finalize_local_backup, is_backup_artifact_name, verify_backup_output, BackupVerifyError,
-        S3BackupError, S3ClientWrapper,
+        finalize_local_backup, is_backup_artifact_name,
+        pitr::{self, BaseLocation, PitrArchive, PitrError, PitrSettings, PitrSyncReport},
+        verify_backup_output, BackupVerifyError, S3BackupError, S3ClientWrapper,
     },
     config::{Configuration, ServerRole},
     interval::IntervalActor,
@@ -58,16 +59,18 @@ use crypto_glue::{
     traits::Digest,
 };
 use kubidm_proto::{
-    backup::{BackupCompression, S3BackupMetadata, S3Config},
+    backup::{BackupCompression, S3BackupMetadata, S3Config, WalArchiveConfig},
     internal::{ConsistencyError, OperationError},
     scim_v1::client::ScimAssertGeneric,
 };
 use kubidmd_lib::{
     be::{
-        verify_backup_structure, Backend, BackendConfig, BackendTransaction, BackupStructuralReport,
+        verify_backup_structure, Backend, BackendConfig, BackendTransaction,
+        BackupStructuralReport, WalApplyReport,
     },
     idm::ldap::LdapServer,
     prelude::*,
+    repl::wal::WalEntryRecord,
     schema::Schema,
     status::StatusActor,
     value::CredentialType,
@@ -102,6 +105,18 @@ fn setup_backend_vacuum(
     schema: &Schema,
     vacuum: bool,
 ) -> Result<Backend, OperationError> {
+    setup_backend_inner(config, schema, vacuum, None)
+}
+
+/// The backend of a running server. With `wal_archive`, every committed write is archived
+/// for point-in-time recovery. The offline tools never archive: what they write is either
+/// discarded or recorded by the recovery itself.
+fn setup_backend_inner(
+    config: &Configuration,
+    schema: &Schema,
+    vacuum: bool,
+    wal_archive: Option<WalArchiveConfig>,
+) -> Result<Backend, OperationError> {
     // Limit the scope of the schema txn.
     // let schema_txn = task::block_on(schema.write());
     let schema_txn = schema.write();
@@ -114,9 +129,55 @@ fn setup_backend_vacuum(
         pool_size,
         config.db_fs_type.unwrap_or_default(),
         config.db_arc_size,
-    );
+    )
+    .with_wal_archive(wal_archive);
 
     Backend::new(cfg, idxmeta, vacuum)
+}
+
+/// The backend of an offline command that commits writes outside of a restore or a
+/// recovery (a domain rename, a reindex that runs migrations). When WAL archiving is
+/// configured those writes are archived exactly like the running server's, so that
+/// point-in-time recovery does not miss them. The returned guard closes the open segment
+/// when the command ends; the next server start archives it. A command that exits the
+/// process early leaves the segment open, which the next start reports as a gap.
+fn setup_backend_archived(
+    config: &Configuration,
+    schema: &Schema,
+) -> Result<(Backend, OfflineWalGuard), OperationError> {
+    let wal = PitrSettings::from_config(config)
+        .map_err(|err| {
+            error!(%err, "Invalid WAL archive configuration");
+            OperationError::InvalidState
+        })?
+        .map(|settings| settings.backend_wal_config());
+    let be = setup_backend_inner(config, schema, false, wal)?;
+    let guard = OfflineWalGuard(be.wal_archiver());
+    Ok((be, guard))
+}
+
+/// Closes the open WAL segment of an offline command when dropped.
+struct OfflineWalGuard(Option<kubidmd_lib::be::SharedWalArchiver>);
+
+impl Drop for OfflineWalGuard {
+    fn drop(&mut self) {
+        if let Some(archiver) = self.0.take() {
+            let mut archiver = archiver
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Err(err) = archiver.flush_current_segment() {
+                error!(
+                    %err,
+                    "Unable to close the WAL segment of this command; the next server start \
+                     reports its transactions as a gap in the archive"
+                );
+            }
+            // Gaps are recorded in the archive index by the running server.
+            if let Err(err) = archiver.defer_gaps_to_next_start() {
+                error!(%err, "Unable to hand the WAL archive gaps to the next server start");
+            }
+        }
+    }
 }
 
 // TODO #54: We could move most of the be/schema/qs setup and startup
@@ -476,11 +537,37 @@ fn report_backup_verification(verified: Result<BackupStructuralReport, BackupVer
 }
 
 pub async fn restore_server_core(config: &Configuration, dst_path: &Path) {
-    if restore_database(config, dst_path).await.is_err() {
+    let outcome = match restore_and_replay(config, dst_path, &[]).await {
+        Ok(outcome) => outcome,
+        Err(_) => std::process::exit(1),
+    };
+
+    if note_restore_in_wal_archive(config, outcome.watermark)
+        .await
+        .is_err()
+    {
         std::process::exit(1);
     }
 
     info!("✅ Restore Success!");
+}
+
+/// After a restore of the configured database, record in the WAL archive (when one is
+/// configured) that the history after the restored backup was abandoned, so that a later
+/// point-in-time recovery never replays it.
+async fn note_restore_in_wal_archive(
+    config: &Configuration,
+    watermark: Duration,
+) -> Result<(), OperationError> {
+    pitr::note_restore(config, watermark).await.map_err(|err| {
+        error!(
+            %err,
+            "The database WAS restored, but the abandoned history could not be recorded in \
+             the WAL archive. A later point-in-time recovery past this point could replay it: \
+             take a new online backup right after starting the server."
+        );
+        OperationError::InvalidState
+    })
 }
 
 /// Restore the backup at `src_path` into the database described by `config` and
@@ -490,6 +577,25 @@ pub async fn restore_database(
     config: &Configuration,
     src_path: &Path,
 ) -> Result<(), OperationError> {
+    restore_and_replay(config, src_path, &[]).await.map(|_| ())
+}
+
+/// What [`restore_and_replay`] did.
+pub(crate) struct RestoreOutcome {
+    /// The CID watermark of the restored backup.
+    pub watermark: Duration,
+    /// The WAL records applied on top of it, if any were given.
+    pub apply: Option<WalApplyReport>,
+}
+
+/// Restore the backup at `src_path` into the database described by `config`, apply
+/// `records` on top of it in the same transaction, and reindex. A failure before the
+/// commit leaves the database as it was.
+pub(crate) async fn restore_and_replay(
+    config: &Configuration,
+    src_path: &Path,
+    records: &[WalEntryRecord],
+) -> Result<RestoreOutcome, OperationError> {
     // If it's an in memory database, we don't need to touch anything
     if let Some(db_path) = config.db_path.as_ref() {
         touch_file_or_quit(db_path);
@@ -518,15 +624,30 @@ pub async fn restore_database(
         OperationError::FsError
     })?;
 
-    be_wr_txn
-        .restore(input, compression)
-        .and_then(|_| be_wr_txn.commit())
-        .inspect_err(|err| {
-            error!(?err, "Failed to restore database");
-        })?;
+    be_wr_txn.restore(input, compression).inspect_err(|err| {
+        error!(?err, "Failed to restore database");
+    })?;
+    let watermark = be_wr_txn.get_db_ts_max(Duration::ZERO)?;
+
+    let apply = if records.is_empty() {
+        None
+    } else {
+        info!("Replaying {} WAL records ...", records.len());
+        Some(be_wr_txn.wal_apply(records).inspect_err(|err| {
+            error!(
+                ?err,
+                "Failed to replay the WAL records; the database was not changed"
+            );
+        })?)
+    };
+
+    be_wr_txn.commit().inspect_err(|err| {
+        error!(?err, "Failed to commit the restored database");
+    })?;
     info!("Database loaded successfully");
 
-    reindex_inner(be, schema, config).await
+    reindex_inner(be, schema, config).await?;
+    Ok(RestoreOutcome { watermark, apply })
 }
 
 /// How deeply `verify_backup_server_core` inspects a backup artifact.
@@ -750,8 +871,11 @@ pub async fn restore_s3_database(
         fetched.metadata.size_bytes, fetched.metadata.checksum_sha256
     );
 
-    restore_database(config, &fetched.path).await
-    // `fetched` is dropped here, removing the downloaded artifact.
+    let outcome = restore_and_replay(config, &fetched.path, &[]).await?;
+    // Remove the downloaded artifact.
+    drop(fetched);
+
+    note_restore_in_wal_archive(config, outcome.watermark).await
 }
 
 /// Verify the backup stored under `key` in S3. The SHA-256 of the stored object is checked
@@ -990,7 +1114,8 @@ pub async fn reindex_server_core(config: &Configuration) {
         }
     };
 
-    let be = match setup_backend(config, &schema) {
+    // Booting the query server may run migrations, which are archived.
+    let (be, _wal_guard) = match setup_backend_archived(config, &schema) {
         Ok(be) => be,
         Err(e) => {
             error!("Failed to setup BE: {:?}", e);
@@ -1087,8 +1212,8 @@ pub async fn domain_rename_core(config: &Configuration) {
         }
     };
 
-    // Start the backend.
-    let be = match setup_backend(config, &schema) {
+    // Start the backend. The rename is archived for point-in-time recovery.
+    let (be, _wal_guard) = match setup_backend_archived(config, &schema) {
         Ok(be) => be,
         Err(e) => {
             error!("Failed to setup BE: {:?}", e);
@@ -1486,6 +1611,7 @@ pub(crate) enum TaskName {
     ReplicationSupervisor,
     TlsAcceptorReload,
     MigrationReload,
+    WalArchive,
 }
 
 impl Display for TaskName {
@@ -1504,6 +1630,7 @@ impl Display for TaskName {
                 TaskName::ReplicationSupervisor => "Replication Supervisor",
                 TaskName::TlsAcceptorReload => "TlsAcceptor Reload Monitor",
                 TaskName::MigrationReload => "Migration Reload Monitor",
+                TaskName::WalArchive => "WAL Archive",
             }
         )
     }
@@ -1515,6 +1642,8 @@ pub struct CoreHandle {
     /// This stores a name for the handle, and the handle itself so we can tell which failed/succeeded at the end.
     handles: Vec<(TaskName, task::JoinHandle<()>)>,
     server_read_ref: &'static QueryServerReadV1,
+    /// The WAL archive, when point-in-time recovery is enabled.
+    pitr_archive: Option<Arc<PitrArchive>>,
 }
 
 impl CoreHandle {
@@ -1536,7 +1665,32 @@ impl CoreHandle {
             }
         }
 
+        // Every task that can write has stopped: close the open WAL segment and archive
+        // it, so that a clean shutdown loses no committed transaction.
+        if let Some(archive) = &self.pitr_archive {
+            match archive.sync(duration_from_epoch_now(), true).await {
+                Ok(report) => debug!(?report, "WAL archive synchronised at shutdown"),
+                Err(err) => error!(
+                    %err,
+                    "WAL archive synchronisation at shutdown failed; the closed segments stay in \
+                     {} and are archived at the next start",
+                    archive.settings().local_dir.display()
+                ),
+            }
+            archive.defer_gaps_to_next_start();
+        }
+
         self.clean_shutdown = true;
+    }
+
+    /// Close the open WAL segment and archive every closed one now, as the periodic WAL
+    /// archive task and the shutdown do. None when WAL archiving is not enabled. This
+    /// exists so tests can archive on demand.
+    pub async fn sync_wal_archive(&self) -> Option<Result<PitrSyncReport, PitrError>> {
+        match &self.pitr_archive {
+            Some(archive) => Some(archive.sync(duration_from_epoch_now(), true).await),
+            None => None,
+        }
     }
 
     pub async fn reload(&mut self) {
@@ -1554,7 +1708,8 @@ impl CoreHandle {
         versions: usize,
         compression: BackupCompression,
     ) -> Result<(), OperationError> {
-        self.server_read_ref
+        let outcome = self
+            .server_read_ref
             .handle_online_backup(
                 kubidmd_lib::event::OnlineBackupEvent::new(),
                 outpath,
@@ -1562,7 +1717,18 @@ impl CoreHandle {
                 compression,
                 None,
             )
-            .await
+            .await?;
+        if let Some(archive) = &self.pitr_archive {
+            archive
+                .register_base_backup_logged(
+                    &BaseLocation::Local(outpath.to_path_buf()),
+                    &outcome.key,
+                    &outcome.timestamp,
+                    &outcome.report,
+                )
+                .await;
+        }
+        Ok(())
     }
 
     /// Run an online backup to S3 now, through the same code path the scheduled S3 backup
@@ -1574,12 +1740,15 @@ impl CoreHandle {
         versions: usize,
         compression: BackupCompression,
     ) -> Result<(), OperationError> {
-        let client = S3ClientWrapper::new(s3_config).await.map_err(|err| {
-            error!(%err, "Unable to create the S3 client");
-            OperationError::InvalidState
-        })?;
+        let client = S3ClientWrapper::new(s3_config.clone())
+            .await
+            .map_err(|err| {
+                error!(%err, "Unable to create the S3 client");
+                OperationError::InvalidState
+            })?;
 
-        self.server_read_ref
+        let outcome = self
+            .server_read_ref
             .handle_online_backup(
                 kubidmd_lib::event::OnlineBackupEvent::new(),
                 Path::new("s3://backup"),
@@ -1587,7 +1756,18 @@ impl CoreHandle {
                 compression,
                 Some(client),
             )
-            .await
+            .await?;
+        if let Some(archive) = &self.pitr_archive {
+            archive
+                .register_base_backup_logged(
+                    &BaseLocation::S3(s3_config),
+                    &outcome.key,
+                    &outcome.timestamp,
+                    &outcome.report,
+                )
+                .await;
+        }
+        Ok(())
     }
 }
 
@@ -1646,13 +1826,38 @@ pub async fn create_server_core(
         }
     };
 
+    // Point-in-time recovery: the backend archives every committed write. A config test
+    // validates the settings but must not create the WAL directory.
+    let pitr_settings = match PitrSettings::from_config(&config) {
+        Ok(settings) => settings,
+        Err(err) => {
+            error!(%err, "Invalid WAL archive configuration");
+            return Err(());
+        }
+    };
+    let backend_wal_config = match (&pitr_settings, config_test) {
+        (Some(settings), false) => Some(settings.backend_wal_config()),
+        _ => None,
+    };
+
     // Setup the be for the qs.
-    let be = match setup_backend(&config, &schema) {
+    let be = match setup_backend_inner(&config, &schema, false, backend_wal_config) {
         Ok(be) => be,
         Err(e) => {
             error!("Failed to setup BE -> {:?}", e);
             return Err(());
         }
+    };
+    let pitr_archive = match (pitr_settings, be.wal_archiver()) {
+        (Some(settings), Some(archiver)) => {
+            info!(
+                location = %settings.location,
+                bases = %settings.bases,
+                "Point-in-time recovery: archiving committed writes"
+            );
+            Some(Arc::new(PitrArchive::new(settings, archiver)))
+        }
+        _ => None,
     };
     // Start the IDM server.
     let (_qs, idms, idms_delayed, idms_audit) = match setup_qs_idms(be, schema, &config).await {
@@ -1770,6 +1975,7 @@ pub async fn create_server_core(
             server_write_ref,
             idms_arc,
             maybe_tls_acceptor,
+            pitr_archive.clone(),
         )
         .await
     };
@@ -1779,6 +1985,7 @@ pub async fn create_server_core(
         tx: broadcast_tx,
         handles,
         server_read_ref,
+        pitr_archive,
     };
 
     if startup_success.is_ok() {
@@ -1805,6 +2012,8 @@ async fn launch_server_tasks(
     idms_arc: Arc<IdmServer>,
 
     maybe_tls_acceptor: Option<TlsAcceptor>,
+
+    pitr_archive: Option<Arc<PitrArchive>>,
 ) -> Result<(), ()> {
     let status_ref = StatusActor::start();
     let tracker = status_ref.get_tracker_clone();
@@ -1867,6 +2076,13 @@ async fn launch_server_tasks(
 
     handles.push((TaskName::AuditdActor, auditd_handle));
 
+    // WAL archiving runs in every mode, integration tests included: it only ships what
+    // the backend already recorded.
+    if let Some(archive) = &pitr_archive {
+        let wal_handle = pitr::start_wal_archive_task(archive.clone(), broadcast_tx.subscribe());
+        handles.push((TaskName::WalArchive, wal_handle));
+    }
+
     // Run the migrations *once*, only in production though.
     let migration_path = config
         .migration_path
@@ -1902,6 +2118,7 @@ async fn launch_server_tasks(
                     let backup_handle = IntervalActor::start_online_backup(
                         server_read_ref,
                         online_backup_config,
+                        pitr_archive.clone(),
                         broadcast_tx.subscribe(),
                     )?;
                     handles.push((TaskName::BackupActor, backup_handle));

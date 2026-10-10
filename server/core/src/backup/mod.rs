@@ -1,6 +1,7 @@
 pub mod encryption;
 pub mod finalize;
 pub mod mock_s3;
+pub mod pitr;
 pub mod retention;
 pub mod s3;
 

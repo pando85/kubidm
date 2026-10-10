@@ -113,8 +113,12 @@ impl Default for OnlineBackup {
 }
 
 impl OnlineBackup {
-    /// Reject settings that are parsed but have no effect in this release. Accepting them
-    /// silently would let an operator believe a feature is active when it is not.
+    /// Reject settings that are parsed but have no effect in this release, and settings
+    /// of the WAL archive that can not work. Accepting them silently would let an operator
+    /// believe a feature is active when it is not.
+    ///
+    /// The WAL directory itself is checked for writability when the server starts (the
+    /// backend creates and probes it), not here, since `configtest` must not create it.
     pub fn validate(&self) -> Result<(), String> {
         if self.encryption.enabled {
             return Err(
@@ -124,16 +128,17 @@ impl OnlineBackup {
             );
         }
 
-        if self
-            .wal_archive
-            .as_ref()
-            .is_some_and(|wal_archive| wal_archive.enabled)
-        {
-            return Err(
-                "online_backup.wal_archive: point-in-time recovery (WAL archiving) is not available in this release; \
-                 remove or disable this setting"
-                    .to_string(),
-            );
+        if let Some(wal_archive) = self.wal_archive.as_ref().filter(|w| w.enabled) {
+            if !self.enabled {
+                return Err(
+                    "online_backup.wal_archive: WAL archiving requires online_backup.enabled = true, \
+                     since point-in-time recovery replays the archive on top of a base backup"
+                        .to_string(),
+                );
+            }
+            wal_archive
+                .validate()
+                .map_err(|reason| format!("online_backup.wal_archive: {reason}"))?;
         }
 
         if self
@@ -669,6 +674,9 @@ impl fmt::Display for Configuration {
                 if let Some(s3) = &bck.s3 {
                     write!(f, "s3: {}, ", s3)?;
                 }
+                if let Some(wal) = bck.wal_archive.as_ref().filter(|wal| wal.enabled) {
+                    write!(f, "wal_archive: {}, ", wal)?;
+                }
                 write!(f, "")
             }
             None => write!(f, "online_backup: disabled, "),
@@ -1147,6 +1155,16 @@ impl ConfigurationBuilder {
                     return None;
                 }
             }
+
+            if online_backup_ref
+                .wal_archive
+                .as_ref()
+                .is_some_and(|wal| wal.enabled && wal.local_path.is_none())
+                && db_path.is_none()
+            {
+                eprintln!("ERROR: online_backup.wal_archive: local_path must be set when db_path is unset (in memory).");
+                return None;
+            }
         };
 
         // Apply any defaults if needed
@@ -1235,14 +1253,23 @@ enabled = false
     }
 
     #[test]
-    fn online_backup_wal_archive_enabled_is_rejected() {
+    fn online_backup_wal_archive_is_validated() {
         let enabled = format!(
             "{BASE_V2_CONFIG}
 [online_backup.wal_archive]
 enabled = true
 "
         );
-        assert!(build_from_toml(&enabled).is_none());
+        let config = build_from_toml(&enabled).expect("WAL archiving must be accepted");
+        let wal = config
+            .online_backup
+            .as_ref()
+            .and_then(|b| b.wal_archive.as_ref())
+            .expect("wal_archive must be parsed");
+        assert!(wal.enabled);
+        assert_eq!(wal.segment_interval_seconds, 300);
+        assert_eq!(wal.retention_days, 7);
+        assert!(wal.local_path.is_none());
 
         let disabled = format!(
             "{BASE_V2_CONFIG}
@@ -1251,6 +1278,80 @@ enabled = false
 "
         );
         assert!(build_from_toml(&disabled).is_some());
+
+        let zero_interval = format!(
+            "{BASE_V2_CONFIG}
+[online_backup.wal_archive]
+enabled = true
+segment_interval_seconds = 0
+"
+        );
+        assert!(build_from_toml(&zero_interval).is_none());
+
+        let zero_retention = format!(
+            "{BASE_V2_CONFIG}
+[online_backup.wal_archive]
+enabled = true
+retention_days = 0
+"
+        );
+        assert!(build_from_toml(&zero_retention).is_none());
+
+        let zero_size = format!(
+            "{BASE_V2_CONFIG}
+[online_backup.wal_archive]
+enabled = true
+segment_size_bytes = 0
+"
+        );
+        assert!(build_from_toml(&zero_size).is_none());
+
+        let tuned = format!(
+            "{BASE_V2_CONFIG}
+[online_backup.wal_archive]
+enabled = true
+segment_interval_seconds = 60
+segment_size_bytes = 1048576
+retention_days = 14
+local_path = \"/srv/kubidm/wal\"
+"
+        );
+        let config = build_from_toml(&tuned).expect("tuned WAL archiving must be accepted");
+        let wal = config
+            .online_backup
+            .as_ref()
+            .and_then(|b| b.wal_archive.as_ref())
+            .expect("wal_archive must be parsed");
+        assert_eq!(wal.segment_interval_seconds, 60);
+        assert_eq!(wal.segment_size_bytes, 1048576);
+        assert_eq!(wal.retention_days, 14);
+        assert_eq!(wal.local_path, Some(PathBuf::from("/srv/kubidm/wal")));
+        assert!(config.to_string().contains("wal_archive:"));
+
+        // The archive replays on top of online backups, which must be enabled.
+        let backups_disabled = BASE_V2_CONFIG.replace(
+            "schedule = \"@daily\"",
+            "schedule = \"@daily\"\nenabled = false",
+        );
+        let backups_disabled = format!(
+            "{backups_disabled}
+[online_backup.wal_archive]
+enabled = true
+"
+        );
+        assert!(build_from_toml(&backups_disabled).is_none());
+
+        // An in-memory database has no directory to put the segments next to.
+        let in_memory = BASE_V2_CONFIG.replace("db_path = \"/var/lib/kubidm/kubidm.db\"\n", "");
+        let in_memory = format!(
+            "{in_memory}
+[online_backup.wal_archive]
+enabled = true
+"
+        );
+        assert!(build_from_toml(&in_memory).is_none());
+        let in_memory_with_path = format!("{in_memory}local_path = \"/srv/kubidm/wal\"\n");
+        assert!(build_from_toml(&in_memory_with_path).is_some());
     }
 
     #[test]
@@ -1296,8 +1397,25 @@ regions = []
             enabled: true,
             ..WalArchiveConfig::default()
         });
+        assert!(online_backup.validate().is_ok());
+
+        online_backup.wal_archive = Some(WalArchiveConfig {
+            enabled: true,
+            retention_days: 0,
+            ..WalArchiveConfig::default()
+        });
+        let err = online_backup.validate().expect_err("must be rejected");
+        assert!(err.starts_with("online_backup.wal_archive: retention_days"));
+
+        // Point-in-time recovery replays the archive on top of online base backups.
+        online_backup.wal_archive = Some(WalArchiveConfig {
+            enabled: true,
+            ..WalArchiveConfig::default()
+        });
+        online_backup.enabled = false;
         let err = online_backup.validate().expect_err("must be rejected");
         assert!(err.starts_with("online_backup.wal_archive:"));
+        assert!(err.contains("online_backup.enabled"));
     }
 
     #[test]
