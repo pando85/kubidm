@@ -114,9 +114,9 @@ pub struct OnlineBackup {
 
     /// Where the scheduled verification creates its scratch directories (the copied or
     /// downloaded artifact and the restored, unencrypted scratch database), each named
-    /// `kubidm-verify-*`. Defaults to the directory of the database. The server removes the
-    /// `kubidm-verify-*` directories it finds there when it starts, so it must not be
-    /// shared with another server.
+    /// `kubidm-verify-*`: in a `<database file>.verify` directory created here, by default
+    /// next to the database. The server removes the `kubidm-verify-*` directories it finds
+    /// in its own `<database file>.verify` when it starts.
     #[serde(default)]
     pub verify_temp_path: Option<PathBuf>,
 

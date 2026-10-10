@@ -37,19 +37,19 @@ use crate::config::{Configuration, OnlineBackup};
 /// The `Content-Type` of the Prometheus text exposition format.
 pub const PROMETHEUS_TEXT_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
-/// The name of the state file of the metrics, in the directory of the database.
-pub const METRICS_STATE_FILE_NAME: &str = "kubidm-backup-metrics.json";
+/// The suffix of the state file of the metrics: `<database file><suffix>`, next to the
+/// database.
+pub const METRICS_STATE_FILE_SUFFIX: &str = ".backup-metrics.json";
 
 /// Where the server described by `config` keeps the state of its backup metrics: next to
-/// its database, which is per server even when several servers share a backup directory.
+/// its database, named after the database file, so that it is per server even when
+/// several servers keep their databases in one directory or share a backup directory.
 /// None for a server without a database file.
 pub fn metrics_state_file(config: &Configuration) -> Option<PathBuf> {
     let db_path = config.db_path.as_ref()?;
-    let dir = match db_path.parent() {
-        Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
-        _ => PathBuf::from("."),
-    };
-    Some(dir.join(METRICS_STATE_FILE_NAME))
+    let mut name = db_path.as_os_str().to_os_string();
+    name.push(METRICS_STATE_FILE_SUFFIX);
+    Some(PathBuf::from(name))
 }
 
 /// Where a backup is stored: the label set of its metrics.
@@ -1027,7 +1027,9 @@ mod tests {
     #[tokio::test]
     async fn the_timestamps_survive_a_restart_and_the_counters_do_not() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join(METRICS_STATE_FILE_NAME);
+        let path = dir
+            .path()
+            .join(format!("kubidm.db{METRICS_STATE_FILE_SUFFIX}"));
         let config = full_config();
         let local = BackupDestination::Local;
         let eu = BackupDestination::S3Region("eu".to_string());
@@ -1100,7 +1102,9 @@ mod tests {
     #[tokio::test]
     async fn a_damaged_state_file_is_ignored() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join(METRICS_STATE_FILE_NAME);
+        let path = dir
+            .path()
+            .join(format!("kubidm.db{METRICS_STATE_FILE_SUFFIX}"));
         std::fs::write(&path, b"{ not json").expect("write");
         let metrics = BackupMetrics::new(Some(&full_config())).with_state_file(Some(path));
         metrics.load_state_file().await;
@@ -1153,12 +1157,44 @@ mod tests {
         config.db_path = Some(PathBuf::from("/var/lib/kubidm/kubidm.db"));
         assert_eq!(
             metrics_state_file(&config),
-            Some(PathBuf::from("/var/lib/kubidm").join(METRICS_STATE_FILE_NAME))
+            Some(PathBuf::from(
+                "/var/lib/kubidm/kubidm.db.backup-metrics.json"
+            ))
         );
         config.db_path = Some(PathBuf::from("kubidm.db"));
         assert_eq!(
             metrics_state_file(&config),
-            Some(PathBuf::from(".").join(METRICS_STATE_FILE_NAME))
+            Some(PathBuf::from("kubidm.db.backup-metrics.json"))
+        );
+    }
+
+    /// Two servers whose databases share a directory (a test or staging pair on one host)
+    /// keep their metrics apart: a shared state file would report the backups of one as
+    /// those of the other after a restart, which hides a stale backup.
+    #[tokio::test]
+    async fn servers_whose_databases_share_a_directory_keep_their_own_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_file = |db: &str| {
+            let mut config = Configuration::new_for_test();
+            config.db_path = Some(dir.path().join(db));
+            metrics_state_file(&config).expect("state file")
+        };
+        let (a, b) = (state_file("a.db"), state_file("b.db"));
+        assert_ne!(a, b);
+
+        let config = full_config();
+        let local = BackupDestination::Local;
+        let server_a = BackupMetrics::new(Some(&config)).with_state_file(Some(a.clone()));
+        server_a.backup_succeeded(&local, Duration::from_secs(1_700_000_000));
+        server_a.save_state_file().await;
+        assert!(a.is_file());
+
+        // The restarted server b never saw a backup: it reports none.
+        let server_b = BackupMetrics::new(Some(&config)).with_state_file(Some(b));
+        server_b.load_state_file().await;
+        assert_eq!(
+            sample(&server_b.render(), LAST_SUCCESS, "destination=\"local\"").as_deref(),
+            Some("0")
         );
     }
 }

@@ -172,9 +172,8 @@ compression = "gzip"
 #   Requires enabled = true.
 # verify_schedule = "30 3 * * Sun"
 #   Where the verification puts its scratch directories (kubidm-verify-*), which hold an
-#   unencrypted copy of the database while it runs. Defaults to the directory of the
-#   database; must be as private, and not shared with another server, since the server
-#   removes leftover kubidm-verify-* directories there when it starts.
+#   unencrypted copy of the database while it runs: in a <database file>.verify directory
+#   created here, next to the database by default. It must be as private as the database.
 # verify_temp_path = "/var/lib/kubidm/verify"
 #   Serve the backup metrics (last success, last failure and last verification time per
 #   backup destination, WAL archive synchronisation) in the Prometheus text format on

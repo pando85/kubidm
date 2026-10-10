@@ -13,9 +13,10 @@ use kubidm_proto::backup::{
     BackupCompression, BackupEncryptionConfig, EncryptionKeySource, KeyDerivationParams,
     ReplicationConfig, S3Config, WalArchiveConfig,
 };
-use kubidmd_core::backup::metrics::{BackupDestination, METRICS_STATE_FILE_NAME};
+use kubidmd_core::backup::metrics::{BackupDestination, METRICS_STATE_FILE_SUFFIX};
 use kubidmd_core::backup::verify::{
     BackupVerifyOutcome, BackupVerifyRun, DestinationVerification, SCRATCH_DIR_PREFIX,
+    SCRATCH_PARENT_SUFFIX,
 };
 use kubidmd_core::backup::MIN_KDF_M_COST;
 use kubidmd_core::config::{Configuration, OnlineBackup};
@@ -162,10 +163,25 @@ fn newest_backup(dir: &Path) -> PathBuf {
     backups.pop().expect("No backup artifact")
 }
 
-/// The scratch directories of a verification in `dir`.
+/// The state file of the metrics of the server whose database is `source.db` in `workdir`.
+fn state_file(workdir: &Path) -> PathBuf {
+    workdir.join(format!("source.db{METRICS_STATE_FILE_SUFFIX}"))
+}
+
+/// Where the scheduled verification of the server whose database is `source.db` in
+/// `workdir` creates its scratch directories by default.
+fn default_scratch(workdir: &Path) -> PathBuf {
+    workdir.join(format!("source.db{SCRATCH_PARENT_SUFFIX}"))
+}
+
+/// The scratch directories of a verification in `dir`, none when it does not exist.
 fn scratch_dirs(dir: &Path) -> Vec<PathBuf> {
-    std::fs::read_dir(dir)
-        .expect("Failed to read directory")
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(err) => panic!("Failed to read {}: {err}", dir.display()),
+    };
+    entries
         .filter_map(Result::ok)
         .filter(|entry| {
             entry
@@ -378,7 +394,7 @@ fn test_metrics_survive_a_restart() {
         let verified = sample(&before_restart, VERIFIED, LOCAL).expect("sample");
         assert!(last_success > 0.0 && verified > 0.0, "{before_restart}");
         env.core_handle.shutdown().await;
-        assert!(workdir.path().join(METRICS_STATE_FILE_NAME).is_file());
+        assert!(state_file(workdir.path()).is_file());
 
         // The restarted server reports the backup and the verification of the previous
         // run: an alert on their age does not fire because of the restart.
@@ -396,8 +412,7 @@ fn test_metrics_survive_a_restart() {
 
         // Without the state file (a first start after an upgrade), the last success comes
         // from the newest backup in the directory, by the time in its name.
-        std::fs::remove_file(workdir.path().join(METRICS_STATE_FILE_NAME))
-            .expect("Failed to remove the state file");
+        std::fs::remove_file(state_file(workdir.path())).expect("Failed to remove the state file");
         let mut env = kubidmd_testkit::setup_async_test(config).await;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         let seeded = loop {
@@ -498,7 +513,7 @@ fn test_scheduled_full_verification_of_an_encrypted_backup_updates_last_verified
         assert_eq!(metric(&env, VERIFICATION_ERRORS, LOCAL).await, 0.0);
 
         env.core_handle.shutdown().await;
-        assert!(scratch_dirs(workdir.path()).is_empty());
+        assert!(scratch_dirs(&default_scratch(workdir.path())).is_empty());
     });
 }
 
@@ -624,11 +639,17 @@ fn test_shutdown_during_a_verification_leaves_no_scratch_data() {
         let backup_dir = workdir.path().join("backups");
         std::fs::create_dir_all(&backup_dir).expect("Failed to create backup directory");
 
-        // What a killed run leaves behind, in the default scratch location: the
-        // directory of the database.
-        let stale = workdir.path().join(format!("{SCRATCH_DIR_PREFIX}killed"));
+        // What a killed run leaves behind, in the default scratch location: next to the
+        // database, named after it.
+        let stale = default_scratch(workdir.path()).join(format!("{SCRATCH_DIR_PREFIX}killed"));
         std::fs::create_dir_all(&stale).expect("Failed to create directory");
         std::fs::write(stale.join("verify.db"), b"restored data").expect("Failed to write");
+        // The run in progress of another server whose database is in the same directory.
+        let other = workdir
+            .path()
+            .join(format!("other.db{SCRATCH_PARENT_SUFFIX}"))
+            .join(format!("{SCRATCH_DIR_PREFIX}running"));
+        std::fs::create_dir_all(&other).expect("Failed to create directory");
 
         let config = config_with_online_backup(
             &workdir.path().join("source.db"),
@@ -644,12 +665,16 @@ fn test_shutdown_during_a_verification_leaves_no_scratch_data() {
             !stale.exists(),
             "the start must remove the stale scratch data"
         );
+        assert!(
+            other.is_dir(),
+            "the start must leave the scratch data of another server alone"
+        );
         populate(&env).await;
         backup_now(&env, &backup_dir).await;
 
         // Shut down while a scheduled run has its scratch data on disk.
         let deadline = tokio::time::Instant::now() + SCHEDULED_VERIFICATION_TIMEOUT;
-        while scratch_dirs(workdir.path()).is_empty() {
+        while scratch_dirs(&default_scratch(workdir.path())).is_empty() {
             assert!(
                 tokio::time::Instant::now() < deadline,
                 "no scheduled verification started"
@@ -660,17 +685,16 @@ fn test_shutdown_during_a_verification_leaves_no_scratch_data() {
 
         // The abandoned run stops before its next step and removes its scratch data.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-        while !scratch_dirs(workdir.path()).is_empty() {
+        while !scratch_dirs(&default_scratch(workdir.path())).is_empty() {
             assert!(
                 tokio::time::Instant::now() < deadline,
                 "scratch data left behind: {:?}",
-                scratch_dirs(workdir.path())
+                scratch_dirs(&default_scratch(workdir.path()))
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         // An abandoned run is neither a failure nor an error.
-        let state = std::fs::read_to_string(workdir.path().join(METRICS_STATE_FILE_NAME))
-            .unwrap_or_default();
+        let state = std::fs::read_to_string(state_file(workdir.path())).unwrap_or_default();
         assert!(!state.contains("verification_last_failure"), "{state}");
         assert!(!state.contains("verification_last_error"), "{state}");
     });
@@ -799,8 +823,7 @@ fn test_s3_metrics_and_scheduled_verification() {
 
         // Without a state file, a restarted server takes the last success of S3 and of the
         // region from the newest backup each holds.
-        std::fs::remove_file(workdir.path().join(METRICS_STATE_FILE_NAME))
-            .expect("Failed to remove the state file");
+        std::fs::remove_file(state_file(workdir.path())).expect("Failed to remove the state file");
         std::fs::write(&passphrase_file, "observability e2e passphrase\n")
             .expect("Failed to write the passphrase");
         let mut env = kubidmd_testkit::setup_async_test(config).await;

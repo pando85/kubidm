@@ -10,8 +10,8 @@
 //! verification runs on it. The database of the configuration is never opened.
 //!
 //! Every scratch directory (the copied or downloaded artifact, the scratch database) is
-//! named with [`SCRATCH_DIR_PREFIX`]. The scheduled verification creates them in
-//! `online_backup.verify_temp_path`, by default the directory of the database
+//! named with [`SCRATCH_DIR_PREFIX`]. The scheduled verification creates them in a
+//! directory of its server, named after the database file, by default next to the database
 //! ([`verify_scratch_parent`]); the server removes the ones an interrupted run left behind
 //! when it starts. The command uses `TMPDIR`.
 
@@ -175,23 +175,35 @@ pub(crate) fn remove_stale_scratch_dirs(parent: &Path) -> io::Result<usize> {
     Ok(removed)
 }
 
+/// The suffix of the directory the scheduled verification of a server creates its scratch
+/// directories in: `<database file><suffix>`, see [`verify_scratch_parent`].
+pub const SCRATCH_PARENT_SUFFIX: &str = ".verify";
+
 /// Where the scheduled verification of the server described by `config` creates its
-/// scratch directories: `online_backup.verify_temp_path`, by default the directory of the
-/// database, which is sized for a database and as private as one. None for a server without
-/// a database file, which then uses `TMPDIR`.
+/// scratch directories: `<database file>.verify`, in `online_backup.verify_temp_path`, by
+/// default in the directory of the database, which is sized for a database and as private
+/// as one. Being named after the database file, it is per server even when several servers
+/// keep their databases in one directory or share a `verify_temp_path`: the start-up sweep
+/// of one never removes the scratch data of another one's run. `verify_temp_path` itself
+/// for a server without a database file, and None, for `TMPDIR`, without either.
 pub fn verify_scratch_parent(config: &Configuration) -> Option<PathBuf> {
-    if let Some(path) = config
+    let configured = config
         .online_backup
         .as_ref()
-        .and_then(|online_backup| online_backup.verify_temp_path.clone())
-    {
-        return Some(path);
-    }
-    let db_path = config.db_path.as_ref()?;
-    Some(match db_path.parent() {
+        .and_then(|online_backup| online_backup.verify_temp_path.clone());
+    let Some(db_path) = config.db_path.as_ref() else {
+        return configured;
+    };
+    let Some(db_file) = db_path.file_name() else {
+        return configured;
+    };
+    let base = configured.unwrap_or_else(|| match db_path.parent() {
         Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
         _ => PathBuf::from("."),
-    })
+    });
+    let mut name = db_file.to_os_string();
+    name.push(SCRATCH_PARENT_SUFFIX);
+    Some(base.join(name))
 }
 
 /// Restore the artifact at `path` into a scratch database in a new scratch directory in
@@ -981,14 +993,14 @@ mod tests {
     }
 
     #[test]
-    fn scratch_directories_default_to_the_database_directory() {
+    fn scratch_directories_are_named_after_the_database_file() {
         let mut config = Configuration::new_for_test();
         config.db_path = None;
         assert_eq!(verify_scratch_parent(&config), None);
         config.db_path = Some(PathBuf::from("/var/lib/kubidm/kubidm.db"));
         assert_eq!(
             verify_scratch_parent(&config),
-            Some(PathBuf::from("/var/lib/kubidm"))
+            Some(PathBuf::from("/var/lib/kubidm/kubidm.db.verify"))
         );
         config.online_backup = Some(OnlineBackup {
             verify_temp_path: Some(PathBuf::from("/scratch")),
@@ -996,8 +1008,34 @@ mod tests {
         });
         assert_eq!(
             verify_scratch_parent(&config),
+            Some(PathBuf::from("/scratch/kubidm.db.verify"))
+        );
+        config.db_path = None;
+        assert_eq!(
+            verify_scratch_parent(&config),
             Some(PathBuf::from("/scratch"))
         );
+    }
+
+    /// Two servers whose databases share a directory: the start of one removes what a
+    /// killed run of its own left behind, never the scratch data of the other one's run in
+    /// progress, which would then fail as if its backup could not be restored.
+    #[test]
+    fn the_sweep_of_a_server_leaves_the_scratch_data_of_another_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let parent = |db: &str| {
+            let mut config = Configuration::new_for_test();
+            config.db_path = Some(dir.path().join(db));
+            verify_scratch_parent(&config).expect("scratch parent")
+        };
+        let (a, b) = (parent("a.db"), parent("b.db"));
+        assert_ne!(a, b);
+
+        let running = new_scratch_dir(Some(&a)).expect("scratch dir");
+        let killed = new_scratch_dir(Some(&b)).expect("scratch dir").keep();
+        assert_eq!(remove_stale_scratch_dirs(&b).expect("sweep"), 1);
+        assert!(!killed.exists());
+        assert!(running.path().is_dir());
     }
 
     #[tokio::test]

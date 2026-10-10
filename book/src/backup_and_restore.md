@@ -885,7 +885,7 @@ path = "/var/lib/kubidm/backups"
 schedule = "00 22 * * *"
 # Every Sunday at 03:30 UTC
 verify_schedule = "30 3 * * Sun"
-# Where the scratch data goes; the directory of the database by default.
+# Where the scratch data goes; next to the database by default.
 # verify_temp_path = "/var/lib/kubidm/verify"
 ```
 
@@ -912,11 +912,13 @@ complete backup of the S3 prefix, each picked by the time in its name:
     no verdict on the backup.
 
 The live database is never opened. Every scratch directory of a run (the copied or downloaded artifact, the scratch
-database) is named `kubidm-verify-*` and created in `verify_temp_path`, by default the directory of the database. The
-scratch database is not encrypted, like the one of `kubidmd database verify-backup`, so the default keeps it as private
-as the database; a `verify_temp_path` must be too. The directories are removed when the run ends, and at the next start
-when the process was killed during a run. Because of that clean-up, `verify_temp_path` must not be shared with another
-server.
+database) is named `kubidm-verify-*` and created in a directory named after the database file, `<database file>.verify`
+(for `db_path = "/var/lib/kubidm/kubidm.db"`, `/var/lib/kubidm/kubidm.db.verify`). It is next to the database by
+default, and in `verify_temp_path` when that is set. The scratch database is not encrypted, like the one of
+`kubidmd database verify-backup`, so the default keeps it as private as the database; a `verify_temp_path` must be too.
+The directories are removed when the run ends, and at the next start when the process was killed during a run. That
+clean-up only looks in the server's own `<database file>.verify`, so servers whose databases share a directory, or that
+share a `verify_temp_path`, never remove each other's scratch data, as long as their database files are named apart.
 
 Things to plan for:
 
@@ -950,8 +952,8 @@ be recovered from. Without it, `/metrics` answers 404 like any other unknown pat
 Restrict who can read it, in one or both of these ways:
 
 - Set `metrics_token_file` to a file holding a token: a request must then send `Authorization: Bearer <token>`, and is
-  answered 401 otherwise. The server reads the file when it starts, and the start fails when it is missing or empty.
-  The offline commands (`database backup`, `restore`, `recover`, `db-scan` and the others) never read it, so it can be
+  answered 401 otherwise. The server reads the file when it starts, and the start fails when it is missing or empty. The
+  offline commands (`database backup`, `restore`, `recover`, `db-scan` and the others) never read it, so it can be
   mounted for the server alone.
 - Block `/metrics` on the reverse proxy or load balancer that exposes the server, and scrape the server directly.
 
@@ -988,11 +990,13 @@ metrics_token_file = "/etc/kubidm/metrics-token"
 - Every destination the configuration names is reported from the start, with `0` for "never", so an alert on a stale
   timestamp also fires for a destination that never received a backup. The WAL archive series exist when
   `[online_backup.wal_archive]` is enabled.
-- **Restarts.** The timestamps survive a restart. They are written to `kubidm-backup-metrics.json` in the directory of
-  the database whenever they change, and read back when the server starts. The last success of every destination is also
-  taken, at start, from the newest complete backup it holds (by the time in its name), which covers a server that has no
-  state file yet; for S3 and the regions this is read in the background within seconds of the start. The counters
-  restart at `0`, as Prometheus expects of a restarted process: alert on them with `increase()`.
+- **Restarts.** The timestamps survive a restart. They are written next to the database, to
+  `<database file>.backup-metrics.json` (for `db_path = "/var/lib/kubidm/kubidm.db"`,
+  `/var/lib/kubidm/kubidm.db.backup-metrics.json`), whenever they change, and read back when the server starts. The last
+  success of every destination is also taken, at start, from the newest complete backup it holds (by the time in its
+  name), which covers a server that has no state file yet; for S3 and the regions this is read in the background within
+  seconds of the start. The counters restart at `0`, as Prometheus expects of a restarted process: alert on them with
+  `increase()`.
 - Backups taken by `kubidmd database backup` and verifications by `kubidmd database verify-backup` run in another
   process and are not counted.
 
