@@ -270,7 +270,10 @@ impl S3ClientWrapper {
             .metadata("backup-size", metadata.size_bytes.to_string())
             .storage_class(parse_storage_class(self.config.storage_class.as_str()));
 
-        builder = self.apply_encryption(builder);
+        let (sse, kms_key_id) = self.server_side_encryption();
+        builder = builder
+            .set_server_side_encryption(sse)
+            .set_ssekms_key_id(kms_key_id);
 
         builder.send().await.map_err(|e| {
             S3BackupError::UploadError(format!(
@@ -353,7 +356,10 @@ impl S3ClientWrapper {
             .metadata("backup-size", metadata.size_bytes.to_string())
             .storage_class(parse_storage_class(self.config.storage_class.as_str()));
 
-        builder = self.apply_encryption_multipart(builder);
+        let (sse, kms_key_id) = self.server_side_encryption();
+        builder = builder
+            .set_server_side_encryption(sse)
+            .set_ssekms_key_id(kms_key_id);
 
         builder.send().await.map_err(|e| {
             S3BackupError::UploadError(format!(
@@ -429,12 +435,15 @@ impl S3ClientWrapper {
             ))
         })?;
 
+        let (sse, kms_key_id) = self.server_side_encryption();
         self.client
             .put_object()
             .bucket(&self.config.bucket)
             .key(&metadata_key)
             .body(ByteStream::from(metadata_json.into_bytes()))
             .content_type("application/json")
+            .set_server_side_encryption(sse)
+            .set_ssekms_key_id(kms_key_id)
             .send()
             .await
             .map_err(|e| {
@@ -447,39 +456,21 @@ impl S3ClientWrapper {
         Ok(())
     }
 
-    fn apply_encryption(
-        &self,
-        mut builder: aws_sdk_s3::operation::put_object::builders::PutObjectFluentBuilder,
-    ) -> aws_sdk_s3::operation::put_object::builders::PutObjectFluentBuilder {
-        if let Some(sse) = &self.config.server_side_encryption {
-            let sse_type = match &sse.algorithm {
-                Some(S3EncryptionAlgorithm::Aes256) => ServerSideEncryption::Aes256,
-                _ => ServerSideEncryption::AwsKms,
-            };
-            builder = builder.server_side_encryption(sse_type);
-            if let Some(kms_key) = &sse.kms_key_id {
-                builder = builder.ssekms_key_id(kms_key);
-            }
+    /// The server-side encryption every object this client writes is stored with: the
+    /// algorithm and, for `aws:kms`, the key. Applied to the backup objects, multipart
+    /// uploads and metadata sidecars alike, so that a bucket policy requiring encryption,
+    /// or a specific KMS key, accepts every one of them.
+    fn server_side_encryption(&self) -> (Option<ServerSideEncryption>, Option<String>) {
+        match &self.config.server_side_encryption {
+            Some(sse) => (
+                Some(match sse.algorithm {
+                    Some(S3EncryptionAlgorithm::Aes256) => ServerSideEncryption::Aes256,
+                    Some(S3EncryptionAlgorithm::AwsKms) | None => ServerSideEncryption::AwsKms,
+                }),
+                sse.kms_key_id.clone(),
+            ),
+            None => (None, None),
         }
-        builder
-    }
-
-    fn apply_encryption_multipart(
-        &self,
-        mut builder: aws_sdk_s3::operation::create_multipart_upload::builders::CreateMultipartUploadFluentBuilder,
-    ) -> aws_sdk_s3::operation::create_multipart_upload::builders::CreateMultipartUploadFluentBuilder
-    {
-        if let Some(sse) = &self.config.server_side_encryption {
-            let sse_type = match &sse.algorithm {
-                Some(S3EncryptionAlgorithm::Aes256) => ServerSideEncryption::Aes256,
-                _ => ServerSideEncryption::AwsKms,
-            };
-            builder = builder.server_side_encryption(sse_type);
-            if let Some(kms_key) = &sse.kms_key_id {
-                builder = builder.ssekms_key_id(kms_key);
-            }
-        }
-        builder
     }
 
     pub async fn download_backup(
@@ -1248,9 +1239,167 @@ fn parse_storage_class(s: &str) -> StorageClass {
     }
 }
 
+/// A minimal S3 endpoint for tests: it records every request and answers it with what the
+/// test's responder returns, so that the requests the client sends, and its reaction to
+/// failures, can be checked without a real object store.
+#[cfg(test)]
+pub(crate) mod fake_s3 {
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+
+    use kubidm_proto::backup::{S3Config, S3Credentials};
+
+    /// One request the fake endpoint received. `path` is `/<bucket>/<key>`, with the `:`
+    /// of the timestamps decoded.
+    #[derive(Debug, Clone)]
+    pub struct Recorded {
+        pub method: String,
+        pub path: String,
+        pub headers: BTreeMap<String, String>,
+    }
+
+    impl Recorded {
+        pub fn header(&self, name: &str) -> Option<&str> {
+            self.headers.get(name).map(String::as_str)
+        }
+    }
+
+    /// The status, headers and body to answer a request with.
+    pub type Reply = (u16, Vec<(&'static str, String)>, String);
+    pub type Responder = Arc<dyn Fn(&Recorded) -> Reply + Send + Sync>;
+
+    /// The answer of a store that accepts everything.
+    pub fn ok(request: &Recorded) -> Reply {
+        match request.method.as_str() {
+            "DELETE" => (204, vec![], String::new()),
+            _ => (200, vec![("etag", "\"etag\"".to_string())], String::new()),
+        }
+    }
+
+    pub struct FakeS3 {
+        pub endpoint: String,
+        requests: Arc<Mutex<Vec<Recorded>>>,
+    }
+
+    impl FakeS3 {
+        pub async fn start(responder: Responder) -> Self {
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let recorder = Arc::clone(&requests);
+            let app = axum::Router::new().fallback(move |request: axum::extract::Request| {
+                let responder = Arc::clone(&responder);
+                let recorder = Arc::clone(&recorder);
+                async move {
+                    let (parts, body) = request.into_parts();
+                    let _ = axum::body::to_bytes(body, usize::MAX).await;
+                    let recorded = Recorded {
+                        method: parts.method.to_string(),
+                        // Backup names carry the `:` of their timestamp.
+                        path: parts.uri.path().replace("%3A", ":"),
+                        headers: parts
+                            .headers
+                            .iter()
+                            .map(|(name, value)| {
+                                (
+                                    name.as_str().to_string(),
+                                    value.to_str().unwrap_or_default().to_string(),
+                                )
+                            })
+                            .collect(),
+                    };
+                    let (status, headers, body) = responder(&recorded);
+                    recorder.lock().expect("recorder").push(recorded);
+                    let mut response = axum::response::Response::builder().status(status);
+                    for (name, value) in headers {
+                        response = response.header(name, value);
+                    }
+                    response
+                        .body(axum::body::Body::from(body))
+                        .expect("response")
+                }
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let endpoint = format!("http://{}", listener.local_addr().expect("addr"));
+            tokio::spawn(async move { axum::serve(listener, app).await });
+            Self { endpoint, requests }
+        }
+
+        /// A configuration for `bucket` at this endpoint.
+        pub fn config(&self, bucket: &str) -> S3Config {
+            let mut config = S3Config::with_bucket(bucket.to_string());
+            config.region = Some("us-east-1".to_string());
+            config.endpoint = Some(self.endpoint.clone());
+            config.credentials = Some(S3Credentials {
+                access_key_id: "key".to_string(),
+                secret_access_key: "secret".to_string(),
+                session_token: None,
+            });
+            config
+        }
+
+        pub fn requests(&self) -> Vec<Recorded> {
+            self.requests.lock().expect("recorder").clone()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn test_every_object_is_written_with_the_configured_encryption() {
+        let fake = fake_s3::FakeS3::start(Arc::new(fake_s3::ok)).await;
+        let mut config = fake.config("bucket");
+        config.server_side_encryption = Some(S3ServerSideEncryption {
+            algorithm: Some(S3EncryptionAlgorithm::AwsKms),
+            kms_key_id: Some("backup-key".to_string()),
+        });
+        let client = S3ClientWrapper::new(config).await.expect("client");
+
+        client
+            .upload_backup(
+                b"artifact",
+                "backup-2024-01-01T22:00:00Z.json.gz",
+                "2024-01-01T22:00:00Z",
+                BackupCompression::Gzip,
+                None,
+            )
+            .await
+            .expect("upload");
+
+        let puts: Vec<_> = fake
+            .requests()
+            .into_iter()
+            .filter(|request| request.method == "PUT")
+            .collect();
+        let paths: Vec<&str> = puts.iter().map(|put| put.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            [
+                "/bucket/backup-2024-01-01T22:00:00Z.json.gz",
+                "/bucket/backup-2024-01-01T22:00:00Z.json.gz.metadata.json"
+            ]
+        );
+        // The sidecar too: a bucket policy that denies unencrypted uploads, or requires
+        // this key, must accept it.
+        for put in &puts {
+            assert_eq!(
+                put.header("x-amz-server-side-encryption"),
+                Some("aws:kms"),
+                "{}",
+                put.path
+            );
+            assert_eq!(
+                put.header("x-amz-server-side-encryption-aws-kms-key-id"),
+                Some("backup-key"),
+                "{}",
+                put.path
+            );
+        }
+    }
 
     #[tokio::test]
     async fn test_sdk_config_bounds_every_request() {
