@@ -6,21 +6,20 @@
 //! between them and at the latest point. The recovered databases are booted as servers and
 //! inspected through the client API.
 //!
-//! The S3 variant needs an S3-compatible service and is skipped unless
-//! `KUBIDM_TEST_S3_ENDPOINT` is set, exactly like `s3_recovery_test`; see there for running
-//! it against a local Silo container.
+//! The S3 variants need an S3-compatible service; see `backup_common` for how it is found,
+//! when they are skipped and how to run them locally.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
+use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client as SdkClient;
 use kubidm_client::KubidmClient;
 use kubidm_proto::backup::{
     is_encrypted_backup_name, BackupCompression, BackupEncryptionConfig, EncryptionKeySource,
-    KeyDerivationParams, PitrManifest, ReplicationConfig, ReplicationRegionConfig, S3Config,
-    S3Credentials, WalArchiveConfig, PITR_MANIFEST_KEY,
+    KeyDerivationParams, PitrManifest, ReplicationConfig, S3Config, WalArchiveConfig,
+    PITR_MANIFEST_KEY,
 };
 use kubidmd_core::backup::pitr::{
     pitr_list_server_core, pitr_recover_server_core, PitrArchive, PitrError, PitrSettings,
@@ -34,9 +33,10 @@ use kubidmd_testkit::{login_put_admin_idm_admins, setup_async_test, AsyncTestEnv
 use uuid::Uuid;
 
 use super::backup_common::{
-    assert_directory_state_restored, config_with_db, populate, run, BACKUP_ENGINEERS_GROUP,
+    assert_directory_state_restored, config_with_db, delete_prefix, ensure_bucket, full_key,
+    object_keys, populate, run, s3_object, sdk_client, test_s3_config, test_s3_region,
+    BACKUP_ENGINEERS_GROUP,
 };
-use super::s3_recovery_test::ensure_bucket;
 
 /// Created after the base backup and before the recovery target.
 const PITR_USER_BEFORE: &str = "pitr_user_before";
@@ -345,105 +345,28 @@ fn test_pitr_unclean_stop_leaves_a_gap_recovery_does_not_cross() {
 
 // === S3 ===
 
-const ENDPOINT_ENV: &str = "KUBIDM_TEST_S3_ENDPOINT";
-const BUCKET_ENV: &str = "KUBIDM_TEST_S3_BUCKET";
-const ACCESS_KEY_ENV: &str = "KUBIDM_TEST_S3_ACCESS_KEY";
-const SECRET_KEY_ENV: &str = "KUBIDM_TEST_S3_SECRET_KEY";
-const REGION: &str = "us-east-1";
-
-/// The S3 configuration for this test run, or None (after printing why) when no endpoint
-/// is configured. Every run uses its own prefix.
-fn test_s3_config() -> Option<S3Config> {
-    let Ok(endpoint) = std::env::var(ENDPOINT_ENV) else {
-        eprintln!("skipping: {ENDPOINT_ENV} not set");
-        return None;
-    };
-    let env_or =
-        |name: &str, default: &str| std::env::var(name).unwrap_or_else(|_| default.to_string());
-    Some(S3Config {
-        bucket: env_or(BUCKET_ENV, "kubidm-test"),
-        region: Some(REGION.to_string()),
-        endpoint: Some(endpoint),
-        path_prefix: Some(format!("pitr-test/{}", Uuid::new_v4())),
-        credentials: Some(S3Credentials {
-            access_key_id: env_or(ACCESS_KEY_ENV, "kubidm-test"),
-            secret_access_key: env_or(SECRET_KEY_ENV, "kubidm-test-secret"),
-            session_token: None,
-        }),
-        server_side_encryption: None,
-        storage_class: "STANDARD".to_string(),
-        replication: None,
-    })
-}
-
-async fn sdk_client(s3_config: &S3Config) -> SdkClient {
-    let credentials = s3_config
-        .credentials
-        .as_ref()
-        .expect("Test S3 config has no credentials");
-    let sdk_config = aws_config::defaults(BehaviorVersion::latest())
-        .endpoint_url(
-            s3_config
-                .endpoint
-                .clone()
-                .expect("Test S3 config has no endpoint"),
-        )
-        .region(Region::new(REGION))
-        .credentials_provider(Credentials::new(
-            credentials.access_key_id.clone(),
-            credentials.secret_access_key.clone(),
-            None,
-            None,
-            "kubidm-test",
-        ))
-        .load()
-        .await;
-    SdkClient::from_conf(
-        aws_sdk_s3::config::Builder::from(&sdk_config)
-            .force_path_style(true)
-            .build(),
-    )
-}
-
-/// Every object key below the prefix of `s3_config`, with the prefix stripped, sorted.
-async fn object_keys(sdk: &SdkClient, s3_config: &S3Config) -> Vec<String> {
-    // Several S3 tests of this binary may race to create the shared bucket.
-    ensure_bucket(sdk, &s3_config.bucket).await;
-    let prefix = format!(
-        "{}/",
-        s3_config
-            .path_prefix
-            .as_deref()
-            .expect("Test S3 config has no prefix")
-    );
-    let output = sdk
-        .list_objects_v2()
-        .bucket(&s3_config.bucket)
-        .prefix(&prefix)
-        .send()
-        .await
-        .expect("Failed to list objects");
-    let mut keys: Vec<String> = output
-        .contents()
-        .iter()
-        .filter_map(|object| object.key())
-        .filter_map(|key| key.strip_prefix(&prefix))
-        .map(str::to_string)
-        .collect();
-    keys.sort();
-    keys
-}
+/// An object under the prefix that is neither a backup nor part of the archive.
+const FOREIGN_OBJECT: &str = "notes/readme.txt";
 
 #[test]
 fn test_pitr_s3_recover_on_a_new_host() {
-    let Some(s3_config) = test_s3_config() else {
+    let Some(s3_config) = test_s3_config("pitr-test") else {
         return;
     };
 
     run(async {
         let sdk = sdk_client(&s3_config).await;
-        // Creates the bucket when needed; the prefix is fresh.
+        ensure_bucket(&sdk, &s3_config.bucket).await;
         assert!(object_keys(&sdk, &s3_config).await.is_empty());
+
+        // An object of someone else under the prefix, which no retention may touch.
+        sdk.put_object()
+            .bucket(&s3_config.bucket)
+            .key(full_key(&s3_config, FOREIGN_OBJECT))
+            .body(ByteStream::from_static(b"not a backup"))
+            .send()
+            .await
+            .expect("Failed to upload the foreign object");
 
         let source_host = tempfile::tempdir().expect("Failed to create workdir");
         let source_wal: PathBuf = source_host.path().join("wal");
@@ -456,20 +379,28 @@ fn test_pitr_s3_recover_on_a_new_host() {
 
         let env = setup_async_test(source_config).await;
         populate(&env).await;
-        env.core_handle
-            .trigger_s3_backup(
-                s3_config.clone(),
-                7,
-                BackupCompression::Gzip,
-                &Default::default(),
-            )
-            .await
-            .expect("S3 backup failed");
+        // Two backups with a retention of one: retention deletes the first one, and must
+        // leave the archive and the foreign object alone.
+        for round in 0..2 {
+            if round > 0 {
+                // Backup keys carry the timestamp; make sure they differ.
+                tokio::time::sleep(Duration::from_millis(1100)).await;
+            }
+            env.core_handle
+                .trigger_s3_backup(
+                    s3_config.clone(),
+                    1,
+                    BackupCompression::Gzip,
+                    &Default::default(),
+                )
+                .await
+                .expect("S3 backup failed");
+        }
         let target = write_history(env).await;
 
         // Everything was shipped: the local WAL directory holds no segment any more, and
         // the prefix holds the base backup, the segments and the manifest, each with its
-        // metadata sidecar. Backup retention left the archive alone.
+        // metadata sidecar. Backup retention deleted the older backup only.
         assert!(
             list_segments(&source_wal)
                 .expect("Failed to list the local WAL directory")
@@ -490,9 +421,10 @@ fn test_pitr_s3_recover_on_a_new_host() {
             .filter(|key| key.starts_with("wal/wal-") && key.ends_with(".json.gz"))
             .count();
         assert!(segment_count >= 2, "{keys:?}");
+        assert!(keys.iter().any(|key| key == FOREIGN_OBJECT), "{keys:?}");
         assert!(keys
             .iter()
-            .filter(|key| !key.ends_with(".metadata.json"))
+            .filter(|key| !key.ends_with(".metadata.json") && key.as_str() != FOREIGN_OBJECT)
             .all(|key| keys.contains(&format!("{key}.metadata.json"))));
 
         // A new host: an empty WAL directory and no local backups. Everything comes from
@@ -530,6 +462,8 @@ fn test_pitr_s3_recover_on_a_new_host() {
             .expect("Recovery from S3 to the latest point failed");
         let mut env = assert_state_at_target(latest_config).await;
         env.core_handle.shutdown().await;
+
+        delete_prefix(&sdk, &s3_config).await;
     });
 }
 
@@ -538,7 +472,6 @@ fn test_pitr_s3_recover_on_a_new_host() {
 const PITR_PASSPHRASE: &str = "pitr e2e passphrase, long enough to matter";
 const PITR_KEY_ID: &str = "pitr-e2e-key";
 const PITR_REGION: &str = "eu-west-1";
-const REGION_BUCKET_ENV: &str = "KUBIDM_TEST_S3_REGION_BUCKET";
 
 /// Backup encryption with the passphrase in a file under `dir` and the cheapest key
 /// derivation the server accepts.
@@ -656,22 +589,6 @@ fn test_pitr_local_encrypted_base_and_wal_recover() {
     });
 }
 
-/// The region of the PITR replication test, in its own bucket and prefix.
-fn pitr_region(primary: &S3Config) -> ReplicationRegionConfig {
-    ReplicationRegionConfig {
-        name: None,
-        region: PITR_REGION.to_string(),
-        endpoint: primary.endpoint.clone(),
-        bucket: std::env::var(REGION_BUCKET_ENV)
-            .unwrap_or_else(|_| "kubidm-test-region".to_string()),
-        path_prefix: Some(format!("pitr-dr/{}", Uuid::new_v4())),
-        credentials: primary.credentials.clone(),
-        server_side_encryption: None,
-        storage_class: "STANDARD".to_string(),
-        kms_key_id: None,
-    }
-}
-
 /// The keys of the WAL segments among `keys`.
 fn segment_keys(keys: &[String]) -> Vec<String> {
     keys.iter()
@@ -681,49 +598,8 @@ fn segment_keys(keys: &[String]) -> Vec<String> {
 }
 
 async fn s3_manifest(sdk: &SdkClient, s3_config: &S3Config) -> PitrManifest {
-    let prefix = s3_config.path_prefix.as_deref().expect("No prefix");
-    let object = sdk
-        .get_object()
-        .bucket(&s3_config.bucket)
-        .key(format!("{prefix}/{PITR_MANIFEST_KEY}"))
-        .send()
-        .await
-        .expect("Failed to get the manifest");
-    let data = object
-        .body
-        .collect()
-        .await
-        .expect("Failed to read the manifest")
-        .into_bytes();
-    serde_json::from_slice(&data).expect("Failed to parse the manifest")
-}
-
-async fn s3_object(sdk: &SdkClient, s3_config: &S3Config, key: &str) -> Vec<u8> {
-    let prefix = s3_config.path_prefix.as_deref().expect("No prefix");
-    sdk.get_object()
-        .bucket(&s3_config.bucket)
-        .key(format!("{prefix}/{key}"))
-        .send()
-        .await
-        .expect("Failed to get the object")
-        .body
-        .collect()
-        .await
-        .expect("Failed to read the object")
-        .into_bytes()
-        .to_vec()
-}
-
-async fn delete_all(sdk: &SdkClient, s3_config: &S3Config) {
-    let prefix = s3_config.path_prefix.as_deref().expect("No prefix");
-    for key in object_keys(sdk, s3_config).await {
-        sdk.delete_object()
-            .bucket(&s3_config.bucket)
-            .key(format!("{prefix}/{key}"))
-            .send()
-            .await
-            .expect("Failed to delete an object");
-    }
+    serde_json::from_slice(&s3_object(sdk, s3_config, PITR_MANIFEST_KEY).await)
+        .expect("Failed to parse the manifest")
 }
 
 /// Encryption, replication and PITR together, against S3: the base backups and the WAL
@@ -733,10 +609,10 @@ async fn delete_all(sdk: &SdkClient, s3_config: &S3Config) {
 /// history its recovery abandoned back to the primary.
 #[test]
 fn test_pitr_s3_encrypted_replicated_recover_from_region() {
-    let Some(mut s3_config) = test_s3_config() else {
+    let Some(mut s3_config) = test_s3_config("pitr-test") else {
         return;
     };
-    let region = pitr_region(&s3_config);
+    let region = test_s3_region(&s3_config, PITR_REGION, "pitr-dr");
     s3_config.replication = Some(ReplicationConfig {
         enabled: true,
         regions: vec![region.clone()],
@@ -748,6 +624,8 @@ fn test_pitr_s3_encrypted_replicated_recover_from_region() {
     // in a debug build; keep it on the heap.
     run(Box::pin(async {
         let sdk = sdk_client(&s3_config).await;
+        ensure_bucket(&sdk, &s3_config.bucket).await;
+        ensure_bucket(&sdk, &region_s3.bucket).await;
         assert!(object_keys(&sdk, &s3_config).await.is_empty());
         assert!(object_keys(&sdk, &region_s3).await.is_empty());
 
@@ -873,7 +751,7 @@ fn test_pitr_s3_encrypted_replicated_recover_from_region() {
         // The primary archive is lost. The region still holds everything, including the
         // history written after the recovery, which was replicated at shutdown.
         let primary_segments = s3_manifest(&sdk, &s3_config).await.segments;
-        delete_all(&sdk, &s3_config).await;
+        delete_prefix(&sdk, &s3_config).await;
         let last_host = tempfile::tempdir().expect("Failed to create workdir");
         std::fs::copy(
             source_host.path().join("backup-passphrase"),
@@ -958,5 +836,8 @@ fn test_pitr_s3_encrypted_replicated_recover_from_region() {
             region_manifest.segments
         );
         assert!(segment_keys(&object_keys(&sdk, &region_s3).await).is_empty());
+
+        delete_prefix(&sdk, &s3_config).await;
+        delete_prefix(&sdk, &region_s3).await;
     }));
 }

@@ -1,32 +1,15 @@
 //! End to end test of cross-region S3 backup replication against a real S3 endpoint.
 //!
-//! Like `s3_recovery_test`, this needs an S3-compatible service and is skipped unless
-//! `KUBIDM_TEST_S3_ENDPOINT` is set. CI runs it against [Silo](https://github.com/pgsty/silo),
-//! which can be reproduced locally with:
-//!
-//! ```text
-//! docker run -d --name silo -p 9000:9000 \
-//!     -e MINIO_ROOT_USER=kubidm-test -e MINIO_ROOT_PASSWORD=kubidm-test-secret \
-//!     pgsty/silo:RELEASE.2026-09-16T00-00-00Z server /data
-//! KUBIDM_TEST_S3_ENDPOINT=http://127.0.0.1:9000 \
-//!     cargo test -p kubidmd_testkit --test integration_test s3_replication
-//! ```
-//!
-//! The credentials come from `KUBIDM_TEST_S3_ACCESS_KEY` and `KUBIDM_TEST_S3_SECRET_KEY`
-//! (defaults `kubidm-test` / `kubidm-test-secret`). The primary bucket is taken from
-//! `KUBIDM_TEST_S3_BUCKET` (default `kubidm-test`) and the replica bucket from
-//! `KUBIDM_TEST_S3_REGION_BUCKET` (default `kubidm-test-region`); both live on the same
-//! endpoint and are created when missing. Every run uses its own prefixes, so runs never
-//! interfere.
+//! Like `s3_recovery_test`, this needs an S3-compatible service; see `backup_common` for how
+//! it is found, when it is skipped and how to run it locally. The replicas live in the
+//! region test bucket on the same endpoint.
 
 use std::time::Duration;
 
-use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::Client as SdkClient;
 use kubidm_proto::backup::{
     BackupCompression, BackupEncryptionConfig, EncryptionKeySource, KeyDerivationParams,
-    ReplicationConfig, ReplicationRegionConfig, ReplicationStatus, S3Config, S3Credentials,
+    ReplicationConfig, ReplicationRegionConfig, ReplicationStatus, S3Config,
 };
 use kubidmd_core::backup::{is_encrypted_artifact, S3ClientWrapper, MIN_KDF_M_COST};
 use kubidmd_core::config::{Configuration, OnlineBackup};
@@ -39,19 +22,11 @@ use uuid::Uuid;
 use kubidmd_testkit::login_put_admin_idm_admins;
 
 use super::backup_common::{
-    assert_directory_state_restored, config_with_db, populate, run, start_server,
+    assert_directory_state_restored, config_with_db, delete_prefix, ensure_bucket, full_key,
+    object_keys, populate, run, sdk_client, start_server, test_s3_config, test_s3_region,
+    with_sidecars,
 };
 
-const ENDPOINT_ENV: &str = "KUBIDM_TEST_S3_ENDPOINT";
-const BUCKET_ENV: &str = "KUBIDM_TEST_S3_BUCKET";
-const REGION_BUCKET_ENV: &str = "KUBIDM_TEST_S3_REGION_BUCKET";
-const ACCESS_KEY_ENV: &str = "KUBIDM_TEST_S3_ACCESS_KEY";
-const SECRET_KEY_ENV: &str = "KUBIDM_TEST_S3_SECRET_KEY";
-const DEFAULT_BUCKET: &str = "kubidm-test";
-const DEFAULT_REGION_BUCKET: &str = "kubidm-test-region";
-const DEFAULT_ACCESS_KEY: &str = "kubidm-test";
-const DEFAULT_SECRET_KEY: &str = "kubidm-test-secret";
-const PRIMARY_REGION: &str = "us-east-1";
 /// The name of the replication region. It is also the signing region of its requests;
 /// Silo and MinIO accept any signing region unless one is configured on the server.
 const REPLICA_REGION: &str = "eu-west-1";
@@ -70,51 +45,27 @@ struct TestSetup {
     broken: ReplicationRegionConfig,
 }
 
-fn credentials() -> S3Credentials {
-    S3Credentials {
-        access_key_id: std::env::var(ACCESS_KEY_ENV)
-            .unwrap_or_else(|_| DEFAULT_ACCESS_KEY.to_string()),
-        secret_access_key: std::env::var(SECRET_KEY_ENV)
-            .unwrap_or_else(|_| DEFAULT_SECRET_KEY.to_string()),
-        session_token: None,
+impl TestSetup {
+    /// The replica as an S3 location, to inspect and clean up its objects.
+    fn replica_s3(&self) -> S3Config {
+        self.replica.to_s3_config()
     }
 }
 
-/// The S3 configurations for this test run, or None (after printing why) when no endpoint
-/// is configured.
+/// The S3 configurations for this test run, or None when S3 tests are skipped.
 fn test_setup() -> Option<TestSetup> {
-    let Ok(endpoint) = std::env::var(ENDPOINT_ENV) else {
-        eprintln!("skipping: {ENDPOINT_ENV} not set");
-        return None;
-    };
-    let bucket = std::env::var(BUCKET_ENV).unwrap_or_else(|_| DEFAULT_BUCKET.to_string());
-    let region_bucket =
-        std::env::var(REGION_BUCKET_ENV).unwrap_or_else(|_| DEFAULT_REGION_BUCKET.to_string());
-    let run_id = Uuid::new_v4();
-
+    let primary = test_s3_config("s3-replication-test")?;
+    let replica = test_s3_region(&primary, REPLICA_REGION, "dr");
     let replica = ReplicationRegionConfig {
-        name: None,
-        region: REPLICA_REGION.to_string(),
-        endpoint: Some(endpoint.clone()),
-        bucket: region_bucket,
         // A different prefix from the primary, with a trailing slash, so that the region
         // prefix handling is exercised and not just mirrored.
-        path_prefix: Some(format!("dr/{run_id}/")),
-        credentials: Some(credentials()),
-        server_side_encryption: None,
-        storage_class: "STANDARD".to_string(),
-        kms_key_id: None,
+        path_prefix: replica.path_prefix.map(|prefix| format!("{prefix}/")),
+        ..replica
     };
     let broken = ReplicationRegionConfig {
-        name: None,
-        region: BROKEN_REGION.to_string(),
-        endpoint: Some(endpoint.clone()),
-        bucket: format!("kubidm-test-missing-{run_id}"),
+        bucket: format!("kubidm-test-missing-{}", Uuid::new_v4()),
         path_prefix: None,
-        credentials: Some(credentials()),
-        server_side_encryption: None,
-        storage_class: "STANDARD".to_string(),
-        kms_key_id: None,
+        ..test_s3_region(&primary, BROKEN_REGION, "broken")
     };
 
     let replication = |regions: Vec<ReplicationRegionConfig>| ReplicationConfig {
@@ -124,14 +75,8 @@ fn test_setup() -> Option<TestSetup> {
     };
 
     let primary = S3Config {
-        bucket,
-        region: Some(PRIMARY_REGION.to_string()),
-        endpoint: Some(endpoint),
-        path_prefix: Some(format!("s3-replication-test/{run_id}")),
-        credentials: Some(credentials()),
-        server_side_encryption: None,
-        storage_class: "STANDARD".to_string(),
         replication: Some(replication(vec![replica.clone()])),
+        ..primary
     };
     let primary_with_broken_region = S3Config {
         replication: Some(replication(vec![replica.clone(), broken.clone()])),
@@ -156,100 +101,6 @@ fn config_with_s3(db_path: &std::path::Path, s3_config: &S3Config) -> Configurat
         }),
         ..config_with_db(db_path)
     }
-}
-
-/// A raw SDK client for the endpoint and credentials, used to prepare the buckets, to
-/// inspect the objects behind the back of `S3ClientWrapper` and to damage them.
-async fn sdk_client(s3_config: &S3Config) -> SdkClient {
-    let credentials = s3_config
-        .credentials
-        .as_ref()
-        .expect("Test S3 config has no credentials");
-    let sdk_config = aws_config::defaults(BehaviorVersion::latest())
-        .endpoint_url(
-            s3_config
-                .endpoint
-                .clone()
-                .expect("Test S3 config has no endpoint"),
-        )
-        .region(Region::new(PRIMARY_REGION))
-        .credentials_provider(Credentials::new(
-            credentials.access_key_id.clone(),
-            credentials.secret_access_key.clone(),
-            None,
-            None,
-            "kubidm-test",
-        ))
-        .load()
-        .await;
-    SdkClient::from_conf(
-        aws_sdk_s3::config::Builder::from(&sdk_config)
-            .force_path_style(true)
-            .build(),
-    )
-}
-
-/// Create `bucket` unless it exists. The S3 tests run concurrently and share the primary
-/// bucket, so a creation that loses the race against another test is fine as long as the
-/// bucket exists afterwards.
-async fn ensure_bucket(sdk: &SdkClient, bucket: &str) {
-    if sdk.head_bucket().bucket(bucket).send().await.is_ok() {
-        return;
-    }
-    if let Err(err) = sdk.create_bucket().bucket(bucket).send().await {
-        assert!(
-            sdk.head_bucket().bucket(bucket).send().await.is_ok(),
-            "Failed to create the test bucket {bucket}: {err:?}"
-        );
-    }
-}
-
-/// Every object key below the prefix of `region`, with the prefix stripped, sorted.
-async fn raw_region_keys(sdk: &SdkClient, region: &ReplicationRegionConfig) -> Vec<String> {
-    let prefix = region
-        .path_prefix
-        .as_deref()
-        .expect("Region config has no prefix")
-        .trim_end_matches('/');
-    let output = sdk
-        .list_objects_v2()
-        .bucket(&region.bucket)
-        .prefix(format!("{prefix}/"))
-        .send()
-        .await
-        .expect("Failed to list the region objects");
-    let mut keys: Vec<String> = output
-        .contents()
-        .iter()
-        .filter_map(|object| object.key())
-        .map(|key| {
-            key.strip_prefix(&format!("{prefix}/"))
-                .unwrap_or(key)
-                .to_string()
-        })
-        .collect();
-    keys.sort();
-    keys
-}
-
-/// `backups` together with their metadata sidecars, sorted: exactly the objects a location
-/// holding these backups contains.
-fn with_sidecars(backups: &[String]) -> Vec<String> {
-    let mut keys: Vec<String> = backups
-        .iter()
-        .flat_map(|key| [key.clone(), format!("{key}.metadata.json")])
-        .collect();
-    keys.sort();
-    keys
-}
-
-fn region_full_key(region: &ReplicationRegionConfig, key: &str) -> String {
-    let prefix = region
-        .path_prefix
-        .as_deref()
-        .expect("Region config has no prefix")
-        .trim_end_matches('/');
-    format!("{prefix}/{key}")
 }
 
 #[test]
@@ -315,7 +166,7 @@ fn test_s3_backup_replication_retention_status_and_recovery() {
         // Behind the scenes: the two backups and their two sidecars under the region
         // prefix, nothing else. Retention removed the sidecar of the pruned backup too.
         assert_eq!(
-            raw_region_keys(&sdk, &setup.replica).await,
+            object_keys(&sdk, &setup.replica_s3()).await,
             with_sidecars(&primary_backups),
             "Unexpected objects under the region prefix"
         );
@@ -403,6 +254,10 @@ fn test_s3_backup_replication_retention_status_and_recovery() {
             .await
             .expect("Restore from the region failed");
         assert!(restored_db.exists(), "Restore did not create the database");
+        let mut restored_env = start_server(&restored_db).await;
+        login_put_admin_idm_admins(&restored_env.rsclient).await;
+        assert_directory_state_restored(&restored_env.rsclient).await;
+        restored_env.core_handle.shutdown().await;
 
         // e. replicate-status reports the region healthy, and reports the broken region
         //    as failed with everything pending while the healthy one stays healthy.
@@ -471,7 +326,7 @@ fn test_s3_backup_replication_retention_status_and_recovery() {
         //    time between the two backups.
         sdk.delete_object()
             .bucket(&setup.replica.bucket)
-            .key(region_full_key(&setup.replica, &newest))
+            .key(full_key(&setup.replica_s3(), &newest))
             .send()
             .await
             .expect("Failed to delete the replicated object");
@@ -518,7 +373,7 @@ fn test_s3_backup_replication_retention_status_and_recovery() {
         let oldest = primary_backups.first().expect("No backups").clone();
         sdk.put_object()
             .bucket(&setup.replica.bucket)
-            .key(region_full_key(&setup.replica, &oldest))
+            .key(full_key(&setup.replica_s3(), &oldest))
             .body(ByteStream::from(b"truncated".to_vec()))
             .send()
             .await
@@ -572,7 +427,7 @@ fn test_s3_backup_replication_retention_status_and_recovery() {
         assert_eq!(region.pending_backups, 0);
         assert_eq!(region.lag_seconds, Some(0));
         assert_eq!(
-            raw_region_keys(&sdk, &setup.replica).await,
+            object_keys(&sdk, &setup.replica_s3()).await,
             with_sidecars(&primary_backups),
             "The sync must restore exactly the backups and sidecars of the primary"
         );
@@ -653,10 +508,18 @@ fn test_s3_backup_replication_retention_status_and_recovery() {
         assert_eq!(health.healthy_regions, 1);
         assert_eq!(health.regions[0].status, ReplicationStatus::Completed);
         assert_eq!(
-            raw_region_keys(&sdk, &late).await,
+            object_keys(&sdk, &late.to_s3_config()).await,
             with_sidecars(&primary_backups),
             "The late region must hold exactly the backups and sidecars of the primary"
         );
+
+        for location in [
+            setup.primary.clone(),
+            setup.replica_s3(),
+            late.to_s3_config(),
+        ] {
+            delete_prefix(&sdk, &location).await;
+        }
     });
 }
 
@@ -738,7 +601,7 @@ fn test_s3_replication_of_encrypted_backups() {
         // b. The region holds the same encrypted object and the same sidecar, which says
         //    encrypted and names the key.
         assert_eq!(
-            raw_region_keys(&sdk, &setup.replica).await,
+            object_keys(&sdk, &setup.replica_s3()).await,
             with_sidecars(&primary_backups),
             "The region must hold the .enc object and its sidecar, nothing else"
         );
@@ -765,7 +628,7 @@ fn test_s3_replication_of_encrypted_backups() {
         // c. A damaged .enc copy is detected and repaired by the sync without the key.
         sdk.put_object()
             .bucket(&setup.replica.bucket)
-            .key(region_full_key(&setup.replica, &key))
+            .key(full_key(&setup.replica_s3(), &key))
             .body(ByteStream::from(b"truncated".to_vec()))
             .send()
             .await
@@ -848,5 +711,8 @@ fn test_s3_replication_of_encrypted_backups() {
         login_put_admin_idm_admins(&env.rsclient).await;
         assert_directory_state_restored(&env.rsclient).await;
         env.core_handle.shutdown().await;
+
+        delete_prefix(&sdk, &setup.primary).await;
+        delete_prefix(&sdk, &setup.replica_s3()).await;
     });
 }

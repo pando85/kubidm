@@ -74,6 +74,8 @@ jobs:
           exit 1
       - name: "Run cargo test"
         env:
+          # The S3 backup tests fail instead of skipping when the endpoint is missing.
+          KUBIDM_TEST_S3_REQUIRED: "1"
           KUBIDM_TEST_S3_ENDPOINT: http://127.0.0.1:9000
           KUBIDM_TEST_S3_BUCKET: kubidm-test
           KUBIDM_TEST_S3_ACCESS_KEY: kubidm-test
@@ -123,6 +125,10 @@ jobs:
           rm -rf target/*
 
       - name: "Run cargo test"
+        env:
+          # This job checks the next toolchains and runs no S3 service: the S3 backup tests
+          # are skipped here and required in rust_build.
+          KUBIDM_TEST_S3_REQUIRED: "0"
         run: cargo test
       - name: "Check disk space at the end"
         run: du -shc *

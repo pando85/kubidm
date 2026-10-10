@@ -7,8 +7,8 @@
 //! without the key, with a wrong key and with a mismatching key identifier must fail
 //! cleanly and leave the target database untouched.
 //!
-//! The S3 variant needs an S3-compatible service and is skipped unless
-//! `KUBIDM_TEST_S3_ENDPOINT` is set, see `s3_recovery_test`.
+//! The S3 variant needs an S3-compatible service; see `backup_common` for how it is found,
+//! when it is skipped and how to run it locally.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -20,7 +20,7 @@ use kubidm_proto::backup::{
 use kubidmd_core::backup::{
     backup_identity, is_backup_artifact_name, is_encrypted_artifact, open_backup_file_with_config,
     read_encryption_header, BackupEncryptionError, BackupEncryptor, BackupOpenError,
-    S3ClientWrapper, MIN_KDF_M_COST, PASSPHRASE_ENV,
+    S3ClientWrapper, MIN_KDF_M_COST,
 };
 use kubidmd_core::config::{Configuration, OnlineBackup};
 use kubidmd_core::{
@@ -28,17 +28,14 @@ use kubidmd_core::{
     verify_s3_backup_server_core, BackupVerifyLevel,
 };
 use kubidmd_testkit::{
-    login_put_admin_idm_admins, AsyncTestEnvironment, NOT_ADMIN_TEST_PASSWORD,
-    NOT_ADMIN_TEST_USERNAME,
+    login_put_admin_idm_admins, NOT_ADMIN_TEST_PASSWORD, NOT_ADMIN_TEST_USERNAME,
 };
 use serde_json::Value;
 
 use super::backup_common::{
-    anonymous_client, assert_directory_state_restored, config_with_db, populate, run, start_server,
-    BACKUP_USER_ALICE,
-};
-use super::s3_recovery_test::{
-    ensure_bucket, raw_object_keys, sdk_client, test_s3_config_with_prefix,
+    anonymous_client, assert_directory_state_restored, backup_via_production_path, config_with_db,
+    delete_prefix, ensure_bucket, object_keys, populate, run, sdk_client, start_server,
+    test_s3_config, BACKUP_USER_ALICE,
 };
 
 const PASSPHRASE: &str = "e2e backup passphrase, long enough to matter";
@@ -52,21 +49,6 @@ fn fast_kdf() -> KeyDerivationParams {
         m_cost: MIN_KDF_M_COST,
         t_cost: 1,
         p_cost: 1,
-    }
-}
-
-/// Encryption with the passphrase taken from the `KUBIDM_BACKUP_PASSPHRASE` environment
-/// variable, which the test sets in its own process. The variable is only read when
-/// encryption is enabled and no `passphrase_file` is configured, so setting it does not
-/// affect the other tests of this binary.
-fn env_passphrase_encryption() -> BackupEncryptionConfig {
-    std::env::set_var(PASSPHRASE_ENV, PASSPHRASE);
-    BackupEncryptionConfig {
-        enabled: true,
-        key_source: EncryptionKeySource::Passphrase,
-        key_derivation: fast_kdf(),
-        key_identifier: Some(KEY_ID.to_string()),
-        passphrase_file: None,
     }
 }
 
@@ -101,29 +83,6 @@ fn config_with_encryption(db_path: &Path, encryption: BackupEncryptionConfig) ->
         ..OnlineBackup::default()
     });
     config
-}
-
-/// Take an encrypted online backup through the production path into `backup_dir` and
-/// return the single artifact it produced.
-async fn encrypted_backup_via_production_path(
-    env: &AsyncTestEnvironment,
-    backup_dir: &Path,
-    compression: BackupCompression,
-    encryption: &BackupEncryptionConfig,
-) -> PathBuf {
-    std::fs::create_dir(backup_dir).expect("Failed to create backup directory");
-    env.core_handle
-        .trigger_online_backup(backup_dir, 1, compression, encryption)
-        .await
-        .expect("Encrypted online backup failed");
-
-    let mut artifacts: Vec<PathBuf> = std::fs::read_dir(backup_dir)
-        .expect("Failed to read backup directory")
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .collect();
-    assert_eq!(artifacts.len(), 1, "Expected exactly one backup artifact");
-    artifacts.pop().expect("Backup artifact is missing")
 }
 
 /// The artifact is named as an encrypted backup, is recognised by retention, and its bytes
@@ -185,13 +144,8 @@ async fn populated_encrypted_backup(
 ) -> (PathBuf, String) {
     let mut env = start_server(&workdir.join("source.db")).await;
     let user_token = populate(&env).await;
-    let backup = encrypted_backup_via_production_path(
-        &env,
-        &workdir.join("backups"),
-        compression,
-        encryption,
-    )
-    .await;
+    let backup =
+        backup_via_production_path(&env, &workdir.join("backups"), compression, encryption).await;
     env.core_handle.shutdown().await;
     (backup, user_token)
 }
@@ -200,14 +154,15 @@ async fn populated_encrypted_backup(
 fn test_encrypted_online_backup_verifies_and_restores_a_functional_server() {
     run(async {
         let workdir = tempfile::tempdir().expect("Failed to create workdir");
-        let encryption = env_passphrase_encryption();
+        let passphrase = write_passphrase(workdir.path(), "passphrase", PASSPHRASE);
+        let encryption = file_passphrase_encryption(&passphrase, Some(KEY_ID));
 
         // Both compressions produce a correctly named, really encrypted artifact.
         {
             let mut env = start_server(&workdir.path().join("compressions.db")).await;
             populate(&env).await;
             for compression in [BackupCompression::NoCompression, BackupCompression::Gzip] {
-                let backup = encrypted_backup_via_production_path(
+                let backup = backup_via_production_path(
                     &env,
                     &workdir
                         .path()
@@ -426,7 +381,7 @@ fn test_encrypted_backup_is_refused_without_the_right_key() {
 
 #[test]
 fn test_encrypted_s3_backup_verify_and_restore() {
-    let Some(s3_config) = test_s3_config_with_prefix("s3-encryption-test") else {
+    let Some(s3_config) = test_s3_config("s3-encryption-test") else {
         return;
     };
 
@@ -464,7 +419,7 @@ fn test_encrypted_s3_backup_verify_and_restore() {
         );
         assert!(is_backup_artifact_name(&key));
         assert_eq!(
-            raw_object_keys(&sdk, &s3_config).await,
+            object_keys(&sdk, &s3_config).await,
             vec![key.clone(), format!("{key}.metadata.json")],
             "The artifact and its sidecar, nothing else"
         );
@@ -641,5 +596,7 @@ fn test_encrypted_s3_backup_verify_and_restore() {
             "restore-s3 must refuse an older backup stored under a newer key"
         );
         assert!(!replayed_db.exists());
+
+        delete_prefix(&sdk, &s3_config).await;
     });
 }

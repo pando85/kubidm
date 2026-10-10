@@ -15,46 +15,28 @@ use kubidmd_core::{
 };
 use kubidmd_lib::be::verify_backup_structure;
 use kubidmd_testkit::{
-    login_put_admin_idm_admins, AsyncTestEnvironment, NOT_ADMIN_TEST_PASSWORD,
-    NOT_ADMIN_TEST_USERNAME, TEST_INTEGRATION_RS_ID,
+    login_put_admin_idm_admins, NOT_ADMIN_TEST_PASSWORD, NOT_ADMIN_TEST_USERNAME,
+    TEST_INTEGRATION_RS_ID,
 };
 use serde_json::Value;
 
 use super::backup_common::{
-    anonymous_client, assert_directory_state_restored, config_with_db, populate, run, start_server,
-    BACKUP_RECYCLED_GROUP, BACKUP_USER_ALICE,
+    anonymous_client, assert_directory_state_restored, backup_via_production_path, config_with_db,
+    populate, run, start_server, BACKUP_RECYCLED_GROUP, BACKUP_USER_ALICE,
 };
-
-/// Take an online backup through the production online backup path and return it.
-async fn backup_via_production_path(env: &AsyncTestEnvironment, backup_dir: &Path) -> PathBuf {
-    env.core_handle
-        .trigger_online_backup(
-            backup_dir,
-            1,
-            BackupCompression::NoCompression,
-            &BackupEncryptionConfig::default(),
-        )
-        .await
-        .expect("Online backup failed");
-
-    let mut backups: Vec<PathBuf> = std::fs::read_dir(backup_dir)
-        .expect("Failed to read backup directory")
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .collect();
-    assert_eq!(backups.len(), 1, "Expected exactly one backup artifact");
-    backups.pop().expect("Backup artifact is missing")
-}
 
 /// Start a server, populate it, back it up through the production path and shut it down.
 /// Returns the backup and the session token of the test user.
 async fn populated_backup(workdir: &Path) -> (PathBuf, String) {
-    let backup_dir = workdir.join("backups");
-    std::fs::create_dir(&backup_dir).expect("Failed to create backup directory");
-
     let mut env = start_server(&workdir.join("source.db")).await;
     let user_token = populate(&env).await;
-    let backup = backup_via_production_path(&env, &backup_dir).await;
+    let backup = backup_via_production_path(
+        &env,
+        &workdir.join("backups"),
+        BackupCompression::NoCompression,
+        &BackupEncryptionConfig::default(),
+    )
+    .await;
     env.core_handle.shutdown().await;
 
     (backup, user_token)
@@ -121,28 +103,16 @@ fn test_online_backup_keeps_verified_artifact_name_and_structure() {
         populate(&env).await;
 
         for compression in [BackupCompression::NoCompression, BackupCompression::Gzip] {
-            let backup_dir = workdir
-                .path()
-                .join(format!("backups{}", compression.suffix()));
-            std::fs::create_dir(&backup_dir).expect("Failed to create backup directory");
-
-            env.core_handle
-                .trigger_online_backup(
-                    &backup_dir,
-                    1,
-                    compression,
-                    &BackupEncryptionConfig::default(),
-                )
-                .await
-                .expect("Online backup failed");
-
-            let artifacts: Vec<PathBuf> = std::fs::read_dir(&backup_dir)
-                .expect("Failed to read backup directory")
-                .filter_map(Result::ok)
-                .map(|entry| entry.path())
-                .collect();
-            assert_eq!(artifacts.len(), 1, "Expected exactly one backup artifact");
-            assert_backup_verified_after_write(&artifacts[0], compression);
+            let backup = backup_via_production_path(
+                &env,
+                &workdir
+                    .path()
+                    .join(format!("backups{}", compression.suffix())),
+                compression,
+                &BackupEncryptionConfig::default(),
+            )
+            .await;
+            assert_backup_verified_after_write(&backup, compression);
         }
 
         env.core_handle.shutdown().await;

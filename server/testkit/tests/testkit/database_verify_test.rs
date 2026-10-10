@@ -5,39 +5,14 @@
 //! server and without running the startup migrations, and must verify clean. The same
 //! is checked for a database produced by restoring a backup of such a server.
 
-use std::future::Future;
-use std::path::{Path, PathBuf};
-
 use kubidm_proto::backup::{BackupCompression, BackupEncryptionConfig};
-use kubidmd_core::config::Configuration;
 use kubidmd_core::{restore_database, verify_database};
-use kubidmd_testkit::{login_put_admin_idm_admins, setup_async_test, AsyncTestEnvironment};
-use url::Url;
+use kubidmd_testkit::{login_put_admin_idm_admins, AsyncTestEnvironment};
+
+use super::backup_common::{backup_via_production_path, config_with_db, run, start_server};
 
 const VERIFY_TEST_USER: &str = "verify_test_user";
 const VERIFY_TEST_GROUP: &str = "verify_test_group";
-
-fn run<F: Future>(future: F) -> F::Output {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("Failed to build the tokio runtime")
-        .block_on(future)
-}
-
-/// A configuration for the test domain, pointing at `db_path`.
-fn config_with_db(db_path: &Path) -> Configuration {
-    Configuration {
-        db_path: Some(db_path.to_path_buf()),
-        domain: "localhost".to_string(),
-        origin: Url::parse("http://localhost").expect("Invalid origin"),
-        ..Configuration::new_for_test()
-    }
-}
-
-async fn start_server(db_path: &Path) -> AsyncTestEnvironment {
-    setup_async_test(config_with_db(db_path)).await
-}
 
 /// Create a person and a group that holds it, so the database carries references between
 /// user created entries as well as the system entries.
@@ -82,37 +57,19 @@ fn test_database_verify_passes_on_cold_database() {
     });
 }
 
-/// Take an online backup through the production online backup path and return it.
-async fn backup_via_production_path(env: &AsyncTestEnvironment, backup_dir: &Path) -> PathBuf {
-    env.core_handle
-        .trigger_online_backup(
-            backup_dir,
-            1,
-            BackupCompression::NoCompression,
-            &BackupEncryptionConfig::default(),
-        )
-        .await
-        .expect("Online backup failed");
-
-    let mut backups: Vec<PathBuf> = std::fs::read_dir(backup_dir)
-        .expect("Failed to read backup directory")
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .collect();
-    assert_eq!(backups.len(), 1, "Expected exactly one backup artifact");
-    backups.pop().expect("Backup artifact is missing")
-}
-
 #[test]
 fn test_database_verify_passes_on_cold_restored_database() {
     run(async {
         let workdir = tempfile::tempdir().expect("Failed to create workdir");
-        let backup_dir = workdir.path().join("backups");
-        std::fs::create_dir(&backup_dir).expect("Failed to create backup directory");
-
         let mut env = start_server(&workdir.path().join("source.db")).await;
         populate(&env).await;
-        let backup = backup_via_production_path(&env, &backup_dir).await;
+        let backup = backup_via_production_path(
+            &env,
+            &workdir.path().join("backups"),
+            BackupCompression::NoCompression,
+            &BackupEncryptionConfig::default(),
+        )
+        .await;
         env.core_handle.shutdown().await;
 
         // Restore through the production restore path (restore + reindex) into a new,
