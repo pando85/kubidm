@@ -10,13 +10,14 @@ use kubidm_proto::backup::{
 use kubidmd_lib::be::{lock_wal, BackupStructuralReport, SharedWalArchiver};
 use kubidmd_lib::prelude::duration_from_epoch_now;
 use kubidmd_lib::repl::wal::{
-    format_ts_rfc3339, list_segments, remove_segment, write_closed_segments, WalArchiver, WalGap,
+    format_ts_rfc3339, parse_segment_file_name, quarantine_segment, rebuild_sidecar,
+    remove_segment, scan_segments, write_closed_segments, WalArchiver, WalGap,
 };
 use tokio::sync::broadcast;
 use tokio::time::{interval, MissedTickBehavior};
 use uuid::Uuid;
 
-use super::store::PitrStore;
+use super::store::{read_local_segment, PitrStore};
 use super::{blocking, BaseLocation, PitrError, PitrLocation, PitrSettings};
 use crate::backup::BackupEncryptor;
 use crate::CoreAction;
@@ -79,7 +80,18 @@ fn prune_markers(manifest: &mut PitrManifest) -> bool {
 struct ArchivedSegments {
     /// The local segments whose archived copy the manifest now names.
     segments: Vec<WalSegment>,
+    /// Whether a damaged segment was set aside and recorded as a gap.
+    quarantined: bool,
     error: Option<PitrError>,
+}
+
+/// What [`PitrArchive::repair_local`] did.
+#[derive(Default)]
+struct RepairedSegments {
+    /// Segments whose sidecar was rebuilt.
+    segments: Vec<WalSegment>,
+    /// The ranges of the segments set aside.
+    gaps: Vec<PitrWalGap>,
 }
 
 /// The outcome of one archive synchronisation.
@@ -245,9 +257,9 @@ impl PitrArchive {
         events_recorded: &mut bool,
         report: &mut PitrSyncReport,
     ) -> Result<(), PitrError> {
-        let local_segments = {
+        let scan = {
             let local_dir = self.settings.local_dir.clone();
-            blocking(move || Ok(list_segments(&local_dir)?)).await?
+            blocking(move || Ok(scan_segments(&local_dir)?)).await?
         };
         let store = PitrStore::open(&self.settings.location).await?;
         let (mut manifest, existed) =
@@ -255,12 +267,25 @@ impl PitrArchive {
         let mut changed = !existed;
 
         changed |= record_gaps(&mut manifest, gaps, now);
+        let mut local_segments = scan.segments;
+        if !scan.unreadable.is_empty() {
+            let repaired = self.repair_local(scan.unreadable, now).await?;
+            changed |= !repaired.gaps.is_empty();
+            for gap in repaired.gaps {
+                manifest.add_gap(gap);
+            }
+            local_segments.extend(repaired.segments);
+            local_segments.sort_by_key(|segment| segment.start_ts);
+        }
 
         let pending = self.pending_segments(&store, &manifest, local_segments, server_uuid);
-        let archived = self.archive_pending(&store, &mut manifest, pending).await;
+        let archived = self
+            .archive_pending(&store, &mut manifest, pending, now)
+            .await;
+        changed |= archived.quarantined;
 
         if !archived.segments.is_empty() || changed {
-            store.save_manifest(&mut manifest).await?;
+            store.save_manifest(&mut manifest, now).await?;
             *events_recorded = true;
             changed = false;
             report.archived += archived.segments.len();
@@ -276,7 +301,7 @@ impl PitrArchive {
         changed |= prune_markers(&mut manifest);
 
         if changed {
-            store.save_manifest(&mut manifest).await?;
+            store.save_manifest(&mut manifest, now).await?;
         }
         *events_recorded = true;
 
@@ -324,11 +349,16 @@ impl PitrArchive {
     /// failure stops the run; the segments archived before it are returned with it, so
     /// that the manifest naming them is saved. Without the encryption key nothing is
     /// archived: a segment is never archived in plaintext while encryption is enabled.
+    ///
+    /// A segment whose local copy does not match its sidecar (torn by a crash, damaged on
+    /// disk) is set aside and its range recorded as a gap, so that it does not hold up
+    /// every segment after it.
     async fn archive_pending(
         &self,
         store: &PitrStore,
         manifest: &mut PitrManifest,
         pending: Vec<WalSegment>,
+        now: Duration,
     ) -> ArchivedSegments {
         let mut archived = ArchivedSegments::default();
         if pending.is_empty() {
@@ -356,10 +386,38 @@ impl PitrArchive {
         };
 
         for segment in pending {
-            match store
-                .put_segment(local_dir, &segment, encryptor.as_ref())
-                .await
-            {
+            let result = match read_local_segment(local_dir, &segment).await {
+                Ok(Some(data)) => {
+                    store
+                        .put_segment(&segment, data, encryptor.as_ref(), now)
+                        .await
+                }
+                // Removed since the directory was listed: nothing to archive.
+                Ok(None) => continue,
+                Err(PitrError::CorruptSegment(msg)) => {
+                    match self.quarantine(&segment.segment_id).await {
+                        Ok(()) => {
+                            error!(
+                                segment = %segment.segment_id,
+                                reason = %msg,
+                                "WAL ARCHIVE HOLE: a closed WAL segment is damaged and was set \
+                                 aside; point-in-time recovery can not replay its transactions \
+                                 until a new base backup is taken"
+                            );
+                            manifest.add_gap(PitrWalGap {
+                                from_ts: segment.start_ts,
+                                until_ts: segment.end_ts,
+                                reason: format!("segment {} was damaged", segment.segment_id),
+                            });
+                            archived.quarantined = true;
+                            continue;
+                        }
+                        Err(err) => Err(err),
+                    }
+                }
+                Err(err) => Err(err),
+            };
+            match result {
                 Ok(stored) => {
                     manifest.add_segment(stored);
                     archived.segments.push(segment);
@@ -372,6 +430,55 @@ impl PitrArchive {
             }
         }
         archived
+    }
+
+    /// Move the local segment `segment_id` aside.
+    async fn quarantine(&self, segment_id: &str) -> Result<(), PitrError> {
+        let local_dir = self.settings.local_dir.clone();
+        let segment_id = segment_id.to_string();
+        blocking(move || Ok(quarantine_segment(&local_dir, &segment_id)?)).await
+    }
+
+    /// Deal with the local segments whose sidecar can not be read: a complete segment file
+    /// gets its sidecar back, any other is set aside and recorded as a gap from its start
+    /// up to `now`, since where it ended is unknown.
+    async fn repair_local(
+        &self,
+        unreadable: Vec<String>,
+        now: Duration,
+    ) -> Result<RepairedSegments, PitrError> {
+        let local_dir = self.settings.local_dir.clone();
+        blocking(move || {
+            let mut repaired = RepairedSegments::default();
+            for segment_id in unreadable {
+                match rebuild_sidecar(&local_dir, &segment_id) {
+                    Ok(segment) => {
+                        warn!(segment = %segment_id, "WAL segment sidecar rebuilt from the segment");
+                        repaired.segments.push(segment);
+                    }
+                    Err(err) => {
+                        quarantine_segment(&local_dir, &segment_id)?;
+                        error!(
+                            %err,
+                            segment = %segment_id,
+                            "WAL ARCHIVE HOLE: a closed WAL segment and its sidecar are damaged \
+                             and were set aside; point-in-time recovery can not replay its \
+                             transactions until a new base backup is taken"
+                        );
+                        let from_ts = parse_segment_file_name(&segment_id)
+                            .map(|(_, start_ts)| start_ts)
+                            .unwrap_or_default();
+                        repaired.gaps.push(PitrWalGap {
+                            from_ts,
+                            until_ts: now.max(from_ts),
+                            reason: format!("segment {segment_id} was damaged"),
+                        });
+                    }
+                }
+            }
+            Ok(repaired)
+        })
+        .await
     }
 
     /// Once the manifest naming their archived copies is saved, remove the local copies of
@@ -450,6 +557,19 @@ impl PitrArchive {
         timestamp: &str,
         report: &BackupStructuralReport,
     ) -> Result<(), PitrError> {
+        self.register_base_backup_at(duration_from_epoch_now(), location, key, timestamp, report)
+            .await
+    }
+
+    /// [`Self::register_base_backup`] at `now`.
+    pub async fn register_base_backup_at(
+        &self,
+        now: Duration,
+        location: &BaseLocation,
+        key: &str,
+        timestamp: &str,
+        report: &BackupStructuralReport,
+    ) -> Result<(), PitrError> {
         if location != &self.settings.bases {
             debug!(
                 key,
@@ -485,19 +605,14 @@ impl PitrArchive {
             watermark_ts,
             server_version,
         });
-        store.save_manifest(&mut manifest).await?;
+        store.save_manifest(&mut manifest, now).await?;
         info!(
             key,
             watermark = %format_ts_rfc3339(watermark_ts),
             "Base backup indexed for point-in-time recovery"
         );
-        self.replicate(
-            &store,
-            &mut manifest,
-            duration_from_epoch_now(),
-            &mut PitrSyncReport::default(),
-        )
-        .await;
+        self.replicate(&store, &mut manifest, now, &mut PitrSyncReport::default())
+            .await;
         Ok(())
     }
 
@@ -582,7 +697,10 @@ mod tests {
 
     use kubidm_proto::backup::{BackupEncryptionConfig, WalArchiveConfig};
     use kubidmd_lib::repl::cid::Cid;
-    use kubidmd_lib::repl::wal::{segment_file_name, WalArchiver, WalPendingOp};
+    use kubidmd_lib::repl::wal::{
+        list_segments, segment_file_name, segment_meta_path, WalArchiver, WalPendingOp,
+        WAL_QUARANTINE_SUFFIX,
+    };
 
     use super::super::recover::record_timeline_break;
     use super::super::test_util::*;
@@ -780,7 +898,10 @@ mod tests {
 
         // A manifest of another server is never mixed with this one.
         let mut foreign = PitrManifest::new(Uuid::new_v4());
-        store.save_manifest(&mut foreign).await.unwrap();
+        store
+            .save_manifest(&mut foreign, Duration::from_secs(1))
+            .await
+            .unwrap();
         assert!(matches!(
             archive.sync(Duration::from_secs(1), false).await,
             Err(PitrError::Manifest(_))
@@ -846,6 +967,117 @@ mod tests {
             store.load_manifest().await.unwrap().unwrap().segments.len(),
             2
         );
+    }
+
+    #[tokio::test]
+    async fn test_sync_sets_damaged_segments_aside_and_archives_the_next_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("wal");
+        let backup_dir = dir.path().join("backups");
+        fs::create_dir_all(&backup_dir).unwrap();
+        let server = Uuid::new_v4();
+        let wal_cfg = WalArchiveConfig {
+            enabled: true,
+            local_path: Some(wal_dir.clone()),
+            ..WalArchiveConfig::default()
+        };
+        let archiver: SharedWalArchiver = Arc::new(Mutex::new(
+            WalArchiver::new(wal_cfg.clone(), server, wal_dir.clone()).unwrap(),
+        ));
+        let archive = PitrArchive::new(
+            PitrSettings {
+                wal: wal_cfg,
+                local_dir: wal_dir.clone(),
+                location: PitrLocation::Local(wal_dir.clone()),
+                bases: BaseLocation::Local(backup_dir.clone()),
+                encryption: BackupEncryptionConfig::default(),
+            },
+            archiver.clone(),
+        );
+        let key = "backup-2024-01-01T00:00:00Z.json";
+        fs::write(backup_dir.join(key), b"{}").unwrap();
+        archive
+            .register_base_backup(
+                &BaseLocation::Local(backup_dir),
+                key,
+                "t",
+                &report(1000, server),
+            )
+            .await
+            .unwrap();
+
+        // Four closed segments: one torn after its sidecar was written, one whose sidecar
+        // is torn but whose content is complete, one with both torn, and a good one.
+        let mut ids = Vec::new();
+        for secs in [1100, 1200, 1300, 1400] {
+            append_create(&archiver, server, secs, b"x");
+            let segment = archiver
+                .lock()
+                .unwrap()
+                .flush_current_segment()
+                .unwrap()
+                .unwrap();
+            ids.push(segment.segment_id);
+        }
+        fs::write(wal_dir.join(&ids[0]), b"torn").unwrap();
+        fs::write(segment_meta_path(&wal_dir, &ids[1]), b"{").unwrap();
+        fs::write(segment_meta_path(&wal_dir, &ids[2]), b"{").unwrap();
+        fs::write(wal_dir.join(&ids[2]), b"torn").unwrap();
+
+        archive
+            .sync(Duration::from_secs(1500), false)
+            .await
+            .unwrap();
+        let store = PitrStore::open(&archive.settings.location).await.unwrap();
+        let manifest = store.load_manifest().await.unwrap().unwrap();
+        let archived: Vec<&str> = manifest
+            .segments
+            .iter()
+            .map(|s| s.segment_id.as_str())
+            .collect();
+        assert_eq!(archived, vec![ids[1].as_str(), ids[3].as_str()]);
+        let gaps: Vec<(u64, u64)> = manifest
+            .gaps
+            .iter()
+            .map(|gap| (gap.from_ts.as_secs(), gap.until_ts.as_secs()))
+            .collect();
+        assert_eq!(gaps, vec![(1100, 1100), (1300, 1500)]);
+        for id in [&ids[0], &ids[2]] {
+            assert!(wal_dir
+                .join(format!("{id}{WAL_QUARANTINE_SUFFIX}"))
+                .is_file());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_manifest_naming_paths_outside_the_archive_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PitrStore::Local {
+            dir: dir.path().to_path_buf(),
+        };
+        let mut manifest = PitrManifest::new(Uuid::new_v4());
+        let mut forged = segment("ignored", 1, 2);
+        forged.segment_id = "../kubidm.db".to_string();
+        manifest.add_segment(forged);
+        store
+            .save_manifest(&mut manifest, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(matches!(
+            store.load_manifest().await,
+            Err(PitrError::Manifest(msg)) if msg.contains("invalid segment")
+        ));
+
+        let mut manifest = PitrManifest::new(Uuid::new_v4());
+        manifest.add_base_backup(base("../../etc/passwd", 1));
+        store
+            .save_manifest(&mut manifest, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(matches!(
+            store.load_manifest().await,
+            Err(PitrError::Manifest(msg)) if msg.contains("invalid base backup")
+        ));
     }
 
     #[tokio::test]

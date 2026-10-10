@@ -64,6 +64,8 @@ pub enum PitrError {
     Operation(OperationError),
     /// The backup encryption key could not be obtained, or does not open a segment.
     Encryption(String),
+    /// A closed segment in the local WAL directory does not match its sidecar.
+    CorruptSegment(String),
 }
 
 impl fmt::Display for PitrError {
@@ -78,6 +80,7 @@ impl fmt::Display for PitrError {
             PitrError::NotRecoverable(msg) => write!(f, "not recoverable: {msg}"),
             PitrError::Operation(err) => write!(f, "PITR database error: {err:?}"),
             PitrError::Encryption(msg) => write!(f, "PITR encryption error: {msg}"),
+            PitrError::CorruptSegment(msg) => write!(f, "damaged WAL segment: {msg}"),
         }
     }
 }

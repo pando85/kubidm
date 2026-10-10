@@ -637,7 +637,7 @@ pub(super) async fn record_timeline_break(
         at: format_ts_rfc3339(now),
         reason: reason.to_string(),
     });
-    store.save_manifest(&mut manifest).await?;
+    store.save_manifest(&mut manifest, now).await?;
     info!(
         after = %format_ts_rfc3339(after_ts),
         until = %format_ts_rfc3339(until_ts),

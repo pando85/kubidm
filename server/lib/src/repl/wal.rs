@@ -890,9 +890,33 @@ pub fn segment_file_name(server_uuid: Uuid, start_ts: Duration) -> String {
     )
 }
 
+/// The server and start of the segment whose file name is `name`, when `name` is exactly
+/// a name [`segment_file_name`] produces. Segment ids read from sidecars and manifests are
+/// checked with it before they are joined to a path, so that none can name a file outside
+/// the WAL directory.
+pub fn parse_segment_file_name(name: &str) -> Option<(Uuid, Duration)> {
+    let rest = name
+        .strip_prefix(WAL_SEGMENT_PREFIX)?
+        .strip_suffix(WAL_SEGMENT_SUFFIX)?;
+    let (server_uuid, start_nanos) = rest.rsplit_once('-')?;
+    let server_uuid = Uuid::parse_str(server_uuid).ok()?;
+    let start_ts = Duration::from_nanos(start_nanos.parse().ok()?);
+    (segment_file_name(server_uuid, start_ts) == name).then_some((server_uuid, start_ts))
+}
+
 /// Whether `name` is the file name of a closed segment.
 pub fn is_wal_segment_name(name: &str) -> bool {
-    name.starts_with(WAL_SEGMENT_PREFIX) && name.ends_with(WAL_SEGMENT_SUFFIX)
+    parse_segment_file_name(name).is_some()
+}
+
+fn check_segment_id(segment_id: &str) -> Result<(), WalError> {
+    if is_wal_segment_name(segment_id) {
+        Ok(())
+    } else {
+        Err(WalError::InvalidSegment(format!(
+            "'{segment_id}' is not a WAL segment name"
+        )))
+    }
 }
 
 /// The sidecar path of the segment `segment_id` in `dir`.
@@ -903,7 +927,7 @@ pub fn segment_meta_path(dir: &Path, segment_id: &str) -> PathBuf {
 /// Atomically replace `dir/name` with `data`: written to a temporary file that is synced
 /// before it is renamed, then the directory is synced, so that after a crash the file is
 /// either the old or the new content, never a torn one.
-fn write_file_durably(dir: &Path, name: &str, data: &[u8]) -> Result<(), WalError> {
+pub fn write_file_durably(dir: &Path, name: &str, data: &[u8]) -> Result<(), WalError> {
     let path = dir.join(name);
     let tmp = dir.join(format!("{name}{WAL_TMP_SUFFIX}"));
     let mut file = fs::File::create(&tmp)?;
@@ -986,13 +1010,30 @@ pub fn read_marker_gap(dir: &Path) -> Option<WalGap> {
 }
 
 /// Serialise, compress, checksum and atomically write `file` and its sidecar into `dir`.
+/// Both are synced to disk before the sidecar exists, so that a sidecar never describes a
+/// segment file a crash tore.
 pub fn write_segment_file(dir: &Path, file: &WalSegmentFile) -> Result<WalSegment, WalError> {
+    check_segment_id(&file.segment_id)?;
     let serialized = serde_json::to_vec(file)?;
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     encoder.write_all(&serialized)?;
     let compressed = encoder.finish()?;
+    let segment = describe_segment(file, &compressed);
 
-    let segment = WalSegment {
+    write_file_durably(dir, &file.segment_id, &compressed)?;
+    write_file_durably(
+        dir,
+        &format!("{}{WAL_SEGMENT_META_SUFFIX}", file.segment_id),
+        &serde_json::to_vec_pretty(&segment)?,
+    )?;
+
+    debug!(segment = %file.segment_id, "WAL segment written");
+    Ok(segment)
+}
+
+/// The sidecar of the segment `file` whose compressed content is `compressed`.
+fn describe_segment(file: &WalSegmentFile, compressed: &[u8]) -> WalSegment {
+    WalSegment {
         segment_id: file.segment_id.clone(),
         server_uuid: file.server_uuid,
         start_ts: file.start_ts,
@@ -1008,39 +1049,46 @@ pub fn write_segment_file(dir: &Path, file: &WalSegmentFile) -> Result<WalSegmen
             .map(|r| r.cid().to_string())
             .unwrap_or_default(),
         entry_count: file.entries.len() as u64,
-        checksum_sha256: hex::encode(Sha256::digest(&compressed)),
+        checksum_sha256: hex::encode(Sha256::digest(compressed)),
         size_bytes: compressed.len() as u64,
         compression: BackupCompression::Gzip,
         server_version: file.server_version.clone(),
         created_at: format_ts_rfc3339(file.end_ts),
         // The backend always writes the plaintext segment; the archive encrypts it.
         encryption_key: None,
-    };
+    }
+}
 
-    let segment_path = dir.join(&file.segment_id);
-    let tmp_path = dir.join(format!("{}{WAL_TMP_SUFFIX}", file.segment_id));
-    fs::write(&tmp_path, &compressed)?;
-    fs::rename(&tmp_path, &segment_path)?;
-
-    let meta_path = segment_meta_path(dir, &file.segment_id);
-    let meta_tmp = dir.join(format!(
-        "{}{WAL_SEGMENT_META_SUFFIX}{WAL_TMP_SUFFIX}",
-        file.segment_id
-    ));
-    fs::write(&meta_tmp, serde_json::to_vec_pretty(&segment)?)?;
-    fs::rename(&meta_tmp, &meta_path)?;
-
-    debug!(path = %segment_path.display(), "WAL segment written");
-    Ok(segment)
+/// The closed segments of a WAL directory.
+#[derive(Debug, Default)]
+pub struct WalSegmentScan {
+    /// From their sidecars, in CID order.
+    pub segments: Vec<WalSegment>,
+    /// Ids of the segments whose sidecar can not be read.
+    pub unreadable: Vec<String>,
 }
 
 /// The closed segments in `dir`, from their sidecars, in CID order. A segment file
-/// without a sidecar, a sidecar without its segment file, or a file still being written
-/// is skipped.
+/// without a sidecar, a sidecar without its segment file, a file still being written, and
+/// a sidecar whose name is not the one of the segment it describes are skipped. A sidecar
+/// that can not be read is an error, since its segment would silently be missing.
 pub fn list_segments(dir: &Path) -> Result<Vec<WalSegment>, WalError> {
-    let mut segments = Vec::new();
+    let scan = scan_segments(dir)?;
+    match scan.unreadable.first() {
+        Some(segment_id) => Err(WalError::InvalidSegment(format!(
+            "the sidecar of segment {segment_id} in {} is not readable",
+            dir.display()
+        ))),
+        None => Ok(scan.segments),
+    }
+}
+
+/// [`list_segments`], reporting the segments whose sidecar can not be read instead of
+/// failing.
+pub fn scan_segments(dir: &Path) -> Result<WalSegmentScan, WalError> {
+    let mut scan = WalSegmentScan::default();
     if !dir.exists() {
-        return Ok(segments);
+        return Ok(scan);
     }
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
@@ -1048,31 +1096,96 @@ pub fn list_segments(dir: &Path) -> Result<Vec<WalSegment>, WalError> {
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        if !name.ends_with(WAL_SEGMENT_META_SUFFIX) || !path.is_file() {
+        let Some(segment_id) = name.strip_suffix(WAL_SEGMENT_META_SUFFIX) else {
+            continue;
+        };
+        if !path.is_file() {
             continue;
         }
-        let segment: WalSegment = serde_json::from_slice(&fs::read(&path)?).map_err(|err| {
-            WalError::InvalidSegment(format!("sidecar {} is not readable: {err}", path.display()))
-        })?;
-        if !dir.join(&segment.segment_id).is_file() {
+        if !is_wal_segment_name(segment_id) {
+            warn!(path = %path.display(), "Not a WAL segment sidecar, skipping");
+            continue;
+        }
+        let segment: WalSegment = match fs::read(&path)
+            .map_err(WalError::from)
+            .and_then(|data| serde_json::from_slice(&data).map_err(WalError::from))
+        {
+            Ok(segment) => segment,
+            Err(err) => {
+                error!(%err, path = %path.display(), "WAL segment sidecar is not readable");
+                scan.unreadable.push(segment_id.to_string());
+                continue;
+            }
+        };
+        if segment.segment_id != segment_id {
+            warn!(
+                path = %path.display(),
+                segment = %segment.segment_id,
+                "WAL sidecar describes another segment than its name, skipping"
+            );
+            continue;
+        }
+        if !dir.join(segment_id).is_file() {
             debug!(
                 segment = %segment.segment_id,
                 "WAL sidecar without segment file, skipping"
             );
             continue;
         }
-        segments.push(segment);
+        scan.segments.push(segment);
     }
-    segments.sort_by(|a, b| {
+    scan.segments.sort_by(|a, b| {
         a.start_ts
             .cmp(&b.start_ts)
             .then(a.segment_id.cmp(&b.segment_id))
     });
-    Ok(segments)
+    scan.unreadable.sort();
+    Ok(scan)
+}
+
+/// Write the sidecar of the segment `segment_id` in `dir` again from the segment file,
+/// when the file is a complete segment (its gzip trailer checks the content).
+pub fn rebuild_sidecar(dir: &Path, segment_id: &str) -> Result<WalSegment, WalError> {
+    check_segment_id(segment_id)?;
+    let compressed = fs::read(dir.join(segment_id))?;
+    let file = parse_segment(&compressed, BackupCompression::Gzip)?;
+    if file.segment_id != segment_id {
+        return Err(WalError::InvalidSegment(format!(
+            "segment file {segment_id} holds segment {}",
+            file.segment_id
+        )));
+    }
+    let segment = describe_segment(&file, &compressed);
+    write_file_durably(
+        dir,
+        &format!("{segment_id}{WAL_SEGMENT_META_SUFFIX}"),
+        &serde_json::to_vec_pretty(&segment)?,
+    )?;
+    Ok(segment)
+}
+
+/// Suffix of a segment file or sidecar moved aside because it is damaged.
+pub const WAL_QUARANTINE_SUFFIX: &str = ".corrupt";
+
+/// Move the segment `segment_id` and its sidecar aside in `dir`, so that a damaged segment
+/// no longer holds up the ones after it. The files are kept for inspection.
+pub fn quarantine_segment(dir: &Path, segment_id: &str) -> Result<(), WalError> {
+    check_segment_id(segment_id)?;
+    for name in [
+        segment_id.to_string(),
+        format!("{segment_id}{WAL_SEGMENT_META_SUFFIX}"),
+    ] {
+        let path = dir.join(&name);
+        if path.exists() {
+            fs::rename(&path, dir.join(format!("{name}{WAL_QUARANTINE_SUFFIX}")))?;
+        }
+    }
+    sync_dir(dir)
 }
 
 /// Remove the segment `segment_id` and its sidecar from `dir`.
 pub fn remove_segment(dir: &Path, segment_id: &str) -> Result<(), WalError> {
+    check_segment_id(segment_id)?;
     let segment_path = dir.join(segment_id);
     if segment_path.exists() {
         fs::remove_file(&segment_path)?;
@@ -1110,6 +1223,7 @@ pub fn parse_segment(
 }
 
 /// Read and parse the segment file at `path`.
+#[cfg(test)]
 pub fn read_segment_file(path: &Path) -> Result<WalSegmentFile, WalError> {
     let data = fs::read(path)?;
     parse_segment(&data, BackupCompression::identify_file(path))
@@ -1782,6 +1896,104 @@ mod tests {
         std::fs::remove_file(segment_meta_path(dir.path(), &segment.segment_id)).unwrap();
         std::fs::write(dir.path().join(&segment.segment_id), b"x").unwrap();
         assert!(list_segments(dir.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_segment_ids_from_files_never_leave_the_wal_directory() {
+        let server = Uuid::new_v4();
+        let name = segment_file_name(server, Duration::from_secs(7));
+        assert_eq!(
+            parse_segment_file_name(&name),
+            Some((server, Duration::from_secs(7)))
+        );
+        for bad in [
+            "../kubidm.db",
+            "wal-../../etc/passwd.json.gz",
+            &format!("../{name}"),
+            &format!("{name}/x"),
+            &name.replace(".json.gz", ".json"),
+            &name.replace('-', "_"),
+        ] {
+            assert!(!is_wal_segment_name(bad), "{bad}");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("wal");
+        fs::create_dir_all(&wal_dir).unwrap();
+        let outside = dir.path().join("kubidm.db");
+        fs::write(&outside, b"database").unwrap();
+
+        // A sidecar naming a file outside the directory is not listed, and nothing removes
+        // or quarantines a file by such a name.
+        let mut forged = describe_segment(
+            &WalSegmentFile {
+                format_version: WAL_SEGMENT_FORMAT_VERSION,
+                segment_id: name.clone(),
+                server_uuid: server,
+                server_version: "test".to_string(),
+                start_ts: Duration::from_secs(7),
+                end_ts: Duration::from_secs(7),
+                entries: vec![],
+            },
+            b"x",
+        );
+        forged.segment_id = "../kubidm.db".to_string();
+        fs::write(
+            wal_dir.join(format!("{name}{WAL_SEGMENT_META_SUFFIX}")),
+            serde_json::to_vec(&forged).unwrap(),
+        )
+        .unwrap();
+        fs::write(wal_dir.join(&name), b"x").unwrap();
+        assert!(list_segments(&wal_dir).unwrap().is_empty());
+        assert!(remove_segment(&wal_dir, "../kubidm.db").is_err());
+        assert!(quarantine_segment(&wal_dir, "../kubidm.db").is_err());
+        assert!(outside.is_file());
+    }
+
+    #[test]
+    fn test_damaged_sidecars_are_reported_rebuilt_and_quarantined() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = Uuid::new_v4();
+        let write = |secs: u64| {
+            write_segment_file(
+                dir.path(),
+                &WalSegmentFile {
+                    format_version: WAL_SEGMENT_FORMAT_VERSION,
+                    segment_id: segment_file_name(server, Duration::from_secs(secs)),
+                    server_uuid: server,
+                    server_version: "test".to_string(),
+                    start_ts: Duration::from_secs(secs),
+                    end_ts: Duration::from_secs(secs + 1),
+                    entries: vec![],
+                },
+            )
+            .unwrap()
+        };
+        let intact = write(1);
+        let torn = write(2);
+        let lost = write(3);
+        fs::write(segment_meta_path(dir.path(), &torn.segment_id), b"{").unwrap();
+        fs::write(segment_meta_path(dir.path(), &lost.segment_id), b"{").unwrap();
+        fs::write(dir.path().join(&lost.segment_id), b"torn").unwrap();
+
+        // Listing fails loudly; scanning reports the unreadable sidecars.
+        assert!(list_segments(dir.path()).is_err());
+        let scan = scan_segments(dir.path()).unwrap();
+        assert_eq!(scan.segments, vec![intact.clone()]);
+        assert_eq!(
+            scan.unreadable,
+            vec![torn.segment_id.clone(), lost.segment_id.clone()]
+        );
+
+        // A complete segment file gets its sidecar back; a torn one can only go aside.
+        assert_eq!(rebuild_sidecar(dir.path(), &torn.segment_id).unwrap(), torn);
+        assert!(rebuild_sidecar(dir.path(), &lost.segment_id).is_err());
+        quarantine_segment(dir.path(), &lost.segment_id).unwrap();
+        assert!(dir
+            .path()
+            .join(format!("{}{WAL_QUARANTINE_SUFFIX}", lost.segment_id))
+            .is_file());
+        assert_eq!(list_segments(dir.path()).unwrap(), vec![intact, torn]);
     }
 
     #[test]

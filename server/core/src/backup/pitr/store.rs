@@ -2,12 +2,14 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use kubidm_proto::backup::{
     BackupEncryptionConfig, PitrBaseBackup, PitrManifest, WalSegment, PITR_MANIFEST_KEY,
 };
-use kubidmd_lib::prelude::duration_from_epoch_now;
-use kubidmd_lib::repl::wal::{format_ts_rfc3339, remove_segment};
+use kubidmd_lib::repl::wal::{
+    format_ts_rfc3339, is_wal_segment_name, remove_segment, write_file_durably,
+};
 use sha2::{Digest, Sha256};
 
 use super::{blocking, BaseLocation, PitrError, PitrLocation};
@@ -132,11 +134,17 @@ impl PitrStore {
         let manifest: PitrManifest = serde_json::from_slice(&data).map_err(|err| {
             PitrError::Manifest(format!("{PITR_MANIFEST_KEY} is not readable: {err}"))
         })?;
+        check_manifest_names(&manifest)?;
         Ok(Some(manifest))
     }
 
-    pub(super) async fn save_manifest(&self, manifest: &mut PitrManifest) -> Result<(), PitrError> {
-        let now = format_ts_rfc3339(duration_from_epoch_now());
+    /// Save `manifest`, updated at `now`.
+    pub(super) async fn save_manifest(
+        &self,
+        manifest: &mut PitrManifest,
+        now: Duration,
+    ) -> Result<(), PitrError> {
+        let now = format_ts_rfc3339(now);
         manifest.updated_at = now.clone();
         let data = serde_json::to_vec_pretty(manifest)
             .map_err(|err| PitrError::Manifest(format!("unable to serialise: {err}")))?;
@@ -145,11 +153,7 @@ impl PitrStore {
                 let dir = dir.clone();
                 blocking(move || {
                     fs::create_dir_all(&dir)?;
-                    let path = dir.join(PITR_MANIFEST_KEY);
-                    let tmp = dir.join(format!("{PITR_MANIFEST_KEY}.tmp"));
-                    fs::write(&tmp, &data)?;
-                    fs::rename(&tmp, &path)?;
-                    Ok(())
+                    Ok(write_file_durably(&dir, PITR_MANIFEST_KEY, &data)?)
                 })
                 .await?;
             }
@@ -168,7 +172,8 @@ impl PitrStore {
         Ok(())
     }
 
-    /// Archive the closed segment in `local_dir` and return it as the manifest records it.
+    /// Archive the closed segment whose checked content is `data` at `now`, and return it
+    /// as the manifest records it.
     ///
     /// With an `encryptor` the segment is sealed with the backup encryption scheme first
     /// and stored as `<segment>.enc`: uploaded to S3, or written next to the plaintext in
@@ -177,16 +182,14 @@ impl PitrStore {
     /// the local location has nothing to do: the segment already is where it belongs.
     pub(super) async fn put_segment(
         &self,
-        local_dir: &Path,
         segment: &WalSegment,
+        data: Vec<u8>,
         encryptor: Option<&BackupEncryptor>,
+        now: Duration,
     ) -> Result<WalSegment, PitrError> {
         if !self.is_s3() && encryptor.is_none() {
             return Ok(segment.clone());
         }
-        let path = local_dir.join(&segment.segment_id);
-        let data = blocking(move || Ok(fs::read(path)?)).await?;
-        verify_segment_checksum(segment, &data)?;
 
         let mut archived = WalSegment {
             encryption_key: None,
@@ -209,21 +212,16 @@ impl PitrStore {
 
         match self {
             PitrStore::Local { dir } => {
-                let path = dir.join(archived.stored_name());
-                let tmp = dir.join(format!("{}.tmp", archived.stored_name()));
-                blocking(move || {
-                    fs::write(&tmp, &stored)?;
-                    fs::rename(&tmp, &path)?;
-                    Ok(())
-                })
-                .await?;
+                let dir = dir.clone();
+                let name = archived.stored_name();
+                blocking(move || Ok(write_file_durably(&dir, &name, &stored)?)).await?;
             }
             PitrStore::S3 { client } => {
                 client
                     .upload_backup(
                         &stored,
                         &archived.object_key(),
-                        &segment.created_at,
+                        &format_ts_rfc3339(now),
                         segment.compression,
                         archived.encryption_key.as_deref(),
                     )
@@ -370,6 +368,52 @@ async fn open_segment(
             })
     })
     .await
+}
+
+/// Refuse a manifest that names a segment or a base backup by something else than the
+/// names the server produces: those names are joined to local paths, and must never reach
+/// outside the archive directory.
+fn check_manifest_names(manifest: &PitrManifest) -> Result<(), PitrError> {
+    if let Some(segment) = manifest
+        .segments
+        .iter()
+        .find(|segment| !is_wal_segment_name(&segment.segment_id))
+    {
+        return Err(PitrError::Manifest(format!(
+            "{PITR_MANIFEST_KEY} names an invalid segment '{}'",
+            segment.segment_id
+        )));
+    }
+    if let Some(base) = manifest
+        .base_backups
+        .iter()
+        .find(|base| !is_backup_artifact_name(&base.key))
+    {
+        return Err(PitrError::Manifest(format!(
+            "{PITR_MANIFEST_KEY} names an invalid base backup '{}'",
+            base.key
+        )));
+    }
+    Ok(())
+}
+
+/// Read the local segment `segment` from `local_dir` and check it against its sidecar.
+/// None when the file is gone; [`PitrError::CorruptSegment`] when it does not match.
+pub(super) async fn read_local_segment(
+    local_dir: &Path,
+    segment: &WalSegment,
+) -> Result<Option<Vec<u8>>, PitrError> {
+    let path = local_dir.join(&segment.segment_id);
+    let data = match blocking(move || Ok(fs::read(path)?)).await {
+        Ok(data) => data,
+        Err(PitrError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    match verify_segment_checksum(segment, &data) {
+        Ok(()) => Ok(Some(data)),
+        Err(PitrError::NotRecoverable(msg)) => Err(PitrError::CorruptSegment(msg)),
+        Err(err) => Err(err),
+    }
 }
 
 pub(super) fn verify_segment_checksum(segment: &WalSegment, data: &[u8]) -> Result<(), PitrError> {

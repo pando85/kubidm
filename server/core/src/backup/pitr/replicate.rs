@@ -118,7 +118,7 @@ async fn replicate_to_region(
                 region = %region_name,
                 "Abandoned history or gaps recorded in the region merged into the WAL archive"
             );
-            store.save_manifest(manifest).await?;
+            store.save_manifest(manifest, target.now).await?;
         }
     }
 
@@ -165,7 +165,9 @@ async fn replicate_to_region(
         region_manifest == mirrored
     });
     if !up_to_date {
-        region_store.save_manifest(&mut mirrored).await?;
+        region_store
+            .save_manifest(&mut mirrored, target.now)
+            .await?;
     }
 
     for segment in &expired {
