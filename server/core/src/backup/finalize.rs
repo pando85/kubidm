@@ -553,6 +553,8 @@ mod tests {
             .expect_err("garbage must be rejected");
         assert!(err.quarantined_to.is_none());
         assert!(err.to_string().contains("could not be parsed"));
+        // The parser says where it stopped.
+        assert!(err.to_string().contains("line 1 column 1"), "{err}");
     }
 
     #[test]
