@@ -606,12 +606,15 @@ fn report_backup_verification(verified: Result<BackupStructuralReport, BackupVer
 }
 
 pub async fn restore_server_core(config: &Configuration, dst_path: &Path) {
-    let outcome = match restore_and_replay(config, dst_path, &[]).await {
-        Ok(outcome) => outcome,
+    let committed = match restore_and_replay_commit(config, dst_path, &[]).await {
+        Ok(committed) => committed,
         Err(_) => std::process::exit(1),
     };
 
-    if note_restore_in_wal_archive(config, &outcome).await.is_err() {
+    // The database holds the backup from here on, so the history after it is abandoned
+    // whatever happens next.
+    let noted = note_restore_in_wal_archive(config, &committed.outcome).await;
+    if committed.reindex(config).await.is_err() || noted.is_err() {
         std::process::exit(1);
     }
 
@@ -666,6 +669,47 @@ pub(crate) async fn restore_and_replay(
     src_path: &Path,
     records: &[WalEntryRecord],
 ) -> Result<RestoreOutcome, OperationError> {
+    restore_and_replay_commit(config, src_path, records)
+        .await?
+        .reindex(config)
+        .await
+}
+
+/// A database [`restore_and_replay_commit`] restored and committed, not reindexed yet.
+pub(crate) struct CommittedRestore {
+    pub outcome: RestoreOutcome,
+    be: Backend,
+    schema: Schema,
+}
+
+impl CommittedRestore {
+    /// Reindex the restored database, the last step of a restore. A failure leaves the
+    /// restored content in place: the database is no longer what it was before.
+    pub(crate) async fn reindex(
+        self,
+        config: &Configuration,
+    ) -> Result<RestoreOutcome, OperationError> {
+        reindex_inner(self.be, self.schema, config)
+            .await
+            .inspect_err(|err| {
+                error!(
+                    ?err,
+                    "The database WAS restored, but reindexing it failed; run \
+                     `kubidmd database reindex` before starting the server"
+                );
+            })?;
+        Ok(self.outcome)
+    }
+}
+
+/// [`restore_and_replay`] up to the commit: the caller learns whether the database was
+/// changed, and reindexes it with [`CommittedRestore::reindex`]. A failure leaves the
+/// database as it was.
+pub(crate) async fn restore_and_replay_commit(
+    config: &Configuration,
+    src_path: &Path,
+    records: &[WalEntryRecord],
+) -> Result<CommittedRestore, OperationError> {
     // The artifact is opened before the database is touched, so that a backup that can
     // not be read (missing, or encrypted with a key this configuration does not have)
     // leaves the target database as it was. An encrypted artifact is decrypted with the
@@ -727,11 +771,14 @@ pub(crate) async fn restore_and_replay(
     })?;
     info!("Database loaded successfully");
 
-    reindex_inner(be, schema, config).await?;
-    Ok(RestoreOutcome {
-        watermark,
-        server_uuid,
-        apply,
+    Ok(CommittedRestore {
+        outcome: RestoreOutcome {
+            watermark,
+            server_uuid,
+            apply,
+        },
+        be,
+        schema,
     })
 }
 
@@ -1025,11 +1072,15 @@ pub async fn restore_s3_database(
         fetched.metadata.size_bytes, fetched.metadata.checksum_sha256
     );
 
-    let outcome = restore_and_replay(config, &fetched.path, &[]).await?;
+    let committed = restore_and_replay_commit(config, &fetched.path, &[]).await?;
     // Remove the downloaded artifact.
     drop(fetched);
 
-    note_restore_in_wal_archive(config, &outcome).await
+    // The database holds the backup from here on, so the history after it is abandoned
+    // whatever happens next.
+    let noted = note_restore_in_wal_archive(config, &committed.outcome).await;
+    committed.reindex(config).await?;
+    noted
 }
 
 /// Verify the backup stored under `key` in S3. The SHA-256 of the stored object is checked

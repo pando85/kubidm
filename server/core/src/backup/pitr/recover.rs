@@ -540,19 +540,17 @@ pub async fn pitr_recover_server_core(
         plan.base.key,
         records.len()
     );
-    let restored = crate::restore_and_replay(config, base.path(), &records)
+    let committed = crate::restore_and_replay_commit(config, base.path(), &records)
         .await
         .map_err(|err| {
             error!(
                 ?err,
-                "Recovery failed; the database at {db_path} was not changed unless the error \
-                 says otherwise"
+                "Recovery failed; the database at {db_path} was not changed"
             );
             PitrError::Operation(err)
         })?;
-    let apply = restored.apply;
     drop(base);
-
+    let apply = committed.outcome.apply.clone();
     if let Some(report) = &apply {
         info!(
             applied = report.applied,
@@ -563,77 +561,28 @@ pub async fn pitr_recover_server_core(
         );
     }
 
-    info!("Verifying the recovered database ...");
-    let consistency_errors = crate::verify_booted_database(config)
-        .await
-        .map_err(PitrError::Operation)?;
-    if !consistency_errors.is_empty() {
-        for err in &consistency_errors {
-            error!(?err, "Recovered database consistency error");
-        }
-        error!(
-            "RECOVERY INCOMPLETE: the recovered database at {db_path} failed its consistency \
-             verification. Do not start the server on it; recover to another point or restore a backup."
-        );
-        return Err(PitrError::Operation(OperationError::ConsistencyError(
-            consistency_errors,
-        )));
-    }
-
+    // The database holds the recovered state from here on: the history after it is
+    // abandoned whether or not the steps that follow succeed, so it is recorded first.
     let restored = RestoredDatabase {
         after_ts: recovered_ts,
-        server_uuid: restored.server_uuid,
+        server_uuid: committed.outcome.server_uuid,
         reason: "recover",
         now: duration_from_epoch_now(),
     };
-    let identity_change = record_timeline_break(&opened.settings, &restored)
-        .await
-        .inspect_err(|err| {
-            error!(
-                %err,
-                "The database at {db_path} WAS recovered, but the abandoned history could not \
-                 be recorded in the archive. A later recovery past this point could replay it: \
-                 take a new online backup right after starting the server, and recover only to \
-                 points after it."
-            );
-        })?;
+    let recorded = record_abandoned_history(&opened, &restored, &db_path).await;
 
-    // Recovered from a region: the primary archive, which the recovered server archives
-    // into, must learn about the abandoned history too. It is often unreachable when a
-    // region is used, so this is best effort; the server merges what the region recorded
-    // into the primary archive at its first synchronisation that reaches both.
-    if let Some(primary) = &opened.primary {
-        if let Err(err) = record_timeline_break(primary, &restored).await {
-            // A change of identity must reach the primary archive before the server
-            // archives into it under the new one: hand it to the server's first
-            // synchronisation.
-            if let Some(change) = &identity_change {
-                let change = WalServerUuidChange {
-                    from: change.from_server_uuid,
-                    to: change.to_server_uuid,
-                    at_ts: change.at_ts,
-                };
-                let local_dir = primary.local_dir.clone();
-                blocking(move || Ok(add_pending_server_uuid_change(&local_dir, change)?))
-                    .await
-                    .unwrap_or_else(|err| {
-                        error!(
-                            %err,
-                            "Unable to hand the change of server uuid to the server; it will \
-                             refuse to archive into {} until the change is recorded there",
-                            primary.location
-                        )
-                    });
-            }
-            warn!(
-                %err,
-                "The abandoned history was recorded in the region, but not in the primary WAL \
-                 archive at {}. The server merges it into the primary archive once it reaches \
-                 both; until then take a new online backup right after starting the server.",
-                primary.location
-            );
-        }
+    let finished = finish_recovery(config, committed).await;
+    if let Err(err) = &finished {
+        error!(
+            %err,
+            "RECOVERY INCOMPLETE: the database at {db_path} WAS recovered to {}, but it could not \
+             be reindexed or failed its verification. Do not start the server on it; recover to \
+             another point or restore a backup.",
+            format_ts_rfc3339(recovered_ts)
+        );
     }
+    finished?;
+    recorded?;
 
     eprintln!(
         "Recovered {db_path} to {} ({} records replayed on {})",
@@ -649,6 +598,83 @@ pub async fn pitr_recover_server_core(
         dry_run: false,
         apply,
     })
+}
+
+/// The steps of a recovery after its commit: reindex, boot and verify the database.
+async fn finish_recovery(
+    config: &Configuration,
+    committed: crate::CommittedRestore,
+) -> Result<(), PitrError> {
+    committed.reindex(config).await?;
+    info!("Verifying the recovered database ...");
+    let consistency_errors = crate::verify_booted_database(config).await?;
+    if consistency_errors.is_empty() {
+        return Ok(());
+    }
+    for err in &consistency_errors {
+        error!(?err, "Recovered database consistency error");
+    }
+    Err(PitrError::Operation(OperationError::ConsistencyError(
+        consistency_errors,
+    )))
+}
+
+/// Record the history a recovery abandoned in the archive it was read from and, when that
+/// is a replication region, in the primary archive the recovered server archives into.
+async fn record_abandoned_history(
+    opened: &OpenedArchive,
+    restored: &RestoredDatabase<'_>,
+    db_path: &str,
+) -> Result<(), PitrError> {
+    let identity_change = record_timeline_break(&opened.settings, restored)
+        .await
+        .inspect_err(|err| {
+            error!(
+                %err,
+                "The database at {db_path} WAS recovered, but the abandoned history could not \
+                 be recorded in the archive. A later recovery past this point could replay it: \
+                 take a new online backup right after starting the server, and recover only to \
+                 points after it."
+            );
+        })?;
+
+    // Recovered from a region: the primary archive, which the recovered server archives
+    // into, must learn about the abandoned history too. It is often unreachable when a
+    // region is used, so this is best effort; the server merges what the region recorded
+    // into the primary archive at its first synchronisation that reaches both.
+    let Some(primary) = &opened.primary else {
+        return Ok(());
+    };
+    if let Err(err) = record_timeline_break(primary, restored).await {
+        // A change of identity must reach the primary archive before the server archives
+        // into it under the new one: hand it to the server's first synchronisation.
+        if let Some(change) = &identity_change {
+            let change = WalServerUuidChange {
+                from: change.from_server_uuid,
+                to: change.to_server_uuid,
+                at_ts: change.at_ts,
+            };
+            let local_dir = primary.local_dir.clone();
+            blocking(move || Ok(add_pending_server_uuid_change(&local_dir, change)?))
+                .await
+                .unwrap_or_else(|err| {
+                    error!(
+                        %err,
+                        "Unable to hand the change of server uuid to the server; it will refuse \
+                         to archive into {} until the change is recorded there",
+                        primary.location
+                    )
+                });
+        }
+        warn!(
+            %err,
+            "The abandoned history was recorded in the region, but not in the primary WAL \
+             archive at {}. The server merges it into the primary archive once it reaches \
+             both; until then take a new online backup right after starting the server.",
+            primary.location
+        );
+    }
+    Ok(())
 }
 
 /// What a restore or recovery did to the database, for the archive.
