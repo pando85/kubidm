@@ -19,6 +19,7 @@ use kubidm_proto::backup::{
 use super::encryption::{
     is_encrypted_artifact, read_encryption_header, BackupEncryptionError, BackupEncryptor,
 };
+use super::run_blocking;
 
 /// A backup artifact resolved to the plaintext a restore can parse.
 pub struct OpenedBackup {
@@ -123,6 +124,24 @@ pub fn seal_backup(
     }
 }
 
+/// [`seal_backup`] for async callers: the Argon2id key derivation and the encryption of
+/// the whole backup run on the blocking thread pool so that they never stall the async
+/// runtime. A plain backup is returned as it is.
+pub async fn seal_backup_async(
+    plaintext: Vec<u8>,
+    compression: BackupCompression,
+    encryptor: Option<&BackupEncryptor>,
+) -> Result<Vec<u8>, BackupEncryptionError> {
+    let Some(encryptor) = encryptor.cloned() else {
+        return Ok(plaintext);
+    };
+    tokio::task::spawn_blocking(move || encryptor.encrypt(&plaintext, compression))
+        .await
+        .map_err(|err| {
+            BackupEncryptionError::EncryptionFailed(format!("the encryption task failed: {err}"))
+        })?
+}
+
 /// Open an artifact held in memory. `name` is the file name or object key the artifact
 /// is stored under; it only matters for the compression of a plain artifact.
 ///
@@ -222,6 +241,10 @@ pub fn open_backup_file(
 /// The key an encrypted artifact at `path` needs, resolved from `encryption` only when the
 /// artifact is actually encrypted, then [`open_backup_file`]. This is the entry point of
 /// the restore and verification commands, which hold a configuration rather than a key.
+///
+/// The file is read, and an encrypted artifact decrypted, on the blocking thread pool so
+/// that neither the I/O nor the Argon2id key derivation and decryption stall the async
+/// runtime.
 pub async fn open_backup_file_with_config(
     path: &Path,
     encryption: Option<&BackupEncryptionConfig>,
@@ -231,12 +254,18 @@ pub async fn open_backup_file_with_config(
         source,
     };
 
-    let mut file = File::open(path).map_err(io_err)?;
-    let prefix = peek_prefix(&mut file).map_err(io_err)?;
-    drop(file);
+    let prefix = {
+        let path = path.to_path_buf();
+        run_blocking(move || {
+            let mut file = File::open(&path)?;
+            peek_prefix(&mut file)
+        })
+        .await
+        .map_err(io_err)?
+    };
 
     if !is_encrypted_artifact(&prefix) {
-        let opened = open_backup_file(path, None)?;
+        let opened = open_backup_file_off_runtime(path, None).await?;
         if encryption.is_some_and(|config| config.enabled) {
             // Kept working so that backups from before encryption was enabled restore, but
             // a plain artifact is not authenticated: say so.
@@ -256,9 +285,14 @@ pub async fn open_backup_file_with_config(
     };
 
     match encryptor {
-        Ok(encryptor) => open_backup_file(path, encryptor.as_ref()),
+        Ok(encryptor) => open_backup_file_off_runtime(path, encryptor).await,
         Err(source) => {
-            let data = std::fs::read(path).map_err(io_err)?;
+            let data = {
+                let path = path.to_path_buf();
+                run_blocking(move || std::fs::read(path))
+                    .await
+                    .map_err(io_err)?
+            };
             let (header, _) = read_encryption_header(&data).map_err(BackupOpenError::Decrypt)?;
             Err(BackupOpenError::KeyUnavailable {
                 key_identifier: header.key_identifier,
@@ -266,6 +300,20 @@ pub async fn open_backup_file_with_config(
             })
         }
     }
+}
+
+/// [`open_backup_file`] on the blocking thread pool.
+async fn open_backup_file_off_runtime(
+    path: &Path,
+    encryptor: Option<BackupEncryptor>,
+) -> Result<OpenedBackup, BackupOpenError> {
+    let owned_path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || open_backup_file(&owned_path, encryptor.as_ref()))
+        .await
+        .map_err(|err| BackupOpenError::Io {
+            path: path.display().to_string(),
+            source: std::io::Error::other(err),
+        })?
 }
 
 #[cfg(test)]

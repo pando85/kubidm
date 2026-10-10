@@ -429,6 +429,11 @@ pub async fn resolve_key_material(
 }
 
 /// Key material resolved from a configuration, ready to encrypt and decrypt artifacts.
+///
+/// [`Self::encrypt`] and [`Self::decrypt`] run Argon2id and process a whole backup, so they
+/// are CPU bound: async callers run them on the blocking thread pool, which is what the
+/// encryptor is cloneable for. A clone zeroizes its copy of the key material when dropped.
+#[derive(Clone)]
 pub struct BackupEncryptor {
     config: BackupEncryptionConfig,
     key_material: Zeroizing<Vec<u8>>,
@@ -454,7 +459,17 @@ impl BackupEncryptor {
             return Ok(None);
         }
         let key_material = resolve_key_material(config).await?;
-        Self::with_key_material(config.clone(), key_material).map(Some)
+        // Without a configured identifier, a key file or key endpoint is fingerprinted with
+        // Argon2id, which must not stall the async runtime.
+        let config = config.clone();
+        tokio::task::spawn_blocking(move || Self::with_key_material(config, key_material))
+            .await
+            .map_err(|err| {
+                BackupEncryptionError::KeyDerivationFailed(format!(
+                    "the key derivation task failed: {err}"
+                ))
+            })?
+            .map(Some)
     }
 
     /// Build an encryptor from already obtained key material. The identifier of the key is

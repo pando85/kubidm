@@ -45,9 +45,10 @@ use crate::{
     actors::{QueryServerReadV1, QueryServerWriteV1},
     admin::AdminActor,
     backup::{
-        finalize_local_backup, is_backup_artifact_name, lag_metrics_from_health,
-        open_backup_file_with_config, region_is_healthy, s3_location, seal_backup,
-        verify_backup_output, BackupEncryptor, BackupVerifyError, S3BackupError, S3ClientWrapper,
+        finalize_local_backup_async, is_backup_artifact_name, lag_metrics_from_health,
+        open_backup_file_with_config, region_is_healthy, run_blocking, s3_location,
+        seal_backup_async, verify_backup_output_async, BackupEncryptor, BackupVerifyError,
+        S3BackupError, S3ClientWrapper,
     },
     config::{Configuration, ServerRole},
     interval::IntervalActor,
@@ -437,14 +438,6 @@ pub async fn backup_server_core(config: &Configuration, dst_path: Option<&Path>)
         }
     };
 
-    let mut be_ro_txn = match be.read() {
-        Ok(txn) => txn,
-        Err(err) => {
-            error!(?err, "Unable to proceed, backend read transaction failure.");
-            return;
-        }
-    };
-
     if let Some(dst_path) = dst_path {
         if dst_path.exists() {
             error!(
@@ -456,16 +449,31 @@ pub async fn backup_server_core(config: &Configuration, dst_path: Option<&Path>)
     }
 
     // The backup is produced in memory first so that it can be encrypted and so that only
-    // a verified backup is ever emitted to stdout.
-    let mut backup_data = Vec::new();
-    if let Err(e) = be_ro_txn.backup(&mut backup_data, compression) {
-        error!("Backup failed: {:?}", e);
-        std::process::exit(1);
-    }
-    // Let the txn abort, even on success.
-    drop(be_ro_txn);
+    // a verified backup is ever emitted to stdout. Serialising and compressing the whole
+    // database is blocking work, so it runs on the blocking thread pool.
+    let backup_data = tokio::task::spawn_blocking(move || {
+        let mut be_ro_txn = be.read().inspect_err(|err| {
+            error!(?err, "Unable to proceed, backend read transaction failure.");
+        })?;
+        let mut backup_data = Vec::new();
+        be_ro_txn.backup(&mut backup_data, compression)?;
+        // Let the txn abort, even on success.
+        Ok::<_, OperationError>(backup_data)
+    })
+    .await;
+    let backup_data = match backup_data {
+        Ok(Ok(backup_data)) => backup_data,
+        Ok(Err(e)) => {
+            error!("Backup failed: {:?}", e);
+            std::process::exit(1);
+        }
+        Err(err) => {
+            error!(%err, "Backup failed: the backup task failed");
+            std::process::exit(1);
+        }
+    };
 
-    let artifact = match seal_backup(backup_data, compression, encryptor.as_ref()) {
+    let artifact = match seal_backup_async(backup_data, compression, encryptor.as_ref()).await {
         Ok(artifact) => artifact,
         Err(err) => {
             error!(%err, "Backup failed: unable to encrypt the backup");
@@ -474,7 +482,8 @@ pub async fn backup_server_core(config: &Configuration, dst_path: Option<&Path>)
     };
 
     if let Some(dst_path) = dst_path {
-        if let Err(err) = std::fs::write(dst_path, &artifact) {
+        let write_to = dst_path.to_path_buf();
+        if let Err(err) = run_blocking(move || std::fs::write(write_to, artifact)).await {
             error!(
                 ?err,
                 "Backup failed: unable to write {}",
@@ -482,22 +491,19 @@ pub async fn backup_server_core(config: &Configuration, dst_path: Option<&Path>)
             );
             std::process::exit(1);
         }
-        drop(artifact);
         info!("Backup written to {}", dst_path.display());
 
         // Read the artifact back before announcing it. A rejected artifact is kept under
         // an `.invalid` suffix for inspection.
-        report_backup_verification(finalize_local_backup(
-            dst_path,
-            compression,
-            encryptor.as_ref(),
-        ));
+        report_backup_verification(
+            finalize_local_backup_async(dst_path, compression, encryptor.as_ref()).await,
+        );
     } else {
-        report_backup_verification(verify_backup_output(
-            &artifact,
-            compression,
-            encryptor.as_ref(),
-        ));
+        let artifact = Arc::new(artifact);
+        report_backup_verification(
+            verify_backup_output_async(Arc::clone(&artifact), compression, encryptor.as_ref())
+                .await,
+        );
 
         let mut stdout = std::io::stdout().lock();
         if let Err(err) = stdout.write_all(&artifact).and_then(|()| stdout.flush()) {
@@ -631,11 +637,21 @@ pub async fn verify_backup_server_core(
         };
     let encryption_key = opened.key_identifier().map(str::to_string);
 
-    let report = match verify_backup_structure(opened.reader, opened.compression) {
-        Ok(report) => report,
-        Err(err) => {
+    // Decompressing and parsing the whole backup is blocking work.
+    let compression = opened.compression;
+    let reader = opened.reader;
+    let parsed =
+        tokio::task::spawn_blocking(move || verify_backup_structure(reader, compression)).await;
+    let report = match parsed {
+        Ok(Ok(report)) => report,
+        Ok(Err(err)) => {
             eprintln!("Backup structural verification: FAIL");
             eprintln!("  - artifact could not be parsed as a kubidm backup: {err:?}");
+            return false;
+        }
+        Err(err) => {
+            eprintln!("Backup structural verification: FAIL");
+            eprintln!("  - the verification task failed: {err}");
             return false;
         }
     };
@@ -839,7 +855,8 @@ async fn fetch_s3_backup(s3_config: S3Config, key: &str) -> Result<FetchedS3Back
         "backup.json{}{encryption_suffix}",
         metadata.compression.suffix()
     ));
-    std::fs::write(&path, &data)?;
+    let write_to = path.clone();
+    run_blocking(move || std::fs::write(write_to, data)).await?;
 
     info!(
         key,

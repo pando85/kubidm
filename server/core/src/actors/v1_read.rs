@@ -45,14 +45,16 @@ use std::{
     net::IpAddr,
     path::{Path, PathBuf},
     str::FromStr,
+    sync::Arc,
 };
 use tracing::{error, info, instrument, trace};
 use uuid::Uuid;
 
 use super::QueryServerReadV1;
 use crate::backup::{
-    backup_artifact_name, finalize_local_backup, is_backup_artifact_name, seal_backup,
-    select_backups_to_delete, verify_backup_output, BackupEncryptor, S3ClientWrapper,
+    backup_artifact_name, finalize_local_backup_async, is_backup_artifact_name, run_blocking,
+    seal_backup_async, select_backups_to_delete, verify_backup_output_async, BackupEncryptor,
+    S3ClientWrapper,
 };
 use kubidm_proto::backup::BackupEncryptionConfig;
 
@@ -270,11 +272,13 @@ impl QueryServerReadV1 {
                 );
             })?;
 
-        std::fs::write(&dest_file, &artifact).map_err(|err| {
-            error!(?err, "Unable to write {}", dest_file.display());
-            OperationError::FsError
-        })?;
-        drop(artifact);
+        let write_to = dest_file.clone();
+        run_blocking(move || std::fs::write(write_to, artifact))
+            .await
+            .map_err(|err| {
+                error!(?err, "Unable to write {}", dest_file.display());
+                OperationError::FsError
+            })?;
         debug!("Online backup written to {}", dest_file.display());
 
         // Never announce, retain or prune on the strength of a backup that can not be
@@ -284,8 +288,9 @@ impl QueryServerReadV1 {
         // Should the rename itself fail, the rejected file keeps a retention-matching name
         // and the next run may count it as a backup; the loud error below, which carries
         // the rename failure in `reasons`, is the mitigation.
-        let report =
-            finalize_local_backup(&dest_file, compression, encryptor.as_ref()).map_err(|err| {
+        let report = finalize_local_backup_async(&dest_file, compression, encryptor.as_ref())
+            .await
+            .map_err(|err| {
                 error!(
                     reasons = ?err.reasons,
                     quarantined_to = ?err.quarantined_to,
@@ -404,10 +409,12 @@ impl QueryServerReadV1 {
                 })?;
         }
 
-        seal_backup(backup_data, compression, encryptor).map_err(|err| {
-            error!(%err, "Online backup failed to encrypt the backup");
-            OperationError::CryptographyError
-        })
+        seal_backup_async(backup_data, compression, encryptor)
+            .await
+            .map_err(|err| {
+                error!(%err, "Online backup failed to encrypt the backup");
+                OperationError::CryptographyError
+            })
     }
 
     #[instrument(
@@ -427,21 +434,23 @@ impl QueryServerReadV1 {
     ) -> Result<(), OperationError> {
         trace!(eventid = ?msg.eventid, "Begin S3 backup event");
 
-        let backup_data = self.produce_backup_artifact(compression, encryptor).await?;
+        let backup_data = Arc::new(self.produce_backup_artifact(compression, encryptor).await?);
 
         let object_key = backup_artifact_name(timestamp, compression, encryptor.is_some());
 
         // A backup that can not be read back is never uploaded, so the bucket only ever
         // holds artifacts that passed the same structural checks as `verify-backup`. An
         // encrypted artifact is decrypted for this, which proves the key opens it.
-        let report = verify_backup_output(&backup_data, compression, encryptor).map_err(|err| {
-            error!(
-                reasons = ?err.reasons,
-                "S3 backup {} failed verification and was not uploaded",
-                object_key
-            );
-            OperationError::InvalidState
-        })?;
+        let report = verify_backup_output_async(Arc::clone(&backup_data), compression, encryptor)
+            .await
+            .map_err(|err| {
+                error!(
+                    reasons = ?err.reasons,
+                    "S3 backup {} failed verification and was not uploaded",
+                    object_key
+                );
+                OperationError::InvalidState
+            })?;
         info!(
             entries = report.entry_count,
             version = ?report.version,

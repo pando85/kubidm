@@ -11,6 +11,7 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use kubidm_proto::backup::BackupCompression;
 use kubidmd_lib::be::{verify_backup_structure, BackupStructuralReport};
@@ -113,6 +114,22 @@ pub fn verify_backup_output(
     }
 }
 
+/// [`verify_backup_output`] for async callers: the decryption, decompression and parsing
+/// of the whole backup run on the blocking thread pool so that they never stall the async
+/// runtime. `data` is shared rather than moved so that the caller can still upload it.
+pub async fn verify_backup_output_async(
+    data: Arc<Vec<u8>>,
+    compression: BackupCompression,
+    encryptor: Option<&BackupEncryptor>,
+) -> Result<BackupStructuralReport, BackupVerifyError> {
+    let encryptor = encryptor.cloned();
+    tokio::task::spawn_blocking(move || {
+        verify_backup_output(&data, compression, encryptor.as_ref())
+    })
+    .await
+    .unwrap_or_else(|err| Err(verification_task_failed(&err)))
+}
+
 /// Reopen the backup that was just written to `path` and structurally verify it with the
 /// `compression` and the `encryptor` it was written with. On failure the file is renamed
 /// to [`invalid_backup_path`] so that it is kept but never treated as a backup again.
@@ -149,6 +166,31 @@ pub fn finalize_local_backup(
         }
         err
     })
+}
+
+/// [`finalize_local_backup`] for async callers: reading the artifact back, decrypting,
+/// decompressing and parsing it, and quarantining a rejected one run on the blocking thread
+/// pool so that they never stall the async runtime.
+pub async fn finalize_local_backup_async(
+    path: &Path,
+    compression: BackupCompression,
+    encryptor: Option<&BackupEncryptor>,
+) -> Result<BackupStructuralReport, BackupVerifyError> {
+    let path = path.to_path_buf();
+    let encryptor = encryptor.cloned();
+    tokio::task::spawn_blocking(move || {
+        finalize_local_backup(&path, compression, encryptor.as_ref())
+    })
+    .await
+    .unwrap_or_else(|err| Err(verification_task_failed(&err)))
+}
+
+/// The rejection of a verification whose blocking task panicked or was cancelled.
+fn verification_task_failed(err: &tokio::task::JoinError) -> BackupVerifyError {
+    BackupVerifyError {
+        reasons: vec![format!("the verification task failed: {err}")],
+        quarantined_to: None,
+    }
 }
 
 #[cfg(test)]
