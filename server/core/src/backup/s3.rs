@@ -632,7 +632,8 @@ impl S3ClientWrapper {
     ///
     /// An object written as a backup, with a sidecar, carries the same checksum in its own
     /// metadata, so a manifest written by an earlier version is read the same way, and
-    /// its sidecar is ignored.
+    /// its sidecar is ignored. An object without that metadata is read unchecked, with a
+    /// warning each time.
     pub async fn download_document_if_exists(
         &self,
         key: &str,
@@ -666,11 +667,19 @@ impl S3ClientWrapper {
             .and_then(|metadata| metadata.get("checksum-sha256"))
             .cloned();
         let data = self.collect_stream(output).await?;
-        if let Some(expected) = expected {
-            let actual = sha256_hex(data.clone()).await?;
-            if actual != expected {
-                return Err(S3BackupError::InvalidChecksum { expected, actual });
+        match expected {
+            Some(expected) => {
+                let actual = sha256_hex(data.clone()).await?;
+                if actual != expected {
+                    return Err(S3BackupError::InvalidChecksum { expected, actual });
+                }
             }
+            None => warn!(
+                object = %format!("s3://{}/{object_key}", self.config.bucket),
+                "The object carries no checksum-sha256 metadata and is read without an \
+                 integrity check: the object store, or the tool that copied it, dropped its \
+                 user metadata"
+            ),
         }
         Ok(Some(Vec::from(data)))
     }

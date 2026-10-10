@@ -486,6 +486,85 @@ mod tests {
         assert_eq!(store.load_manifest().await.expect("load"), Some(manifest));
     }
 
+    /// Collects the messages of the warnings logged on the thread it is the default
+    /// subscriber of.
+    #[derive(Clone, Default)]
+    struct Warnings(Arc<Mutex<Vec<String>>>);
+
+    impl Warnings {
+        fn containing(&self, text: &str) -> usize {
+            self.0
+                .lock()
+                .expect("warnings")
+                .iter()
+                .filter(|message| message.contains(text))
+                .count()
+        }
+    }
+
+    impl tracing::Subscriber for Warnings {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() == tracing::Level::WARN
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Message<'a>(&'a mut String);
+            impl tracing::field::Visit for Message<'_> {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        *self.0 = format!("{value:?}");
+                    }
+                }
+            }
+            let mut message = String::new();
+            event.record(&mut Message(&mut message));
+            self.0.lock().expect("warnings").push(message);
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    #[tokio::test]
+    async fn test_s3_manifest_without_checksum_metadata_loads_with_a_warning_each_time() {
+        let warnings = Warnings::default();
+        let _default = tracing::subscriber::set_default(warnings.clone());
+        // A store that drops user metadata.
+        let objects = Arc::new(Mutex::new(BTreeMap::new()));
+        let store_objects = fake_s3::store(Arc::clone(&objects));
+        let fake = fake_s3::FakeS3::start(Arc::new(move |request: &fake_s3::Recorded| {
+            let mut request = request.clone();
+            request.headers.remove(fake_s3::CHECKSUM_HEADER);
+            store_objects(&request)
+        }))
+        .await;
+        let store = PitrStore::open(&PitrLocation::S3(fake.config("bucket")))
+            .await
+            .expect("store");
+        let mut manifest = PitrManifest::new(Uuid::new_v4());
+        store
+            .save_manifest(&mut manifest, Duration::from_secs(10))
+            .await
+            .expect("save");
+
+        let unchecked = "no checksum-sha256 metadata";
+        assert_eq!(warnings.containing(unchecked), 0);
+        for loads in 1..=2 {
+            assert_eq!(
+                store.load_manifest().await.expect("load"),
+                Some(manifest.clone())
+            );
+            assert_eq!(warnings.containing(unchecked), loads);
+        }
+    }
+
     #[tokio::test]
     async fn test_s3_bases_without_a_sidecar_or_an_object_are_not_listed() {
         let objects = Arc::new(Mutex::new(BTreeMap::new()));
