@@ -18,8 +18,8 @@ use aws_sdk_s3::Client as SdkClient;
 use kubidm_client::KubidmClient;
 use kubidm_proto::backup::{
     is_encrypted_backup_name, BackupCompression, BackupEncryptionConfig, EncryptionKeySource,
-    KeyDerivationParams, PitrManifest, ReplicationConfig, S3Config, WalArchiveConfig,
-    PITR_MANIFEST_KEY,
+    KeyDerivationParams, PitrManifest, ReplicationConfig, ReplicationRegionConfig, S3Config,
+    WalArchiveConfig, PITR_MANIFEST_KEY,
 };
 use kubidmd_core::backup::pitr::{
     pitr_list_server_core, pitr_recover_server_core, PitrArchive, PitrError, PitrSettings,
@@ -1027,5 +1027,270 @@ fn test_pitr_s3_restore_abandons_history_and_reports_an_unreachable_archive() {
         .await;
 
         delete_prefix(&sdk, &s3_config).await;
+    });
+}
+
+// === A WAL archive in its own S3 location ===
+
+/// `config` with the WAL archive in `wal_s3`, `[online_backup.wal_archive.s3]`, instead of
+/// the location of the base backups.
+fn with_wal_s3(mut config: Configuration, wal_s3: &S3Config) -> Configuration {
+    if let Some(wal) = config
+        .online_backup
+        .as_mut()
+        .and_then(|backup| backup.wal_archive.as_mut())
+    {
+        wal.s3 = Some(wal_s3.clone());
+    }
+    config
+}
+
+fn replicated_to(s3_config: S3Config, region: &ReplicationRegionConfig) -> S3Config {
+    S3Config {
+        replication: Some(ReplicationConfig {
+            enabled: true,
+            regions: vec![region.clone()],
+            sync_interval_seconds: 3600,
+        }),
+        ..s3_config
+    }
+}
+
+/// The WAL archive in `[online_backup.wal_archive.s3]`, the base backups in
+/// `[online_backup.s3]`, each replicating to a region of the same name: recovery reads the
+/// segments from one location and the bases from the other, from the primaries and from
+/// the region.
+#[test]
+fn test_pitr_s3_separate_wal_location_recovers_from_primary_and_region() {
+    let Some(base_s3) = test_s3_config("pitr-bases") else {
+        return;
+    };
+    let Some(wal_s3) = test_s3_config("pitr-wal") else {
+        return;
+    };
+    let base_region = test_s3_region(&base_s3, PITR_REGION, "pitr-bases-dr");
+    let wal_region = test_s3_region(&wal_s3, PITR_REGION, "pitr-wal-dr");
+    let base_s3 = replicated_to(base_s3, &base_region);
+    let wal_s3 = replicated_to(wal_s3, &wal_region);
+    let base_region_s3 = base_region.to_s3_config();
+    let wal_region_s3 = wal_region.to_s3_config();
+
+    run(Box::pin(async {
+        let sdk = sdk_client(&base_s3).await;
+        ensure_bucket(&sdk, &base_s3.bucket).await;
+        ensure_bucket(&sdk, &base_region_s3.bucket).await;
+
+        let host_config = |host: &Path, db: &str, base_s3: &S3Config, wal_s3: &S3Config| {
+            with_wal_s3(
+                pitr_config(
+                    &host.join(db),
+                    &host.join("backups"),
+                    &host.join("wal"),
+                    Some(base_s3.clone()),
+                ),
+                wal_s3,
+            )
+        };
+
+        let source_host = tempfile::tempdir().expect("Failed to create workdir");
+        let env = setup_async_test(host_config(
+            source_host.path(),
+            "source.db",
+            &base_s3,
+            &wal_s3,
+        ))
+        .await;
+        populate(&env).await;
+        env.core_handle
+            .trigger_s3_backup(
+                base_s3.clone(),
+                7,
+                BackupCompression::Gzip,
+                &Default::default(),
+            )
+            .await
+            .expect("S3 backup failed");
+        let target = write_history(env).await;
+
+        // The bases are in the backup location and its region, the archive in the WAL
+        // location and its region, and nothing of either in the other.
+        let base_keys = object_keys(&sdk, &base_s3).await;
+        let backups: Vec<String> = base_keys
+            .iter()
+            .filter(|key| !key.ends_with(".metadata.json"))
+            .cloned()
+            .collect();
+        assert_eq!(backups.len(), 1, "{base_keys:?}");
+        assert!(backups[0].starts_with("backup-"), "{base_keys:?}");
+        assert_eq!(object_keys(&sdk, &base_region_s3).await, base_keys);
+        for location in [&wal_s3, &wal_region_s3] {
+            let keys = object_keys(&sdk, location).await;
+            assert!(keys.iter().any(|key| key == PITR_MANIFEST_KEY), "{keys:?}");
+            assert!(segment_keys(&keys).len() >= 2, "{keys:?}");
+            assert!(
+                !keys.iter().any(|key| key.starts_with("backup-")),
+                "{keys:?}"
+            );
+        }
+        let manifest = s3_manifest(&sdk, &wal_s3).await;
+        assert_eq!(
+            manifest.base_backups.len(),
+            1,
+            "{:?}",
+            manifest.base_backups
+        );
+        assert_eq!(manifest.base_backups[0].key, backups[0]);
+        assert_eq!(
+            s3_manifest(&sdk, &wal_region_s3).await.base_backups,
+            manifest.base_backups
+        );
+
+        // A new host recovers from the primaries: segments from the WAL location, the base
+        // from the backup location.
+        let new_host = tempfile::tempdir().expect("Failed to create workdir");
+        let recovered_config = host_config(new_host.path(), "recovered.db", &base_s3, &wal_s3);
+        assert!(pitr_list_server_core(&recovered_config, None).await);
+        pitr_recover_server_core(
+            &recovered_config,
+            &RecoveryTargetSpec::Time(target.clone()),
+            false,
+            None,
+        )
+        .await
+        .expect("Recovery from the primaries failed");
+        let mut env = assert_state_at_target(recovered_config).await;
+        env.core_handle.shutdown().await;
+
+        // Both primaries are unreachable: `--region` finds the archive in the region of the
+        // WAL location and the base in the region of the same name of the backup location.
+        let missing = |s3: &S3Config| S3Config {
+            bucket: format!("kubidm-test-missing-{}", Uuid::new_v4()),
+            ..s3.clone()
+        };
+        let region_host = tempfile::tempdir().expect("Failed to create workdir");
+        let from_region = host_config(
+            region_host.path(),
+            "from-region.db",
+            &missing(&base_s3),
+            &missing(&wal_s3),
+        );
+        assert!(!pitr_list_server_core(&from_region, None).await);
+        assert!(pitr_list_server_core(&from_region, Some(PITR_REGION)).await);
+        pitr_recover_server_core(
+            &from_region,
+            &RecoveryTargetSpec::Time(target),
+            false,
+            Some(PITR_REGION),
+        )
+        .await
+        .expect("Recovery from the region failed");
+        let mut env = assert_state_at_target(from_region).await;
+        env.core_handle.shutdown().await;
+
+        // Without a region of that name in the backup location, the bases can not be found
+        // in a region, and `--region` is refused.
+        let unreplicated_bases = S3Config {
+            replication: None,
+            ..base_s3.clone()
+        };
+        let refused_db = region_host.path().join("refused.db");
+        let refused = pitr_recover_server_core(
+            &host_config(
+                region_host.path(),
+                "refused.db",
+                &unreplicated_bases,
+                &wal_s3,
+            ),
+            &RecoveryTargetSpec::Latest,
+            true,
+            Some(PITR_REGION),
+        )
+        .await;
+        assert!(
+            matches!(&refused, Err(PitrError::Config(msg)) if msg.contains("[online_backup.s3]")),
+            "{refused:?}"
+        );
+        assert!(!refused_db.exists());
+
+        for location in [&base_s3, &wal_s3, &base_region_s3, &wal_region_s3] {
+            delete_prefix(&sdk, location).await;
+        }
+    }));
+}
+
+/// The WAL archive in `[online_backup.wal_archive.s3]` and the base backups in the local
+/// backup directory: a new host recovers with that directory and the S3 archive.
+#[test]
+fn test_pitr_s3_wal_location_with_local_bases() {
+    let Some(wal_s3) = test_s3_config("pitr-wal-local-bases") else {
+        return;
+    };
+
+    run(async {
+        let sdk = sdk_client(&wal_s3).await;
+        ensure_bucket(&sdk, &wal_s3.bucket).await;
+
+        let host_config = |host: &Path, db: &str, backup_dir: &Path| {
+            with_wal_s3(
+                pitr_config(&host.join(db), backup_dir, &host.join("wal"), None),
+                &wal_s3,
+            )
+        };
+        let source_host = tempfile::tempdir().expect("Failed to create workdir");
+        let backup_dir = source_host.path().join("backups");
+        let env = setup_async_test(host_config(source_host.path(), "source.db", &backup_dir)).await;
+        populate(&env).await;
+        let base = backup_via_production_path(
+            &env,
+            &backup_dir,
+            BackupCompression::Gzip,
+            &Default::default(),
+        )
+        .await;
+        let target = write_history(env).await;
+
+        // Segments and the manifest went to S3; the base stayed local.
+        let keys = object_keys(&sdk, &wal_s3).await;
+        assert!(keys.iter().any(|key| key == PITR_MANIFEST_KEY), "{keys:?}");
+        assert!(segment_keys(&keys).len() >= 2, "{keys:?}");
+        assert!(
+            !keys.iter().any(|key| key.starts_with("backup-")),
+            "{keys:?}"
+        );
+
+        // A new host without the backup directory can not recover.
+        let new_host = tempfile::tempdir().expect("Failed to create workdir");
+        let new_backup_dir = new_host.path().join("backups");
+        std::fs::create_dir(&new_backup_dir).expect("Failed to create backup directory");
+        let without_bases = host_config(new_host.path(), "without-bases.db", &new_backup_dir);
+        assert!(
+            pitr_recover_server_core(
+                &without_bases,
+                &RecoveryTargetSpec::Time(target.clone()),
+                false,
+                None,
+            )
+            .await
+            .is_err(),
+            "Recovery must fail without the local base backup"
+        );
+        assert!(!new_host.path().join("without-bases.db").exists());
+
+        // With a copy of the backup directory it recovers.
+        let file_name = base.file_name().expect("The base has no file name");
+        std::fs::copy(&base, new_backup_dir.join(file_name)).expect("Failed to copy the base");
+        let recovered_config = host_config(new_host.path(), "recovered.db", &new_backup_dir);
+        pitr_recover_server_core(
+            &recovered_config,
+            &RecoveryTargetSpec::Time(target),
+            false,
+            None,
+        )
+        .await
+        .expect("Recovery with the local base and the S3 archive failed");
+        let mut env = assert_state_at_target(recovered_config).await;
+        env.core_handle.shutdown().await;
+
+        delete_prefix(&sdk, &wal_s3).await;
     });
 }
