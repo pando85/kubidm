@@ -40,7 +40,7 @@ use kubidmd_testkit::{login_put_admin_idm_admins, setup_async_test, AsyncTestEnv
 use uuid::Uuid;
 
 use super::backup_common::{
-    assert_directory_state_restored, assert_runtime_stays_free, backup_via_production_path,
+    assert_directory_state_restored, assert_runtime_stays_free, backup_via_production_path, boxed,
     config_with_db, delete_prefix, ensure_bucket, full_key, object_keys, populate, run, s3_object,
     sdk_client, test_s3_config, test_s3_region, BACKUP_ENGINEERS_GROUP,
 };
@@ -974,13 +974,14 @@ fn test_pitr_s3_encrypted_replicated_recover_from_region() {
     let region_s3 = region.to_s3_config();
 
     // The scenario is long enough for its future to overflow the stack of the test thread
-    // in a debug build; keep it on the heap.
+    // in a debug build; keep it on the heap, and await its steps through `boxed` so that the
+    // frame polling it stays small too.
     run(Box::pin(async {
-        let sdk = sdk_client(&s3_config).await;
-        ensure_bucket(&sdk, &s3_config.bucket).await;
-        ensure_bucket(&sdk, &region_s3.bucket).await;
-        assert!(object_keys(&sdk, &s3_config).await.is_empty());
-        assert!(object_keys(&sdk, &region_s3).await.is_empty());
+        let sdk = boxed(|| sdk_client(&s3_config)).await;
+        boxed(|| ensure_bucket(&sdk, &s3_config.bucket)).await;
+        boxed(|| ensure_bucket(&sdk, &region_s3.bucket)).await;
+        assert!(boxed(|| object_keys(&sdk, &s3_config)).await.is_empty());
+        assert!(boxed(|| object_keys(&sdk, &region_s3)).await.is_empty());
 
         let source_host = tempfile::tempdir().expect("Failed to create workdir");
         let encryption = pitr_encryption(source_host.path());
@@ -996,28 +997,34 @@ fn test_pitr_s3_encrypted_replicated_recover_from_region() {
             )
         };
 
-        let env = setup_async_test(host_config(source_host.path(), "source.db")).await;
-        populate(&env).await;
-        env.core_handle
-            .trigger_s3_backup(s3_config.clone(), 7, BackupCompression::Gzip, &encryption)
-            .await
-            .expect("Encrypted, replicated S3 backup failed");
-        let target = write_history(env).await;
+        let env = boxed(|| setup_async_test(host_config(source_host.path(), "source.db"))).await;
+        boxed(|| populate(&env)).await;
+        boxed(|| {
+            env.core_handle.trigger_s3_backup(
+                s3_config.clone(),
+                7,
+                BackupCompression::Gzip,
+                &encryption,
+            )
+        })
+        .await
+        .expect("Encrypted, replicated S3 backup failed");
+        let target = boxed(|| write_history(env)).await;
 
         // The primary and the region hold the same encrypted base, the same encrypted
         // segments and an equivalent manifest.
-        let primary_keys = object_keys(&sdk, &s3_config).await;
-        let region_keys = object_keys(&sdk, &region_s3).await;
+        let primary_keys = boxed(|| object_keys(&sdk, &s3_config)).await;
+        let region_keys = boxed(|| object_keys(&sdk, &region_s3)).await;
         let primary_segments = segment_keys(&primary_keys);
         assert!(primary_segments.len() >= 2, "{primary_keys:?}");
         assert_eq!(primary_segments, segment_keys(&region_keys));
         for key in &primary_segments {
             assert!(key.ends_with(".json.gz.enc"), "{key}");
             assert!(is_encrypted_artifact(
-                &s3_object(&sdk, &s3_config, key).await
+                &boxed(|| s3_object(&sdk, &s3_config, key)).await
             ));
             assert!(is_encrypted_artifact(
-                &s3_object(&sdk, &region_s3, key).await
+                &boxed(|| s3_object(&sdk, &region_s3, key)).await
             ));
         }
         for keys in [&primary_keys, &region_keys] {
@@ -1030,8 +1037,8 @@ fn test_pitr_s3_encrypted_replicated_recover_from_region() {
                 "{keys:?}"
             );
         }
-        let primary_manifest = s3_manifest(&sdk, &s3_config).await;
-        let region_manifest = s3_manifest(&sdk, &region_s3).await;
+        let primary_manifest = boxed(|| s3_manifest(&sdk, &s3_config)).await;
+        let region_manifest = boxed(|| s3_manifest(&sdk, &region_s3)).await;
         assert_eq!(primary_manifest.segments, region_manifest.segments);
         assert_eq!(primary_manifest.base_backups, region_manifest.base_backups);
 
@@ -1041,12 +1048,15 @@ fn test_pitr_s3_encrypted_replicated_recover_from_region() {
             new_host.path().join("backup-passphrase"),
         )
         .expect("Failed to copy the passphrase");
-        let unknown = pitr_recover_server_core(
-            &host_config(new_host.path(), "unknown.db"),
-            &RecoveryTargetSpec::Latest,
-            true,
-            Some("nowhere"),
-        )
+        let unknown_config = host_config(new_host.path(), "unknown.db");
+        let unknown = boxed(|| {
+            pitr_recover_server_core(
+                &unknown_config,
+                &RecoveryTargetSpec::Latest,
+                true,
+                Some("nowhere"),
+            )
+        })
         .await;
         assert!(matches!(unknown, Err(PitrError::Config(_))), "{unknown:?}");
 
@@ -1061,20 +1071,18 @@ fn test_pitr_s3_encrypted_replicated_recover_from_region() {
         {
             s3.bucket = format!("kubidm-test-missing-{}", Uuid::new_v4());
         }
-        assert!(!pitr_list_server_core(&unreachable_primary, None).await);
-        assert!(pitr_list_server_core(&unreachable_primary, Some(PITR_REGION)).await);
-        let outcome = pitr_recover_server_core(
-            &unreachable_primary,
-            &RecoveryTargetSpec::Time(target),
-            false,
-            Some(PITR_REGION),
-        )
+        assert!(!boxed(|| pitr_list_server_core(&unreachable_primary, None)).await);
+        assert!(boxed(|| pitr_list_server_core(&unreachable_primary, Some(PITR_REGION))).await);
+        let at_target = RecoveryTargetSpec::Time(target);
+        let outcome = boxed(|| {
+            pitr_recover_server_core(&unreachable_primary, &at_target, false, Some(PITR_REGION))
+        })
         .await
         .expect("Recovery from the region failed");
         assert!(outcome.records > 0);
-        let region_manifest = s3_manifest(&sdk, &region_s3).await;
+        let region_manifest = boxed(|| s3_manifest(&sdk, &region_s3)).await;
         assert_eq!(region_manifest.timeline_breaks.len(), 1);
-        assert!(s3_manifest(&sdk, &s3_config)
+        assert!(boxed(|| s3_manifest(&sdk, &s3_config))
             .await
             .timeline_breaks
             .is_empty());
@@ -1083,28 +1091,34 @@ fn test_pitr_s3_encrypted_replicated_recover_from_region() {
         // the abandoned history from the region into the primary, so that a recovery from
         // the primary never replays it either.
         let recovered_config = host_config(new_host.path(), "recovered.db");
-        let mut env = assert_state_at_target(recovered_config.clone()).await;
-        env.rsclient
-            .idm_person_account_create(PITR_USER_NEW_HISTORY, "New history")
-            .await
-            .expect("Failed to create the person on the recovered server");
-        env.core_handle.shutdown().await;
+        let mut env = boxed(|| assert_state_at_target(recovered_config.clone())).await;
+        boxed(|| {
+            env.rsclient
+                .idm_person_account_create(PITR_USER_NEW_HISTORY, "New history")
+        })
+        .await
+        .expect("Failed to create the person on the recovered server");
+        boxed(|| env.core_handle.shutdown()).await;
         assert_eq!(
-            s3_manifest(&sdk, &s3_config).await.timeline_breaks,
+            boxed(|| s3_manifest(&sdk, &s3_config))
+                .await
+                .timeline_breaks,
             region_manifest.timeline_breaks
         );
         let latest_config = host_config(new_host.path(), "latest.db");
-        pitr_recover_server_core(&latest_config, &RecoveryTargetSpec::Latest, false, None)
-            .await
-            .expect("Recovery from the primary failed");
-        let mut env = assert_state_at_target(latest_config).await;
-        assert!(person_exists(&env.rsclient, PITR_USER_NEW_HISTORY).await);
-        env.core_handle.shutdown().await;
+        boxed(|| {
+            pitr_recover_server_core(&latest_config, &RecoveryTargetSpec::Latest, false, None)
+        })
+        .await
+        .expect("Recovery from the primary failed");
+        let mut env = boxed(|| assert_state_at_target(latest_config)).await;
+        assert!(boxed(|| person_exists(&env.rsclient, PITR_USER_NEW_HISTORY)).await);
+        boxed(|| env.core_handle.shutdown()).await;
 
         // The primary archive is lost. The region still holds everything, including the
         // history written after the recovery, which was replicated at shutdown.
-        let primary_segments = s3_manifest(&sdk, &s3_config).await.segments;
-        delete_prefix(&sdk, &s3_config).await;
+        let primary_segments = boxed(|| s3_manifest(&sdk, &s3_config)).await.segments;
+        boxed(|| delete_prefix(&sdk, &s3_config)).await;
         let last_host = tempfile::tempdir().expect("Failed to create workdir");
         std::fs::copy(
             source_host.path().join("backup-passphrase"),
@@ -1112,22 +1126,24 @@ fn test_pitr_s3_encrypted_replicated_recover_from_region() {
         )
         .expect("Failed to copy the passphrase");
         let from_region = host_config(last_host.path(), "from-region.db");
-        pitr_recover_server_core(
-            &from_region,
-            &RecoveryTargetSpec::Latest,
-            false,
-            Some(PITR_REGION),
-        )
+        boxed(|| {
+            pitr_recover_server_core(
+                &from_region,
+                &RecoveryTargetSpec::Latest,
+                false,
+                Some(PITR_REGION),
+            )
+        })
         .await
         .expect("Recovery from the region after the loss of the primary failed");
-        let mut env = assert_state_at_target(from_region.clone()).await;
-        assert!(person_exists(&env.rsclient, PITR_USER_NEW_HISTORY).await);
-        env.core_handle.shutdown().await;
+        let mut env = boxed(|| assert_state_at_target(from_region.clone())).await;
+        assert!(boxed(|| person_exists(&env.rsclient, PITR_USER_NEW_HISTORY)).await);
+        boxed(|| env.core_handle.shutdown()).await;
 
         // The server now archives into an empty primary; the region keeps the segments the
         // primary no longer has.
-        let region_manifest = s3_manifest(&sdk, &region_s3).await;
-        let primary_manifest = s3_manifest(&sdk, &s3_config).await;
+        let region_manifest = boxed(|| s3_manifest(&sdk, &region_s3)).await;
+        let primary_manifest = boxed(|| s3_manifest(&sdk, &s3_config)).await;
         for segment in primary_segments.iter().chain(&primary_manifest.segments) {
             assert!(
                 region_manifest.segments.contains(segment),
@@ -1146,12 +1162,14 @@ fn test_pitr_s3_encrypted_replicated_recover_from_region() {
             .clone();
         let region_prefix = region_s3.path_prefix.as_deref().expect("No prefix");
         for key in [region_base.clone(), format!("{region_base}.metadata.json")] {
-            sdk.delete_object()
-                .bucket(&region_s3.bucket)
-                .key(format!("{region_prefix}/{key}"))
-                .send()
-                .await
-                .expect("Failed to delete the region base");
+            boxed(|| {
+                sdk.delete_object()
+                    .bucket(&region_s3.bucket)
+                    .key(format!("{region_prefix}/{key}"))
+                    .send()
+            })
+            .await
+            .expect("Failed to delete the region base");
         }
         let settings = PitrSettings::from_config(&from_region)
             .expect("Invalid PITR settings")
@@ -1177,22 +1195,21 @@ fn test_pitr_s3_encrypted_replicated_recover_from_region() {
             .duration_since(UNIX_EPOCH)
             .expect("The clock is before the epoch")
             + Duration::from_secs(60 * 86400);
-        let report = archive
-            .sync(far_future, false)
+        let report = boxed(|| archive.sync(far_future, false))
             .await
             .expect("Synchronisation failed");
         assert_eq!(report.region_errors, 0);
-        let region_manifest = s3_manifest(&sdk, &region_s3).await;
+        let region_manifest = boxed(|| s3_manifest(&sdk, &region_s3)).await;
         assert!(region_manifest.base_backups.is_empty());
         assert!(
             region_manifest.segments.is_empty(),
             "{:?}",
             region_manifest.segments
         );
-        assert!(segment_keys(&object_keys(&sdk, &region_s3).await).is_empty());
+        assert!(segment_keys(&boxed(|| object_keys(&sdk, &region_s3)).await).is_empty());
 
-        delete_prefix(&sdk, &s3_config).await;
-        delete_prefix(&sdk, &region_s3).await;
+        boxed(|| delete_prefix(&sdk, &s3_config)).await;
+        boxed(|| delete_prefix(&sdk, &region_s3)).await;
     }));
 }
 

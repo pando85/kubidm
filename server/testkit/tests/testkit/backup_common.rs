@@ -34,6 +34,7 @@
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -97,6 +98,16 @@ pub async fn assert_runtime_stays_free<F: Future>(work: F) -> F::Output {
         "The runtime was blocked for {longest_stall:?} of the {elapsed:?} the command took"
     );
     output
+}
+
+/// The future `make` builds, boxed. It is built in this function's frame, not in the
+/// caller's: a debug build gives every future an async block awaits a stack slot of its own
+/// in the frame that polls the block, even when the future is boxed right away, and the
+/// frames of a long scenario then add up past the stack of the test thread, which also runs
+/// the tasks of the servers the scenario starts. Awaited through this, a step costs that
+/// frame a pointer.
+pub fn boxed<F: Future>(make: impl FnOnce() -> F) -> Pin<Box<F>> {
+    Box::pin(make())
 }
 
 pub fn run<F: Future>(future: F) -> F::Output {
