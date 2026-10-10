@@ -9,7 +9,9 @@ use kubidm_proto::backup::{
 };
 use kubidmd_lib::be::{lock_wal, BackupStructuralReport, SharedWalArchiver};
 use kubidmd_lib::prelude::duration_from_epoch_now;
-use kubidmd_lib::repl::wal::{format_ts_rfc3339, list_segments, remove_segment, WalArchiver, WalGap};
+use kubidmd_lib::repl::wal::{
+    format_ts_rfc3339, list_segments, remove_segment, write_closed_segments, WalArchiver, WalGap,
+};
 use tokio::sync::broadcast;
 use tokio::time::{interval, MissedTickBehavior};
 use uuid::Uuid;
@@ -85,6 +87,9 @@ struct ArchivedSegments {
 pub struct PitrSyncReport {
     /// Whether the open segment was closed by this run.
     pub flushed: bool,
+    /// Whether closed segments could not be written to the local directory. They stay in
+    /// memory and the next run retries them.
+    pub flush_failed: bool,
     /// Segments added to the manifest (uploaded, for the S3 location).
     pub archived: usize,
     /// Segments removed by retention.
@@ -132,8 +137,20 @@ impl PitrArchive {
         blocking(move || work(&mut lock_wal(&archiver))).await
     }
 
+    /// Write the closed segments of the archiver, off the async runtime and without
+    /// holding the archiver lock while they are compressed and written.
+    async fn write_closed_segments(&self, now: Duration) -> Result<bool, PitrError> {
+        let archiver = self.archiver.clone();
+        blocking(move || Ok(write_closed_segments(&archiver, now, true)?.is_some())).await
+    }
+
     /// Close the open segment when it is stale (or always, with `force_flush`), move every
     /// closed segment to the location, apply retention and save the manifest.
+    ///
+    /// A segment that can not be written to the local directory does not stop the run:
+    /// the segments already there are still archived and removed locally, which is what
+    /// frees the space a full disk needs, and the write is retried at the end. Its error
+    /// is returned once the rest of the run is done.
     pub async fn sync(
         &self,
         now: Duration,
@@ -142,26 +159,27 @@ impl PitrArchive {
         let _guard = self.manifest_lock.lock().await;
         let mut report = PitrSyncReport::default();
 
-        let (flushed, events, server_uuid) = self
+        let (sealed, events, server_uuid) = self
             .with_archiver(move |archiver| {
-                let flushed = if force_flush {
-                    archiver.flush_current_segment()
+                let sealed = if force_flush {
+                    archiver.seal_current()
                 } else {
-                    archiver.flush_if_stale(now)
-                }?;
-                Ok((
-                    flushed,
-                    archiver.pending_events(),
-                    archiver.server_uuid(),
-                ))
+                    archiver.seal_if_stale(now)
+                };
+                Ok((sealed, archiver.pending_events(), archiver.server_uuid()))
             })
             .await?;
-        report.flushed = flushed.is_some();
+        report.flushed = sealed;
+        let mut flush_error = self.write_closed_segments(now).await.err();
+        if let Some(err) = &flush_error {
+            report.flush_failed = true;
+            warn!(%err, "Unable to write the closed WAL segments; archiving what is already written");
+        }
 
         // The events the archiver noticed go into the manifest with this run. They stay
         // pending in the archiver, on disk, until a saved manifest records them.
         let mut events_recorded = false;
-        let result = self
+        let mut result = self
             .sync_locked(
                 now,
                 &events.gaps,
@@ -178,7 +196,29 @@ impl PitrArchive {
                     warn!(%err, "Unable to forget the WAL archive events the manifest records");
                 });
         }
-        result.map(|()| report)
+
+        // The archiving may have freed the space the write needed: try it again, and
+        // archive what it wrote.
+        if flush_error.is_some() && result.is_ok() {
+            match self.write_closed_segments(now).await {
+                Ok(written) => {
+                    flush_error = None;
+                    report.flush_failed = false;
+                    if written {
+                        result = self
+                            .sync_locked(now, &[], server_uuid, &mut false, &mut report)
+                            .await;
+                    }
+                }
+                Err(err) => flush_error = Some(err),
+            }
+        }
+
+        result?;
+        match flush_error {
+            Some(err) => Err(err),
+            None => Ok(report),
+        }
     }
 
     /// At shutdown: make sure the events no manifest records yet are on disk for the next
@@ -223,7 +263,7 @@ impl PitrArchive {
             store.save_manifest(&mut manifest).await?;
             *events_recorded = true;
             changed = false;
-            report.archived = archived.segments.len();
+            report.archived += archived.segments.len();
             self.cleanup_local(&store, &archived.segments).await?;
         }
         if let Some(err) = archived.error {
@@ -542,7 +582,7 @@ mod tests {
 
     use kubidm_proto::backup::{BackupEncryptionConfig, WalArchiveConfig};
     use kubidmd_lib::repl::cid::Cid;
-    use kubidmd_lib::repl::wal::{WalArchiver, WalPendingOp};
+    use kubidmd_lib::repl::wal::{segment_file_name, WalArchiver, WalPendingOp};
 
     use super::super::recover::record_timeline_break;
     use super::super::test_util::*;
@@ -745,6 +785,67 @@ mod tests {
             archive.sync(Duration::from_secs(1), false).await,
             Err(PitrError::Manifest(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn test_sync_archives_written_segments_when_closing_one_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("wal");
+        let backup_dir = dir.path().join("backups");
+        fs::create_dir_all(&backup_dir).unwrap();
+        let server = Uuid::new_v4();
+        let wal_cfg = WalArchiveConfig {
+            enabled: true,
+            local_path: Some(wal_dir.clone()),
+            ..WalArchiveConfig::default()
+        };
+        let archiver: SharedWalArchiver = Arc::new(Mutex::new(
+            WalArchiver::new(wal_cfg.clone(), server, wal_dir.clone()).unwrap(),
+        ));
+        let archive = PitrArchive::new(
+            PitrSettings {
+                wal: wal_cfg,
+                local_dir: wal_dir.clone(),
+                location: PitrLocation::Local(wal_dir.clone()),
+                bases: BaseLocation::Local(backup_dir),
+                encryption: BackupEncryptionConfig::default(),
+            },
+            archiver.clone(),
+        );
+
+        // A segment closed on disk but not archived yet, then records whose segment can
+        // not be written: a directory is in the way of its file.
+        append_create(&archiver, server, 1100, b"written");
+        archiver.lock().unwrap().flush_current_segment().unwrap();
+        append_create(&archiver, server, 1200, b"stuck");
+        let blocker = wal_dir.join(segment_file_name(server, Duration::from_secs(1200)));
+        fs::create_dir(&blocker).unwrap();
+        fs::write(blocker.join("x"), b"x").unwrap();
+
+        // The run reports the failure, but archives the segment already written first.
+        assert!(matches!(
+            archive.sync(Duration::from_secs(1300), true).await,
+            Err(PitrError::Wal(_))
+        ));
+        let store = PitrStore::open(&archive.settings.location).await.unwrap();
+        let manifest = store.load_manifest().await.unwrap().unwrap();
+        let starts: Vec<Duration> = manifest.segments.iter().map(|s| s.start_ts).collect();
+        assert_eq!(starts, vec![Duration::from_secs(1100)]);
+        assert!(archiver.lock().unwrap().has_pending_records());
+
+        // Once the obstacle is gone the kept records are written and archived.
+        fs::remove_dir_all(&blocker).unwrap();
+        let report = archive
+            .sync(Duration::from_secs(1400), false)
+            .await
+            .unwrap();
+        assert_eq!(report.archived, 1);
+        assert!(!report.flush_failed);
+        assert!(!archiver.lock().unwrap().has_pending_records());
+        assert_eq!(
+            store.load_manifest().await.unwrap().unwrap().segments.len(),
+            2
+        );
     }
 
     #[tokio::test]
