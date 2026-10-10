@@ -381,12 +381,7 @@ pub async fn verify_backup_server_core(
     let parsed =
         tokio::task::spawn_blocking(move || verify_backup_structure(reader, compression)).await;
     let report = match parsed {
-        Ok(Ok(report)) => report,
-        Ok(Err(err)) => {
-            eprintln!("Backup structural verification: FAIL");
-            eprintln!("  - artifact could not be parsed as a kubidm backup: {err:?}");
-            return false;
-        }
+        Ok(report) => report,
         Err(err) => {
             eprintln!("Backup structural verification: FAIL");
             eprintln!("  - the verification task failed: {err}");

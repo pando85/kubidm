@@ -177,7 +177,7 @@ impl BackupStructuralReport {
 pub fn verify_backup_structure<IN>(
     input: IN,
     compression: BackupCompression,
-) -> Result<BackupStructuralReport, OperationError>
+) -> BackupStructuralReport
 where
     IN: std::io::Read,
 {
@@ -193,7 +193,7 @@ where
         Ok(dbbak) => dbbak,
         Err(err) => {
             error!(?err, "Backup artifact could not be parsed");
-            return Ok(BackupStructuralReport {
+            return BackupStructuralReport {
                 entry_count: 0,
                 version: None,
                 db_s_uuid: None,
@@ -201,7 +201,7 @@ where
                 errors: vec![format!(
                     "artifact could not be parsed as a kubidm backup: {err}"
                 )],
-            });
+            };
         }
     };
 
@@ -260,13 +260,13 @@ where
         errors.push("Backup contains no entries".to_string());
     }
 
-    Ok(BackupStructuralReport {
+    BackupStructuralReport {
         entry_count,
         version,
         db_s_uuid,
         db_ts_max,
         errors,
-    })
+    }
 }
 
 #[derive(Clone)]

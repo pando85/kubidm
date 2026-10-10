@@ -147,15 +147,14 @@ pub fn verify_backup_output(
         }
     }
 
-    match verify_backup_structure(opened.reader, compression) {
-        Ok(report) if report.is_valid() => Ok(report),
-        Ok(report) => Err(BackupVerifyError {
+    let report = verify_backup_structure(opened.reader, compression);
+    if report.is_valid() {
+        Ok(report)
+    } else {
+        Err(BackupVerifyError {
             reasons: report.errors,
             quarantined_to: None,
-        }),
-        Err(err) => Err(reject(format!(
-            "artifact could not be parsed as a kubidm backup: {err:?}"
-        ))),
+        })
     }
 }
 

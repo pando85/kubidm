@@ -66,8 +66,7 @@ fn assert_backup_verified_after_write(backup: &Path, compression: BackupCompress
     let report = verify_backup_structure(
         std::fs::File::open(backup).expect("Failed to open backup"),
         compression,
-    )
-    .expect("A verified backup must parse");
+    );
     assert!(
         report.is_valid(),
         "A verified backup must pass structural checks: {:?}",
