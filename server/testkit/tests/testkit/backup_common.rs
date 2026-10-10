@@ -34,6 +34,8 @@
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
 use aws_sdk_s3::Client as SdkClient;
@@ -55,6 +57,44 @@ pub const BACKUP_ENGINEERS_GROUP: &str = "backup_engineers";
 pub const BACKUP_RECYCLED_GROUP: &str = "backup_recycled_group";
 pub const BACKUP_USER_ALICE: &str = "backup_user_alice";
 pub const BACKUP_USER_BOB: &str = "backup_user_bob";
+
+/// Drive `work`, an offline database command, on the current thread runtime of the test
+/// while a task ticks on the same runtime, and check that the runtime stayed free: the
+/// longest stretch without a tick must be short against the whole command. A command that
+/// ran its database work on the runtime would hold the only thread of the runtime for
+/// most of it.
+pub async fn assert_runtime_stays_free<F: Future>(work: F) -> F::Output {
+    const TICK: Duration = Duration::from_millis(10);
+    let ticks = Arc::new(Mutex::new(Vec::new()));
+    let ticker = {
+        let ticks = Arc::clone(&ticks);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(TICK).await;
+                ticks.lock().expect("ticks").push(Instant::now());
+            }
+        })
+    };
+    let start = Instant::now();
+    let output = work.await;
+    let end = Instant::now();
+    ticker.abort();
+
+    let elapsed = end - start;
+    let mut times = vec![start];
+    times.extend(ticks.lock().expect("ticks").iter().copied());
+    times.push(end);
+    let longest_stall = times
+        .windows(2)
+        .map(|pair| pair[1].saturating_duration_since(pair[0]))
+        .max()
+        .unwrap_or_default();
+    assert!(
+        longest_stall <= (elapsed / 2).max(Duration::from_millis(250)),
+        "The runtime was blocked for {longest_stall:?} of the {elapsed:?} the command took"
+    );
+    output
+}
 
 pub fn run<F: Future>(future: F) -> F::Output {
     tokio::runtime::Builder::new_current_thread()

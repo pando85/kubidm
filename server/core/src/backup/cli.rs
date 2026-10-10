@@ -29,14 +29,14 @@ use super::{
     pitr::{self, AbandonedHistory},
     region_is_healthy,
     restore::{
-        backup_encryption_config, restore_and_replay_commit, restore_database, CommittedRestore,
-        RestoreOutcome,
+        backup_encryption_config, restore_and_replay_commit, restore_database,
+        verify_booted_database_on_thread, CommittedRestore, RestoreOutcome,
     },
     run_blocking, s3_location, seal_backup_async, verify_backup_output_async,
     write_verified_local_backup_async, BackupEncryptor, BackupVerifyError, S3BackupError,
     S3ClientWrapper,
 };
-use crate::{config::Configuration, setup_backend, verify_booted_database};
+use crate::{config::Configuration, setup_backend};
 
 /// Take an offline backup of the database described by `config` into `dst_path`, or to
 /// stdout without a path. The backup uses the compression and the client-side encryption
@@ -446,7 +446,7 @@ pub async fn verify_backup_server_core(
     // restore above ran in this process, so its backend still carries in-memory state
     // from before the restore (such as the RUV). A fresh boot is what proves the
     // database starts into a consistent state.
-    let consistency_errors = match verify_booted_database(&scratch_config).await {
+    let consistency_errors = match verify_booted_database_on_thread(&scratch_config).await {
         Ok(errors) => errors,
         Err(err) => {
             eprintln!("Backup restore verification: FAIL");

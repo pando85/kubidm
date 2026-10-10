@@ -804,7 +804,7 @@ async fn finish_recovery(
         );
     })?;
     info!("Verifying the recovered database ...");
-    let consistency_errors = crate::verify_booted_database(config)
+    let consistency_errors = crate::backup::restore::verify_booted_database_on_thread(config)
         .await
         .inspect_err(|err| {
             error!(

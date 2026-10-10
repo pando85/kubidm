@@ -95,8 +95,9 @@ Recovery restores the newest base backup at or before the target, then applies l
       exits 3; until a new online backup is taken after the start, a recovery past it could replay that history
 - [ ] `db-scan` quarantine commands bypass the WAL archive (documented)
 - [ ] Manual `database backup` files are not PITR bases
-- [ ] The offline `restore` and `recover` still restore and replay inside one write transaction on the CLI's runtime
-      (the online backup snapshot and all checksums now run on the blocking pool)
+- [x] The offline `restore` and `recover` ran their write transaction and reindex on the CLI's runtime: the restore,
+      replay, reindex and boot verification now run on a dedicated database thread (`on_database_thread`), checked by
+      a test that the single thread of a current thread runtime keeps ticking through a restore and a recovery
 - [ ] A region of a separate `[online_backup.wal_archive.s3]` location only has base backups when `[online_backup.s3]`
       replicates to a region of the same name, which `recover --region` requires
 

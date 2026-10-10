@@ -34,9 +34,9 @@ use kubidmd_testkit::{login_put_admin_idm_admins, setup_async_test, AsyncTestEnv
 use uuid::Uuid;
 
 use super::backup_common::{
-    assert_directory_state_restored, backup_via_production_path, config_with_db, delete_prefix,
-    ensure_bucket, full_key, object_keys, populate, run, s3_object, sdk_client, test_s3_config,
-    test_s3_region, BACKUP_ENGINEERS_GROUP,
+    assert_directory_state_restored, assert_runtime_stays_free, backup_via_production_path,
+    config_with_db, delete_prefix, ensure_bucket, full_key, object_keys, populate, run, s3_object,
+    sdk_client, test_s3_config, test_s3_region, BACKUP_ENGINEERS_GROUP,
 };
 
 /// Created after the base backup and before the recovery target.
@@ -221,13 +221,14 @@ fn test_pitr_local_recover_to_time_and_latest() {
             "A dry run must not create the database"
         );
 
-        // Recover to the target time.
-        let outcome = pitr_recover_server_core(
+        // Recover to the target time. The restore, replay, reindex and verification run on
+        // a thread of their own: the single thread of the test runtime stays free.
+        let outcome = assert_runtime_stays_free(pitr_recover_server_core(
             &recovered_config,
             &RecoveryTargetSpec::Time(target),
             false,
             None,
-        )
+        ))
         .await
         .expect("Recovery to the target time failed");
         assert_eq!(outcome.records, dry.records);

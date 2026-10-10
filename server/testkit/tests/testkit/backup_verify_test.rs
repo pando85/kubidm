@@ -11,7 +11,8 @@ use kubidm_proto::backup::{BackupCompression, BackupEncryptionConfig};
 use kubidmd_core::backup::{is_backup_artifact_name, INVALID_BACKUP_SUFFIX};
 use kubidmd_core::config::Configuration;
 use kubidmd_core::{
-    restore_database, verify_backup_server_core, verify_booted_database, BackupVerifyLevel,
+    restore_database, restore_server_core, verify_backup_server_core, verify_booted_database,
+    BackupVerifyLevel, RestoreStatus,
 };
 use kubidmd_lib::be::verify_backup_structure;
 use kubidmd_testkit::{
@@ -21,8 +22,9 @@ use kubidmd_testkit::{
 use serde_json::Value;
 
 use super::backup_common::{
-    anonymous_client, assert_directory_state_restored, backup_via_production_path, config_with_db,
-    populate, run, start_server, BACKUP_RECYCLED_GROUP, BACKUP_USER_ALICE,
+    anonymous_client, assert_directory_state_restored, assert_runtime_stays_free,
+    backup_via_production_path, config_with_db, populate, run, start_server, BACKUP_RECYCLED_GROUP,
+    BACKUP_USER_ALICE,
 };
 
 /// Start a server, populate it, back it up through the production path and shut it down.
@@ -221,6 +223,39 @@ fn test_backup_verify_rejects_invalid_artifacts() {
         assert!(
             !verify_backup_server_core(&config, &empty, BackupVerifyLevel::Structural).await,
             "An empty, versionless backup must fail structural verification"
+        );
+    });
+}
+
+/// The offline restore runs its write transaction, reindex and boot on a thread of its own:
+/// the runtime of the command, here the single thread of the test runtime, stays free for
+/// the whole restore.
+#[test]
+fn test_backup_restore_leaves_the_runtime_free() {
+    run(async {
+        let workdir = tempfile::tempdir().expect("Failed to create workdir");
+        let (backup, _) = populated_backup(workdir.path()).await;
+
+        let restored_db = workdir.path().join("restored.db");
+        let config = config_with_db(&restored_db);
+        let status = assert_runtime_stays_free(restore_server_core(&config, &backup))
+            .await
+            .expect("Restore failed");
+        assert_eq!(status, RestoreStatus::Complete);
+
+        let mut env = start_server(&restored_db).await;
+        login_put_admin_idm_admins(&env.rsclient).await;
+        assert_directory_state_restored(&env.rsclient).await;
+        env.core_handle.shutdown().await;
+
+        // The full verification restores and boots on that thread as well.
+        assert!(
+            assert_runtime_stays_free(verify_backup_server_core(
+                &config_with_db(&workdir.path().join("unused.db")),
+                &backup,
+                BackupVerifyLevel::Full,
+            ))
+            .await
         );
     });
 }
