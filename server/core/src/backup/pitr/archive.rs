@@ -297,12 +297,12 @@ impl PitrArchive {
 
     /// At shutdown: make sure the events no manifest records yet are on disk for the next
     /// start.
-    pub fn defer_gaps_to_next_start(&self) {
-        if let Err(err) = lock_wal(&self.archiver).defer_gaps_to_next_start() {
+    pub fn persist_pending_events(&self) {
+        if let Err(err) = lock_wal(&self.archiver).persist_pending_events() {
             error!(
                 %err,
-                "Unable to hand the WAL archive gaps to the next start; point-in-time recovery \
-                 may replay across them. Take a new online backup."
+                "Unable to hand the pending WAL archive events to the next start; \
+                 point-in-time recovery may replay across their gaps. Take a new online backup."
             );
         }
     }

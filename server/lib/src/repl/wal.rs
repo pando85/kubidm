@@ -632,10 +632,11 @@ impl WalArchiver {
         write_pending_events(&self.segments_path, &self.pending)
     }
 
-    /// At the end of a run: make sure the events the archive index does not record yet
-    /// are on disk, so that the next [`WalArchiver::new`] reports them again. Call after the
-    /// last flush.
-    pub fn defer_gaps_to_next_start(&mut self) -> Result<(), WalError> {
+    /// At the end of a run: write the pending events (gaps, changes of identity, restores)
+    /// the archive index does not record yet to disk once more, in case an earlier write
+    /// of them failed, so that the next [`WalArchiver::new`] reports them again. Call after
+    /// the last flush.
+    pub fn persist_pending_events(&mut self) -> Result<(), WalError> {
         write_pending_events(&self.segments_path, &self.pending)
     }
 
@@ -1955,7 +1956,7 @@ mod tests {
             list_segments(archiver.segments_path()).unwrap().len(),
             WAL_MAX_UNWRITTEN_SEGMENTS
         );
-        archiver.defer_gaps_to_next_start().unwrap();
+        archiver.persist_pending_events().unwrap();
         assert_eq!(
             read_pending_events(archiver.segments_path()).gaps.len(),
             extra as usize

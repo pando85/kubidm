@@ -1209,7 +1209,7 @@ impl BackupListing {
     }
 }
 
-/// What one `sync_region` run did in a region.
+/// What one `reconcile_region` run did in a region.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct RegionSyncOutcome {
     /// Backups copied to the region because it missed them or held a differing copy.

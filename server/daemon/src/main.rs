@@ -406,8 +406,9 @@ fn check_file_ownership(opt: &KubidmdParser) -> Result<(), ExitCode> {
     Ok(())
 }
 
-/// The exit code of `database restore` and `restore-s3`: 1 when the database was not
-/// restored, otherwise [`RestoreStatus::exit_code`].
+/// The exit code of `database restore` and `restore-s3`: 1 when the restore failed, which
+/// includes a database that was restored but could not be reindexed (its error says so),
+/// otherwise [`RestoreStatus::exit_code`].
 fn restore_exit_code(restored: Result<RestoreStatus, OperationError>) -> ExitCode {
     match restored.ok() {
         Some(RestoreStatus::Complete) => {
