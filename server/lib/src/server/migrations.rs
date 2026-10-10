@@ -788,14 +788,7 @@ impl QueryServerWriteTransaction<'_> {
         // new indexes, or this is a bootstrap and we have no indexes yet.
         self.reindex(false)?;
 
-        // Delete all existing DB contained schema.
-
-        let filter = filter!(f_and(vec![
-            f_eq(Attribute::Class, EntryClass::ClassType.into()),
-            f_eq(Attribute::Class, EntryClass::AttributeType.into()),
-        ]));
-
-        self.internal_delete_if_exists(&filter)?;
+        self.delete_db_stored_schema()?;
 
         // Set Phase
         // Indicate the schema is now ready, which allows dyngroups to work when they
@@ -858,6 +851,25 @@ impl QueryServerWriteTransaction<'_> {
         Ok(())
     }
 
+    /// Delete every `attributetype` and `classtype` entry stored in the database.
+    ///
+    /// From 1.11 the schema lives in memory and `reload_schema` never reads these
+    /// entries, so they are inert. A fresh 1.11+ database has none, and removing
+    /// them makes upgraded databases match. This includes custom schema created
+    /// before 1.11, which is equally ignored from 1.11 onwards.
+    ///
+    /// 1.11.x releases matched these with `f_and` (no entry carries both classes),
+    /// so they were never removed there. The 1.11 -> 1.12 migration calls this
+    /// again to clean up databases upgraded by those releases.
+    fn delete_db_stored_schema(&mut self) -> Result<(), OperationError> {
+        let filter = filter!(f_or(vec![
+            f_eq(Attribute::Class, EntryClass::ClassType.into()),
+            f_eq(Attribute::Class, EntryClass::AttributeType.into()),
+        ]));
+
+        self.internal_delete_if_exists(&filter)
+    }
+
     pub(crate) fn migrate_schema_1_12(&mut self) -> Result<(), OperationError> {
         // Flag that the schema changes - this is important because now that the
         // schema is in memory only, the on-disk triggers won't fire now.
@@ -901,14 +913,7 @@ impl QueryServerWriteTransaction<'_> {
         // new indexes, or this is a bootstrap and we have no indexes yet.
         self.reindex(false)?;
 
-        // Delete all existing DB contained schema.
-
-        let filter = filter!(f_and(vec![
-            f_eq(Attribute::Class, EntryClass::ClassType.into()),
-            f_eq(Attribute::Class, EntryClass::AttributeType.into()),
-        ]));
-
-        self.internal_delete_if_exists(&filter)?;
+        self.delete_db_stored_schema()?;
 
         // Set Phase
         // Indicate the schema is now ready, which allows dyngroups to work when they
@@ -1458,6 +1463,39 @@ mod tests {
         write_txn.commit().expect("Unable to commit");
     }
 
+    /// Assert whether the database holds `attributetype` and `classtype` entries,
+    /// checking each class on its own so that neither can hide behind the other.
+    fn assert_db_stored_schema(write_txn: &mut QueryServerWriteTransaction<'_>, present: bool) {
+        for class in [EntryClass::AttributeType, EntryClass::ClassType] {
+            let filter = filter!(f_eq(Attribute::Class, class.into()));
+            let exists = write_txn.internal_exists(&filter).unwrap();
+            assert_eq!(exists, present, "db stored {class:?} entries present");
+        }
+    }
+
+    /// Create a person after a migration, proving the server still accepts writes
+    /// and can read them back.
+    fn assert_person_create_works(write_txn: &mut QueryServerWriteTransaction<'_>) {
+        let tuuid = Uuid::new_v4();
+        let e1 = entry_init!(
+            (Attribute::Class, EntryClass::Object.to_value()),
+            (Attribute::Class, EntryClass::Person.to_value()),
+            (Attribute::Class, EntryClass::Account.to_value()),
+            (Attribute::Name, Value::new_iname("testperson1")),
+            (Attribute::Uuid, Value::Uuid(tuuid)),
+            (Attribute::Description, Value::new_utf8s("testperson1")),
+            (Attribute::DisplayName, Value::new_utf8s("testperson1"))
+        );
+
+        write_txn
+            .internal_create(vec![e1])
+            .expect("Unable to create test person");
+
+        write_txn
+            .internal_search_uuid(tuuid)
+            .expect("Unable to load test person");
+    }
+
     #[qs_test(domain_level=DOMAIN_LEVEL_14)]
     async fn test_migrations_dl14_dl1_11(server: &QueryServer) {
         let mut write_txn = server.write(duration_from_epoch_now()).await.unwrap();
@@ -1470,17 +1508,42 @@ mod tests {
 
         assert_eq!(db_domain_version, DOMAIN_LEVEL_14);
 
+        // Before 1.11 schema is stored in the database. Add custom schema on top of
+        // the system schema, as a schema admin could have done.
+        let custom_attr_uuid = Uuid::new_v4();
+        let custom_attr = entry_init!(
+            (Attribute::Class, EntryClass::Object.to_value()),
+            (Attribute::Class, EntryClass::AttributeType.to_value()),
+            (Attribute::Uuid, Value::Uuid(custom_attr_uuid)),
+            (Attribute::AttributeName, Value::from(Attribute::TestAttr)),
+            (Attribute::Description, Value::new_utf8s("Test Attribute")),
+            (Attribute::MultiValue, Value::new_bool(false)),
+            (Attribute::Unique, Value::new_bool(false)),
+            (
+                Attribute::Syntax,
+                Value::new_syntaxs("UTF8STRING").expect("syntax")
+            )
+        );
+
+        let custom_class_uuid = Uuid::new_v4();
+        let custom_class = entry_init!(
+            (Attribute::Class, EntryClass::Object.to_value()),
+            (Attribute::Class, EntryClass::ClassType.to_value()),
+            (Attribute::Uuid, Value::Uuid(custom_class_uuid)),
+            (Attribute::ClassName, EntryClass::TestClass.to_value()),
+            (Attribute::Description, Value::new_utf8s("Test Class")),
+            (Attribute::May, Value::from(Attribute::TestAttr))
+        );
+
+        write_txn
+            .internal_create(vec![custom_attr, custom_class])
+            .expect("Unable to create custom schema");
+
+        assert_db_stored_schema(&mut write_txn, true);
+
         write_txn.commit().expect("Unable to commit");
 
-        // == pre migration verification. ==
-        // check we currently would fail a migration.
-
-        // let mut read_txn = server.read().await.unwrap();
-        // drop(read_txn);
-
         let mut write_txn = server.write(duration_from_epoch_now()).await.unwrap();
-
-        // Fix any issues
 
         // == Increase the version ==
         write_txn
@@ -1489,15 +1552,55 @@ mod tests {
 
         // post migration verification.
 
-        // Assert all lingering schema db entries are removed.
+        // Assert all lingering schema db entries are removed, both system and custom.
+        assert_db_stored_schema(&mut write_txn, false);
+        assert!(!write_txn.internal_exists_uuid(custom_attr_uuid).unwrap());
+        assert!(!write_txn.internal_exists_uuid(custom_class_uuid).unwrap());
 
-        let filter = filter!(f_and(vec![
-            f_eq(Attribute::Class, EntryClass::ClassType.into()),
-            f_eq(Attribute::Class, EntryClass::AttributeType.into()),
-        ]));
+        // The in memory schema still serves the server.
+        assert_person_create_works(&mut write_txn);
 
-        let entries_remain = write_txn.internal_exists(&filter).unwrap();
-        assert!(!entries_remain);
+        write_txn.commit().expect("Unable to commit");
+    }
+
+    /// 1.11.x releases never removed the database stored schema, so a database at
+    /// 1.11 can still hold it. The 1.11 -> 1.12 migration must remove it.
+    #[qs_test(domain_level=DOMAIN_LEVEL_1_11)]
+    async fn test_migrations_dl1_11_to_dl_1_12_removes_db_stored_schema(server: &QueryServer) {
+        let mut write_txn = server.write(duration_from_epoch_now()).await.unwrap();
+
+        let db_domain_version = write_txn
+            .internal_search_uuid(UUID_DOMAIN_INFO)
+            .expect("unable to access domain entry")
+            .get_ava_single_uint32(Attribute::Version)
+            .expect("Attribute Version not present");
+
+        assert_eq!(db_domain_version, DOMAIN_LEVEL_1_11);
+
+        // A database created at 1.11 has no stored schema.
+        assert_db_stored_schema(&mut write_txn, false);
+
+        // Store the schema in the database, as an upgrade from 1.10 by a 1.11.x
+        // release left it.
+        write_txn
+            .initialise_schema_core()
+            .expect("Unable to store schema in the database");
+
+        assert_db_stored_schema(&mut write_txn, true);
+
+        write_txn.commit().expect("Unable to commit");
+
+        let mut write_txn = server.write(duration_from_epoch_now()).await.unwrap();
+
+        // == Increase the version ==
+        write_txn
+            .internal_apply_domain_migration(DOMAIN_LEVEL_1_12)
+            .expect("Unable to set domain level to version 1_12");
+
+        // post migration verification.
+        assert_db_stored_schema(&mut write_txn, false);
+
+        assert_person_create_works(&mut write_txn);
 
         write_txn.commit().expect("Unable to commit");
     }
