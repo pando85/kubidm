@@ -14,7 +14,7 @@ use kubidmd_lib::prelude::*;
     get,
     path = "/v1/oauth2/federation",
     responses(
-        (status = 200, content_type=APPLICATION_JSON, body=Vec<ProtoEntry>),
+        (status = 200, description = "Ok", content_type=APPLICATION_JSON, body=Vec<ProtoEntry>),
         ApiResponseWithout200,
     ),
     security(("token_jwt" = [])),
@@ -58,7 +58,7 @@ pub(crate) async fn oauth2_federation_post(
     get,
     path = "/v1/oauth2/federation/{name}",
     responses(
-        (status = 200, content_type=APPLICATION_JSON, body=ProtoEntry),
+        (status = 200, description = "Ok", content_type=APPLICATION_JSON, body=ProtoEntry),
         ApiResponseWithout200,
     ),
     security(("token_jwt" = [])),

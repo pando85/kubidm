@@ -18,7 +18,7 @@ use kubidm_proto::internal::{
     path = "/v1/authorize",
     request_body = AuthorizationRequest,
     responses(
-        (status = 200, body = AuthorizationResponse, content_type = "application/json"),
+        (status = 200, description = "Ok", body = AuthorizationResponse, content_type = "application/json"),
         ApiResponseWithout200,
     ),
     security(("token_jwt" = [])),
@@ -44,7 +44,7 @@ pub async fn authorize(
     path = "/v1/authorize/batch",
     request_body = BatchAuthorizationRequest,
     responses(
-        (status = 200, body = BatchAuthorizationResponse, content_type = "application/json"),
+        (status = 200, description = "Ok", body = BatchAuthorizationResponse, content_type = "application/json"),
         ApiResponseWithout200,
     ),
     security(("token_jwt" = [])),
