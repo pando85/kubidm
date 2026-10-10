@@ -22,9 +22,9 @@ use kubidm_proto::backup::{
 
 use super::encryption::{
     is_encrypted_artifact, read_encryption_header, BackupEncryptionError, BackupEncryptor,
+    MAX_HEADER_LEN,
 };
 use super::retention::is_backup_artifact_name;
-use super::run_blocking;
 
 /// A backup artifact resolved to the plaintext a restore can parse.
 pub struct OpenedBackup {
@@ -236,13 +236,78 @@ fn check_plain_name(name: &Path) -> Result<(), BackupOpenError> {
     }
 }
 
-/// The first bytes of `file`, as many as the encrypted container magic has (fewer when the
-/// file is shorter).
-fn peek_prefix(file: &mut File) -> std::io::Result<Vec<u8>> {
-    let mut prefix = Vec::with_capacity(BACKUP_ENCRYPTION_MAGIC.len());
-    file.take(BACKUP_ENCRYPTION_MAGIC.len() as u64)
-        .read_to_end(&mut prefix)?;
-    Ok(prefix)
+/// The start of a stored artifact, read with the file opened once.
+enum ArtifactHead {
+    /// A plain artifact, ready to be streamed from the file.
+    Plain(OpenedBackup),
+    /// An encrypted artifact: its parsed header, the bytes read so far (magic, length and
+    /// header) and the file positioned right behind them, at the ciphertext.
+    Encrypted {
+        file: File,
+        head: Vec<u8>,
+        header: BackupEncryptionHeader,
+    },
+}
+
+fn io_error(path: &Path) -> impl Fn(std::io::Error) -> BackupOpenError + '_ {
+    move |source| BackupOpenError::Io {
+        path: path.display().to_string(),
+        source,
+    }
+}
+
+/// Open the artifact at `path` and read as little of it as tells what it is: the magic,
+/// and for an encrypted container its header, so that the key it needs is known without
+/// reading the whole artifact.
+fn read_artifact_head(path: &Path) -> Result<ArtifactHead, BackupOpenError> {
+    let io_err = io_error(path);
+    let mut file = File::open(path).map_err(&io_err)?;
+
+    // Peek at the magic so that a plain artifact is streamed rather than loaded.
+    let mut head = Vec::with_capacity(BACKUP_ENCRYPTION_MAGIC.len());
+    (&mut file)
+        .take(BACKUP_ENCRYPTION_MAGIC.len() as u64)
+        .read_to_end(&mut head)
+        .map_err(&io_err)?;
+
+    if !is_encrypted_artifact(&head) {
+        check_plain_name(path)?;
+        return Ok(ArtifactHead::Plain(OpenedBackup {
+            reader: Box::new(Cursor::new(head).chain(file)),
+            compression: BackupCompression::identify_file(path),
+            encryption: None,
+        }));
+    }
+
+    // The header length, then the header itself unless the length is out of bounds, in
+    // which case the parser refuses it without the bytes.
+    (&mut file)
+        .take(4)
+        .read_to_end(&mut head)
+        .map_err(&io_err)?;
+    let header_len = head
+        .get(BACKUP_ENCRYPTION_MAGIC.len()..)
+        .and_then(|len| <[u8; 4]>::try_from(len).ok())
+        .map(u32::from_le_bytes)
+        .filter(|len| *len as usize <= MAX_HEADER_LEN)
+        .unwrap_or(0);
+    (&mut file)
+        .take(u64::from(header_len))
+        .read_to_end(&mut head)
+        .map_err(&io_err)?;
+    let (header, _) = read_encryption_header(&head).map_err(BackupOpenError::Decrypt)?;
+    Ok(ArtifactHead::Encrypted { file, head, header })
+}
+
+/// Read the rest of an encrypted artifact behind its `head` and decrypt it.
+fn open_encrypted_rest(
+    path: &Path,
+    mut file: File,
+    mut data: Vec<u8>,
+    encryptor: &BackupEncryptor,
+) -> Result<OpenedBackup, BackupOpenError> {
+    file.read_to_end(&mut data).map_err(io_error(path))?;
+    open_backup_bytes(data, path, Some(encryptor), false)
 }
 
 /// Open the artifact stored at `path`. A plain artifact is streamed from the file, an
@@ -251,101 +316,80 @@ pub fn open_backup_file(
     path: &Path,
     encryptor: Option<&BackupEncryptor>,
 ) -> Result<OpenedBackup, BackupOpenError> {
-    let io_err = |source| BackupOpenError::Io {
-        path: path.display().to_string(),
-        source,
-    };
-
-    let mut file = File::open(path).map_err(io_err)?;
-
-    // Peek at the magic so that a plain artifact is streamed rather than loaded.
-    let prefix = peek_prefix(&mut file).map_err(io_err)?;
-
-    if !is_encrypted_artifact(&prefix) {
-        check_plain_name(path)?;
-        return Ok(OpenedBackup {
-            reader: Box::new(Cursor::new(prefix).chain(file)),
-            compression: BackupCompression::identify_file(path),
-            encryption: None,
-        });
+    match read_artifact_head(path)? {
+        ArtifactHead::Plain(opened) => Ok(opened),
+        ArtifactHead::Encrypted { file, head, header } => match encryptor {
+            Some(encryptor) => open_encrypted_rest(path, file, head, encryptor),
+            None => Err(BackupOpenError::EncryptedWithoutKey {
+                key_identifier: header.key_identifier,
+            }),
+        },
     }
-
-    let mut data = prefix;
-    file.read_to_end(&mut data).map_err(io_err)?;
-    open_backup_bytes(data, path, encryptor, false)
 }
 
 /// The key an encrypted artifact at `path` needs, resolved from `encryption` only when the
 /// artifact is actually encrypted, then [`open_backup_file`]. This is the entry point of
 /// the restore and verification commands, which hold a configuration rather than a key.
 ///
-/// The file is read, and an encrypted artifact decrypted, on the blocking thread pool so
-/// that neither the I/O nor the Argon2id key derivation and decryption stall the async
-/// runtime.
+/// The file is opened once. Only its header is read before the key is resolved, so a key
+/// that can not be obtained is reported without reading the artifact. The file is read,
+/// and an encrypted artifact decrypted, on the blocking thread pool so that neither the
+/// I/O nor the Argon2id key derivation and decryption stall the async runtime.
 pub async fn open_backup_file_with_config(
     path: &Path,
     encryption: Option<&BackupEncryptionConfig>,
 ) -> Result<OpenedBackup, BackupOpenError> {
-    let io_err = |source| BackupOpenError::Io {
-        path: path.display().to_string(),
-        source,
-    };
+    let owned_path = path.to_path_buf();
+    let head = off_runtime(path, move || read_artifact_head(&owned_path)).await?;
 
-    let prefix = {
-        let path = path.to_path_buf();
-        run_blocking(move || {
-            let mut file = File::open(&path)?;
-            peek_prefix(&mut file)
-        })
-        .await
-        .map_err(io_err)?
-    };
-
-    if !is_encrypted_artifact(&prefix) {
-        let opened = open_backup_file_off_runtime(path, None).await?;
-        if encryption.is_some_and(|config| config.enabled) {
-            // Kept working so that backups from before encryption was enabled restore, but
-            // a plain artifact is not authenticated: say so.
-            warn!(
-                "{} is not encrypted although backup encryption is enabled; its integrity is \
-                 not protected by the encryption key. Only restore it if you know where it \
-                 comes from",
-                path.display()
-            );
+    let (file, head, header) = match head {
+        ArtifactHead::Plain(opened) => {
+            if encryption.is_some_and(|config| config.enabled) {
+                // Kept working so that backups from before encryption was enabled restore,
+                // but a plain artifact is not authenticated: say so.
+                warn!(
+                    "{} is not encrypted although backup encryption is enabled; its integrity \
+                     is not protected by the encryption key. Only restore it if you know where \
+                     it comes from",
+                    path.display()
+                );
+            }
+            return Ok(opened);
         }
-        return Ok(opened);
-    }
+        ArtifactHead::Encrypted { file, head, header } => (file, head, header),
+    };
 
     let encryptor = match encryption {
-        Some(config) if config.enabled => BackupEncryptor::from_config(config).await,
-        _ => Ok(None),
+        Some(config) if config.enabled => {
+            BackupEncryptor::from_config(config)
+                .await
+                .map_err(|source| BackupOpenError::KeyUnavailable {
+                    key_identifier: header.key_identifier.clone(),
+                    source,
+                })?
+        }
+        _ => None,
+    };
+    let Some(encryptor) = encryptor else {
+        return Err(BackupOpenError::EncryptedWithoutKey {
+            key_identifier: header.key_identifier,
+        });
     };
 
-    match encryptor {
-        Ok(encryptor) => open_backup_file_off_runtime(path, encryptor).await,
-        Err(source) => {
-            let data = {
-                let path = path.to_path_buf();
-                run_blocking(move || std::fs::read(path))
-                    .await
-                    .map_err(io_err)?
-            };
-            let (header, _) = read_encryption_header(&data).map_err(BackupOpenError::Decrypt)?;
-            Err(BackupOpenError::KeyUnavailable {
-                key_identifier: header.key_identifier,
-                source,
-            })
-        }
-    }
+    let owned_path = path.to_path_buf();
+    off_runtime(path, move || {
+        open_encrypted_rest(&owned_path, file, head, &encryptor)
+    })
+    .await
 }
 
-/// [`open_backup_file`] on the blocking thread pool.
-async fn open_backup_file_off_runtime(
-    path: &Path,
-    encryptor: Option<BackupEncryptor>,
-) -> Result<OpenedBackup, BackupOpenError> {
-    let owned_path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || open_backup_file(&owned_path, encryptor.as_ref()))
+/// Run blocking work on an artifact at `path` on the blocking thread pool.
+async fn off_runtime<T, F>(path: &Path, work: F) -> Result<T, BackupOpenError>
+where
+    F: FnOnce() -> Result<T, BackupOpenError> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(work)
         .await
         .map_err(|err| BackupOpenError::Io {
             path: path.display().to_string(),
@@ -359,27 +403,23 @@ mod tests {
 
     use flate2::write::GzEncoder;
     use flate2::Compression;
-    use kubidm_proto::backup::{EncryptionKeySource, KeyDerivationParams};
+    use kubidm_proto::backup::EncryptionKeySource;
 
     use super::*;
-    use crate::backup::encryption::MIN_KDF_M_COST;
+    use crate::backup::encryption::{test_encryptor, test_kdf};
 
     fn config(passphrase_file: Option<&Path>) -> BackupEncryptionConfig {
         BackupEncryptionConfig {
             enabled: true,
             key_source: EncryptionKeySource::Passphrase,
-            key_derivation: KeyDerivationParams {
-                m_cost: MIN_KDF_M_COST,
-                t_cost: 1,
-                p_cost: 1,
-            },
+            key_derivation: test_kdf(),
             key_identifier: None,
             passphrase_file: passphrase_file.map(Path::to_path_buf),
         }
     }
 
     fn encryptor(passphrase: &[u8]) -> BackupEncryptor {
-        BackupEncryptor::with_key_material(config(None), passphrase.to_vec()).unwrap()
+        test_encryptor(passphrase)
     }
 
     /// The identity of a backup whose name claims no timestamp.
@@ -754,6 +794,65 @@ mod tests {
                 BackupEncryptionError::ArtifactMismatch { .. }
             ))
         ));
+    }
+
+    #[tokio::test]
+    async fn test_encrypted_artifact_needs_only_its_header_to_name_the_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let enc = encryptor(b"pw");
+        let sealed = seal_backup_async(
+            b"{}".to_vec(),
+            BackupCompression::NoCompression,
+            Some(&enc),
+            unnamed(),
+        )
+        .await
+        .unwrap();
+        let (_, ciphertext_start) = read_encryption_header(&sealed).unwrap();
+
+        // Only the header is stored: whatever follows it is never needed to tell which key
+        // the artifact needs.
+        let head_only = dir.path().join("head-only.json.enc");
+        std::fs::write(&head_only, &sealed[..ciphertext_start]).unwrap();
+        let unresolvable = config(Some(&dir.path().join("missing")));
+        match open_backup_file_with_config(&head_only, Some(&unresolvable)).await {
+            Err(BackupOpenError::KeyUnavailable { key_identifier, .. }) => {
+                assert_eq!(key_identifier, enc.key_identifier())
+            }
+            other => panic!("expected KeyUnavailable, got {other:?}"),
+        }
+        for result in [
+            open_backup_file_with_config(&head_only, None).await,
+            open_backup_file(&head_only, None),
+        ] {
+            assert!(matches!(
+                result,
+                Err(BackupOpenError::EncryptedWithoutKey { .. })
+            ));
+        }
+        // With the key, the missing ciphertext fails the authentication.
+        assert!(matches!(
+            open_backup_file(&head_only, Some(&enc)),
+            Err(BackupOpenError::Decrypt(
+                BackupEncryptionError::DecryptionFailed { .. }
+            ))
+        ));
+
+        // A header cut short, or a length beyond the bound, is a malformed container.
+        for bytes in [
+            sealed[..ciphertext_start - 1].to_vec(),
+            [BACKUP_ENCRYPTION_MAGIC, &u32::MAX.to_le_bytes()].concat(),
+            BACKUP_ENCRYPTION_MAGIC[..].to_vec(),
+        ] {
+            let broken = dir.path().join("broken.json.enc");
+            std::fs::write(&broken, &bytes).unwrap();
+            assert!(matches!(
+                open_backup_file(&broken, Some(&enc)),
+                Err(BackupOpenError::Decrypt(
+                    BackupEncryptionError::InvalidHeader
+                ))
+            ));
+        }
     }
 
     #[test]

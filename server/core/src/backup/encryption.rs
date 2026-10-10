@@ -96,7 +96,7 @@ const KEY_ENDPOINT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Largest key endpoint response accepted, in bytes.
 const MAX_KEY_ENDPOINT_BODY: usize = 64 * 1024;
 /// Largest encryption header accepted, in bytes. A real header is a few hundred bytes.
-const MAX_HEADER_LEN: usize = 64 * 1024;
+pub(crate) const MAX_HEADER_LEN: usize = 64 * 1024;
 
 #[derive(Debug)]
 pub enum BackupEncryptionError {
@@ -765,19 +765,35 @@ fn key_fingerprint(key_material: &[u8]) -> Result<String, BackupEncryptionError>
     Ok(fingerprint)
 }
 
+/// Fast Argon2id parameters for tests: the smallest memory cost the server accepts.
+#[cfg(test)]
+pub(crate) fn test_kdf() -> KeyDerivationParams {
+    KeyDerivationParams {
+        m_cost: MIN_KDF_M_COST,
+        t_cost: 1,
+        p_cost: 1,
+    }
+}
+
+/// A passphrase encryptor with [`test_kdf`] and no configured key identifier, for tests.
+#[cfg(test)]
+pub(crate) fn test_encryptor(passphrase: &[u8]) -> BackupEncryptor {
+    #[allow(clippy::expect_used)]
+    BackupEncryptor::with_key_material(
+        BackupEncryptionConfig {
+            enabled: true,
+            key_derivation: test_kdf(),
+            ..BackupEncryptionConfig::default()
+        },
+        passphrase.to_vec(),
+    )
+    .expect("test encryptor")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
-
-    /// Fast parameters for the tests: the smallest memory cost the server accepts.
-    fn fast_kdf() -> KeyDerivationParams {
-        KeyDerivationParams {
-            m_cost: MIN_KDF_M_COST,
-            t_cost: 1,
-            p_cost: 1,
-        }
-    }
 
     /// The identity most tests seal and open their artifacts as.
     fn backup_id() -> BackupArtifactIdentity {
@@ -790,7 +806,7 @@ mod tests {
         BackupEncryptionConfig {
             enabled: true,
             key_source: EncryptionKeySource::Passphrase,
-            key_derivation: fast_kdf(),
+            key_derivation: test_kdf(),
             key_identifier: key_identifier.map(str::to_string),
             passphrase_file: None,
         }
@@ -858,7 +874,7 @@ mod tests {
             assert_eq!(opened, plaintext);
             assert_eq!(header.compressed, compression == BackupCompression::Gzip);
             assert_eq!(header.key_identifier, enc.key_identifier());
-            assert_eq!(header.key_derivation, fast_kdf());
+            assert_eq!(header.key_derivation, test_kdf());
             assert_eq!(header.salt.len(), BACKUP_ENCRYPTION_SALT_LEN);
             assert_eq!(header.nonce.len(), BACKUP_ENCRYPTION_NONCE_LEN);
         }
@@ -1195,19 +1211,19 @@ mod tests {
         for params in [
             KeyDerivationParams {
                 m_cost: u32::MAX,
-                ..fast_kdf()
+                ..test_kdf()
             },
             KeyDerivationParams {
                 m_cost: 4 * 1024 * 1024,
-                ..fast_kdf()
+                ..test_kdf()
             },
             KeyDerivationParams {
                 t_cost: 64,
-                ..fast_kdf()
+                ..test_kdf()
             },
             KeyDerivationParams {
                 p_cost: 64,
-                ..fast_kdf()
+                ..test_kdf()
             },
             KeyDerivationParams {
                 m_cost: MAX_KDF_M_COST,
@@ -1294,17 +1310,17 @@ mod tests {
     fn test_derive_key_is_deterministic_and_salt_sensitive() {
         let salt_a = [1u8; BACKUP_ENCRYPTION_SALT_LEN];
         let salt_b = [2u8; BACKUP_ENCRYPTION_SALT_LEN];
-        let k1 = derive_key(b"pw", &salt_a, &fast_kdf()).unwrap();
-        let k2 = derive_key(b"pw", &salt_a, &fast_kdf()).unwrap();
-        let k3 = derive_key(b"pw", &salt_b, &fast_kdf()).unwrap();
-        let k4 = derive_key(b"other", &salt_a, &fast_kdf()).unwrap();
+        let k1 = derive_key(b"pw", &salt_a, &test_kdf()).unwrap();
+        let k2 = derive_key(b"pw", &salt_a, &test_kdf()).unwrap();
+        let k3 = derive_key(b"pw", &salt_b, &test_kdf()).unwrap();
+        let k4 = derive_key(b"other", &salt_a, &test_kdf()).unwrap();
         assert_eq!(k1.len(), BACKUP_ENCRYPTION_KEY_LEN);
         assert_eq!(k1, k2);
         assert_ne!(k1, k3);
         assert_ne!(k1, k4);
 
         assert!(matches!(
-            derive_key(b"pw", &[0u8; 8], &fast_kdf()),
+            derive_key(b"pw", &[0u8; 8], &test_kdf()),
             Err(BackupEncryptionError::InvalidSaltLength)
         ));
     }
@@ -1403,7 +1419,7 @@ mod tests {
     #[test]
     fn test_validate_key_derivation_params_bounds() {
         assert!(validate_key_derivation_params(&KeyDerivationParams::default()).is_ok());
-        assert!(validate_key_derivation_params(&fast_kdf()).is_ok());
+        assert!(validate_key_derivation_params(&test_kdf()).is_ok());
         assert!(validate_key_derivation_params(&KeyDerivationParams {
             m_cost: MAX_KDF_M_COST,
             t_cost: 4,
@@ -1427,37 +1443,37 @@ mod tests {
 
         let err = validate_key_derivation_params(&KeyDerivationParams {
             m_cost: MIN_KDF_M_COST - 1,
-            ..fast_kdf()
+            ..test_kdf()
         })
         .unwrap_err();
         assert!(err.contains("m_cost"), "{err}");
         let err = validate_key_derivation_params(&KeyDerivationParams {
             m_cost: MAX_KDF_M_COST + 1,
-            ..fast_kdf()
+            ..test_kdf()
         })
         .unwrap_err();
         assert!(err.contains("m_cost"), "{err}");
         let err = validate_key_derivation_params(&KeyDerivationParams {
             t_cost: 0,
-            ..fast_kdf()
+            ..test_kdf()
         })
         .unwrap_err();
         assert!(err.contains("t_cost"), "{err}");
         let err = validate_key_derivation_params(&KeyDerivationParams {
             t_cost: MAX_KDF_T_COST + 1,
-            ..fast_kdf()
+            ..test_kdf()
         })
         .unwrap_err();
         assert!(err.contains("t_cost"), "{err}");
         let err = validate_key_derivation_params(&KeyDerivationParams {
             p_cost: 0,
-            ..fast_kdf()
+            ..test_kdf()
         })
         .unwrap_err();
         assert!(err.contains("p_cost"), "{err}");
         let err = validate_key_derivation_params(&KeyDerivationParams {
             p_cost: MAX_KDF_P_COST + 1,
-            ..fast_kdf()
+            ..test_kdf()
         })
         .unwrap_err();
         assert!(err.contains("p_cost"), "{err}");
@@ -1745,7 +1761,7 @@ mod tests {
         let err = validate_encryption_config(&BackupEncryptionConfig {
             key_derivation: KeyDerivationParams {
                 t_cost: 0,
-                ..fast_kdf()
+                ..test_kdf()
             },
             passphrase_file: Some(passphrase_path.clone()),
             ..config(None)
