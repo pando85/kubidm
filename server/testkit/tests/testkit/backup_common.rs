@@ -59,12 +59,15 @@ pub const BACKUP_USER_ALICE: &str = "backup_user_alice";
 pub const BACKUP_USER_BOB: &str = "backup_user_bob";
 
 /// Drive `work`, an offline database command, on the current thread runtime of the test
-/// while a task ticks on the same runtime, and check that the runtime stayed free: the
-/// longest stretch without a tick must be short against the whole command. A command that
-/// ran its database work on the runtime would hold the only thread of the runtime for
-/// most of it.
+/// while a task ticks on the same runtime, and check that the runtime stayed free: no
+/// stretch without a tick may be longer than [`MAX_RUNTIME_STALL`], however long the
+/// command takes. A command that ran its database work on the runtime would hold the only
+/// thread of the runtime for the whole of that work.
 pub async fn assert_runtime_stays_free<F: Future>(work: F) -> F::Output {
     const TICK: Duration = Duration::from_millis(10);
+    /// Many ticks, plus slack for a loaded test machine; far below a restore's database
+    /// work.
+    const MAX_RUNTIME_STALL: Duration = Duration::from_millis(250);
     let ticks = Arc::new(Mutex::new(Vec::new()));
     let ticker = {
         let ticks = Arc::clone(&ticks);
@@ -90,7 +93,7 @@ pub async fn assert_runtime_stays_free<F: Future>(work: F) -> F::Output {
         .max()
         .unwrap_or_default();
     assert!(
-        longest_stall <= (elapsed / 2).max(Duration::from_millis(250)),
+        longest_stall <= MAX_RUNTIME_STALL,
         "The runtime was blocked for {longest_stall:?} of the {elapsed:?} the command took"
     );
     output
