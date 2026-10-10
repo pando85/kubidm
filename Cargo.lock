@@ -1508,7 +1508,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df92276dad9974530bd01a54740e0cdeac37c0d17d391ea635529f7d708f7bfe"
 dependencies = [
  "base64 0.22.1",
- "crypto-glue 0.2.1",
+ "crypto-glue 0.2.2",
  "hex",
  "kanidm-hsm-crypto",
  "serde",
@@ -1856,9 +1856,9 @@ dependencies = [
 
 [[package]]
 name = "crypto-glue"
-version = "0.2.1"
+version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "44ba7765531ec7cadc5a301ee66f2c48aae8477ee961f6dd3b5ce3beb7d90a38"
+checksum = "a2199036d1ea8b42f94ec872d69dc641ec8b603ef12f9da7874cf8bfef419cb7"
 dependencies = [
  "aes 0.9.3",
  "aes-gcm 0.11.1",
@@ -4367,7 +4367,7 @@ version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c43150dbe23367186bb3374b2a1a1548f83531ecd60456f0dbe3463423e7ef02"
 dependencies = [
- "crypto-glue 0.2.1",
+ "crypto-glue 0.2.2",
  "serde",
  "tracing",
  "tss-esapi",
@@ -4551,7 +4551,7 @@ version = "1.12.0-dev"
 dependencies = [
  "base64 0.23.1",
  "base64urlsafedata",
- "crypto-glue 0.2.1",
+ "crypto-glue 0.2.2",
  "hex",
  "kanidm-hsm-crypto",
  "md-5",
@@ -4580,7 +4580,7 @@ dependencies = [
  "base64 0.23.1",
  "chrono",
  "clap",
- "crypto-glue 0.2.1",
+ "crypto-glue 0.2.2",
  "enum-iterator",
  "kubidm_build_profiles",
  "num_enum",
@@ -4670,7 +4670,7 @@ dependencies = [
  "cidr",
  "compact_jwt",
  "cron",
- "crypto-glue 0.2.1",
+ "crypto-glue 0.2.2",
  "filetime",
  "flate2",
  "futures",
@@ -4732,7 +4732,7 @@ dependencies = [
  "chrono",
  "compact_jwt",
  "concread",
- "crypto-glue 0.2.1",
+ "crypto-glue 0.2.2",
  "dhat",
  "dyn-clone",
  "flate2",
