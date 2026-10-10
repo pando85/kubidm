@@ -390,6 +390,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::backup::artifact::backup_identity;
     use crate::backup::encryption::MIN_KDF_M_COST;
 
     fn encryptor(passphrase: &[u8]) -> BackupEncryptor {
@@ -598,7 +599,9 @@ mod tests {
             (BackupCompression::NoCompression, minimal_valid_backup()),
             (BackupCompression::Gzip, gzip(&minimal_valid_backup())),
         ] {
-            let sealed = enc.encrypt(&plaintext, compression).expect("encrypt");
+            let sealed = enc
+                .encrypt(&plaintext, compression, &backup_identity(Path::new("")))
+                .expect("encrypt");
             let report = verify_backup_output(&sealed, None, compression, Some(&enc))
                 .expect("an encrypted backup verified with its key must pass");
             assert_eq!(report.entry_count, 1);
@@ -610,7 +613,11 @@ mod tests {
     fn test_verify_backup_output_rejects_configuration_mismatches() {
         let enc = encryptor(b"pw");
         let sealed = enc
-            .encrypt(&gzip(&minimal_valid_backup()), BackupCompression::Gzip)
+            .encrypt(
+                &gzip(&minimal_valid_backup()),
+                BackupCompression::Gzip,
+                &backup_identity(Path::new("")),
+            )
             .expect("encrypt");
 
         // Encrypted artifact, no key.
@@ -648,7 +655,11 @@ mod tests {
 
         // Encrypted garbage: decrypts, but is not a backup.
         let sealed_garbage = enc
-            .encrypt(b"not a backup", BackupCompression::NoCompression)
+            .encrypt(
+                b"not a backup",
+                BackupCompression::NoCompression,
+                &backup_identity(Path::new("")),
+            )
             .expect("encrypt");
         let err = verify_backup_output(
             &sealed_garbage,
@@ -670,8 +681,12 @@ mod tests {
             .join(format!("backup-good.json.gz{BACKUP_ENCRYPTED_SUFFIX}"));
         std::fs::write(
             &good,
-            enc.encrypt(&gzip(&minimal_valid_backup()), BackupCompression::Gzip)
-                .expect("encrypt"),
+            enc.encrypt(
+                &gzip(&minimal_valid_backup()),
+                BackupCompression::Gzip,
+                &backup_identity(Path::new("")),
+            )
+            .expect("encrypt"),
         )
         .expect("write");
         let report = finalize_local_backup(&good, BackupCompression::Gzip, Some(&enc))
@@ -734,7 +749,13 @@ mod tests {
 
         // An encrypted backup records its compression; its name does not matter.
         let enc = encryptor(b"pw");
-        let sealed = enc.encrypt(&gz, BackupCompression::Gzip).expect("encrypt");
+        let sealed = enc
+            .encrypt(
+                &gz,
+                BackupCompression::Gzip,
+                &backup_identity(Path::new("kubidm.json")),
+            )
+            .expect("encrypt");
         assert!(verify_backup_output(
             &sealed,
             Some(Path::new("kubidm.json")),

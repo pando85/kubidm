@@ -268,15 +268,17 @@ compression = "gzip"
 # passphrase_file = "/etc/kubidm/backup-passphrase"
 #   Alternatively a key file, used byte for byte (for example 32 random bytes) ...
 # key_source = { File = { path = "/etc/kubidm/backup.key" } }
-#   ... or an HTTPS endpoint whose response body is the key material (plain http is only
-#   accepted for a loopback address).
-# key_source = { HttpEndpoint = { url = "https://vault.example.com/v1/kubidm-backup-key" } }
+#   ... or an HTTPS endpoint whose raw response body is the key material and must be the
+#   same bytes on every request (plain http is only accepted for a loopback address; no
+#   proxy, no redirects).
+# key_source = { HttpEndpoint = { url = "https://secrets.example.com/kubidm-backup-key" } }
 #   Name recorded in every artifact and in the S3 metadata sidecar so that a restore can
 #   tell which key an artifact needs. Defaults to a fingerprint of a key file or key
 #   endpoint, and to "passphrase" for a passphrase.
 # key_identifier = "prod-2026"
 #   Argon2id parameters of the key derivation (memory in KiB, iterations, parallelism).
-#   The defaults are 19 MiB, 2 and 1; m_cost must be between 8192 and 4194304.
+#   The defaults are 19 MiB, 2 and 1; m_cost must be between 8192 and 1048576, t_cost and
+#   p_cost between 1 and 16, and m_cost * t_cost at most 4194304.
 # [online_backup.encryption.key_derivation]
 # m_cost = 19456
 # t_cost = 2

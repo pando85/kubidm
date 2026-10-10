@@ -37,9 +37,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kubidm_proto::backup::{
-    is_encrypted_backup_name, BackupEncryptionConfig, PitrBaseBackup, PitrManifest,
-    PitrTimelineBreak, PitrWalGap, ReplicationConfig, ReplicationRegionConfig, S3Config,
-    WalArchiveConfig, WalSegment, PITR_MANIFEST_KEY, WAL_SEGMENT_KEY_PREFIX,
+    is_encrypted_backup_name, BackupArtifactIdentity, BackupEncryptionConfig, PitrBaseBackup,
+    PitrManifest, PitrTimelineBreak, PitrWalGap, ReplicationConfig, ReplicationRegionConfig,
+    S3Config, WalArchiveConfig, WalSegment, PITR_MANIFEST_KEY, WAL_SEGMENT_KEY_PREFIX,
 };
 use kubidm_proto::internal::OperationError;
 use kubidmd_lib::be::{BackupStructuralReport, SharedWalArchiver, WalApplyReport};
@@ -499,14 +499,19 @@ impl PitrStore {
         let stored = match encryptor {
             Some(encryptor) => {
                 archived.encryption_key = Some(encryptor.key_identifier().to_string());
-                seal_backup_async(data, segment.compression, Some(encryptor))
-                    .await
-                    .map_err(|err| {
-                        PitrError::Encryption(format!(
-                            "unable to encrypt segment {}: {err}",
-                            segment.segment_id
-                        ))
-                    })?
+                seal_backup_async(
+                    data,
+                    segment.compression,
+                    Some(encryptor),
+                    BackupArtifactIdentity::wal_segment(&segment.segment_id),
+                )
+                .await
+                .map_err(|err| {
+                    PitrError::Encryption(format!(
+                        "unable to encrypt segment {}: {err}",
+                        segment.segment_id
+                    ))
+                })?
             }
             None => data,
         };
@@ -667,7 +672,7 @@ async fn open_segment(
     let segment_id = segment.segment_id.clone();
     blocking(move || {
         encryptor
-            .decrypt(&data)
+            .decrypt(&data, &BackupArtifactIdentity::wal_segment(&segment_id))
             .map(|(plaintext, _)| plaintext)
             .map_err(|err| {
                 PitrError::Encryption(format!("unable to decrypt segment {segment_id}: {err}"))

@@ -18,9 +18,10 @@ use tracing::instrument;
 
 use super::pitr::{BaseLocation, PitrArchive};
 use super::{
-    backup_artifact_name, backup_timestamp, prune_local_backups, run_blocking, seal_backup_async,
-    select_backups_to_delete, select_incomplete_backups_to_delete, verify_backup_output_async,
-    write_verified_local_backup_async, BackupEncryptor, S3ClientWrapper,
+    backup_artifact_name, backup_identity, backup_timestamp, prune_local_backups, run_blocking,
+    seal_backup_async, select_backups_to_delete, select_incomplete_backups_to_delete,
+    verify_backup_output_async, write_verified_local_backup_async, BackupEncryptor,
+    S3ClientWrapper,
 };
 use crate::actors::QueryServerReadV1;
 use crate::config::OnlineBackup;
@@ -92,15 +93,21 @@ impl OnlineBackupJob {
             })?;
         let key = backup_artifact_name(&timestamp, self.compression, encryptor.is_some());
 
-        // One snapshot and one artifact per run: every location holds the same backup.
+        // One snapshot and one artifact per run: every location holds the same backup,
+        // under the same name, which the encrypted artifact is bound to.
         let plaintext = server.backup_database(self.compression).await?;
-        let artifact = seal_backup_async(plaintext, self.compression, encryptor.as_ref())
-            .await
-            .map(Bytes::from)
-            .map_err(|err| {
-                error!(%err, "Online backup failed to encrypt the backup");
-                OperationError::CryptographyError
-            })?;
+        let artifact = seal_backup_async(
+            plaintext,
+            self.compression,
+            encryptor.as_ref(),
+            backup_identity(Path::new(&key)),
+        )
+        .await
+        .map(Bytes::from)
+        .map_err(|err| {
+            error!(%err, "Online backup failed to encrypt the backup");
+            OperationError::CryptographyError
+        })?;
 
         let mut outcomes = Vec::with_capacity(self.targets.len());
         let mut failure = None;

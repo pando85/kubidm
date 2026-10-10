@@ -11,7 +11,7 @@ use serde_with::DeserializeFromStr;
 use sketching::tracing::warn;
 use uuid::Uuid;
 
-pub const BACKUP_ENCRYPTION_MAGIC: &[u8] = b"KANIDM_ENC_BACKUP_V1";
+pub const BACKUP_ENCRYPTION_MAGIC: &[u8] = b"KUBIDM_ENC_BACKUP_V2";
 pub const BACKUP_ENCRYPTION_KEY_LEN: usize = 32;
 pub const BACKUP_ENCRYPTION_NONCE_LEN: usize = 12;
 pub const BACKUP_ENCRYPTION_SALT_LEN: usize = 16;
@@ -301,17 +301,54 @@ fn test_backup_encryption_header_display() {
         vec![0u8; BACKUP_ENCRYPTION_NONCE_LEN],
         KeyDerivationParams::default(),
         true,
+        BackupArtifactIdentity::wal_segment("seg-1"),
     );
 
     let display = header.to_string();
     assert!(display.contains("test-key-id"));
     assert!(display.contains("compressed: true"));
+    assert!(display.contains("WAL segment seg-1"));
+}
+
+#[test]
+fn test_backup_artifact_identity_accepts() {
+    let october = BackupArtifactIdentity::Backup {
+        taken_at: Some("2026-10-01T00:00:00Z".to_string()),
+    };
+    let january = BackupArtifactIdentity::Backup {
+        taken_at: Some("2026-01-01T00:00:00Z".to_string()),
+    };
+    let unnamed = BackupArtifactIdentity::Backup { taken_at: None };
+    let segment = BackupArtifactIdentity::wal_segment("seg-1");
+
+    // A timestamped name only opens the backup taken at that time.
+    assert!(october.accepts(&october));
+    assert!(!october.accepts(&january));
+    assert!(!october.accepts(&unnamed));
+    // Any other name opens any backup, but never a WAL segment.
+    assert!(unnamed.accepts(&october));
+    assert!(unnamed.accepts(&unnamed));
+    assert!(!unnamed.accepts(&segment));
+    // A segment only opens as itself.
+    assert!(segment.accepts(&segment));
+    assert!(!segment.accepts(&BackupArtifactIdentity::wal_segment("seg-2")));
+    assert!(!segment.accepts(&unnamed));
+
+    assert!(BackupArtifactIdentity::wal_segment("a\u{1b}[2J").has_control_characters());
+    assert!(!october.has_control_characters());
+
+    let json = serde_json::to_string(&october).unwrap();
+    assert_eq!(json, r#"{"backup":{"taken_at":"2026-10-01T00:00:00Z"}}"#);
+    assert_eq!(
+        serde_json::from_str::<BackupArtifactIdentity>(&json).unwrap(),
+        october
+    );
 }
 
 #[test]
 fn test_backup_encryption_magic_constant() {
     assert_eq!(BACKUP_ENCRYPTION_MAGIC.len(), 20);
-    assert_eq!(BACKUP_ENCRYPTION_MAGIC, b"KANIDM_ENC_BACKUP_V1");
+    assert_eq!(BACKUP_ENCRYPTION_MAGIC, b"KUBIDM_ENC_BACKUP_V2");
 }
 
 #[test]
@@ -349,6 +386,7 @@ fn test_backup_encryption_header_validate_magic() {
         vec![0u8; 12],
         KeyDerivationParams::default(),
         false,
+        BackupArtifactIdentity::Backup { taken_at: None },
     );
     assert!(header.validate_magic());
 }
@@ -955,6 +993,72 @@ impl Display for BackupEncryptionConfig {
     }
 }
 
+/// What an encrypted artifact is. It is recorded in the authenticated header of the
+/// artifact, so that an artifact can not be passed off as another one: an older backup
+/// copied over the name of a newer one, or a WAL segment stored under the id of another
+/// segment, is refused when it is opened.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BackupArtifactIdentity {
+    /// A backup of the database.
+    Backup {
+        /// The RFC3339 timestamp of a backup stored under an automatically generated name,
+        /// `backup-<taken_at>.json[.gz][.enc]`. `None` for a backup under any other name, or
+        /// written to stdout, since such a name does not claim when it was taken.
+        taken_at: Option<String>,
+    },
+    /// A segment of the point-in-time recovery WAL archive.
+    WalSegment { segment_id: String },
+}
+
+impl BackupArtifactIdentity {
+    /// A WAL segment of the archive.
+    pub fn wal_segment(segment_id: impl Into<String>) -> Self {
+        BackupArtifactIdentity::WalSegment {
+            segment_id: segment_id.into(),
+        }
+    }
+
+    /// Whether an artifact recorded as `recorded` may be opened as `self`: a WAL segment
+    /// only as the same segment, a backup under an automatically generated name only as
+    /// a backup taken at that time, and a backup under any other name as any backup.
+    pub fn accepts(&self, recorded: &BackupArtifactIdentity) -> bool {
+        match (self, recorded) {
+            (
+                BackupArtifactIdentity::Backup { taken_at: None },
+                BackupArtifactIdentity::Backup { .. },
+            ) => true,
+            (expected, recorded) => expected == recorded,
+        }
+    }
+
+    /// Whether the values carry control characters, which must not reach log lines or
+    /// terminal output before the header is authenticated.
+    pub fn has_control_characters(&self) -> bool {
+        let value = match self {
+            BackupArtifactIdentity::Backup { taken_at } => taken_at.as_deref().unwrap_or(""),
+            BackupArtifactIdentity::WalSegment { segment_id } => segment_id.as_str(),
+        };
+        value.chars().any(char::is_control)
+    }
+}
+
+impl Display for BackupArtifactIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BackupArtifactIdentity::Backup {
+                taken_at: Some(taken_at),
+            } => write!(f, "the backup taken at {taken_at}"),
+            BackupArtifactIdentity::Backup { taken_at: None } => {
+                write!(f, "a backup without a timestamped name")
+            }
+            BackupArtifactIdentity::WalSegment { segment_id } => {
+                write!(f, "WAL segment {segment_id}")
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BackupEncryptionHeader {
     pub magic: String,
@@ -963,6 +1067,8 @@ pub struct BackupEncryptionHeader {
     pub nonce: Vec<u8>,
     pub key_derivation: KeyDerivationParams,
     pub compressed: bool,
+    /// What the artifact is, see [`BackupArtifactIdentity`].
+    pub artifact: BackupArtifactIdentity,
 }
 
 impl BackupEncryptionHeader {
@@ -972,6 +1078,7 @@ impl BackupEncryptionHeader {
         nonce: Vec<u8>,
         key_derivation: KeyDerivationParams,
         compressed: bool,
+        artifact: BackupArtifactIdentity,
     ) -> Self {
         Self {
             magic: String::from_utf8_lossy(BACKUP_ENCRYPTION_MAGIC).to_string(),
@@ -980,6 +1087,7 @@ impl BackupEncryptionHeader {
             nonce,
             key_derivation,
             compressed,
+            artifact,
         }
     }
 
@@ -992,8 +1100,8 @@ impl Display for BackupEncryptionHeader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "BackupEncryptionHeader {{ key_identifier: {}, compressed: {} }}",
-            self.key_identifier, self.compressed
+            "BackupEncryptionHeader {{ key_identifier: {}, compressed: {}, artifact: {} }}",
+            self.key_identifier, self.compressed, self.artifact
         )
     }
 }

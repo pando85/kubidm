@@ -18,7 +18,7 @@ use kubidm_proto::backup::{
     KeyDerivationParams,
 };
 use kubidmd_core::backup::{
-    is_backup_artifact_name, is_encrypted_artifact, open_backup_file_with_config,
+    backup_identity, is_backup_artifact_name, is_encrypted_artifact, open_backup_file_with_config,
     read_encryption_header, BackupEncryptionError, BackupEncryptor, BackupOpenError,
     S3ClientWrapper, MIN_KDF_M_COST, PASSPHRASE_ENV,
 };
@@ -395,6 +395,32 @@ fn test_encrypted_backup_is_refused_without_the_right_key() {
             .await
             .expect("The right passphrase must open the artifact without a key_identifier");
         assert_eq!(opened.key_identifier(), Some(KEY_ID));
+
+        // With the right key, but the valid backup copied over the name of a newer one: it
+        // is not the backup that name claims, so restoring it would silently roll back.
+        let replayed = backup.with_file_name("backup-2099-06-01T00:00:00Z.json.gz.enc");
+        std::fs::copy(&backup, &replayed).expect("Failed to copy the backup");
+        match open_backup_file_with_config(&replayed, Some(&unnamed)).await {
+            Err(BackupOpenError::Decrypt(BackupEncryptionError::ArtifactMismatch {
+                expected,
+                recorded,
+            })) => {
+                assert_eq!(expected, backup_identity(&replayed));
+                assert_eq!(recorded, backup_identity(&backup));
+            }
+            other => panic!("Expected ArtifactMismatch, got {other:?}"),
+        }
+        let replayed_db = workdir.path().join("replayed.db");
+        let replayed_config = config_with_encryption(&replayed_db, unnamed);
+        assert!(
+            restore_database(&replayed_config, &replayed).await.is_err(),
+            "Restore of an older backup under a newer name must fail"
+        );
+        assert!(
+            !verify_backup_server_core(&replayed_config, &replayed, BackupVerifyLevel::Full).await,
+            "Verification of an older backup under a newer name must fail"
+        );
+        assert!(!replayed_db.exists());
     });
 }
 
@@ -541,7 +567,9 @@ fn test_encrypted_s3_backup_verify_and_restore() {
             .await
             .expect("Failed to resolve the key")
             .expect("Encryption is enabled");
-        let (plaintext, _) = opener.decrypt(&raw).expect("Failed to decrypt the backup");
+        let (plaintext, _) = opener
+            .decrypt(&raw, &backup_identity(Path::new(&key)))
+            .expect("Failed to decrypt the backup");
         let swapped_key = "backup-2099-01-01T00:00:00Z.json.gz.enc";
         client
             .upload_backup(
@@ -579,5 +607,39 @@ fn test_encrypted_s3_backup_verify_and_restore() {
             "restore-s3 must refuse a plain artifact under an encrypted name"
         );
         assert!(!swapped_db.exists());
+
+        // The same person stores the valid encrypted backup again under a newer key, with
+        // a consistent sidecar. It decrypts with the key, but it is not the backup the key
+        // claims, so it must not silently roll a restore back to the older state.
+        let replayed_key = "backup-2099-06-01T00:00:00Z.json.gz.enc";
+        client
+            .upload_backup(
+                &raw,
+                replayed_key,
+                "2099-06-01T00:00:00Z",
+                BackupCompression::Gzip,
+                Some(KEY_ID),
+            )
+            .await
+            .expect("Failed to upload the replayed backup");
+        let replayed_db = workdir.path().join("replayed.db");
+        let replayed_config = config_with_encryption(&replayed_db, encryption.clone());
+        assert!(
+            !verify_s3_backup_server_core(
+                &replayed_config,
+                s3_config.clone(),
+                replayed_key,
+                BackupVerifyLevel::Structural,
+            )
+            .await,
+            "verify-s3 must refuse an older backup stored under a newer key"
+        );
+        assert!(
+            restore_s3_database(&replayed_config, s3_config.clone(), replayed_key)
+                .await
+                .is_err(),
+            "restore-s3 must refuse an older backup stored under a newer key"
+        );
+        assert!(!replayed_db.exists());
     });
 }

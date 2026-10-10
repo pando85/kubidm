@@ -25,8 +25,8 @@ use kubidmd_lib::{
 use time::format_description::well_known::Rfc3339;
 
 use super::{
-    compare_backup_names, is_backup_artifact_name, lag_metrics_from_health,
-    open_backup_file_with_config, pitr, region_is_healthy,
+    backup_identity, backup_name_timestamp, compare_backup_names, is_backup_artifact_name,
+    lag_metrics_from_health, open_backup_file_with_config, pitr, region_is_healthy,
     restore::{backup_encryption_config, restore_and_replay, restore_database},
     run_blocking, s3_location, seal_backup_async, verify_backup_output_async,
     write_verified_local_backup_async, BackupEncryptor, BackupVerifyError, S3BackupError,
@@ -117,13 +117,16 @@ pub async fn backup_server_core(config: &Configuration, dst_path: Option<&Path>)
         }
     };
 
-    let artifact = match seal_backup_async(backup_data, compression, encryptor.as_ref()).await {
-        Ok(artifact) => artifact,
-        Err(err) => {
-            error!(%err, "Backup failed: unable to encrypt the backup");
-            return false;
-        }
-    };
+    // Written to stdout, the backup has no name and so claims no timestamp.
+    let identity = backup_identity(dst_path.unwrap_or(Path::new("")));
+    let artifact =
+        match seal_backup_async(backup_data, compression, encryptor.as_ref(), identity).await {
+            Ok(artifact) => artifact,
+            Err(err) => {
+                error!(%err, "Backup failed: unable to encrypt the backup");
+                return false;
+            }
+        };
 
     let artifact = Bytes::from(artifact);
     if let Some(dst_path) = dst_path {
@@ -539,8 +542,15 @@ pub(crate) async fn fetch_s3_backup(
     } else {
         ""
     };
+    // An encrypted backup records the timestamp of the name it was written under, so the
+    // download keeps the timestamp of the key: an older backup stored under a newer key is
+    // refused like a local one.
+    let stem = match backup_name_timestamp(key.rsplit('/').next().unwrap_or(key)) {
+        Some(timestamp) => format!("backup-{timestamp}"),
+        None => "backup".to_string(),
+    };
     let path = scratch_dir.path().join(format!(
-        "backup.json{}{encryption_suffix}",
+        "{stem}.json{}{encryption_suffix}",
         metadata.compression.suffix()
     ));
     let write_to = path.clone();
