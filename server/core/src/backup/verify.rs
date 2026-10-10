@@ -13,7 +13,7 @@
 //! named with [`SCRATCH_DIR_PREFIX`]. The scheduled verification creates them in
 //! `online_backup.verify_temp_path`, by default the directory of the database
 //! ([`verify_scratch_parent`]); the server removes the ones an interrupted run left behind
-//! when it starts ([`remove_stale_scratch_dirs`]). The command uses `TMPDIR`.
+//! when it starts. The command uses `TMPDIR`.
 
 use std::fmt;
 use std::io::{self, Read};
