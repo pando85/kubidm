@@ -45,16 +45,18 @@ struct RestoreS3Opt {
     #[clap(long)]
     key: String,
 
-    /// Override the bucket of the [online_backup.s3] section. Required when the section
-    /// is absent from the configuration.
+    /// Override the bucket of the selected S3 location. Required when the configuration
+    /// has no [online_backup.s3] section.
     #[clap(long)]
     bucket: Option<String>,
 
-    /// Override the region of the [online_backup.s3] section.
-    #[clap(long)]
+    /// Restore from the replication region of this name, as configured under
+    /// [[online_backup.s3.replication.regions]], instead of the primary bucket. The
+    /// region's bucket, endpoint, path prefix and credentials are used.
+    #[clap(long, value_name = "NAME")]
     region: Option<String>,
 
-    /// Override the endpoint of the [online_backup.s3] section, for S3-compatible services.
+    /// Override the endpoint of the selected S3 location, for S3-compatible services.
     #[clap(long)]
     endpoint: Option<String>,
 }
@@ -66,16 +68,18 @@ struct VerifyS3Opt {
     #[clap(long)]
     key: String,
 
-    /// Override the bucket of the [online_backup.s3] section. Required when the section
-    /// is absent from the configuration.
+    /// Override the bucket of the selected S3 location. Required when the configuration
+    /// has no [online_backup.s3] section.
     #[clap(long)]
     bucket: Option<String>,
 
-    /// Override the region of the [online_backup.s3] section.
-    #[clap(long)]
+    /// Verify the copy held by the replication region of this name, as configured under
+    /// [[online_backup.s3.replication.regions]], instead of the primary bucket. The
+    /// region's bucket, endpoint, path prefix and credentials are used.
+    #[clap(long, value_name = "NAME")]
     region: Option<String>,
 
-    /// Override the endpoint of the [online_backup.s3] section, for S3-compatible services.
+    /// Override the endpoint of the selected S3 location, for S3-compatible services.
     #[clap(long)]
     endpoint: Option<String>,
 
@@ -158,11 +162,16 @@ enum DbCommands {
     /// List the backups in the local online backup directory and in S3.
     ListBackups {
         /// Only list the local online backup directory.
-        #[clap(long, conflicts_with = "s3_only")]
+        #[clap(long, conflicts_with_all = ["s3_only", "region"])]
         local_only: bool,
         /// Only list the S3 backups.
         #[clap(long)]
         s3_only: bool,
+        /// List the backups held by the replication region of this name, as configured
+        /// under [[online_backup.s3.replication.regions]], instead of the primary bucket.
+        /// Implies --s3-only.
+        #[clap(long, value_name = "NAME")]
+        region: Option<String>,
     },
     #[clap(name = "reindex")]
     /// Reindex the database (offline)
@@ -174,10 +183,15 @@ enum DbCommands {
     #[clap(name = "pitr-list", hide = true)]
     /// List available recovery points for Point-in-Time Recovery. Not yet implemented.
     PitrList,
-    #[clap(name = "replicate-status", hide = true)]
-    /// Check cross-region backup replication status. Not yet implemented.
+    #[clap(name = "replicate-status")]
+    /// Report the state of cross-region backup replication.
+    ///
+    /// For every region of [online_backup.s3.replication], shows which of the primary's
+    /// backups it holds intact, its newest backup and how far it lags behind the primary.
+    /// Exits non-zero when replication is not configured or when any region is unhealthy.
+    /// Does not open the database.
     ReplicateStatus {
-        /// Output detailed lag metrics for each region
+        /// Also print the lag metrics of every region.
         #[clap(long)]
         detailed: bool,
     },

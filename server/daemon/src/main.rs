@@ -37,9 +37,10 @@ use kubidmd_core::{
     create_server_core, dbscan_get_id2entry_core, dbscan_list_id2entry_core,
     dbscan_list_index_analysis_core, dbscan_list_index_core, dbscan_list_indexes_core,
     dbscan_list_quarantined_core, dbscan_quarantine_id2entry_core, dbscan_restore_quarantined_core,
-    domain_rename_core, list_backups_server_core, reindex_server_core, restore_s3_database,
-    restore_server_core, s3_config_for_cli, vacuum_server_core, verify_backup_server_core,
-    verify_s3_backup_server_core, verify_server_core, BackupVerifyLevel, CoreAction,
+    domain_rename_core, list_backups_server_core, reindex_server_core,
+    replicate_status_server_core, restore_s3_database, restore_server_core, s3_config_for_cli,
+    vacuum_server_core, verify_backup_server_core, verify_s3_backup_server_core,
+    verify_server_core, BackupVerifyLevel, CoreAction,
 };
 use serde::Serialize;
 use sketching::{pipeline::TracingPipelineGuard, tracing_forest::util::*};
@@ -617,6 +618,9 @@ async fn start_daemon(opt: KubidmdParser, config: Configuration) -> ExitCode {
         | KubidmdOpt::DisableAccount { .. }
         | KubidmdOpt::Database {
             commands: DbCommands::ListBackups { .. },
+        }
+        | KubidmdOpt::Database {
+            commands: DbCommands::ReplicateStatus { .. },
         } => None,
         _ => {
             // Okay - Lets now create our lock and go.
@@ -1012,7 +1016,7 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
             let Ok(s3_config) = s3_config_for_cli(
                 &config,
                 ropt.bucket.clone(),
-                ropt.region.clone(),
+                ropt.region.as_deref(),
                 ropt.endpoint.clone(),
             ) else {
                 return ExitCode::FAILURE;
@@ -1036,7 +1040,7 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
             let Ok(s3_config) = s3_config_for_cli(
                 &config,
                 vopt.bucket.clone(),
-                vopt.region.clone(),
+                vopt.region.as_deref(),
                 vopt.endpoint.clone(),
             ) else {
                 return ExitCode::FAILURE;
@@ -1050,10 +1054,11 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
                 DbCommands::ListBackups {
                     local_only,
                     s3_only,
+                    region,
                 },
         } => {
             info!("Running in backup listing mode ...");
-            if !list_backups_server_core(&config, *local_only, *s3_only).await {
+            if !list_backups_server_core(&config, *local_only, *s3_only, region.as_deref()).await {
                 return ExitCode::FAILURE;
             }
         }
@@ -1250,14 +1255,12 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
             return ExitCode::FAILURE;
         }
         KubidmdOpt::Database {
-            commands: DbCommands::ReplicateStatus { .. },
+            commands: DbCommands::ReplicateStatus { detailed },
         } => {
-            error!(
-                "The 'database replicate-status' command is not implemented in this release. \
-                 Cross-region backup replication is not yet available. \
-                 See the Backup and Restore chapter of the book for the supported procedures."
-            );
-            return ExitCode::FAILURE;
+            info!("Running in backup replication status mode ...");
+            if !replicate_status_server_core(&config, *detailed).await {
+                return ExitCode::FAILURE;
+            }
         }
         KubidmdOpt::Scripting { .. } | KubidmdOpt::Version => {}
     }

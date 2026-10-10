@@ -413,8 +413,8 @@ impl QueryServerReadV1 {
             "Online backup verified"
         );
 
-        s3_client
-            .upload_backup(backup_data, &object_key, timestamp, compression)
+        let metadata = s3_client
+            .upload_backup(&backup_data, &object_key, timestamp, compression)
             .await
             .map_err(|e| {
                 error!("S3 backup upload failed: {}", e);
@@ -423,38 +423,48 @@ impl QueryServerReadV1 {
 
         info!("S3 backup uploaded successfully: {}", object_key);
 
-        // Retention: the backup itself has succeeded at this point, so a failure to prune
-        // older backups is logged but never turns a successful backup into a failure.
-        // Only automatically generated backup artifacts are ever deleted; metadata
-        // sidecars, the PITR manifest and any other object under the prefix are kept.
-        let existing = match s3_client.list_backups().await {
-            Ok(existing) => existing,
-            Err(e) => {
-                error!("S3 backup cleanup failed to list backups: {}", e);
-                return Ok(());
+        // The backup itself has succeeded at this point: neither replication nor retention
+        // may turn it into a failure. Both only log.
+        //
+        // Replication copies the object and its sidecar, as uploaded, to every configured
+        // region. A region that fails is reported and skipped; the replication monitor
+        // copies whatever a region misses every `sync_interval_seconds`, and
+        // `replicate-status` shows what is missing in the meantime. Retention
+        // then runs in the primary and in every region that could be reached, so each
+        // location keeps its newest `versions` backups independently.
+        let mut region_clients = Vec::new();
+        if let Some(replication) = s3_client.replication_config() {
+            for region_config in &replication.regions {
+                if let Err(e) = s3_client
+                    .replicate_backup_with_retries(
+                        &object_key,
+                        &backup_data,
+                        &metadata,
+                        region_config,
+                        replication,
+                    )
+                    .await
+                {
+                    error!(
+                        "S3 backup replication of {} to region {} (bucket {}) failed: {}",
+                        object_key, region_config.region, region_config.bucket, e
+                    );
+                    continue;
+                }
+                match S3ClientWrapper::for_region(region_config).await {
+                    Ok(client) => region_clients.push(client),
+                    Err(e) => error!(
+                        "S3 backup cleanup skipped region {}: unable to create its client: {}",
+                        region_config.region, e
+                    ),
+                }
             }
-        };
-
-        let to_delete = select_backups_to_delete(&existing, versions);
-        if to_delete.is_empty() {
-            debug!("S3 backup cleanup had no backups to remove");
-        } else {
-            info!(
-                "S3 backup cleanup found {} backups, should keep {}, will remove {}",
-                existing
-                    .iter()
-                    .filter(|key| is_backup_artifact_name(key))
-                    .count(),
-                versions,
-                to_delete.len()
-            );
         }
+        drop(backup_data);
 
-        for key in to_delete {
-            match s3_client.delete_backup(&key).await {
-                Ok(()) => info!("S3 backup cleanup removed {}", key),
-                Err(e) => error!("S3 backup cleanup failed to remove {}: {}", key, e),
-            }
+        prune_s3_backups(&s3_client, versions).await;
+        for region_client in &region_clients {
+            prune_s3_backups(region_client, versions).await;
         }
 
         Ok(())
@@ -1867,5 +1877,48 @@ impl QueryServerReadV1 {
         idms_prox_read
             .qs_read
             .approval_request_get(&ident, request_uuid)
+    }
+}
+
+/// Apply the `versions` retention to the location `client` writes to: the primary prefix
+/// or the prefix of a replication region. Only automatically generated backup artifacts
+/// are ever deleted, together with their metadata sidecar; the PITR manifest and any other
+/// object under the prefix are kept. Failures are logged and never propagated, because the
+/// backup that triggered the cleanup has already succeeded.
+async fn prune_s3_backups(client: &S3ClientWrapper, versions: usize) {
+    let location = client.location();
+
+    let existing = match client.list_backups().await {
+        Ok(existing) => existing,
+        Err(e) => {
+            error!("S3 backup cleanup failed to list {}: {}", location, e);
+            return;
+        }
+    };
+
+    let to_delete = select_backups_to_delete(&existing, versions);
+    if to_delete.is_empty() {
+        debug!("S3 backup cleanup had no backups to remove in {}", location);
+    } else {
+        info!(
+            "S3 backup cleanup found {} backups in {}, should keep {}, will remove {}",
+            existing
+                .iter()
+                .filter(|key| is_backup_artifact_name(key))
+                .count(),
+            location,
+            versions,
+            to_delete.len()
+        );
+    }
+
+    for key in to_delete {
+        match client.delete_backup(&key).await {
+            Ok(()) => info!("S3 backup cleanup removed {} from {}", key, location),
+            Err(e) => error!(
+                "S3 backup cleanup failed to remove {} from {}: {}",
+                key, location, e
+            ),
+        }
     }
 }

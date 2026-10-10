@@ -45,8 +45,8 @@ use crate::{
     actors::{QueryServerReadV1, QueryServerWriteV1},
     admin::AdminActor,
     backup::{
-        finalize_local_backup, is_backup_artifact_name, verify_backup_output, BackupVerifyError,
-        S3BackupError, S3ClientWrapper,
+        finalize_local_backup, is_backup_artifact_name, lag_metrics_from_health, region_is_healthy,
+        s3_location, verify_backup_output, BackupVerifyError, S3BackupError, S3ClientWrapper,
     },
     config::{Configuration, ServerRole},
     interval::IntervalActor,
@@ -58,7 +58,10 @@ use crypto_glue::{
     traits::Digest,
 };
 use kubidm_proto::{
-    backup::{BackupCompression, S3BackupMetadata, S3Config},
+    backup::{
+        BackupCompression, ReplicationConfig, ReplicationHealthCheck, ReplicationRegionConfig,
+        ReplicationStatus, S3BackupMetadata, S3Config,
+    },
     internal::{ConsistencyError, OperationError},
     scim_v1::client::ScimAssertGeneric,
 };
@@ -643,21 +646,70 @@ fn pass_fail(ok: bool) -> &'static str {
     }
 }
 
-/// Resolve the S3 configuration an offline recovery command (`restore-s3`, `verify-s3`)
-/// uses: the `[online_backup.s3]` section of the server configuration with `bucket`,
-/// `region` and `endpoint` replaced by any command line override. Without a configured
-/// section, `bucket` must be given; credentials and region then come from the SDK's
-/// default provider chain.
+/// The `[[online_backup.s3.replication.regions]]` entries of the configuration, whether
+/// or not replication is enabled: a replica stays a valid recovery source after
+/// replication has been switched off.
+fn configured_replication_regions(config: &Configuration) -> &[ReplicationRegionConfig] {
+    config
+        .online_backup
+        .as_ref()
+        .and_then(|backup| backup.s3.as_ref())
+        .and_then(|s3| s3.replication.as_ref())
+        .map(|replication| replication.regions.as_slice())
+        .unwrap_or_default()
+}
+
+/// The replication region named `name`, as selected by `--region` on the recovery
+/// commands. The error is logged before it is returned.
+fn replication_region<'a>(
+    config: &'a Configuration,
+    name: &str,
+) -> Result<&'a ReplicationRegionConfig, OperationError> {
+    let regions = configured_replication_regions(config);
+    regions
+        .iter()
+        .find(|region| region.region == name)
+        .ok_or_else(|| {
+            if regions.is_empty() {
+                error!(
+                    "--region {name}: no replication region is configured under \
+                     [online_backup.s3.replication], so there is no replica to target."
+                );
+            } else {
+                let names: Vec<&str> = regions.iter().map(|r| r.region.as_str()).collect();
+                error!(
+                    "--region {name}: no replication region of that name is configured. \
+                     Configured regions: {}",
+                    names.join(", ")
+                );
+            }
+            OperationError::InvalidState
+        })
+}
+
+/// Resolve the S3 configuration an offline recovery command (`restore-s3`, `verify-s3`,
+/// `list-backups`) uses.
+///
+/// Without `region`, that is the `[online_backup.s3]` section of the server configuration
+/// (the primary). With `region`, it is the `[[online_backup.s3.replication.regions]]` entry
+/// of that name: the replica's bucket, endpoint, prefix, credentials and encryption, so a
+/// backup can be recovered from a replica while the primary is unavailable. `bucket` and
+/// `endpoint` then override whichever was selected. Without a configured section and
+/// without `region`, `bucket` must be given; credentials and region then come from the
+/// SDK's default provider chain.
 pub fn s3_config_for_cli(
     config: &Configuration,
     bucket: Option<String>,
-    region: Option<String>,
+    region: Option<&str>,
     endpoint: Option<String>,
 ) -> Result<S3Config, OperationError> {
-    let configured = config
-        .online_backup
-        .as_ref()
-        .and_then(|backup| backup.s3.clone());
+    let configured = match region {
+        Some(name) => Some(replication_region(config, name)?.to_s3_config()),
+        None => config
+            .online_backup
+            .as_ref()
+            .and_then(|backup| backup.s3.clone()),
+    };
 
     let mut s3_config = match (configured, bucket) {
         (Some(mut s3_config), bucket) => {
@@ -676,9 +728,6 @@ pub fn s3_config_for_cli(
         }
     };
 
-    if let Some(region) = region {
-        s3_config.region = Some(region);
-    }
     if let Some(endpoint) = endpoint {
         s3_config.endpoint = Some(endpoint);
     }
@@ -787,13 +836,17 @@ pub async fn verify_s3_backup_server_core(
 }
 
 /// List the backups in the configured locations: the local online backup directory and the
-/// S3 prefix. A location that is not configured is reported as such. Returns false only when
-/// a configured location could not be read.
+/// S3 prefix, or, with `region`, the prefix of that replication region instead of the
+/// primary. A location that is not configured is reported as such. Returns false only when
+/// a configured location could not be read, or when `region` names no configured region.
 pub async fn list_backups_server_core(
     config: &Configuration,
     local_only: bool,
     s3_only: bool,
+    region: Option<&str>,
 ) -> bool {
+    // A replica holds no local backups, so a region listing is an S3 listing.
+    let s3_only = s3_only || region.is_some();
     let mut ok = true;
 
     if !s3_only {
@@ -804,7 +857,7 @@ pub async fn list_backups_server_core(
         if !s3_only {
             println!();
         }
-        ok &= list_s3_backups(config).await;
+        ok &= list_s3_backups(config, region).await;
     }
 
     ok
@@ -886,21 +939,33 @@ fn list_local_backups(config: &Configuration) -> bool {
     true
 }
 
-async fn list_s3_backups(config: &Configuration) -> bool {
-    let Some(s3_config) = config
-        .online_backup
-        .as_ref()
-        .and_then(|backup| backup.s3.clone())
-    else {
-        println!("S3 backups: none configured");
-        return true;
+async fn list_s3_backups(config: &Configuration, region: Option<&str>) -> bool {
+    let s3_config = match region {
+        Some(name) => match replication_region(config, name) {
+            Ok(region_config) => region_config.to_s3_config(),
+            Err(_) => {
+                println!("S3 backups in region {name}: no such replication region is configured");
+                return false;
+            }
+        },
+        None => match config
+            .online_backup
+            .as_ref()
+            .and_then(|backup| backup.s3.clone())
+        {
+            Some(s3_config) => s3_config,
+            None => {
+                println!("S3 backups: none configured");
+                return true;
+            }
+        },
     };
 
-    let location = match &s3_config.path_prefix {
-        Some(prefix) => format!("s3://{}/{}", s3_config.bucket, prefix.trim_end_matches('/')),
-        None => format!("s3://{}", s3_config.bucket),
-    };
-    println!("S3 backups in {location}:");
+    let location = s3_location(&s3_config);
+    match region {
+        Some(name) => println!("S3 backups in region {name} ({location}):"),
+        None => println!("S3 backups in {location}:"),
+    }
 
     let client = match S3ClientWrapper::new(s3_config).await {
         Ok(client) => client,
@@ -968,6 +1033,196 @@ async fn list_s3_backups(config: &Configuration) -> bool {
     }
 
     ok
+}
+
+/// Report the state of cross-region backup replication: for every configured region,
+/// which of the primary's backups it holds intact, its newest backup and how far it lags
+/// behind the primary. `detailed` adds the lag metrics of every region. The database is
+/// never opened, so the command can run next to a running server.
+///
+/// Returns false when replication is not configured or disabled, when the primary bucket
+/// can not be listed, or when any region is unhealthy, so the exit code of
+/// `replicate-status` is usable from monitoring.
+pub async fn replicate_status_server_core(config: &Configuration, detailed: bool) -> bool {
+    let Some(s3_config) = config
+        .online_backup
+        .as_ref()
+        .and_then(|backup| backup.s3.clone())
+    else {
+        println!("Cross-region backup replication: not configured ([online_backup.s3] is absent)");
+        return false;
+    };
+
+    let Some(replication) = s3_config
+        .replication
+        .clone()
+        .filter(|replication| replication.enabled)
+    else {
+        println!(
+            "Cross-region backup replication: not configured ([online_backup.s3.replication] \
+             is absent or disabled)"
+        );
+        return false;
+    };
+
+    let primary = s3_location(&s3_config);
+    let client = match S3ClientWrapper::new(s3_config).await {
+        Ok(client) => client,
+        Err(err) => {
+            error!(%err, "Unable to create the S3 client");
+            println!("Cross-region backup replication: unable to create the S3 client: {err}");
+            return false;
+        }
+    };
+
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let health = match client
+        .check_replication_health(&replication, Some(&now))
+        .await
+    {
+        Ok(health) => health,
+        Err(err) => {
+            error!(%err, "Unable to list the primary backups in {primary}");
+            println!(
+                "Cross-region backup replication: unable to list the primary backups in \
+                 {primary}: {err}"
+            );
+            return false;
+        }
+    };
+
+    print!(
+        "{}",
+        format_replication_report(&primary, &health, &replication, detailed)
+    );
+
+    !health.regions.is_empty() && health.unhealthy_regions == 0
+}
+
+/// The text `replicate-status` prints for a health check.
+fn format_replication_report(
+    primary: &str,
+    health: &ReplicationHealthCheck,
+    replication: &ReplicationConfig,
+    detailed: bool,
+) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    // Writing to a String can not fail; the results are ignored on purpose.
+    let _ = writeln!(
+        out,
+        "Cross-region backup replication: {}",
+        health.overall_status
+    );
+    let _ = writeln!(out, "  Primary: {primary}");
+    if !health.last_check_timestamp.is_empty() {
+        let _ = writeln!(out, "  Checked: {}", health.last_check_timestamp);
+    }
+    let _ = writeln!(
+        out,
+        "  Regions: {} healthy, {} unhealthy",
+        health.healthy_regions, health.unhealthy_regions
+    );
+
+    if health.regions.is_empty() {
+        return out;
+    }
+
+    let short_status = |status: &ReplicationStatus| -> &'static str {
+        match status {
+            ReplicationStatus::NotConfigured => "Not Configured",
+            ReplicationStatus::Pending => "Pending",
+            ReplicationStatus::InProgress => "In Progress",
+            ReplicationStatus::Completed => "Completed",
+            ReplicationStatus::Failed { .. } => "Failed",
+            ReplicationStatus::Degraded { .. } => "Degraded",
+        }
+    };
+    let newest = |region: &kubidm_proto::backup::ReplicationRegionStatus| -> String {
+        region
+            .last_sync_backup_id
+            .clone()
+            .unwrap_or_else(|| "-".to_string())
+    };
+    let lag = |region: &kubidm_proto::backup::ReplicationRegionStatus| -> String {
+        region
+            .lag_seconds
+            .map(|lag| format!("{lag}s"))
+            .unwrap_or_else(|| "-".to_string())
+    };
+
+    let width = |header: &str, values: &mut dyn Iterator<Item = usize>| -> usize {
+        values.max().unwrap_or(0).max(header.len())
+    };
+    let region_width = width(
+        "REGION",
+        &mut health.regions.iter().map(|region| region.region.len()),
+    );
+    let bucket_width = width(
+        "BUCKET",
+        &mut health.regions.iter().map(|region| region.bucket.len()),
+    );
+    let status_width = width(
+        "STATUS",
+        &mut health
+            .regions
+            .iter()
+            .map(|region| short_status(&region.status).len()),
+    );
+    let newest_width = width(
+        "NEWEST",
+        &mut health.regions.iter().map(|region| newest(region).len()),
+    );
+
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "  {:<region_width$}  {:<bucket_width$}  {:<status_width$}  {:>10}  {:>7}  {:<newest_width$}  LAG",
+        "REGION", "BUCKET", "STATUS", "REPLICATED", "PENDING", "NEWEST"
+    );
+    for region in &health.regions {
+        let _ = writeln!(
+            out,
+            "  {:<region_width$}  {:<bucket_width$}  {:<status_width$}  {:>10}  {:>7}  {:<newest_width$}  {}",
+            region.region,
+            region.bucket,
+            short_status(&region.status),
+            region.backups_replicated,
+            region.pending_backups,
+            newest(region),
+            lag(region)
+        );
+        if !region_is_healthy(region) {
+            let _ = writeln!(out, "    {}", region.status);
+        }
+    }
+
+    if detailed {
+        let _ = writeln!(out);
+        let _ = writeln!(out, "  Lag metrics:");
+        let metrics = lag_metrics_from_health(health, replication);
+        for (metric, region) in metrics.iter().zip(&health.regions) {
+            let _ = writeln!(
+                out,
+                "    {}: lag {}, pending {}, newest replicated {}, bytes replicated {}, \
+                 check interval {}s",
+                metric.region,
+                // The metric reports an unknown lag (the region holds none of the primary's
+                // backups) as 0; the report says it is unknown.
+                lag(region),
+                metric.pending_backups,
+                metric.last_backup_timestamp.as_deref().unwrap_or("-"),
+                region.bytes_replicated,
+                metric.replication_delay_seconds
+            );
+            if let Some(error) = &region.last_error {
+                let _ = writeln!(out, "      last error: {error}");
+            }
+        }
+    }
+
+    out
 }
 
 /// Format a file modification time as an RFC3339 UTC timestamp with second precision.
@@ -1479,6 +1734,7 @@ pub(crate) enum TaskName {
     AdminSocket,
     AuditdActor,
     BackupActor,
+    BackupReplicationMonitor,
     DelayedActionActor,
     HttpsServer,
     IntervalActor,
@@ -1497,6 +1753,7 @@ impl Display for TaskName {
                 TaskName::AdminSocket => "Admin Socket",
                 TaskName::AuditdActor => "Auditd Actor",
                 TaskName::BackupActor => "Backup Actor",
+                TaskName::BackupReplicationMonitor => "Backup Replication Monitor",
                 TaskName::DelayedActionActor => "Delayed Action Actor",
                 TaskName::HttpsServer => "HTTPS Server",
                 TaskName::IntervalActor => "Interval Actor",
@@ -1899,12 +2156,12 @@ async fn launch_server_tasks(
         match &config.online_backup {
             Some(online_backup_config) => {
                 if online_backup_config.enabled {
-                    let backup_handle = IntervalActor::start_online_backup(
+                    let backup_handles = IntervalActor::start_online_backup(
                         server_read_ref,
                         online_backup_config,
                         broadcast_tx.subscribe(),
                     )?;
-                    handles.push((TaskName::BackupActor, backup_handle));
+                    handles.extend(backup_handles);
                 } else {
                     debug!("Backups disabled");
                 }
@@ -2056,4 +2313,297 @@ async fn launch_server_tasks(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::OnlineBackup;
+    use kubidm_proto::backup::{ReplicationRegionStatus, S3Credentials};
+
+    fn region(name: &str, bucket: &str) -> ReplicationRegionConfig {
+        ReplicationRegionConfig {
+            region: name.to_string(),
+            endpoint: Some(format!("https://s3.{name}.example.com")),
+            bucket: bucket.to_string(),
+            path_prefix: Some("dr".to_string()),
+            credentials: Some(S3Credentials {
+                access_key_id: format!("{name}-key"),
+                secret_access_key: format!("{name}-secret"),
+                session_token: None,
+            }),
+            server_side_encryption: None,
+            storage_class: "STANDARD_IA".to_string(),
+            kms_key_id: None,
+        }
+    }
+
+    fn config_with_s3(replication: Option<ReplicationConfig>) -> Configuration {
+        let s3 = S3Config {
+            bucket: "primary".to_string(),
+            region: Some("us-east-1".to_string()),
+            endpoint: Some("https://s3.primary.example.com".to_string()),
+            path_prefix: Some("prod".to_string()),
+            credentials: None,
+            server_side_encryption: None,
+            storage_class: "STANDARD".to_string(),
+            replication,
+        };
+        Configuration {
+            online_backup: Some(OnlineBackup {
+                s3: Some(s3),
+                ..OnlineBackup::default()
+            }),
+            ..Configuration::new_for_test()
+        }
+    }
+
+    fn replication(enabled: bool) -> ReplicationConfig {
+        ReplicationConfig {
+            enabled,
+            regions: vec![
+                region("eu-west-1", "primary-eu"),
+                region("ap-southeast-1", "primary-ap"),
+            ],
+            ..ReplicationConfig::default()
+        }
+    }
+
+    #[test]
+    fn s3_config_for_cli_uses_the_primary_without_region() {
+        let config = config_with_s3(Some(replication(true)));
+        let s3 = s3_config_for_cli(&config, None, None, None).expect("primary");
+        assert_eq!(s3.bucket, "primary");
+        assert_eq!(s3.path_prefix.as_deref(), Some("prod"));
+        assert_eq!(
+            s3.endpoint.as_deref(),
+            Some("https://s3.primary.example.com")
+        );
+
+        // Overrides replace the selected settings.
+        let s3 = s3_config_for_cli(
+            &config,
+            Some("other".to_string()),
+            None,
+            Some("https://alt.example.com".to_string()),
+        )
+        .expect("primary with overrides");
+        assert_eq!(s3.bucket, "other");
+        assert_eq!(s3.endpoint.as_deref(), Some("https://alt.example.com"));
+        assert_eq!(s3.path_prefix.as_deref(), Some("prod"));
+    }
+
+    #[test]
+    fn s3_config_for_cli_targets_the_named_region() {
+        let config = config_with_s3(Some(replication(true)));
+        let s3 = s3_config_for_cli(&config, None, Some("ap-southeast-1"), None).expect("region");
+        assert_eq!(s3.bucket, "primary-ap");
+        assert_eq!(s3.region.as_deref(), Some("ap-southeast-1"));
+        assert_eq!(
+            s3.endpoint.as_deref(),
+            Some("https://s3.ap-southeast-1.example.com")
+        );
+        assert_eq!(s3.path_prefix.as_deref(), Some("dr"));
+        assert_eq!(
+            s3.credentials.as_ref().map(|c| c.access_key_id.as_str()),
+            Some("ap-southeast-1-key")
+        );
+        assert_eq!(s3.storage_class, "STANDARD_IA");
+        assert!(s3.replication.is_none());
+
+        // --bucket and --endpoint override the region's settings too.
+        let s3 = s3_config_for_cli(
+            &config,
+            Some("restored-copy".to_string()),
+            Some("eu-west-1"),
+            Some("https://mirror.example.com".to_string()),
+        )
+        .expect("region with overrides");
+        assert_eq!(s3.bucket, "restored-copy");
+        assert_eq!(s3.endpoint.as_deref(), Some("https://mirror.example.com"));
+        assert_eq!(s3.region.as_deref(), Some("eu-west-1"));
+    }
+
+    #[test]
+    fn s3_config_for_cli_region_works_while_replication_is_disabled() {
+        // A replica remains a recovery source after replication has been switched off.
+        let config = config_with_s3(Some(replication(false)));
+        let s3 = s3_config_for_cli(&config, None, Some("eu-west-1"), None)
+            .expect("region of a disabled replication section");
+        assert_eq!(s3.bucket, "primary-eu");
+    }
+
+    #[test]
+    fn s3_config_for_cli_rejects_an_unknown_region() {
+        let config = config_with_s3(Some(replication(true)));
+        assert!(s3_config_for_cli(&config, None, Some("us-west-2"), None).is_err());
+
+        let config = config_with_s3(None);
+        assert!(s3_config_for_cli(&config, None, Some("eu-west-1"), None).is_err());
+
+        // Without replication, --bucket alone can not stand in for a region.
+        assert!(s3_config_for_cli(
+            &config,
+            Some("primary-eu".to_string()),
+            Some("eu-west-1"),
+            None
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn s3_config_for_cli_without_section_needs_a_bucket() {
+        let config = Configuration::new_for_test();
+        assert!(s3_config_for_cli(&config, None, None, None).is_err());
+        let s3 =
+            s3_config_for_cli(&config, Some("adhoc".to_string()), None, None).expect("bucket only");
+        assert_eq!(s3, S3Config::with_bucket("adhoc".to_string()));
+    }
+
+    fn region_status(
+        name: &str,
+        status: ReplicationStatus,
+        replicated: u64,
+        pending: u64,
+        lag: Option<u64>,
+    ) -> ReplicationRegionStatus {
+        ReplicationRegionStatus {
+            region: name.to_string(),
+            bucket: format!("primary-{name}"),
+            status,
+            last_sync_timestamp: Some("2024-01-03T22:00:00Z".to_string()),
+            last_sync_backup_id: Some("backup-2024-01-03T22:00:00Z.json.gz".to_string()),
+            lag_seconds: lag,
+            bytes_replicated: 4096,
+            backups_replicated: replicated,
+            pending_backups: pending,
+            last_error: None,
+        }
+    }
+
+    #[test]
+    fn replication_report_lists_every_region() {
+        let health = ReplicationHealthCheck {
+            overall_status: ReplicationStatus::Degraded {
+                message: "1 of 2 regions unhealthy".to_string(),
+            },
+            regions: vec![
+                region_status("eu-west-1", ReplicationStatus::Completed, 3, 0, Some(0)),
+                region_status(
+                    "ap-southeast-1",
+                    ReplicationStatus::Degraded {
+                        message: "1 of 3 backups not replicated: backup-x is missing".to_string(),
+                    },
+                    2,
+                    1,
+                    Some(86400),
+                ),
+            ],
+            total_lag_seconds: 86400,
+            max_lag_seconds: 86400,
+            healthy_regions: 1,
+            unhealthy_regions: 1,
+            last_check_timestamp: "2024-01-04T00:00:00Z".to_string(),
+        };
+
+        let report =
+            format_replication_report("s3://primary/prod", &health, &replication(true), false);
+        assert!(
+            report.starts_with(
+                "Cross-region backup replication: Degraded: 1 of 2 regions unhealthy\n"
+            ),
+            "{report}"
+        );
+        assert!(
+            report.contains("  Primary: s3://primary/prod\n"),
+            "{report}"
+        );
+        assert!(
+            report.contains("  Checked: 2024-01-04T00:00:00Z\n"),
+            "{report}"
+        );
+        assert!(
+            report.contains("  Regions: 1 healthy, 1 unhealthy\n"),
+            "{report}"
+        );
+        assert!(report.contains("REGION"), "{report}");
+        assert!(report.contains("eu-west-1"), "{report}");
+        assert!(report.contains("primary-ap"), "{report}");
+        // The full reason is spelled out for the unhealthy region only.
+        assert!(
+            report.contains("    Degraded: 1 of 3 backups not replicated: backup-x is missing\n"),
+            "{report}"
+        );
+        assert_eq!(report.matches("\n    ").count(), 1, "{report}");
+        assert!(report.contains("86400s"), "{report}");
+        assert!(!report.contains("Lag metrics"), "{report}");
+
+        let detailed =
+            format_replication_report("s3://primary/prod", &health, &replication(true), true);
+        assert!(detailed.contains("  Lag metrics:\n"), "{detailed}");
+        assert!(
+            detailed.contains(
+                "    ap-southeast-1: lag 86400s, pending 1, newest replicated \
+                 2024-01-03T22:00:00Z, bytes replicated 4096, check interval 300s\n"
+            ),
+            "{detailed}"
+        );
+    }
+
+    #[test]
+    fn replication_report_shows_an_unknown_lag_as_unknown() {
+        let mut failed = region_status(
+            "eu-west-1",
+            ReplicationStatus::Failed {
+                error: "bucket does not exist".to_string(),
+            },
+            0,
+            3,
+            None,
+        );
+        failed.last_sync_backup_id = None;
+        failed.last_sync_timestamp = None;
+        failed.last_error = Some("bucket does not exist".to_string());
+        let health = ReplicationHealthCheck {
+            overall_status: ReplicationStatus::Failed {
+                error: "all 1 regions unhealthy".to_string(),
+            },
+            regions: vec![failed],
+            total_lag_seconds: 0,
+            max_lag_seconds: 0,
+            healthy_regions: 0,
+            unhealthy_regions: 1,
+            last_check_timestamp: String::new(),
+        };
+
+        let report = format_replication_report("s3://primary", &health, &replication(true), true);
+        assert!(
+            report.contains("    eu-west-1: lag -, pending 3, newest replicated -,"),
+            "{report}"
+        );
+        assert!(
+            report.contains("      last error: bucket does not exist\n"),
+            "{report}"
+        );
+        assert!(!report.contains("lag 0s"), "{report}");
+    }
+
+    #[test]
+    fn replication_report_without_regions_has_no_table() {
+        let health = ReplicationHealthCheck {
+            overall_status: ReplicationStatus::NotConfigured,
+            regions: vec![],
+            total_lag_seconds: 0,
+            max_lag_seconds: 0,
+            healthy_regions: 0,
+            unhealthy_regions: 0,
+            last_check_timestamp: String::new(),
+        };
+        let report = format_replication_report("s3://primary", &health, &replication(true), true);
+        assert_eq!(
+            report,
+            "Cross-region backup replication: Not Configured\n  Primary: s3://primary\n  \
+             Regions: 0 healthy, 0 unhealthy\n"
+        );
+    }
 }

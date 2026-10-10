@@ -8,15 +8,16 @@ use cron::Schedule;
 
 use tokio::{
     sync::broadcast,
-    time::{interval, sleep, Duration, MissedTickBehavior},
+    task::JoinHandle,
+    time::{interval, interval_at, sleep, Duration, Instant, MissedTickBehavior},
 };
 
-use crate::backup::S3ClientWrapper;
+use crate::backup::{region_is_healthy, S3ClientWrapper};
 use crate::config::OnlineBackup;
-use crate::CoreAction;
+use crate::{CoreAction, TaskName};
 
 use crate::actors::{QueryServerReadV1, QueryServerWriteV1};
-use kubidm_proto::backup::PitrManifest;
+use kubidm_proto::backup::{PitrManifest, ReplicationConfig, S3Config};
 use kubidmd_lib::constants::PURGE_FREQUENCY;
 use kubidmd_lib::event::{
     OnlineBackupEvent, PurgeDeleteAfterEvent, PurgeRecycledEvent, PurgeTombstoneEvent,
@@ -62,6 +63,9 @@ impl IntervalActor {
         })
     }
 
+    /// Start the scheduled online backup and, when the S3 configuration enables
+    /// cross-region replication, the replication health monitor next to it. Returns the
+    /// handles of the started tasks.
     // Allow this because result is the only way to map and ? to bubble up, but we aren't
     // returning an op-error here because this is in early start up.
     #[allow(clippy::result_unit_err)]
@@ -69,7 +73,7 @@ impl IntervalActor {
         server: &'static QueryServerReadV1,
         online_backup_config: &OnlineBackup,
         mut rx: broadcast::Receiver<CoreAction>,
-    ) -> Result<tokio::task::JoinHandle<()>, ()> {
+    ) -> Result<Vec<(TaskName, JoinHandle<()>)>, ()> {
         let outpath = online_backup_config.path.to_owned();
         let has_local_path = outpath.is_some();
         let has_s3_config = online_backup_config.s3.is_some();
@@ -144,6 +148,23 @@ impl IntervalActor {
         let s3_config = online_backup_config.s3.clone();
         let wal_archive_config = online_backup_config.wal_archive.clone();
 
+        let mut handles = Vec::with_capacity(2);
+
+        // The health monitor is a separate task with its own shutdown receiver, so a slow
+        // or unreachable region can never delay the backup schedule.
+        if let Some(replication) = s3_config
+            .as_ref()
+            .and_then(|s3| s3.replication.clone())
+            .filter(|replication| replication.enabled)
+        {
+            if let Some(s3_cfg) = &s3_config {
+                handles.push((
+                    TaskName::BackupReplicationMonitor,
+                    Self::start_replication_monitor(s3_cfg.clone(), replication, rx.resubscribe()),
+                ));
+            }
+        }
+
         let handle = tokio::spawn(async move {
             for next_time in cron_expr.upcoming(Utc) {
                 let wait_seconds = 1 + (next_time - Utc::now()).num_seconds() as u64;
@@ -213,10 +234,180 @@ impl IntervalActor {
                     }
                 }
             }
-            info!("Stopped {}", super::TaskName::BackupActor);
+            info!("Stopped {}", TaskName::BackupActor);
         });
+        handles.push((TaskName::BackupActor, handle));
 
-        Ok(handle)
+        Ok(handles)
+    }
+
+    /// Every `sync_interval_seconds`, copy to every region the primary backups it misses
+    /// or holds a differing copy of, then check the replication health and log a warning
+    /// for every region that is still behind or can not be reached. The first run happens
+    /// one interval after start up. A run in progress is abandoned on shutdown.
+    fn start_replication_monitor(
+        s3_config: S3Config,
+        replication: ReplicationConfig,
+        mut rx: broadcast::Receiver<CoreAction>,
+    ) -> JoinHandle<()> {
+        let period = replication_monitor_period(&replication);
+        tokio::spawn(async move {
+            let mut ticks = interval_at(Instant::now() + period, period);
+            ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+            info!(
+                "Backup replication monitor syncs and checks {} region(s) every {}s",
+                replication.regions.len(),
+                period.as_secs()
+            );
+
+            loop {
+                tokio::select! {
+                    Ok(action) = rx.recv() => {
+                        match action {
+                            CoreAction::Shutdown => break,
+                            CoreAction::Reload => {}
+                        }
+                    }
+                    _ = ticks.tick() => {
+                        let run = sync_and_report_replication(&s3_config, &replication);
+                        tokio::pin!(run);
+                        let shutdown = loop {
+                            tokio::select! {
+                                _ = &mut run => break false,
+                                action = rx.recv() => match action {
+                                    Ok(CoreAction::Shutdown)
+                                    | Err(broadcast::error::RecvError::Closed) => break true,
+                                    Ok(CoreAction::Reload)
+                                    | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                                },
+                            }
+                        };
+                        if shutdown {
+                            break;
+                        }
+                    }
+                }
+            }
+            info!("Stopped {}", TaskName::BackupReplicationMonitor);
+        })
+    }
+}
+
+/// The period of the replication health monitor. The configuration rejects a zero
+/// interval, but a zero period would panic in `interval_at`, so it is clamped here too.
+fn replication_monitor_period(replication: &ReplicationConfig) -> Duration {
+    Duration::from_secs(replication.sync_interval_seconds.max(1))
+}
+
+/// One run of the replication monitor: copy what every region misses, then report the
+/// health, a warning per unhealthy region and an info line per healthy one. Never fails;
+/// a primary that can not be listed is a warning too.
+async fn sync_and_report_replication(s3_config: &S3Config, replication: &ReplicationConfig) {
+    let client = match S3ClientWrapper::new(s3_config.clone()).await {
+        Ok(client) => client,
+        Err(err) => {
+            warn!(
+                "Backup replication sync skipped: unable to create the S3 client: {}",
+                err
+            );
+            return;
+        }
+    };
+
+    match client.sync_replication(replication).await {
+        Ok(results) => {
+            for (region, result) in results {
+                match result {
+                    Ok(outcome) => {
+                        if !outcome.copied.is_empty() {
+                            info!(
+                                "Backup replication sync copied {} backup(s) to region {}: {}",
+                                outcome.copied.len(),
+                                region,
+                                outcome.copied.join(", ")
+                            );
+                        }
+                        for (key, err) in &outcome.failed {
+                            warn!(
+                                "Backup replication sync failed to copy {} to region {}: {}",
+                                key, region, err
+                            );
+                        }
+                    }
+                    Err(err) => warn!(
+                        "Backup replication sync skipped region {}: unable to list it: {}",
+                        region, err
+                    ),
+                }
+            }
+        }
+        Err(err) => {
+            warn!(
+                "Backup replication sync skipped: unable to list the primary backups in {}: {}",
+                client.location(),
+                err
+            );
+            return;
+        }
+    }
+
+    let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let health = match client
+        .check_replication_health(replication, Some(&now))
+        .await
+    {
+        Ok(health) => health,
+        Err(err) => {
+            warn!(
+                "Backup replication health check skipped: unable to list the primary backups \
+                 in {}: {}",
+                client.location(),
+                err
+            );
+            return;
+        }
+    };
+
+    for region in &health.regions {
+        if region_is_healthy(region) {
+            info!(
+                "Backup replication to region {} (bucket {}) is healthy: {} backups replicated, \
+                 newest {}",
+                region.region,
+                region.bucket,
+                region.backups_replicated,
+                region.last_sync_backup_id.as_deref().unwrap_or("none")
+            );
+        } else {
+            warn!(
+                "Backup replication to region {} (bucket {}) is unhealthy: {}; {} backups \
+                 pending, lag {}",
+                region.region,
+                region.bucket,
+                region.status,
+                region.pending_backups,
+                region
+                    .lag_seconds
+                    .map(|lag| format!("{lag}s"))
+                    .unwrap_or_else(|| "unknown".to_string())
+            );
+        }
+    }
+
+    if health.unhealthy_regions > 0 {
+        warn!(
+            "Backup replication health: {} ({} regions healthy, {} unhealthy, max lag {}s)",
+            health.overall_status,
+            health.healthy_regions,
+            health.unhealthy_regions,
+            health.max_lag_seconds
+        );
+    } else {
+        info!(
+            "Backup replication health: {} ({} regions healthy, max lag {}s)",
+            health.overall_status, health.healthy_regions, health.max_lag_seconds
+        );
     }
 }
 
@@ -261,7 +452,7 @@ async fn update_pitr_manifest(
 
     s3_client
         .upload_backup(
-            manifest_json.into_bytes(),
+            manifest_json.as_bytes(),
             manifest_key,
             backup_timestamp,
             kubidm_proto::backup::BackupCompression::NoCompression,
@@ -271,4 +462,31 @@ async fn update_pitr_manifest(
 
     info!("Updated PITR manifest with base backup: {}", backup_id);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replication_monitor_period_follows_the_sync_interval() {
+        let replication = ReplicationConfig {
+            sync_interval_seconds: 600,
+            ..ReplicationConfig::default()
+        };
+        assert_eq!(
+            replication_monitor_period(&replication),
+            Duration::from_secs(600)
+        );
+
+        // A zero interval is rejected by the configuration; the monitor never panics on it.
+        let replication = ReplicationConfig {
+            sync_interval_seconds: 0,
+            ..ReplicationConfig::default()
+        };
+        assert_eq!(
+            replication_monitor_period(&replication),
+            Duration::from_secs(1)
+        );
+    }
 }
