@@ -1820,10 +1820,26 @@ pub fn defer_restore(dir: &Path, restore: WalRestore) -> Result<(), WalError> {
 /// either (it was killed or crashed, perhaps after its change) is taken over as it is:
 /// recording a gap for a change that did not happen only stops recovery early, while
 /// losing the gap of a change that did happen would replay across it.
+///
+/// Fails when `dir` does not exist: it is not mounted where the command runs, or the
+/// server never created it. The server would never see the gap, so the caller must leave
+/// the database alone.
 pub fn hand_over_gap(dir: &Path, gap: &WalGap) -> Result<HandedOverGap, WalError> {
+    if !dir.is_dir() {
+        return Err(WalError::ConfigError(format!(
+            "the WAL directory {} does not exist here: it is not mounted where this command \
+             runs, or the server never ran with WAL archiving. The server could not see the \
+             gap of the change, so point-in-time recovery would replay across it; run the \
+             command where the WAL directory of the server is mounted",
+            dir.display()
+        )));
+    }
     let gaps_dir = dir.join(WAL_HANDED_OVER_GAPS_DIR);
-    fs::create_dir_all(&gaps_dir)?;
-    sync_dir(dir)?;
+    match fs::create_dir(&gaps_dir) {
+        Ok(()) => sync_dir(dir)?,
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(err) => return Err(err.into()),
+    }
     let name = format!(
         "gap-{}-{}.json",
         gap.from_ts.as_nanos(),

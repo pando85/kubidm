@@ -68,7 +68,8 @@ fn offline_change_gap(db_ts_max: Duration, now: Duration) -> WalGap {
 /// manifest: a server running next to the command owns the manifest, and a read, modify
 /// and write of it here could undo a save of the server's. The server records it at its
 /// next start or archive run, and `recover` honours it meanwhile. Fails when the gap could
-/// not be handed over; the caller must then leave the database alone. Once the change happened, confirm it with [`confirm_offline_change`];
+/// not be handed over, the WAL directory missing included; the caller must then leave the
+/// database alone. Once the change happened, confirm it with [`confirm_offline_change`];
 /// when it does not happen after all, take the gap back with [`withdraw_offline_change`].
 pub async fn note_offline_change(
     config: &Configuration,
@@ -492,11 +493,25 @@ mod tests {
         );
     }
 
+    /// The WAL directory is not where the command runs (a volume the maintenance container
+    /// does not mount): the gap is not handed over, so the caller refuses the change, rather
+    /// than leave it where the server never looks.
     #[tokio::test]
-    async fn test_offline_change_before_the_first_archive_run_is_handed_over() {
+    async fn test_offline_change_without_the_wal_directory_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let settings = settings(dir.path());
         let gap = offline_change_gap(Duration::from_secs(200), Duration::from_secs(300));
+        let refused = record_offline_change(&settings, gap, "db-scan quarantine-id2entry").await;
+        assert!(
+            matches!(&refused, Err(err) if err.to_string().contains("does not exist")),
+            "{refused:?}"
+        );
+        assert!(
+            !settings.local_dir.exists(),
+            "the WAL directory was created"
+        );
+
+        fs::create_dir_all(&settings.local_dir).unwrap();
         let record = record_offline_change(&settings, gap, "db-scan quarantine-id2entry")
             .await
             .unwrap();

@@ -601,10 +601,11 @@ owns the manifest, and the command may run next to it, so the command never writ
 records the confirmed gap at its next start or archive run, and `recover` and `pitr-list` honour it from the WAL
 directory meanwhile. A pending gap whose command stopped without confirming or taking it back (it was killed, perhaps
 right after its commit) is recorded as well, with a warning, since the change may have happened. When the gap can not be
-handed over, the command refuses to change the database and exits non-zero, as it does when the change fails. Recovery
-then stops right before the repair, and an online backup taken after it makes later points recoverable again: take one
-after using these commands. Start the server after a repair before recovering on another host, which only sees the gaps
-the manifest records.
+handed over, the command refuses to change the database and exits non-zero, as it does when the change fails. That
+includes a WAL directory that does not exist where the command runs: run the repair where the server's WAL directory
+(`wal_archive.local_path`) is mounted, or the server would never see the gap. Recovery then stops right before the
+repair, and an online backup taken after it makes later points recoverable again: take one after using these commands.
+Start the server after a repair before recovering on another host, which only sees the gaps the manifest records.
 
 #### Manual Backups as Recovery Bases
 
