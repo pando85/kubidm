@@ -36,7 +36,7 @@ use std::{
     io::prelude::*,
     ops::DerefMut,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, MutexGuard},
     time::Duration,
 };
 use tracing::{trace, trace_span};
@@ -330,6 +330,15 @@ impl BackendConfig {
 
 /// The archiver shared by the backend and the server core's upload task.
 pub type SharedWalArchiver = Arc<Mutex<WalArchiver>>;
+
+/// Lock `archiver`. A thread that panicked while holding the lock does not stop the
+/// archiving: every archiver method leaves it consistent before it can fail, so the
+/// poisoned lock is taken over.
+pub fn lock_wal(archiver: &SharedWalArchiver) -> MutexGuard<'_, WalArchiver> {
+    archiver
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// What [`BackendWriteTransaction::wal_apply`] did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -2359,7 +2368,7 @@ impl<'a> BackendWriteTransaction<'a> {
             return;
         }
 
-        let mut archiver = wal.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut archiver = lock_wal(wal);
 
         if wal_stage_failed {
             archiver.note_failure(wal_cid.as_ref().map(|cid| cid.ts));

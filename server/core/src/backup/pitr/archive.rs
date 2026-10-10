@@ -7,9 +7,9 @@ use std::time::Duration;
 use kubidm_proto::backup::{
     PitrBaseBackup, PitrManifest, PitrWalGap, WalSegment, PITR_MANIFEST_KEY,
 };
-use kubidmd_lib::be::{BackupStructuralReport, SharedWalArchiver};
+use kubidmd_lib::be::{lock_wal, BackupStructuralReport, SharedWalArchiver};
 use kubidmd_lib::prelude::duration_from_epoch_now;
-use kubidmd_lib::repl::wal::{format_ts_rfc3339, list_segments, remove_segment, WalGap};
+use kubidmd_lib::repl::wal::{format_ts_rfc3339, list_segments, remove_segment, WalArchiver, WalGap};
 use tokio::sync::broadcast;
 use tokio::time::{interval, MissedTickBehavior};
 use uuid::Uuid;
@@ -121,8 +121,15 @@ impl PitrArchive {
         self.settings.wal.segment_interval()
     }
 
-    fn server_uuid(&self) -> Uuid {
-        self.lock_archiver().server_uuid()
+    /// Run `work` on the archiver off the async runtime: its lock is held by write
+    /// commits while they close a segment, which must never stall a runtime worker.
+    async fn with_archiver<T, F>(&self, work: F) -> Result<T, PitrError>
+    where
+        F: FnOnce(&mut WalArchiver) -> Result<T, PitrError> + Send + 'static,
+        T: Send + 'static,
+    {
+        let archiver = self.archiver.clone();
+        blocking(move || work(&mut lock_wal(&archiver))).await
     }
 
     /// Close the open segment when it is stale (or always, with `force_flush`), move every
@@ -135,50 +142,55 @@ impl PitrArchive {
         let _guard = self.manifest_lock.lock().await;
         let mut report = PitrSyncReport::default();
 
-        // Closing a segment writes a file; keep it off the async runtime.
-        let archiver = self.archiver.clone();
-        let flushed = tokio::task::spawn_blocking(move || {
-            let mut archiver = archiver
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if force_flush {
-                archiver.flush_current_segment()
-            } else {
-                archiver.flush_if_stale(now)
-            }
-        })
-        .await
-        .map_err(|err| PitrError::Manifest(format!("flush task failed: {err}")))??;
+        let (flushed, events, server_uuid) = self
+            .with_archiver(move |archiver| {
+                let flushed = if force_flush {
+                    archiver.flush_current_segment()
+                } else {
+                    archiver.flush_if_stale(now)
+                }?;
+                Ok((
+                    flushed,
+                    archiver.pending_events(),
+                    archiver.server_uuid(),
+                ))
+            })
+            .await?;
         report.flushed = flushed.is_some();
 
-        // Gaps the archiver noticed go into the manifest with this run, and back to the
-        // archiver when the run fails, so that none is ever forgotten.
-        let gaps = self.lock_archiver().take_gaps();
-        let mut gaps_recorded = false;
+        // The events the archiver noticed go into the manifest with this run. They stay
+        // pending in the archiver, on disk, until a saved manifest records them.
+        let mut events_recorded = false;
         let result = self
-            .sync_locked(now, &gaps, &mut gaps_recorded, &mut report)
+            .sync_locked(
+                now,
+                &events.gaps,
+                server_uuid,
+                &mut events_recorded,
+                &mut report,
+            )
             .await;
-        if !gaps_recorded && !gaps.is_empty() {
-            self.lock_archiver().restore_gaps(gaps);
+        if events_recorded && !events.is_empty() {
+            self.with_archiver(move |archiver| Ok(archiver.acknowledge_events(&events)?))
+                .await
+                .unwrap_or_else(|err| {
+                    // They are recorded twice at worst, which changes nothing.
+                    warn!(%err, "Unable to forget the WAL archive events the manifest records");
+                });
         }
         result.map(|()| report)
     }
 
-    /// At shutdown: hand the gaps that could not be recorded to the next start.
+    /// At shutdown: make sure the events no manifest records yet are on disk for the next
+    /// start.
     pub fn defer_gaps_to_next_start(&self) {
-        if let Err(err) = self.lock_archiver().defer_gaps_to_next_start() {
+        if let Err(err) = lock_wal(&self.archiver).defer_gaps_to_next_start() {
             error!(
                 %err,
                 "Unable to hand the WAL archive gaps to the next start; point-in-time recovery \
                  may replay across them. Take a new online backup."
             );
         }
-    }
-
-    fn lock_archiver(&self) -> std::sync::MutexGuard<'_, kubidmd_lib::repl::wal::WalArchiver> {
-        self.archiver
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// One synchronisation, in steps that each say whether they changed the manifest:
@@ -189,7 +201,8 @@ impl PitrArchive {
         &self,
         now: Duration,
         gaps: &[WalGap],
-        gaps_recorded: &mut bool,
+        server_uuid: Uuid,
+        events_recorded: &mut bool,
         report: &mut PitrSyncReport,
     ) -> Result<(), PitrError> {
         let local_segments = {
@@ -197,7 +210,6 @@ impl PitrArchive {
             blocking(move || Ok(list_segments(&local_dir)?)).await?
         };
         let store = PitrStore::open(&self.settings.location).await?;
-        let server_uuid = self.server_uuid();
         let (mut manifest, existed) =
             load_or_new_manifest(&store, &self.settings.location, server_uuid).await?;
         let mut changed = !existed;
@@ -209,7 +221,7 @@ impl PitrArchive {
 
         if !archived.segments.is_empty() || changed {
             store.save_manifest(&mut manifest).await?;
-            *gaps_recorded = true;
+            *events_recorded = true;
             changed = false;
             report.archived = archived.segments.len();
             self.cleanup_local(&store, &archived.segments).await?;
@@ -226,7 +238,7 @@ impl PitrArchive {
         if changed {
             store.save_manifest(&mut manifest).await?;
         }
-        *gaps_recorded = true;
+        *events_recorded = true;
 
         self.replicate(&store, &mut manifest, now, report).await;
 
@@ -415,7 +427,9 @@ impl PitrArchive {
 
         let _guard = self.manifest_lock.lock().await;
         let store = PitrStore::open(&self.settings.location).await?;
-        let server_uuid = self.server_uuid();
+        let server_uuid = self
+            .with_archiver(|archiver| Ok(archiver.server_uuid()))
+            .await?;
         if let Some(db_s_uuid) = report.db_s_uuid {
             if db_s_uuid != server_uuid {
                 return Err(PitrError::Manifest(format!(
@@ -794,7 +808,7 @@ mod tests {
         append(1300);
 
         archive.sync(Duration::from_secs(1400), true).await.unwrap();
-        assert!(archiver.lock().unwrap().take_gaps().is_empty());
+        assert!(archiver.lock().unwrap().pending_events().is_empty());
         let store = PitrStore::open(&archive.settings.location).await.unwrap();
         let manifest = store.load_manifest().await.unwrap().unwrap();
         assert_eq!(manifest.gaps.len(), 1);

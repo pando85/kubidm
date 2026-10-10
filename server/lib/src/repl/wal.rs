@@ -46,6 +46,10 @@ const WAL_TMP_SUFFIX: &str = ".tmp";
 /// memory. Finding it at startup means the previous run stopped without closing that
 /// segment, so its records are missing from the archive.
 pub const WAL_OPEN_SEGMENT_MARKER: &str = ".open-segment.json";
+/// The archive events (gaps) the archive index does not record yet. They are kept on disk
+/// from the moment they are noticed until a synchronisation recorded them, so that a crash,
+/// or a run of crashes, never forgets one.
+pub const WAL_PENDING_EVENTS_FILE: &str = ".pending-events.json";
 /// Fixed per record overhead assumed when measuring a segment against `segment_size_bytes`.
 const RECORD_OVERHEAD_BYTES: u64 = 96;
 
@@ -154,7 +158,7 @@ impl From<serde_json::Error> for WalError {
 /// CID timestamps whose records are missing from the archive: a transaction that could
 /// not be recorded, or the open segment of a run that stopped without closing it.
 /// Recovery can not replay across a gap; only a base backup taken after it can.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WalGap {
     /// The first CID timestamp that may be missing.
     pub from_ts: Duration,
@@ -165,7 +169,7 @@ pub struct WalGap {
     pub reason: WalGapReason,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WalGapReason {
     /// A committed transaction could not be recorded.
     ArchiveFailure,
@@ -179,6 +183,30 @@ impl std::fmt::Display for WalGapReason {
             WalGapReason::ArchiveFailure => write!(f, "a committed transaction was not archived"),
             WalGapReason::UnclosedSegment => {
                 write!(f, "the server stopped without archiving its open segment")
+            }
+        }
+    }
+}
+
+/// What the archiver noticed that the archive index must record: the content of
+/// [`WAL_PENDING_EVENTS_FILE`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WalPendingEvents {
+    /// Gaps, oldest first.
+    #[serde(default)]
+    pub gaps: Vec<WalGap>,
+}
+
+impl WalPendingEvents {
+    pub fn is_empty(&self) -> bool {
+        self.gaps.is_empty()
+    }
+
+    /// Remove the events of `recorded`, each once.
+    fn remove(&mut self, recorded: &WalPendingEvents) {
+        for gap in &recorded.gaps {
+            if let Some(index) = self.gaps.iter().position(|known| known == gap) {
+                self.gaps.remove(index);
             }
         }
     }
@@ -213,8 +241,9 @@ pub struct WalArchiver {
     segments_path: PathBuf,
     current_segment: Option<WalSegmentBuilder>,
     stats: WalArchiverStats,
-    /// Gaps not yet reported to the archive index.
-    gaps: Vec<WalGap>,
+    /// Events not yet recorded by the archive index, mirrored in
+    /// [`WAL_PENDING_EVENTS_FILE`].
+    pending: WalPendingEvents,
     /// CID timestamp of the last record appended, the lower bound of a gap whose
     /// transaction carried no CID.
     last_ts: Option<Duration>,
@@ -253,27 +282,22 @@ impl WalArchiver {
         })?;
         let _ = fs::remove_file(&probe);
 
+        // Events an earlier run noticed and no synchronisation recorded yet.
+        let mut pending = read_pending_events(&segments_path);
+
         // A marker left behind means the previous run stopped with records that were never
-        // written to a segment.
-        let mut gaps = Vec::new();
+        // written to a segment. The gap is made durable before the marker goes, so that a
+        // crash before the next synchronisation still reports it.
         let marker_path = segments_path.join(WAL_OPEN_SEGMENT_MARKER);
-        if marker_path.exists() {
-            let from_ts = fs::read(&marker_path)
-                .ok()
-                .and_then(|data| serde_json::from_slice::<OpenSegmentMarker>(&data).ok())
-                .map(|marker| marker.start_ts)
-                .unwrap_or(Duration::ZERO);
+        if let Some(gap) = read_marker_gap(&segments_path) {
             error!(
-                from = %format_ts_rfc3339(from_ts),
+                from = %format_ts_rfc3339(gap.from_ts),
                 "WAL ARCHIVE HOLE: the previous run stopped without archiving its open segment. \
                  Point-in-time recovery can not replay the transactions committed since then \
                  until a new base backup is taken."
             );
-            gaps.push(WalGap {
-                from_ts,
-                until_ts: None,
-                reason: WalGapReason::UnclosedSegment,
-            });
+            pending.gaps.push(gap);
+            write_pending_events(&segments_path, &pending)?;
             fs::remove_file(&marker_path)?;
         }
 
@@ -290,7 +314,7 @@ impl WalArchiver {
             segments_path,
             current_segment: None,
             stats: WalArchiverStats::default(),
-            gaps,
+            pending,
             last_ts: None,
         })
     }
@@ -335,43 +359,52 @@ impl WalArchiver {
     /// the transaction, when it is known.
     pub fn note_failure(&mut self, cid_ts: Option<Duration>) {
         self.stats.failures += 1;
-        self.gaps.push(WalGap {
+        self.add_gap(WalGap {
             from_ts: cid_ts.or(self.last_ts).unwrap_or(Duration::ZERO),
             until_ts: cid_ts,
             reason: WalGapReason::ArchiveFailure,
         });
     }
 
-    /// The gaps not yet reported, which the caller must record in the archive index. Hand
-    /// them back with [`Self::restore_gaps`] when that fails.
-    pub fn take_gaps(&mut self) -> Vec<WalGap> {
-        std::mem::take(&mut self.gaps)
+    /// Remember `gap` until the archive index records it, on disk first.
+    fn add_gap(&mut self, gap: WalGap) {
+        self.pending.gaps.push(gap);
+        self.persist_pending();
     }
 
-    /// Return gaps taken with [`Self::take_gaps`] that could not be recorded.
-    pub fn restore_gaps(&mut self, gaps: Vec<WalGap>) {
-        let mut gaps = gaps;
-        gaps.append(&mut self.gaps);
-        self.gaps = gaps;
+    /// Write the pending events to [`WAL_PENDING_EVENTS_FILE`]. A failure is logged; the
+    /// events stay in memory and are written again with the next event or at shutdown.
+    fn persist_pending(&mut self) {
+        if let Err(err) = write_pending_events(&self.segments_path, &self.pending) {
+            error!(
+                %err,
+                "Unable to keep the WAL archive gaps on disk; a crash before the next \
+                 archive synchronisation would forget them"
+            );
+        }
     }
 
-    /// Hand the gaps not yet reported to the next start: when the process ends before
-    /// they reach the archive index, the open segment marker is written so that the next
-    /// [`WalArchiver::new`] reports them again (from the earliest one on). Call after the
+    /// The events the archive index must record. Once it did, hand them to
+    /// [`Self::acknowledge_events`]; until then they stay pending, on disk as well.
+    pub fn pending_events(&self) -> WalPendingEvents {
+        self.pending.clone()
+    }
+
+    /// Forget the events of `recorded`, which the archive index now records. Events noticed
+    /// since they were taken stay pending.
+    pub fn acknowledge_events(&mut self, recorded: &WalPendingEvents) -> Result<(), WalError> {
+        if recorded.is_empty() {
+            return Ok(());
+        }
+        self.pending.remove(recorded);
+        write_pending_events(&self.segments_path, &self.pending)
+    }
+
+    /// At the end of a run: make sure the events the archive index does not record yet
+    /// are on disk, so that the next [`WalArchiver::new`] reports them again. Call after the
     /// last flush.
     pub fn defer_gaps_to_next_start(&mut self) -> Result<(), WalError> {
-        let Some(from_ts) = self.gaps.iter().map(|gap| gap.from_ts).min() else {
-            return Ok(());
-        };
-        let marker = OpenSegmentMarker {
-            start_ts: self
-                .current_segment
-                .as_ref()
-                .map_or(from_ts, |segment| segment.start_ts.min(from_ts)),
-        };
-        fs::write(self.marker_path(), serde_json::to_vec(&marker)?)?;
-        self.gaps.clear();
-        Ok(())
+        write_pending_events(&self.segments_path, &self.pending)
     }
 
     fn marker_path(&self) -> PathBuf {
@@ -644,6 +677,91 @@ pub fn is_wal_segment_name(name: &str) -> bool {
 /// The sidecar path of the segment `segment_id` in `dir`.
 pub fn segment_meta_path(dir: &Path, segment_id: &str) -> PathBuf {
     dir.join(format!("{segment_id}{WAL_SEGMENT_META_SUFFIX}"))
+}
+
+/// Atomically replace `dir/name` with `data`: written to a temporary file that is synced
+/// before it is renamed, then the directory is synced, so that after a crash the file is
+/// either the old or the new content, never a torn one.
+fn write_file_durably(dir: &Path, name: &str, data: &[u8]) -> Result<(), WalError> {
+    let path = dir.join(name);
+    let tmp = dir.join(format!("{name}{WAL_TMP_SUFFIX}"));
+    let mut file = fs::File::create(&tmp)?;
+    file.write_all(data)?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(&tmp, &path)?;
+    sync_dir(dir)
+}
+
+/// Sync the directory `dir`, so that a rename or removal in it survives a crash.
+pub fn sync_dir(dir: &Path) -> Result<(), WalError> {
+    #[cfg(unix)]
+    fs::File::open(dir)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
+}
+
+/// The events left in [`WAL_PENDING_EVENTS_FILE`] in `dir`. A file that can not be read is
+/// reported as a gap over all of history, since what it held is unknown.
+pub fn read_pending_events(dir: &Path) -> WalPendingEvents {
+    let path = dir.join(WAL_PENDING_EVENTS_FILE);
+    let data = match fs::read(&path) {
+        Ok(data) => data,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return WalPendingEvents::default()
+        }
+        Err(err) => {
+            error!(%err, path = %path.display(), "Unable to read the pending WAL archive events");
+            return unreadable_pending_events();
+        }
+    };
+    serde_json::from_slice(&data).unwrap_or_else(|err| {
+        error!(%err, path = %path.display(), "Unable to parse the pending WAL archive events");
+        unreadable_pending_events()
+    })
+}
+
+fn unreadable_pending_events() -> WalPendingEvents {
+    WalPendingEvents {
+        gaps: vec![WalGap {
+            from_ts: Duration::ZERO,
+            until_ts: None,
+            reason: WalGapReason::ArchiveFailure,
+        }],
+    }
+}
+
+/// Write `events` to [`WAL_PENDING_EVENTS_FILE`] in `dir`, or remove the file when there
+/// are none.
+pub fn write_pending_events(dir: &Path, events: &WalPendingEvents) -> Result<(), WalError> {
+    if events.is_empty() {
+        return match fs::remove_file(dir.join(WAL_PENDING_EVENTS_FILE)) {
+            Ok(()) => sync_dir(dir),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err.into()),
+        };
+    }
+    write_file_durably(dir, WAL_PENDING_EVENTS_FILE, &serde_json::to_vec(events)?)
+}
+
+/// The gap the open segment marker left in `dir` by a run that stopped without closing
+/// its segment, if there is one. Its end is unknown.
+pub fn read_marker_gap(dir: &Path) -> Option<WalGap> {
+    let marker_path = dir.join(WAL_OPEN_SEGMENT_MARKER);
+    if !marker_path.exists() {
+        return None;
+    }
+    let from_ts = fs::read(&marker_path)
+        .ok()
+        .and_then(|data| serde_json::from_slice::<OpenSegmentMarker>(&data).ok())
+        .map(|marker| marker.start_ts)
+        .unwrap_or(Duration::ZERO);
+    Some(WalGap {
+        from_ts,
+        until_ts: None,
+        reason: WalGapReason::UnclosedSegment,
+    })
 }
 
 /// Serialise, compress, checksum and atomically write `file` and its sidecar into `dir`.
@@ -1123,7 +1241,7 @@ mod tests {
         let marker = wal_dir.join(WAL_OPEN_SEGMENT_MARKER);
 
         let mut archiver = WalArchiver::new(test_config(), server, wal_dir.clone()).unwrap();
-        assert!(archiver.take_gaps().is_empty());
+        assert!(archiver.pending_events().is_empty());
         assert!(!marker.exists());
 
         // The first record of a segment leaves the marker behind until the segment closes.
@@ -1138,62 +1256,93 @@ mod tests {
         assert!(!marker.exists());
 
         // A run that stops with records in memory leaves the marker; the next start
-        // reports everything from the first of those records on as missing.
+        // reports everything from the first of those records on as missing, and keeps
+        // that gap on disk instead of the marker.
         archiver
             .record_create(&cid(server, 20), 3, Uuid::new_v4(), vec![3])
             .unwrap();
         drop(archiver);
         let mut restarted = WalArchiver::new(test_config(), server, wal_dir.clone()).unwrap();
         assert!(!marker.exists());
-        let gaps = restarted.take_gaps();
-        assert_eq!(
-            gaps,
-            vec![WalGap {
-                from_ts: Duration::from_secs(20),
-                until_ts: None,
-                reason: WalGapReason::UnclosedSegment,
-            }]
-        );
-        assert!(restarted.take_gaps().is_empty());
+        assert!(wal_dir.join(WAL_PENDING_EVENTS_FILE).is_file());
+        let unclosed = WalGap {
+            from_ts: Duration::from_secs(20),
+            until_ts: None,
+            reason: WalGapReason::UnclosedSegment,
+        };
+        assert_eq!(restarted.pending_events().gaps, vec![unclosed]);
 
-        // Gaps that could not be recorded are handed back, ahead of newer ones.
+        // Recorded gaps are acknowledged; one noticed meanwhile stays pending.
+        let recorded = restarted.pending_events();
         restarted.note_failure(Some(Duration::from_secs(30)));
-        restarted.restore_gaps(gaps.clone());
-        let all = restarted.take_gaps();
-        assert_eq!(all.len(), 2);
-        assert_eq!(all[0], gaps[0]);
+        restarted.acknowledge_events(&recorded).unwrap();
         assert_eq!(
-            all[1],
-            WalGap {
+            restarted.pending_events().gaps,
+            vec![WalGap {
                 from_ts: Duration::from_secs(30),
                 until_ts: Some(Duration::from_secs(30)),
                 reason: WalGapReason::ArchiveFailure,
-            }
+            }]
         );
         assert_eq!(restarted.stats().failures, 1);
+        let recorded = restarted.pending_events();
+        restarted.acknowledge_events(&recorded).unwrap();
+        assert!(restarted.pending_events().is_empty());
+        assert!(!wal_dir.join(WAL_PENDING_EVENTS_FILE).exists());
     }
 
     #[test]
-    fn test_unreported_gaps_are_handed_to_the_next_start() {
+    fn test_gaps_survive_repeated_crashes_before_they_are_recorded() {
         let server = Uuid::new_v4();
         let dir = tempfile::tempdir().unwrap();
         let wal_dir = dir.path().join("wal");
 
+        // Crash with records of 100 in memory.
         let mut archiver = WalArchiver::new(test_config(), server, wal_dir.clone()).unwrap();
-        // Nothing to hand over: no marker.
-        archiver.defer_gaps_to_next_start().unwrap();
-        assert!(!wal_dir.join(WAL_OPEN_SEGMENT_MARKER).exists());
-
-        archiver.note_failure(Some(Duration::from_secs(50)));
-        archiver.note_failure(Some(Duration::from_secs(30)));
-        archiver.defer_gaps_to_next_start().unwrap();
-        assert!(archiver.take_gaps().is_empty());
+        archiver
+            .record_create(&cid(server, 100), 1, Uuid::new_v4(), vec![1])
+            .unwrap();
         drop(archiver);
 
-        let mut restarted = WalArchiver::new(test_config(), server, wal_dir).unwrap();
-        let gaps = restarted.take_gaps();
+        // The next run reports [100, ...) but never records it (the archive is
+        // unreachable), commits at 200, and crashes again before closing that segment.
+        let mut second = WalArchiver::new(test_config(), server, wal_dir.clone()).unwrap();
+        assert_eq!(second.pending_events().gaps.len(), 1);
+        second
+            .record_create(&cid(server, 200), 2, Uuid::new_v4(), vec![2])
+            .unwrap();
+        second.note_failure(Some(Duration::from_secs(250)));
+        drop(second);
+
+        // Every hole is still reported: the first one was not replaced by the later marker.
+        let third = WalArchiver::new(test_config(), server, wal_dir).unwrap();
+        let starts: Vec<(Duration, WalGapReason)> = third
+            .pending_events()
+            .gaps
+            .iter()
+            .map(|gap| (gap.from_ts, gap.reason))
+            .collect();
+        assert_eq!(
+            starts,
+            vec![
+                (Duration::from_secs(100), WalGapReason::UnclosedSegment),
+                (Duration::from_secs(250), WalGapReason::ArchiveFailure),
+                (Duration::from_secs(200), WalGapReason::UnclosedSegment),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_unreadable_pending_events_are_reported_as_a_gap_over_all_history() {
+        let server = Uuid::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("wal");
+        fs::create_dir_all(&wal_dir).unwrap();
+        fs::write(wal_dir.join(WAL_PENDING_EVENTS_FILE), b"{ torn").unwrap();
+        let archiver = WalArchiver::new(test_config(), server, wal_dir).unwrap();
+        let gaps = archiver.pending_events().gaps;
         assert_eq!(gaps.len(), 1);
-        assert_eq!(gaps[0].from_ts, Duration::from_secs(30));
+        assert_eq!(gaps[0].from_ts, Duration::ZERO);
         assert_eq!(gaps[0].until_ts, None);
     }
 
@@ -1202,15 +1351,15 @@ mod tests {
         let server = Uuid::new_v4();
         let (_dir, mut archiver) = archiver(test_config(), server);
         archiver.note_failure(None);
-        assert_eq!(archiver.take_gaps()[0].from_ts, Duration::ZERO);
+        assert_eq!(archiver.pending_events().gaps[0].from_ts, Duration::ZERO);
 
         archiver
             .record_create(&cid(server, 40), 1, Uuid::new_v4(), vec![1])
             .unwrap();
         archiver.note_failure(None);
-        let gaps = archiver.take_gaps();
-        assert_eq!(gaps[0].from_ts, Duration::from_secs(40));
-        assert_eq!(gaps[0].until_ts, None);
+        let gaps = archiver.pending_events().gaps;
+        assert_eq!(gaps[1].from_ts, Duration::from_secs(40));
+        assert_eq!(gaps[1].until_ts, None);
     }
 
     #[test]
@@ -1238,7 +1387,7 @@ mod tests {
         assert_eq!(archiver.pending_record_count(), 1);
         assert_eq!(archiver.stats().flush_failures, 1);
         assert_eq!(archiver.stats().failures, 0);
-        assert!(archiver.take_gaps().is_empty());
+        assert!(archiver.pending_events().is_empty());
         assert!(archiver.flush_current_segment().is_err());
         assert_eq!(archiver.pending_record_count(), 1);
 
