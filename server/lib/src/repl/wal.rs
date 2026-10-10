@@ -438,6 +438,20 @@ impl WalArchiver {
         server_uuid: Uuid,
         segments_path: PathBuf,
     ) -> Result<Self, WalError> {
+        Self::open(config, server_uuid, segments_path, None)
+    }
+
+    /// [`Self::new`] for a database whose last committed transaction has the CID timestamp
+    /// `db_ts_max`. The records an earlier run left unwritten all belong to transactions
+    /// up to it, so the gap they leave ends there rather than at the first
+    /// synchronisation, which may come long after the start when the archive is
+    /// unreachable.
+    pub fn open(
+        config: WalArchiveConfig,
+        server_uuid: Uuid,
+        segments_path: PathBuf,
+        db_ts_max: Option<Duration>,
+    ) -> Result<Self, WalError> {
         config.validate().map_err(WalError::ConfigError)?;
 
         fs::create_dir_all(&segments_path)?;
@@ -463,7 +477,8 @@ impl WalArchiver {
         // written to a segment. The gap is made durable before the marker goes, so that a
         // crash before the next synchronisation still reports it.
         let marker_path = segments_path.join(WAL_OPEN_SEGMENT_MARKER);
-        if let Some(gap) = read_marker_gap(&segments_path) {
+        if let Some(mut gap) = read_marker_gap(&segments_path) {
+            gap.until_ts = db_ts_max.map(|ts| ts.max(gap.from_ts));
             error!(
                 from = %format_ts_rfc3339(gap.from_ts),
                 "WAL ARCHIVE HOLE: the previous run stopped without archiving its open segment. \
@@ -1719,12 +1734,19 @@ mod tests {
             .record_create(&cid(server, 20), 3, Uuid::new_v4(), vec![3])
             .unwrap();
         drop(archiver);
-        let mut restarted = WalArchiver::new(test_config(), server, wal_dir.clone()).unwrap();
+        // The database it left behind committed up to 25: the gap ends there.
+        let mut restarted = WalArchiver::open(
+            test_config(),
+            server,
+            wal_dir.clone(),
+            Some(Duration::from_secs(25)),
+        )
+        .unwrap();
         assert!(!marker.exists());
         assert!(wal_dir.join(WAL_PENDING_EVENTS_FILE).is_file());
         let unclosed = WalGap {
             from_ts: Duration::from_secs(20),
-            until_ts: None,
+            until_ts: Some(Duration::from_secs(25)),
             reason: WalGapReason::UnclosedSegment,
         };
         assert_eq!(restarted.pending_events().gaps, vec![unclosed]);

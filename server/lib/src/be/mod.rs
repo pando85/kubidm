@@ -2776,8 +2776,11 @@ impl Backend {
         // Now rebuild the ruv.
         let wal_segments_path = be.cfg.wal_segments_path()?;
         let mut be_write = be.write()?;
-        let s_uuid = match wal_segments_path.as_ref() {
-            Some(_) => Some(be_write.get_db_s_uuid()?),
+        let wal_identity = match wal_segments_path.as_ref() {
+            Some(_) => Some((
+                be_write.get_db_s_uuid()?,
+                be_write.get_idlayer().get_db_ts_max()?,
+            )),
             None => None,
         };
         be_write
@@ -2790,13 +2793,14 @@ impl Backend {
 
         // WAL archiving starts only once the database is set up, so that the server uuid
         // the segments are tagged with is the one the database carries.
-        if let (Some(segments_path), Some(s_uuid), Some(wal_cfg)) =
-            (wal_segments_path, s_uuid, be.cfg.wal_archive.clone())
+        if let (Some(segments_path), Some((s_uuid, db_ts_max)), Some(wal_cfg)) =
+            (wal_segments_path, wal_identity, be.cfg.wal_archive.clone())
         {
-            let archiver = WalArchiver::new(wal_cfg, s_uuid, segments_path).map_err(|err| {
-                admin_error!(%err, "Failed to start WAL archiving");
-                OperationError::FsError
-            })?;
+            let archiver =
+                WalArchiver::open(wal_cfg, s_uuid, segments_path, db_ts_max).map_err(|err| {
+                    admin_error!(%err, "Failed to start WAL archiving");
+                    OperationError::FsError
+                })?;
             be.wal = Some(Arc::new(Mutex::new(archiver)));
         }
 
