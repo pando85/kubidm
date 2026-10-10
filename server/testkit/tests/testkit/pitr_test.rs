@@ -27,15 +27,16 @@ use kubidmd_core::backup::pitr::{
 };
 use kubidmd_core::backup::{is_encrypted_artifact, MIN_KDF_M_COST};
 use kubidmd_core::config::{Configuration, OnlineBackup};
+use kubidmd_core::{restore_s3_database, restore_server_core, RestoreStatus};
 use kubidmd_lib::be::SharedWalArchiver;
 use kubidmd_lib::repl::wal::{format_ts_rfc3339, list_segments, WalArchiver};
 use kubidmd_testkit::{login_put_admin_idm_admins, setup_async_test, AsyncTestEnvironment};
 use uuid::Uuid;
 
 use super::backup_common::{
-    assert_directory_state_restored, config_with_db, delete_prefix, ensure_bucket, full_key,
-    object_keys, populate, run, s3_object, sdk_client, test_s3_config, test_s3_region,
-    BACKUP_ENGINEERS_GROUP,
+    assert_directory_state_restored, backup_via_production_path, config_with_db, delete_prefix,
+    ensure_bucket, full_key, object_keys, populate, run, s3_object, sdk_client, test_s3_config,
+    test_s3_region, BACKUP_ENGINEERS_GROUP,
 };
 
 /// Created after the base backup and before the recovery target.
@@ -840,4 +841,191 @@ fn test_pitr_s3_encrypted_replicated_recover_from_region() {
         delete_prefix(&sdk, &s3_config).await;
         delete_prefix(&sdk, &region_s3).await;
     }));
+}
+
+// === Restores abandon history ===
+
+/// An endpoint nothing listens on.
+const UNREACHABLE_ENDPOINT: &str = "http://127.0.0.1:1";
+
+/// Created on the source after its base backup, and abandoned by a restore of that backup.
+const PITR_USER_ABANDONED: &str = "pitr_user_abandoned";
+
+/// Boot the database a restore produced from the base backup of `write_abandoned_history`:
+/// the abandoned write is not there. Write new history on it and shut it down.
+async fn write_new_history_after_restore(config: Configuration) {
+    let mut env = setup_async_test(config).await;
+    login_put_admin_idm_admins(&env.rsclient).await;
+    assert_directory_state_restored(&env.rsclient).await;
+    assert!(!person_exists(&env.rsclient, PITR_USER_ABANDONED).await);
+    env.rsclient
+        .idm_person_account_create(PITR_USER_NEW_HISTORY, "New history")
+        .await
+        .expect("Failed to create the person on the restored server");
+    env.core_handle.shutdown().await;
+}
+
+/// Write a person after the base backup on `env`, archive it, and shut the server down.
+async fn write_abandoned_history(mut env: AsyncTestEnvironment) {
+    env.rsclient
+        .idm_person_account_create(PITR_USER_ABANDONED, "Abandoned")
+        .await
+        .expect("Failed to create the person after the base backup");
+    archive_now(&env).await;
+    env.core_handle.shutdown().await;
+}
+
+/// Recover `config` to the latest point and check that it holds the history written after
+/// the restore, and not the history the restore abandoned.
+async fn assert_latest_skips_abandoned_history(config: Configuration) {
+    pitr_recover_server_core(&config, &RecoveryTargetSpec::Latest, false, None)
+        .await
+        .expect("Recovery to the latest point failed");
+    let mut env = setup_async_test(config).await;
+    login_put_admin_idm_admins(&env.rsclient).await;
+    assert_directory_state_restored(&env.rsclient).await;
+    assert!(
+        person_exists(&env.rsclient, PITR_USER_NEW_HISTORY).await,
+        "The history written after the restore must be recovered"
+    );
+    assert!(
+        !person_exists(&env.rsclient, PITR_USER_ABANDONED).await,
+        "The history the restore abandoned must never be replayed"
+    );
+    env.core_handle.shutdown().await;
+}
+
+/// `kubidmd database restore` of a base backup, with WAL archiving configured, records in
+/// the archive that the history after the backup was abandoned, so a later `recover` never
+/// replays it.
+#[test]
+fn test_pitr_restore_abandons_the_history_after_the_backup() {
+    run(async {
+        let workdir = tempfile::tempdir().expect("Failed to create workdir");
+        let backup_dir = workdir.path().join("backups");
+        let wal_dir = workdir.path().join("wal");
+        let config = pitr_config(
+            &workdir.path().join("source.db"),
+            &backup_dir,
+            &wal_dir,
+            None,
+        );
+
+        let env = setup_async_test(config.clone()).await;
+        populate(&env).await;
+        let base = backup_via_production_path(
+            &env,
+            &backup_dir,
+            BackupCompression::Gzip,
+            &Default::default(),
+        )
+        .await;
+        write_abandoned_history(env).await;
+        assert!(read_manifest(&wal_dir.join(PITR_MANIFEST_KEY))
+            .timeline_breaks
+            .is_empty());
+
+        // Restore the base into the configured database, as after a bad change.
+        let status = restore_server_core(&config, &base)
+            .await
+            .expect("Restore failed");
+        assert_eq!(status, RestoreStatus::Complete);
+        let breaks = read_manifest(&wal_dir.join(PITR_MANIFEST_KEY)).timeline_breaks;
+        assert_eq!(breaks.len(), 1, "{breaks:?}");
+
+        write_new_history_after_restore(config).await;
+        assert_latest_skips_abandoned_history(pitr_config(
+            &workdir.path().join("latest.db"),
+            &backup_dir,
+            &wal_dir,
+            None,
+        ))
+        .await;
+    });
+}
+
+/// `restore-s3` records the abandoned history in the S3 archive like `restore`, and
+/// reports, without failing, a restore whose archive could not be reached.
+#[test]
+fn test_pitr_s3_restore_abandons_history_and_reports_an_unreachable_archive() {
+    let Some(s3_config) = test_s3_config("pitr-restore-test") else {
+        return;
+    };
+
+    run(async {
+        let sdk = sdk_client(&s3_config).await;
+        ensure_bucket(&sdk, &s3_config.bucket).await;
+
+        let host = tempfile::tempdir().expect("Failed to create workdir");
+        let host_config = |db: &str| {
+            pitr_config(
+                &host.path().join(db),
+                &host.path().join("backups"),
+                &host.path().join("wal"),
+                Some(s3_config.clone()),
+            )
+        };
+        let config = host_config("source.db");
+
+        let env = setup_async_test(config.clone()).await;
+        populate(&env).await;
+        env.core_handle
+            .trigger_s3_backup(
+                s3_config.clone(),
+                7,
+                BackupCompression::Gzip,
+                &Default::default(),
+            )
+            .await
+            .expect("S3 backup failed");
+        write_abandoned_history(env).await;
+        let base = s3_manifest(&sdk, &s3_config)
+            .await
+            .base_backups
+            .first()
+            .expect("The base backup is indexed")
+            .key
+            .clone();
+
+        // The archive's endpoint is unreachable, as during an outage: the database is
+        // restored, and the status says the archive was not updated (exit code 2).
+        let mut unreachable = host_config("unreachable.db");
+        if let Some(s3) = unreachable
+            .online_backup
+            .as_mut()
+            .and_then(|backup| backup.s3.as_mut())
+        {
+            s3.endpoint = Some(UNREACHABLE_ENDPOINT.to_string());
+        }
+        let status = restore_s3_database(&unreachable, s3_config.clone(), &base)
+            .await
+            .expect("The restore itself must succeed");
+        assert_eq!(status, RestoreStatus::WalArchiveNotUpdated);
+        assert_eq!(status.exit_code(), 2);
+        assert!(host.path().join("unreachable.db").exists());
+        assert!(s3_manifest(&sdk, &s3_config)
+            .await
+            .timeline_breaks
+            .is_empty());
+
+        // The archive is reachable: the abandoned history is recorded.
+        let status = restore_s3_database(&config, s3_config.clone(), &base)
+            .await
+            .expect("Restore from S3 failed");
+        assert_eq!(status, RestoreStatus::Complete);
+        let breaks = s3_manifest(&sdk, &s3_config).await.timeline_breaks;
+        assert_eq!(breaks.len(), 1, "{breaks:?}");
+
+        write_new_history_after_restore(config).await;
+        let new_host = tempfile::tempdir().expect("Failed to create workdir");
+        assert_latest_skips_abandoned_history(pitr_config(
+            &new_host.path().join("latest.db"),
+            &new_host.path().join("backups"),
+            &new_host.path().join("wal"),
+            Some(s3_config.clone()),
+        ))
+        .await;
+
+        delete_prefix(&sdk, &s3_config).await;
+    });
 }
