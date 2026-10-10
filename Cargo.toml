@@ -214,7 +214,7 @@ fs4 = "^1.0.2"
 futures = "0.3.34"
 futures-util = { version = "0.3.34", features = ["sink"] }
 gethostname = "1.1.0"
-gix = { version = "0.87.1", default-features = false, features = ["sha1"] }
+gix = { version = "0.89.0", default-features = false, features = ["sha1"] }
 haproxy-protocol = { version = "0.0.4" }
 hashbrown = { version = "0.17.1", features = ["serde", "inline-more"] }
 hex = "^0.4.3"
@@ -229,7 +229,7 @@ image = { version = "0.25.9", default-features = false, features = [
     "webp",
 ] }
 itertools = "0.15.0"
-jsonschema = "0.56.0"
+jsonschema = "0.58.0"
 ldap3_client = "^0.8.0"
 ldap3_proto = { version = "^0.8.0", features = ["serde"] }
 lettre = { version = "0.11.22", default-features = false }
@@ -324,7 +324,7 @@ utoipa = { version = "5.5.0", features = ["url", "uuid"] }
 utoipa-swagger-ui = { version = "9.0.2", default-features = false, features = [
     "vendored",
 ] }
-uuid = "1.26.1"
+uuid = "1.27.0"
 webauthn-authenticator-rs = { version = "0.6.1-dev", default-features = false }
 webauthn-rs = { version = "0.6.1-dev", features = ["preview-features"] }
 webauthn-rs-core = "0.6.1-dev"

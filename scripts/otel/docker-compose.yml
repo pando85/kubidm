@@ -74,7 +74,7 @@ services:
   prometheus:
     hostname: prometheus
     container_name: prometheus
-    image: prom/prometheus:v3.14.0
+    image: prom/prometheus:v3.15.0
     restart: always
     ports:
       - "9090:9090"
