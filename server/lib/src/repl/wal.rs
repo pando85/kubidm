@@ -828,7 +828,12 @@ impl WalArchiver {
         match self.current_segment.take() {
             Some(builder) if !builder.entries.is_empty() => {
                 self.sealed.push_back(builder.seal());
-                self.drop_unwritable_backlog();
+                // Beyond the limit the next write is tried at once instead of after the
+                // retry delay, and only a write that fails again drops segments: the
+                // directory may well have recovered since the last failure.
+                if self.sealed.len() > WAL_MAX_UNWRITTEN_SEGMENTS {
+                    self.retry_after = None;
+                }
                 true
             }
             _ => false,
@@ -925,9 +930,9 @@ impl WalArchiver {
         self.finish_writes(written, now)
     }
 
-    /// Drop the oldest closed segments beyond [`WAL_MAX_UNWRITTEN_SEGMENTS`] and record
-    /// each as a gap: writing keeps failing, and holding them would grow memory without
-    /// bound.
+    /// After a failed write: drop the oldest closed segments beyond
+    /// [`WAL_MAX_UNWRITTEN_SEGMENTS`] and record each as a gap, since writing keeps failing
+    /// and holding them would grow memory without bound.
     fn drop_unwritable_backlog(&mut self) {
         while self.sealed.len() > WAL_MAX_UNWRITTEN_SEGMENTS {
             let Some(dropped) = self.sealed.pop_front() else {
@@ -1954,6 +1959,41 @@ mod tests {
         assert_eq!(
             read_pending_events(archiver.segments_path()).gaps.len(),
             extra as usize
+        );
+    }
+
+    #[test]
+    fn test_a_backlog_is_written_rather_than_dropped_once_the_directory_recovered() {
+        let server = Uuid::new_v4();
+        let (_dir, mut archiver) = archiver(
+            WalArchiveConfig {
+                segment_size_bytes: 1,
+                ..test_config()
+            },
+            server,
+        );
+
+        // One failed write makes commits wait a segment interval before writing again.
+        let repair = break_wal_dir(&archiver);
+        assert!(archiver
+            .record_create(&cid(server, 1), 1, Uuid::new_v4(), vec![1])
+            .is_err());
+        repair();
+
+        // Within that interval, more segments close than the backlog may hold: the write
+        // is tried again, succeeds, and nothing is lost.
+        let total = WAL_MAX_UNWRITTEN_SEGMENTS as u64 + 3;
+        for secs in 2..=total {
+            archiver
+                .record_create(&cid(server, secs), secs, Uuid::new_v4(), vec![1])
+                .unwrap();
+        }
+        assert_eq!(archiver.stats().dropped_segments, 0);
+        assert!(archiver.pending_events().gaps.is_empty());
+        assert!(!archiver.has_pending_records());
+        assert_eq!(
+            list_segments(archiver.segments_path()).unwrap().len(),
+            total as usize
         );
     }
 
