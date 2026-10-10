@@ -436,8 +436,8 @@ async fn scripting_command(cmd: ScriptingCommand, config: Configuration) -> Exit
             .await;
         }
 
-        ScriptingCommand::Backup { path } => {
-            if !backup_server_core(&config, path.as_deref()).await {
+        ScriptingCommand::Backup { path, name } => {
+            if !backup_server_core(&config, path.as_deref(), name.as_deref()).await {
                 return ExitCode::FAILURE;
             }
         }
@@ -1005,7 +1005,7 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
         } => {
             info!("Running in backup mode ...");
 
-            if !backup_server_core(&config, Some(&bopt.path)).await {
+            if !backup_server_core(&config, Some(&bopt.path), None).await {
                 return ExitCode::FAILURE;
             }
         }

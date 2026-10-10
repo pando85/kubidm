@@ -297,6 +297,12 @@ enum ScriptingCommand {
     Backup {
         /// The path to backup to. If not set, defaults to stdout.
         path: Option<PathBuf>,
+        /// With stdout: the name the backup will be stored under, such as
+        /// `backup-<timestamp>.json.gz.enc`. It is checked against the configured
+        /// compression and encryption, and an encrypted backup records its timestamp, so
+        /// that it opens under that name.
+        #[clap(long, conflicts_with = "path")]
+        name: Option<String>,
     },
     /// Initiate a server reload.
     Reload,

@@ -42,10 +42,18 @@ use crate::{config::Configuration, setup_backend, verify_booted_database};
 /// stdout without a path. The backup uses the compression and the client-side encryption
 /// of the `[online_backup]` section, so it is interchangeable with an online backup.
 ///
+/// `stdout_name` is the name a backup written to stdout will be stored under. It is checked
+/// like a destination path, and an encrypted backup records its timestamp, so that it
+/// opens under a `backup-<timestamp>` name; it is ignored with a `dst_path`.
+///
 /// Returns true when the backup was written and verified. Every failure, including a
 /// database that can not be opened and a destination that already exists, returns false,
 /// which the command turns into a non-zero exit code.
-pub async fn backup_server_core(config: &Configuration, dst_path: Option<&Path>) -> bool {
+pub async fn backup_server_core(
+    config: &Configuration,
+    dst_path: Option<&Path>,
+    stdout_name: Option<&str>,
+) -> bool {
     let schema = match Schema::new() {
         Ok(s) => s,
         Err(e) => {
@@ -72,13 +80,22 @@ pub async fn backup_server_core(config: &Configuration, dst_path: Option<&Path>)
         None => None,
     };
 
-    if let Some(dst_path) = dst_path {
-        if let Err(reason) =
-            check_backup_destination_name(dst_path, compression, encryptor.is_some())
-        {
+    // The name the backup is stored under, when it is known.
+    let name = dst_path.or(stdout_name.map(Path::new));
+    if let Some(name) = name {
+        if let Err(reason) = check_backup_destination_name(name, compression, encryptor.is_some()) {
             error!("Backup failed: {reason}");
             return false;
         }
+    } else if encryptor.is_some() {
+        warn!(
+            "The encrypted backup written to stdout records no timestamp, so it only opens \
+             under a name that claims none: stored as backup-<timestamp>{}{BACKUP_ENCRYPTED_SUFFIX}, \
+             restore refuses it. Pass --name with the name it will be stored under.",
+            compression.suffix()
+        );
+    }
+    if let Some(dst_path) = dst_path {
         if dst_path.exists() {
             error!(
                 "Backup failed: backup file {} already exists, will not overwrite it.",
@@ -121,8 +138,8 @@ pub async fn backup_server_core(config: &Configuration, dst_path: Option<&Path>)
         }
     };
 
-    // Written to stdout, the backup has no name and so claims no timestamp.
-    let identity = backup_identity(dst_path.unwrap_or(Path::new("")));
+    // Written to stdout without a name, the backup claims no timestamp.
+    let identity = backup_identity(name.unwrap_or(Path::new("")));
     let artifact =
         match seal_backup_async(backup_data, compression, encryptor.as_ref(), identity).await {
             Ok(artifact) => artifact,
@@ -146,7 +163,7 @@ pub async fn backup_server_core(config: &Configuration, dst_path: Option<&Path>)
         info!("Backup written to {}", dst_path.display());
     } else {
         if !report_backup_verification(
-            verify_backup_output_async(artifact.clone(), None, compression, encryptor.as_ref())
+            verify_backup_output_async(artifact.clone(), name, compression, encryptor.as_ref())
                 .await,
         ) {
             return false;
@@ -1164,7 +1181,7 @@ mod tests {
         let existing = dir.path().join("kubidm.json.gz");
         std::fs::write(&existing, b"an older backup").expect("write");
         let config = Configuration::new_for_test();
-        assert!(!backup_server_core(&config, Some(&existing)).await);
+        assert!(!backup_server_core(&config, Some(&existing), None).await);
         assert_eq!(std::fs::read(&existing).expect("read"), b"an older backup");
 
         // The database can not be opened.
@@ -1173,8 +1190,13 @@ mod tests {
             ..Configuration::new_for_test()
         };
         let dest = dir.path().join("new.json.gz");
-        assert!(!backup_server_core(&config, Some(&dest)).await);
+        assert!(!backup_server_core(&config, Some(&dest), None).await);
         assert!(!dest.exists());
+
+        // The name a backup to stdout will be stored under is checked like a path, before
+        // anything is written: a gzip backup can not be stored as plain JSON.
+        let config = Configuration::new_for_test();
+        assert!(!backup_server_core(&config, None, Some("backup-2024-01-01T22:00:00Z.json")).await);
     }
 
     #[test]
