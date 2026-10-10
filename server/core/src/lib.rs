@@ -49,10 +49,6 @@ pub use crate::backup::{
     },
     restore::restore_database,
 };
-pub(crate) use crate::backup::{
-    cli::{fetch_s3_backup, FetchedS3Backup},
-    restore::{restore_and_replay_commit, CommittedRestore},
-};
 use crate::{
     actors::{QueryServerReadV1, QueryServerWriteV1},
     admin::AdminActor,
@@ -1086,7 +1082,6 @@ impl CoreHandle {
         }
         .run(self.server_read_ref)
         .await
-        .map(|_| ())
     }
 }
 

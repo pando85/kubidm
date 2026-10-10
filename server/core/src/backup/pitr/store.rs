@@ -22,7 +22,7 @@ use crate::backup::{
 /// A base backup fetched for recovery. The S3 variant is removed when dropped.
 pub(super) enum FetchedBase {
     Local(PathBuf),
-    S3(crate::FetchedS3Backup),
+    S3(crate::backup::cli::FetchedS3Backup),
 }
 
 impl FetchedBase {
@@ -83,7 +83,8 @@ impl BaseLocation {
                 Ok(FetchedBase::Local(path))
             }
             BaseLocation::S3(config) => {
-                let fetched = crate::fetch_s3_backup(config.clone(), &base.key).await?;
+                let fetched =
+                    crate::backup::cli::fetch_s3_backup(config.clone(), &base.key).await?;
                 Ok(FetchedBase::S3(fetched))
             }
         }

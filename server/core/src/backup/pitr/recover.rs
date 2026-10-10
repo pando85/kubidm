@@ -711,15 +711,19 @@ pub async fn pitr_recover_server_core(
         "Restoring base backup {} and replaying {} WAL records into {db_path}",
         plan.base.key, record_count
     );
-    let committed = crate::restore_and_replay_commit(config, base.path(), replay.into_records())
-        .await
-        .map_err(|err| {
-            error!(
-                ?err,
-                "Recovery failed; the database at {db_path} was not changed"
-            );
-            PitrError::Operation(err)
-        })?;
+    let committed = crate::backup::restore::restore_and_replay_commit(
+        config,
+        base.path(),
+        replay.into_records(),
+    )
+    .await
+    .map_err(|err| {
+        error!(
+            ?err,
+            "Recovery failed; the database at {db_path} was not changed"
+        );
+        PitrError::Operation(err)
+    })?;
     drop(base);
     let apply = committed.outcome.apply.clone();
     if let Some(report) = &apply {
@@ -786,7 +790,7 @@ pub async fn pitr_recover_server_core(
 /// recovered to `recovered_ts` at `db_path`.
 async fn finish_recovery(
     config: &Configuration,
-    committed: crate::CommittedRestore,
+    committed: crate::backup::restore::CommittedRestore,
     db_path: &str,
     recovered_ts: Duration,
 ) -> Result<(), PitrError> {

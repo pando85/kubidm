@@ -26,18 +26,6 @@ use super::{
 use crate::actors::QueryServerReadV1;
 use crate::config::OnlineBackup;
 
-/// A backup stored in one location: what it is called and what the structural
-/// verification read back from it, including the CID watermark point-in-time recovery
-/// indexes.
-#[derive(Debug, Clone)]
-pub struct OnlineBackupOutcome {
-    /// File name (local) or object key relative to the S3 prefix.
-    pub key: String,
-    /// RFC3339 time of the backup.
-    pub timestamp: String,
-    pub report: BackupStructuralReport,
-}
-
 /// What one online backup run does: where it stores the backup, how many backups every
 /// location keeps, how the artifact is compressed and encrypted, and the WAL archive that
 /// indexes every stored backup as a point-in-time recovery base.
@@ -70,14 +58,11 @@ impl OnlineBackupJob {
         }
     }
 
-    /// Run one online backup. Every target is attempted; the backups stored successfully
-    /// are returned in target order. Fails when the artifact can not be produced or when
-    /// any target failed, after every target has been attempted.
+    /// Run one online backup. Every target is attempted, and every backup stored is
+    /// indexed by the WAL archive. Fails when the artifact can not be produced or when any
+    /// target failed, after every target has been attempted.
     #[instrument(level = "info", name = "online_backup", skip_all)]
-    pub async fn run(
-        &self,
-        server: &'static QueryServerReadV1,
-    ) -> Result<Vec<OnlineBackupOutcome>, OperationError> {
+    pub async fn run(&self, server: &'static QueryServerReadV1) -> Result<(), OperationError> {
         #[allow(clippy::disallowed_methods)]
         // Allowed as this timestamp is only used for the backup name.
         let now = time::OffsetDateTime::now_utc();
@@ -109,7 +94,6 @@ impl OnlineBackupJob {
             OperationError::CryptographyError
         })?;
 
-        let mut outcomes = Vec::with_capacity(self.targets.len());
         let mut failure = None;
         for target in &self.targets {
             let stored = match target {
@@ -129,11 +113,6 @@ impl OnlineBackupJob {
                             .register_base_backup_logged(target, &key, &timestamp, &report)
                             .await;
                     }
-                    outcomes.push(OnlineBackupOutcome {
-                        key: key.clone(),
-                        timestamp: timestamp.clone(),
-                        report,
-                    });
                 }
                 Err(err) => {
                     error!(?err, "Online backup to {} failed", target);
@@ -144,7 +123,7 @@ impl OnlineBackupJob {
 
         match failure {
             Some(err) => Err(err),
-            None => Ok(outcomes),
+            None => Ok(()),
         }
     }
 

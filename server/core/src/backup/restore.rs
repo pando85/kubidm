@@ -31,12 +31,14 @@ pub async fn restore_database(
     config: &Configuration,
     src_path: &Path,
 ) -> Result<(), OperationError> {
-    restore_and_replay(config, src_path, Vec::new())
+    restore_and_replay_commit(config, src_path, Vec::new())
+        .await?
+        .reindex(config)
         .await
         .map(|_| ())
 }
 
-/// What [`restore_and_replay`] did.
+/// What [`restore_and_replay_commit`] did.
 pub(crate) struct RestoreOutcome {
     /// The CID watermark of the restored backup.
     pub watermark: Duration,
@@ -44,20 +46,6 @@ pub(crate) struct RestoreOutcome {
     pub server_uuid: Uuid,
     /// The WAL records applied on top of it, if any were given.
     pub apply: Option<WalApplyReport>,
-}
-
-/// Restore the backup at `src_path` into the database described by `config`, apply
-/// `records` on top of it in the same transaction, and reindex. A failure before the
-/// commit leaves the database as it was.
-pub(crate) async fn restore_and_replay(
-    config: &Configuration,
-    src_path: &Path,
-    records: Vec<WalEntryRecord>,
-) -> Result<RestoreOutcome, OperationError> {
-    restore_and_replay_commit(config, src_path, records)
-        .await?
-        .reindex(config)
-        .await
 }
 
 /// A database [`restore_and_replay_commit`] restored and committed, not reindexed yet.
@@ -83,9 +71,10 @@ impl CommittedRestore {
     }
 }
 
-/// [`restore_and_replay`] up to the commit: the caller learns whether the database was
-/// changed, and reindexes it with [`CommittedRestore::reindex`]. A failure leaves the
-/// database as it was.
+/// Restore the backup at `src_path` into the database described by `config` and apply
+/// `records` on top of it in the same transaction, up to the commit: the caller learns
+/// whether the database was changed, and reindexes it with [`CommittedRestore::reindex`].
+/// A failure leaves the database as it was.
 pub(crate) async fn restore_and_replay_commit(
     config: &Configuration,
     src_path: &Path,
