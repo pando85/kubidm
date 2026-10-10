@@ -261,6 +261,37 @@ impl S3ClientWrapper {
         let create_output = self.create_multipart_upload(key, metadata).await?;
         let upload_id = create_output.upload_id().unwrap_or_default();
 
+        // A failed upload is aborted, so that its parts do not linger (and get billed) in
+        // the bucket. Replication retries uploads, which would otherwise pile them up.
+        if let Err(err) = self.upload_parts_and_complete(key, upload_id, data).await {
+            if let Err(abort_err) = self
+                .client
+                .abort_multipart_upload()
+                .bucket(&self.config.bucket)
+                .key(key)
+                .upload_id(upload_id)
+                .send()
+                .await
+            {
+                warn!(
+                    "Failed to abort the multipart upload of {}: {}",
+                    key,
+                    DisplayErrorContext(&abort_err)
+                );
+            }
+            return Err(err);
+        }
+
+        info!("Completed multipart upload to S3: {}", key);
+        Ok(())
+    }
+
+    async fn upload_parts_and_complete(
+        &self,
+        key: &str,
+        upload_id: &str,
+        data: &[u8],
+    ) -> Result<(), S3BackupError> {
         let mut parts = Vec::new();
 
         for (part_number, chunk) in (1_i32..).zip(data.chunks(MULTIPART_CHUNK_SIZE)) {
@@ -273,10 +304,7 @@ impl S3ClientWrapper {
             );
         }
 
-        self.complete_multipart_upload(key, upload_id, parts)
-            .await?;
-        info!("Completed multipart upload to S3: {}", key);
-        Ok(())
+        self.complete_multipart_upload(key, upload_id, parts).await
     }
 
     async fn create_multipart_upload(
@@ -321,7 +349,11 @@ impl S3ClientWrapper {
             .send()
             .await
             .map_err(|e| {
-                S3BackupError::UploadError(format!("Failed to upload part {}: {}", part_number, e))
+                S3BackupError::UploadError(format!(
+                    "Failed to upload part {}: {}",
+                    part_number,
+                    DisplayErrorContext(&e)
+                ))
             })
     }
 
@@ -723,13 +755,109 @@ impl S3ClientWrapper {
         backup_key: &str,
     ) -> Result<(S3BackupMetadata, Option<String>), S3BackupError> {
         let primary = self.get_backup_metadata(backup_key).await?;
+        let mismatch = Self::replica_differs(region, backup_key, &primary).await?;
+        Ok((primary, mismatch))
+    }
+
+    /// Why the copy of `backup_key` in `region` differs from the primary copy described by
+    /// `primary`, or None when sidecar and reported size agree with it.
+    async fn replica_differs(
+        region: &S3ClientWrapper,
+        backup_key: &str,
+        primary: &S3BackupMetadata,
+    ) -> Result<Option<String>, S3BackupError> {
         let replica = region.get_backup_metadata(backup_key).await?;
         let replica_size = region
             .head_object_size(&region.build_object_key(backup_key))
             .await?;
+        Ok(replica_mismatch(primary, &replica, replica_size))
+    }
 
-        let mismatch = replica_mismatch(&primary, &replica, replica_size);
-        Ok((primary, mismatch))
+    /// Bring `region_config` up to date with the primary: every backup of `source_backups`
+    /// (prefix-relative keys, as returned by `list_backup_artifacts`) that the region
+    /// misses, or holds a copy of that differs from the primary (another checksum or size,
+    /// a missing sidecar), is downloaded from the primary, checked against the primary's
+    /// checksum and uploaded to the region with the primary's sidecar.
+    ///
+    /// This is how a backup that could not be replicated when it was taken (the region was
+    /// unreachable, all retries failed, the region was added later) reaches the region
+    /// eventually. A primary copy that fails its checksum is never propagated. A backup
+    /// whose primary sidecar can not be read (it is still being uploaded, or retention just
+    /// removed it) is skipped and picked up by the next run. Fails only when the region
+    /// itself can not be listed.
+    pub async fn sync_region(
+        &self,
+        region_config: &ReplicationRegionConfig,
+        source_backups: &[String],
+    ) -> Result<RegionSyncOutcome, S3BackupError> {
+        let region = Self::for_region(region_config).await?;
+        let replicated = region.list_backup_artifacts().await?;
+
+        let mut outcome = RegionSyncOutcome::default();
+        for backup_key in source_backups {
+            let primary = match self.get_backup_metadata(backup_key).await {
+                Ok(primary) => primary,
+                Err(err) => {
+                    debug!(
+                        "Replication sync skips {} for now: its primary metadata can not be \
+                         read: {}",
+                        backup_key, err
+                    );
+                    continue;
+                }
+            };
+
+            let reason = if replicated.contains(backup_key) {
+                match Self::replica_differs(&region, backup_key, &primary).await {
+                    Ok(None) => continue,
+                    Ok(Some(reason)) => reason,
+                    Err(err) => format!("could not be checked: {err}"),
+                }
+            } else {
+                "is missing".to_string()
+            };
+
+            info!(
+                "Replication sync copies {} to region {}: the region copy {}",
+                backup_key, region_config.region, reason
+            );
+            match self.copy_backup_to(&region, backup_key).await {
+                Ok(()) => outcome.copied.push(backup_key.clone()),
+                Err(err) => outcome.failed.push((backup_key.clone(), err.to_string())),
+            }
+        }
+
+        Ok(outcome)
+    }
+
+    /// `sync_region` for every region of `replication_config` against the backups
+    /// currently in the primary bucket. Fails only when the primary bucket can not be
+    /// listed; a region that can not be synced is reported in its result instead.
+    pub async fn sync_replication(
+        &self,
+        replication_config: &ReplicationConfig,
+    ) -> Result<Vec<(String, Result<RegionSyncOutcome, S3BackupError>)>, S3BackupError> {
+        let source_backups = self.list_backup_artifacts().await?;
+
+        let mut results = Vec::with_capacity(replication_config.regions.len());
+        for region_config in &replication_config.regions {
+            let result = self.sync_region(region_config, &source_backups).await;
+            results.push((region_config.region.clone(), result));
+        }
+        Ok(results)
+    }
+
+    /// Copy the primary backup `backup_key` and its sidecar to `region`, after checking
+    /// the downloaded bytes against the primary's checksum.
+    async fn copy_backup_to(
+        &self,
+        region: &S3ClientWrapper,
+        backup_key: &str,
+    ) -> Result<(), S3BackupError> {
+        let (data, metadata) = self.download_backup(backup_key).await?;
+        region
+            .upload_with_metadata(&data, backup_key, &metadata)
+            .await
     }
 
     /// The replication status of one region: which of the primary's backup artifacts
@@ -851,6 +979,31 @@ impl S3ClientWrapper {
             .await?;
         Ok(lag_metrics_from_health(&health, replication_config))
     }
+}
+
+/// What one `sync_region` run did in a region.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RegionSyncOutcome {
+    /// Backups copied to the region because it missed them or held a differing copy.
+    pub copied: Vec<String>,
+    /// Backups that needed a copy which failed, with the reason.
+    pub failed: Vec<(String, String)>,
+}
+
+/// Whether two S3 configurations address the same objects: same endpoint, same bucket and
+/// same normalised path prefix. A replication region at the primary's own location would
+/// copy every backup onto itself and report perfect health without any redundancy.
+pub fn same_s3_location(a: &S3Config, b: &S3Config) -> bool {
+    let endpoint = |config: &S3Config| {
+        config
+            .endpoint
+            .as_deref()
+            .map(|endpoint| endpoint.trim_end_matches('/').to_ascii_lowercase())
+    };
+    a.bucket == b.bucket
+        && endpoint(a) == endpoint(b)
+        && S3ClientWrapper::listing_prefix(a.path_prefix.as_deref())
+            == S3ClientWrapper::listing_prefix(b.path_prefix.as_deref())
 }
 
 /// Whether a region is healthy for the purpose of monitoring and the exit code of
@@ -1386,6 +1539,52 @@ mod tests {
             S3ClientWrapper::strip_listing_prefix(&listing, "other/backup.json.gz"),
             None
         );
+    }
+
+    #[test]
+    fn test_same_s3_location() {
+        let base = S3Config {
+            bucket: "backups".to_string(),
+            region: Some("us-east-1".to_string()),
+            endpoint: Some("https://s3.example.com".to_string()),
+            path_prefix: Some("prod".to_string()),
+            credentials: None,
+            server_side_encryption: None,
+            storage_class: "STANDARD".to_string(),
+            replication: None,
+        };
+        let with = |change: fn(&mut S3Config)| {
+            let mut config = base.clone();
+            change(&mut config);
+            config
+        };
+
+        assert!(same_s3_location(&base, &base));
+        // Signing region, storage class and the spelling of prefix and endpoint do not
+        // make another location.
+        assert!(same_s3_location(
+            &base,
+            &with(|c| {
+                c.region = Some("eu-west-1".to_string());
+                c.storage_class = "STANDARD_IA".to_string();
+                c.path_prefix = Some("prod/".to_string());
+                c.endpoint = Some("https://S3.example.com/".to_string());
+            })
+        ));
+        assert!(!same_s3_location(
+            &base,
+            &with(|c| c.bucket = "backups-eu".to_string())
+        ));
+        assert!(!same_s3_location(
+            &base,
+            &with(|c| c.path_prefix = Some("dr".to_string()))
+        ));
+        assert!(!same_s3_location(&base, &with(|c| c.path_prefix = None)));
+        assert!(!same_s3_location(
+            &base,
+            &with(|c| c.endpoint = Some("https://s3.eu.example.com".to_string()))
+        ));
+        assert!(!same_s3_location(&base, &with(|c| c.endpoint = None)));
     }
 
     #[test]

@@ -196,17 +196,19 @@ compression = "gzip"
 #   copied to every region listed here, and each region keeps its newest `versions`
 #   backups (the same retention as the primary bucket). A region that can not be
 #   written to is logged as an error and skipped; the primary backup still succeeds.
-#   Every `sync_interval_seconds`, the server checks that each region holds all the
-#   primary's backups and logs a warning per region that does not.
+#   Every `sync_interval_seconds`, the server copies to each region the primary
+#   backups it misses (or holds a differing copy of), then checks that each region
+#   holds all the primary's backups and logs a warning per region that does not.
 #   `kubidmd database replicate-status` prints the same check on demand, and
 #   `restore-s3`, `verify-s3` and `list-backups` take `--region <name>` to work on a
 #   region's copies instead of the primary bucket.
-#   Requires at least one region, unique region names, a bucket per region and a
-#   positive sync_interval_seconds when enabled.
+#   Requires at least one region, unique region names, a bucket per region, a
+#   location (endpoint, bucket, path_prefix) per region distinct from the primary and
+#   from every other region, and a positive sync_interval_seconds when enabled.
 #
 # [online_backup.s3.replication]
 # enabled = true
-#   Seconds between two replication health checks (default 300)
+#   Seconds between two replication sync and health check runs (default 300)
 # sync_interval_seconds = 300
 #   Further attempts when copying a backup to a region fails (default 3) ...
 # max_retries = 3

@@ -229,6 +229,17 @@ async fn raw_region_keys(sdk: &SdkClient, region: &ReplicationRegionConfig) -> V
     keys
 }
 
+/// `backups` together with their metadata sidecars, sorted: exactly the objects a location
+/// holding these backups contains.
+fn with_sidecars(backups: &[String]) -> Vec<String> {
+    let mut keys: Vec<String> = backups
+        .iter()
+        .flat_map(|key| [key.clone(), format!("{key}.metadata.json")])
+        .collect();
+    keys.sort();
+    keys
+}
+
 fn region_full_key(region: &ReplicationRegionConfig, key: &str) -> String {
     let prefix = region
         .path_prefix
@@ -299,17 +310,9 @@ fn test_s3_backup_replication_retention_status_and_recovery() {
 
         // Behind the scenes: the two backups and their two sidecars under the region
         // prefix, nothing else. Retention removed the sidecar of the pruned backup too.
-        let expected_raw: Vec<String> = {
-            let mut keys: Vec<String> = primary_backups
-                .iter()
-                .flat_map(|key| [key.clone(), format!("{key}.metadata.json")])
-                .collect();
-            keys.sort();
-            keys
-        };
         assert_eq!(
             raw_region_keys(&sdk, &setup.replica).await,
-            expected_raw,
+            with_sidecars(&primary_backups),
             "Unexpected objects under the region prefix"
         );
 
@@ -529,12 +532,124 @@ fn test_s3_backup_replication_retention_status_and_recovery() {
         assert!(
             !verify_s3_backup_server_core(
                 &server_config,
-                replica_s3,
+                replica_s3.clone(),
                 &oldest,
                 BackupVerifyLevel::Structural,
             )
             .await,
             "verify-s3 --region must fail on the truncated copy"
+        );
+
+        // h. The sync the replication monitor runs every `sync_interval_seconds` repairs
+        //    the region: the missing and the truncated copies are copied again from the
+        //    primary, after which the region is healthy and its copies verify.
+        let results = primary
+            .sync_replication(replication)
+            .await
+            .expect("Replication sync failed");
+        assert_eq!(results.len(), 1);
+        let (region_name, outcome) = results.into_iter().next().expect("No sync result");
+        assert_eq!(region_name, REPLICA_REGION);
+        let outcome = outcome.expect("The region must be synced");
+        assert_eq!(
+            outcome.copied, primary_backups,
+            "Both damaged copies must be copied"
+        );
+        assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+
+        let health = primary
+            .check_replication_health(replication, None)
+            .await
+            .expect("Health check failed");
+        assert_eq!(health.overall_status, ReplicationStatus::Completed);
+        let region = health.regions.first().expect("No region status");
+        assert_eq!(region.backups_replicated, RETAINED_VERSIONS as u64);
+        assert_eq!(region.pending_backups, 0);
+        assert_eq!(region.lag_seconds, Some(0));
+        assert_eq!(
+            raw_region_keys(&sdk, &setup.replica).await,
+            with_sidecars(&primary_backups),
+            "The sync must restore exactly the backups and sidecars of the primary"
+        );
+        for key in [&newest, &oldest] {
+            assert!(
+                verify_s3_backup_server_core(
+                    &server_config,
+                    replica_s3.clone(),
+                    key,
+                    BackupVerifyLevel::Structural,
+                )
+                .await,
+                "verify-s3 --region must pass on the repaired copy of {key}"
+            );
+        }
+
+        // A second sync has nothing left to do.
+        let results = primary
+            .sync_replication(replication)
+            .await
+            .expect("Replication sync failed");
+        let outcome = results
+            .into_iter()
+            .next()
+            .and_then(|(_, outcome)| outcome.ok())
+            .expect("The region must be synced");
+        assert!(outcome.copied.is_empty(), "{:?}", outcome.copied);
+        assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+
+        // i. A region added after the backups were taken receives them on the next sync,
+        //    while a region that can not be reached is reported without failing the sync
+        //    of the others.
+        let late = ReplicationRegionConfig {
+            region: "eu-central-1".to_string(),
+            path_prefix: Some(format!(
+                "late/{}",
+                setup
+                    .replica
+                    .path_prefix
+                    .as_deref()
+                    .expect("Region config has no prefix")
+            )),
+            ..setup.replica.clone()
+        };
+        let late_replication = ReplicationConfig {
+            regions: vec![late.clone(), setup.broken.clone()],
+            ..replication.clone()
+        };
+        let health = primary
+            .check_replication_health(&late_replication, None)
+            .await
+            .expect("Health check failed");
+        assert_eq!(health.regions[0].backups_replicated, 0);
+        assert_eq!(health.regions[0].pending_backups, RETAINED_VERSIONS as u64);
+
+        let results = primary
+            .sync_replication(&late_replication)
+            .await
+            .expect("Replication sync failed");
+        assert_eq!(results.len(), 2);
+        let late_outcome = results[0]
+            .1
+            .as_ref()
+            .expect("The late region must be synced");
+        assert_eq!(late_outcome.copied, primary_backups);
+        assert!(late_outcome.failed.is_empty(), "{:?}", late_outcome.failed);
+        assert_eq!(results[1].0, BROKEN_REGION);
+        assert!(
+            results[1].1.is_err(),
+            "A region whose bucket does not exist can not be synced"
+        );
+
+        let health = primary
+            .check_replication_health(&late_replication, None)
+            .await
+            .expect("Health check failed");
+        assert_eq!(health.healthy_regions, 1);
+        assert_eq!(health.regions[0].status, ReplicationStatus::Completed);
+        assert_eq!(
+            raw_region_keys(&sdk, &late).await,
+            with_sidecars(&primary_backups),
+            "The late region must hold exactly the backups and sidecars of the primary"
         );
     });
 }

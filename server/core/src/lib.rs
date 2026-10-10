@@ -1205,10 +1205,12 @@ fn format_replication_report(
         for (metric, region) in metrics.iter().zip(&health.regions) {
             let _ = writeln!(
                 out,
-                "    {}: lag {}s, pending {}, newest replicated {}, bytes replicated {}, \
+                "    {}: lag {}, pending {}, newest replicated {}, bytes replicated {}, \
                  check interval {}s",
                 metric.region,
-                metric.lag_seconds,
+                // The metric reports an unknown lag (the region holds none of the primary's
+                // backups) as 0; the report says it is unknown.
+                lag(region),
                 metric.pending_backups,
                 metric.last_backup_timestamp.as_deref().unwrap_or("-"),
                 region.bytes_replicated,
@@ -2546,6 +2548,44 @@ mod tests {
             ),
             "{detailed}"
         );
+    }
+
+    #[test]
+    fn replication_report_shows_an_unknown_lag_as_unknown() {
+        let mut failed = region_status(
+            "eu-west-1",
+            ReplicationStatus::Failed {
+                error: "bucket does not exist".to_string(),
+            },
+            0,
+            3,
+            None,
+        );
+        failed.last_sync_backup_id = None;
+        failed.last_sync_timestamp = None;
+        failed.last_error = Some("bucket does not exist".to_string());
+        let health = ReplicationHealthCheck {
+            overall_status: ReplicationStatus::Failed {
+                error: "all 1 regions unhealthy".to_string(),
+            },
+            regions: vec![failed],
+            total_lag_seconds: 0,
+            max_lag_seconds: 0,
+            healthy_regions: 0,
+            unhealthy_regions: 1,
+            last_check_timestamp: String::new(),
+        };
+
+        let report = format_replication_report("s3://primary", &health, &replication(true), true);
+        assert!(
+            report.contains("    eu-west-1: lag -, pending 3, newest replicated -,"),
+            "{report}"
+        );
+        assert!(
+            report.contains("      last error: bucket does not exist\n"),
+            "{report}"
+        );
+        assert!(!report.contains("lag 0s"), "{report}");
     }
 
     #[test]

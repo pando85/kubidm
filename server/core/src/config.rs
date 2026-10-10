@@ -25,6 +25,7 @@ use std::{
 };
 use url::Url;
 
+use crate::backup::same_s3_location;
 use crate::repl::config::ReplicationConfiguration;
 
 #[derive(Debug, Deserialize)]
@@ -140,19 +141,23 @@ impl OnlineBackup {
             );
         }
 
-        if let Some(replication) = self.s3.as_ref().and_then(|s3| s3.replication.as_ref()) {
-            validate_replication(replication)?;
+        if let Some(s3) = &self.s3 {
+            if let Some(replication) = &s3.replication {
+                validate_replication(s3, replication)?;
+            }
         }
 
         Ok(())
     }
 }
 
-/// Check an enabled `[online_backup.s3.replication]` section: it needs at least one region,
-/// every region needs a name and a bucket, region names must be unique (they identify the
-/// region in `replicate-status` and in `--region`), and the health check interval must be
-/// positive. A disabled section is accepted as is.
-fn validate_replication(replication: &ReplicationConfig) -> Result<(), String> {
+/// Check an enabled `[online_backup.s3.replication]` section of `s3`: it needs at least one
+/// region, every region needs a name and a bucket, region names must be unique (they
+/// identify the region in `replicate-status` and in `--region`), the sync interval must be
+/// positive, and every region must be a location of its own: neither the primary location
+/// nor that of another region (same endpoint, bucket and path prefix), since such a copy
+/// adds no redundancy while being reported as healthy. A disabled section is accepted as is.
+fn validate_replication(s3: &S3Config, replication: &ReplicationConfig) -> Result<(), String> {
     if !replication.enabled {
         return Ok(());
     }
@@ -190,6 +195,27 @@ fn validate_replication(replication: &ReplicationConfig) -> Result<(), String> {
                 "online_backup.s3.replication.regions[{index}]: region name {:?} is used by \
                  more than one entry; region names must be unique",
                 region.region
+            ));
+        }
+        let location = region.to_s3_config();
+        if same_s3_location(&location, s3) {
+            return Err(format!(
+                "online_backup.s3.replication.regions[{index}] ({}): bucket {:?} with this \
+                 endpoint and path_prefix is the primary backup location itself; a replica \
+                 must be stored elsewhere",
+                region.region, region.bucket
+            ));
+        }
+        if let Some(other) = replication
+            .regions
+            .iter()
+            .take(index)
+            .find(|other| same_s3_location(&other.to_s3_config(), &location))
+        {
+            return Err(format!(
+                "online_backup.s3.replication.regions[{index}] ({}): bucket {:?} with this \
+                 endpoint and path_prefix is already the location of region {:?}",
+                region.region, region.bucket, other.region
             ));
         }
     }
@@ -1424,6 +1450,85 @@ bucket = \"kubidm-backups-eu\"
         }
     }
 
+    fn primary_s3() -> S3Config {
+        S3Config {
+            bucket: "kubidm-backups".to_string(),
+            region: Some("us-east-1".to_string()),
+            endpoint: None,
+            path_prefix: Some("prod".to_string()),
+            credentials: None,
+            server_side_encryption: None,
+            storage_class: "STANDARD".to_string(),
+            replication: None,
+        }
+    }
+
+    #[test]
+    fn validate_replication_rejects_a_region_at_the_primary_location() {
+        let mut replication = ReplicationConfig {
+            enabled: true,
+            regions: vec![region("eu-west-1", "kubidm-backups")],
+            ..ReplicationConfig::default()
+        };
+
+        // Same bucket, same (absent) endpoint, same prefix: the primary itself, whatever
+        // the signing region.
+        replication.regions[0].path_prefix = Some("prod/".to_string());
+        let err = validate_replication(&primary_s3(), &replication).expect_err("primary itself");
+        assert!(
+            err.starts_with("online_backup.s3.replication.regions[0] (eu-west-1):"),
+            "{err}"
+        );
+        assert!(err.contains("primary backup location"), "{err}");
+
+        // Another prefix in the same bucket, or another endpoint, is a location of its own.
+        replication.regions[0].path_prefix = Some("dr".to_string());
+        assert!(validate_replication(&primary_s3(), &replication).is_ok());
+        replication.regions[0].path_prefix = Some("prod".to_string());
+        replication.regions[0].endpoint = Some("https://s3.eu.example.com".to_string());
+        assert!(validate_replication(&primary_s3(), &replication).is_ok());
+
+        // Two regions sharing a location are rejected too.
+        let mut second = region("eu-central-1", "kubidm-backups");
+        second.path_prefix = Some("prod".to_string());
+        second.endpoint = Some("https://s3.eu.example.com/".to_string());
+        replication.regions.push(second);
+        let err = validate_replication(&primary_s3(), &replication).expect_err("shared location");
+        assert!(
+            err.starts_with("online_backup.s3.replication.regions[1] (eu-central-1):"),
+            "{err}"
+        );
+        assert!(err.contains("\"eu-west-1\""), "{err}");
+    }
+
+    #[test]
+    fn online_backup_s3_replication_to_the_primary_bucket_is_rejected() {
+        let to_itself = format!(
+            "{BASE_V2_CONFIG}{S3_SECTION}
+[online_backup.s3.replication]
+enabled = true
+
+[[online_backup.s3.replication.regions]]
+region = \"eu-west-1\"
+bucket = \"kubidm-backups\"
+"
+        );
+        assert!(build_from_toml(&to_itself).is_none());
+
+        let other_prefix = format!(
+            "{BASE_V2_CONFIG}{S3_SECTION}
+[online_backup.s3.replication]
+enabled = true
+
+[[online_backup.s3.replication.regions]]
+region = \"eu-west-1\"
+bucket = \"kubidm-backups\"
+path_prefix = \"dr\"
+"
+        );
+        assert!(build_from_toml(&other_prefix).is_some());
+    }
+
     #[test]
     fn validate_replication_reports_the_offending_key() {
         let mut replication = ReplicationConfig {
@@ -1431,20 +1536,20 @@ bucket = \"kubidm-backups-eu\"
             regions: vec![],
             ..ReplicationConfig::default()
         };
-        let err = validate_replication(&replication).expect_err("no regions");
+        let err = validate_replication(&primary_s3(), &replication).expect_err("no regions");
         assert!(err.starts_with("online_backup.s3.replication:"), "{err}");
         assert!(err.contains("at least one"), "{err}");
 
         replication.regions = vec![region("eu-west-1", "eu"), region("ap-southeast-1", "ap")];
-        assert!(validate_replication(&replication).is_ok());
+        assert!(validate_replication(&primary_s3(), &replication).is_ok());
 
         replication.sync_interval_seconds = 0;
-        let err = validate_replication(&replication).expect_err("zero interval");
+        let err = validate_replication(&primary_s3(), &replication).expect_err("zero interval");
         assert!(err.contains("sync_interval_seconds"), "{err}");
         replication.sync_interval_seconds = 300;
 
         replication.regions[1].bucket = " ".to_string();
-        let err = validate_replication(&replication).expect_err("blank bucket");
+        let err = validate_replication(&primary_s3(), &replication).expect_err("blank bucket");
         assert!(
             err.starts_with("online_backup.s3.replication.regions[1] (ap-southeast-1): bucket"),
             "{err}"
@@ -1452,20 +1557,21 @@ bucket = \"kubidm-backups-eu\"
         replication.regions[1].bucket = "ap".to_string();
 
         replication.regions[1].region = String::new();
-        let err = validate_replication(&replication).expect_err("empty region name");
+        let err = validate_replication(&primary_s3(), &replication).expect_err("empty region name");
         assert!(
             err.starts_with("online_backup.s3.replication.regions[1]: region"),
             "{err}"
         );
 
         replication.regions[1].region = "eu-west-1".to_string();
-        let err = validate_replication(&replication).expect_err("duplicate region name");
+        let err =
+            validate_replication(&primary_s3(), &replication).expect_err("duplicate region name");
         assert!(err.contains("\"eu-west-1\""), "{err}");
         assert!(err.contains("unique"), "{err}");
 
         // Nothing is checked while replication is disabled.
         replication.enabled = false;
-        assert!(validate_replication(&replication).is_ok());
+        assert!(validate_replication(&primary_s3(), &replication).is_ok());
     }
 
     #[test]

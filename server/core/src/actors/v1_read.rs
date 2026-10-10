@@ -427,8 +427,9 @@ impl QueryServerReadV1 {
         // may turn it into a failure. Both only log.
         //
         // Replication copies the object and its sidecar, as uploaded, to every configured
-        // region. A region that fails is reported and skipped; the next backup tries it
-        // again and `replicate-status` shows what is missing in the meantime. Retention
+        // region. A region that fails is reported and skipped; the replication monitor
+        // copies whatever a region misses every `sync_interval_seconds`, and
+        // `replicate-status` shows what is missing in the meantime. Retention
         // then runs in the primary and in every region that could be reached, so each
         // location keeps its newest `versions` backups independently.
         let mut region_clients = Vec::new();

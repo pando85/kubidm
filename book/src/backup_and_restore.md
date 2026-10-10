@@ -114,7 +114,7 @@ Add a `replication` section with one entry per region to `[online_backup.s3]`:
 ```toml
 [online_backup.s3.replication]
 enabled = true
-# Seconds between two replication health checks (default 300)
+# Seconds between two replication sync and health check runs (default 300)
 sync_interval_seconds = 300
 # Further attempts when copying a backup to a region fails (default 3) ...
 max_retries = 3
@@ -152,21 +152,22 @@ bucket = "kubidm-backups-ap"
 as the signing region of the requests to that bucket. Each region has its own `bucket`, and optionally its own
 `endpoint`, `path_prefix`, `credentials`, `storage_class` and server-side encryption, so a replica can live at a
 different provider than the primary. When `enabled = true`, the configuration must list at least one region, region
-names must be unique, every region needs a bucket, and `sync_interval_seconds` must be greater than zero; the server and
-`kubidmd configtest` reject anything else. With `enabled = false` the section is ignored, but its regions can still be
-targeted with `--region`, so a replica remains a recovery source after replication has been switched off.
+names must be unique, every region needs a bucket, no region may point at the primary location or at the location of
+another region (same endpoint, bucket and `path_prefix`), and `sync_interval_seconds` must be greater than zero; the
+server and `kubidmd configtest` reject anything else. With `enabled = false` the section is ignored, but its regions can
+still be targeted with `--region`, so a replica remains a recovery source after replication has been switched off.
 
 #### What Is Replicated, and When
 
 After every scheduled S3 backup has been uploaded and its `<key>.metadata.json` sidecar written, the server copies both
 objects, unchanged, to every configured region under that region's `path_prefix`. The copy keeps the primary's key,
 checksum, size and timestamp, so a replica is indistinguishable from the primary object for `verify-s3` and
-`restore-s3`. Only automatically generated backups are replicated; nothing else under the primary prefix is copied, and
-nothing is copied retroactively: a region added to the configuration receives the backups taken from then on.
+`restore-s3`. Only automatically generated backups are replicated; nothing else under the primary prefix is copied.
+Local backups are never replicated.
 
 A region that can not be written to is retried `max_retries` times, `retry_delay_seconds` apart, then logged at error
-level and skipped. A failing region never fails the primary backup, and the next backup tries the region again. Local
-backups are never replicated.
+level and skipped. A failing region never fails the primary backup. Backups a region missed this way, and all the
+existing backups of a region added to the configuration, are copied by the replication sync described below.
 
 #### Retention per Region
 
@@ -175,13 +176,18 @@ prefix of every region it could write to, keeping the newest `versions` automati
 deleting the older ones together with their `.metadata.json` object. As in the primary, no other object under a region's
 prefix is ever deleted. A region that could not be written to is not pruned in that run.
 
-#### Health Monitoring
+#### Sync and Health Monitoring
 
-Every `sync_interval_seconds` the server compares the backups in the primary prefix with every region: a region is
-healthy when it holds all of them, and each copy's sidecar (checksum and size) and the size the service reports for the
-copy agree with the primary. The server logs one warning per region that misses a backup, holds a copy that differs, or
-can not be reached, with the number of pending backups and the lag, and an info line per healthy region. The check runs
-in its own task and never delays the backup schedule. The first check runs one interval after start up.
+Every `sync_interval_seconds` the server compares the backups in the primary prefix with every region. A copy is intact
+when it exists, its sidecar (checksum and size) agrees with the primary's, and the size the service reports for it
+matches. Every backup a region misses or holds a differing copy of is downloaded from the primary, checked against the
+primary's checksum, and uploaded to the region again; a primary copy that fails its checksum is never propagated. A
+region that can not be reached is skipped and retried on the next run.
+
+After the sync the server checks every region once more: a region is healthy when it holds every primary backup intact.
+It logs one warning per region that still misses a backup, holds a copy that differs, or can not be reached, with the
+number of pending backups and the lag, and an info line per healthy region. The sync runs in its own task and never
+delays the backup schedule. The first run happens one interval after start up.
 
 The lag of a region is the time between the newest backup in the primary and the newest backup the region holds intact:
 zero when the region is up to date, one backup interval when it misses the latest backup only. A copy whose bytes were
@@ -190,8 +196,8 @@ recomputes its checksum.
 
 #### Checking Replication Status
 
-`kubidmd database replicate-status` runs the same comparison on demand and prints it. It does not open the database, so
-it can run while the server is running:
+`kubidmd database replicate-status` runs the same health check on demand and prints it, without copying anything. It
+does not open the database, so it can run while the server is running:
 
 ```bash
 kubidmd database replicate-status -c /data/server.toml
