@@ -155,7 +155,7 @@ schedule = "00 22 * * *"
 #   sec  min   hour   day of month   month   day of week   year
 #   (it's very similar to the standard cron syntax, it just allows to specify the seconds
 #   at the beginning and the year at the end)
-#   Number of backups to keep (default 7)
+#   Number of backups to keep in every backup location (default 7, at least 1)
 # versions = 7
 
 # Compression can either be "gzip" or "nocompression".
@@ -173,7 +173,9 @@ compression = "gzip"
 # endpoint = "https://minio.example.com"
 #   Optional: Path prefix for organizing backups
 # path_prefix = "production"
-#   Optional: Storage class (STANDARD, GLACIER, DEEP_ARCHIVE, etc.)
+#   Optional: Storage class: STANDARD (default), REDUCED_REDUNDANCY, STANDARD_IA,
+#   ONEZONE_IA, INTELLIGENT_TIERING or GLACIER_IR. GLACIER and DEEP_ARCHIVE are refused:
+#   their objects can only be read after a restore request.
 # storage_class = "STANDARD"
 #
 #   Authentication: Static credentials (for testing)
@@ -186,16 +188,18 @@ compression = "gzip"
 #   Authentication: IAM role (recommended for EC2/EKS)
 #   Omit credentials section to use IAM role authentication
 #
-#   Optional: Server-side encryption
+#   Optional: Server-side encryption, applied to the backups and their metadata objects
 # [online_backup.s3.server_side_encryption]
 # algorithm = "aws:kms"  # or "AES256"
+#   Only with aws:kms; S3 refuses a KMS key with AES256
 # kms_key_id = "arn:aws:kms:us-east-1:123456789:key/..."
 #
 #   Optional: Cross-region replication of the S3 backups.
 #   After every successful upload, the backup object and its .metadata.json sidecar are
 #   copied to every region listed here, and each region keeps its newest `versions`
-#   backups (the same retention as the primary bucket). A region that can not be
-#   written to is logged as an error and skipped; the primary backup still succeeds.
+#   backups (the same retention as the primary bucket). The backup makes one attempt
+#   per region and never retries: a region that can not be written to is logged and
+#   skipped, and the primary backup still succeeds.
 #   Every `sync_interval_seconds`, the server copies to each region the primary
 #   backups it misses (or holds a differing copy of), then checks that each region
 #   holds all the primary's backups and logs a warning per region that does not.
@@ -208,24 +212,24 @@ compression = "gzip"
 #   The WAL archive of point-in-time recovery (see [online_backup.wal_archive] below),
 #   when it is uploaded here, is mirrored to the same regions after every archive run;
 #   `pitr-list` and `recover` take `--region <name>` as well.
-#   Requires at least one region, unique region names, a bucket per region, a
-#   location (endpoint, bucket, path_prefix) per region distinct from the primary and
-#   from every other region, and a positive sync_interval_seconds when enabled.
+#   Requires at least one region, unique region names (name, or region without one),
+#   a bucket per region, a location (endpoint, bucket, path_prefix) per region distinct
+#   from the primary and from every other region, and a positive sync_interval_seconds
+#   when enabled.
 #
 # [online_backup.s3.replication]
 # enabled = true
 #   Seconds between two replication sync and health check runs (default 300)
 # sync_interval_seconds = 300
-#   Further attempts when copying a backup to a region fails (default 3) ...
-# max_retries = 3
-#   ... and the seconds to wait between attempts (default 30)
-# retry_delay_seconds = 30
 #
-#   One entry per region. `region` names the entry (for replicate-status and --region)
-#   and is the signing region of its requests; `bucket` is required.
+#   One entry per region. `region` is the signing region of its requests and, unless
+#   `name` is set, names the entry (for replicate-status and --region); `bucket` is
+#   required. Names must be unique: set `name` when two replicas share a region.
 # [[online_backup.s3.replication.regions]]
 # region = "eu-west-1"
 # bucket = "kubidm-backups-eu"
+#   Optional: The name of the replica (default: region)
+# name = "eu-dr"
 #   Optional: Custom endpoint for MinIO or other S3-compatible services
 # endpoint = "https://s3.eu-west-1.example.com"
 #   Optional: Path prefix inside the region's bucket (independent from the primary's)

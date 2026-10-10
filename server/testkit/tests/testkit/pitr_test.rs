@@ -659,6 +659,7 @@ fn test_pitr_local_encrypted_base_and_wal_recover() {
 /// The region of the PITR replication test, in its own bucket and prefix.
 fn pitr_region(primary: &S3Config) -> ReplicationRegionConfig {
     ReplicationRegionConfig {
+        name: None,
         region: PITR_REGION.to_string(),
         endpoint: primary.endpoint.clone(),
         bucket: std::env::var(REGION_BUCKET_ENV)
@@ -740,8 +741,6 @@ fn test_pitr_s3_encrypted_replicated_recover_from_region() {
         enabled: true,
         regions: vec![region.clone()],
         sync_interval_seconds: 3600,
-        max_retries: 0,
-        retry_delay_seconds: 0,
     });
     let region_s3 = region.to_s3_config();
 

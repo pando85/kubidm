@@ -13,8 +13,8 @@ use kubidm_proto::{
     },
 };
 use kubidmd_lib::{
-    be::{BackendTransaction, BackupStructuralReport},
-    event::{OnlineBackupEvent, SearchEvent, SearchResult, WhoamiResult},
+    be::BackendTransaction,
+    event::{SearchEvent, SearchResult, WhoamiResult},
     filter::{Filter, FilterInvalid},
     idm::{
         account::ListUserAuthTokenEvent,
@@ -39,37 +39,13 @@ use kubidmd_lib::{
     prelude::*,
 };
 use ldap3_proto::simple::*;
-use std::{
-    convert::TryFrom,
-    fs,
-    net::IpAddr,
-    path::{Path, PathBuf},
-    str::FromStr,
-    sync::Arc,
-};
-use tracing::{error, info, instrument, trace};
+use std::{convert::TryFrom, net::IpAddr, str::FromStr};
+use tracing::{error, instrument, trace};
 use uuid::Uuid;
 
 use super::QueryServerReadV1;
-use crate::backup::{
-    backup_artifact_name, finalize_local_backup_async, is_backup_artifact_name, run_blocking,
-    seal_backup_async, select_backups_to_delete, verify_backup_output_async, BackupEncryptor,
-    S3ClientWrapper,
-};
-use kubidm_proto::backup::BackupEncryptionConfig;
 
 // ===========================================================
-
-/// A successful online backup: what it is called and what the structural verification
-/// read back from it, including the CID watermark point-in-time recovery indexes.
-#[derive(Debug, Clone)]
-pub struct OnlineBackupOutcome {
-    /// File name (local) or object key relative to the S3 prefix.
-    pub key: String,
-    /// RFC3339 time of the backup.
-    pub timestamp: String,
-    pub report: BackupStructuralReport,
-}
 
 impl QueryServerReadV1 {
     // The server only receives "Message" structures, which
@@ -210,207 +186,17 @@ impl QueryServerReadV1 {
         res
     }
 
-    #[instrument(
-        level = "info",
-        name = "online_backup",
-        skip_all,
-        fields(uuid = ?msg.eventid)
-    )]
-    pub async fn handle_online_backup(
-        &self,
-        msg: OnlineBackupEvent,
-        outpath: &Path,
-        versions: usize,
+    /// Serialise and compress the whole database inside one read transaction: the
+    /// consistent snapshot an online backup is made of. The transaction is opened here and
+    /// the serialisation, which reads and compresses every entry, runs on the blocking
+    /// thread pool so that it never stalls the workers serving LDAP and HTTPS.
+    pub(crate) async fn backup_database(
+        &'static self,
         compression: BackupCompression,
-        encryption: &BackupEncryptionConfig,
-        s3_client: Option<S3ClientWrapper>,
-    ) -> Result<OnlineBackupOutcome, OperationError> {
-        trace!(eventid = ?msg.eventid, "Begin online backup event");
-
-        #[allow(clippy::disallowed_methods)]
-        // Allowed as this timestamp is only used for the filename creation.
-        let now = time::OffsetDateTime::now_utc();
-
-        #[allow(clippy::unwrap_used)]
-        let timestamp = now.format(&Rfc3339).unwrap();
-
-        // The key is obtained once per run, before any backup is produced, so that an
-        // unavailable key fails the run without leaving a half written artifact behind.
-        let encryptor = BackupEncryptor::from_config(encryption)
-            .await
-            .map_err(|err| {
-                error!(%err, "Online backup can not obtain the backup encryption key");
-                OperationError::InvalidState
-            })?;
-
-        // Handle S3 backup
-        if let Some(s3) = s3_client {
-            return self
-                .handle_s3_backup(
-                    &msg,
-                    &timestamp,
-                    versions,
-                    compression,
-                    encryptor.as_ref(),
-                    s3,
-                )
-                .await;
-        }
-
-        // Handle local file backup
-        let file_name = backup_artifact_name(&timestamp, compression, encryptor.is_some());
-        let dest_file = outpath.join(&file_name);
-
-        if dest_file.exists() {
-            error!(
-                "Online backup file {} already exists, will not overwrite it.",
-                dest_file.display()
-            );
-            return Err(OperationError::InvalidState);
-        }
-
-        let artifact = self
-            .produce_backup_artifact(compression, encryptor.as_ref())
-            .await
-            .inspect_err(|err| {
-                error!(
-                    ?err,
-                    "Online backup failed to create {}",
-                    dest_file.display()
-                );
-            })?;
-
-        let write_to = dest_file.clone();
-        run_blocking(move || std::fs::write(write_to, artifact))
-            .await
-            .map_err(|err| {
-                error!(?err, "Unable to write {}", dest_file.display());
-                OperationError::FsError
-            })?;
-        debug!("Online backup written to {}", dest_file.display());
-
-        // Never announce, retain or prune on the strength of a backup that can not be
-        // read back. A rejected artifact is kept under an `.invalid` suffix, which the
-        // retention matcher ignores, and retention below is skipped so that a failed
-        // backup can not cause an older good backup to be removed.
-        // Should the rename itself fail, the rejected file keeps a retention-matching name
-        // and the next run may count it as a backup; the loud error below, which carries
-        // the rename failure in `reasons`, is the mitigation.
-        let report = finalize_local_backup_async(&dest_file, compression, encryptor.as_ref())
-            .await
-            .map_err(|err| {
-                error!(
-                    reasons = ?err.reasons,
-                    quarantined_to = ?err.quarantined_to,
-                    "Online backup {} failed verification",
-                    dest_file.display()
-                );
-                OperationError::InvalidState
-            })?;
-        info!(
-            entries = report.entry_count,
-            version = ?report.version,
-            encryption_key = encryptor.as_ref().map(BackupEncryptor::key_identifier),
-            "Online backup verified"
-        );
-
-        // TODO: make the file rotation a separate function
-
-        // cleanup of maximum backup versions to keep
-        let mut backup_file_list: Vec<PathBuf> = Vec::new();
-        // get a list of backup files
-        match fs::read_dir(outpath) {
-            Ok(rd) => {
-                for entry in rd {
-                    // get PathBuf
-                    let pb = entry
-                        .map_err(|e| {
-                            error!(?e, "Pathbuf access");
-                            OperationError::InvalidState
-                        })?
-                        .path();
-
-                    // skip everything that is not a file
-                    if !pb.is_file() {
-                        continue;
-                    }
-
-                    // get the /some/dir/<file_name> of the file
-                    let file_name = pb.file_name().and_then(|f| f.to_str()).ok_or_else(|| {
-                        error!("filename is invalid");
-                        OperationError::InvalidState
-                    })?;
-                    // check for a online backup file
-                    if is_backup_artifact_name(file_name) {
-                        backup_file_list.push(pb.clone());
-                    }
-                }
-            }
-            Err(e) => {
-                error!(
-                    "Online backup cleanup error read dir {}: {}",
-                    outpath.display(),
-                    e
-                );
-                return Err(OperationError::InvalidState);
-            }
-        }
-
-        // sort it to have items listed old to new
-        backup_file_list.sort();
-
-        // Versions: OLD 10.9.8.7.6.5.4.3.2.1 NEW
-        //              |----delete----|keep|
-        // 10 items, we want to keep the latest 3
-
-        // if we have more files then we want to keep, me do some cleanup
-        if backup_file_list.len() > versions {
-            let x = backup_file_list.len() - versions;
-            info!(
-                "Online backup cleanup found {} versions, should keep {}, will remove {}",
-                backup_file_list.len(),
-                versions,
-                x
-            );
-            backup_file_list.truncate(x);
-
-            // removing files
-            for file in backup_file_list {
-                debug!("Online backup cleanup: removing {:?}", &file);
-                match fs::remove_file(&file) {
-                    Ok(_) => {}
-                    Err(e) => {
-                        error!(
-                            "Online backup cleanup failed to remove file {:?}: {:?}",
-                            file, e
-                        )
-                    }
-                };
-            }
-        } else {
-            debug!("Online backup cleanup had no files to remove");
-        };
-
-        Ok(OnlineBackupOutcome {
-            key: file_name,
-            timestamp,
-            report,
-        })
-    }
-
-    /// Produce the complete backup artifact in memory: the backend serialises and
-    /// compresses the database inside a read transaction, and the result is encrypted
-    /// when an `encryptor` is given.
-    async fn produce_backup_artifact(
-        &self,
-        compression: BackupCompression,
-        encryptor: Option<&BackupEncryptor>,
     ) -> Result<Vec<u8>, OperationError> {
-        let mut backup_data = Vec::new();
-
-        // Scope to limit the read txn and collect backup data
-        {
-            let mut idms_prox_read = self.idms.proxy_read().await?;
+        let mut idms_prox_read = self.idms.proxy_read().await?;
+        tokio::task::spawn_blocking(move || {
+            let mut backup_data = Vec::new();
             idms_prox_read
                 .qs_read
                 .get_be_txn()
@@ -419,122 +205,13 @@ impl QueryServerReadV1 {
                     error!("Online backup failed to create backup data: {:?}", e);
                     OperationError::InvalidState
                 })?;
-        }
-
-        seal_backup_async(backup_data, compression, encryptor)
-            .await
-            .map_err(|err| {
-                error!(%err, "Online backup failed to encrypt the backup");
-                OperationError::CryptographyError
-            })
-    }
-
-    #[instrument(
-        level = "info",
-        name = "s3_backup",
-        skip_all,
-        fields(uuid = ?msg.eventid)
-    )]
-    async fn handle_s3_backup(
-        &self,
-        msg: &OnlineBackupEvent,
-        timestamp: &str,
-        versions: usize,
-        compression: BackupCompression,
-        encryptor: Option<&BackupEncryptor>,
-        s3_client: S3ClientWrapper,
-    ) -> Result<OnlineBackupOutcome, OperationError> {
-        trace!(eventid = ?msg.eventid, "Begin S3 backup event");
-
-        let backup_data = Arc::new(self.produce_backup_artifact(compression, encryptor).await?);
-
-        let object_key = backup_artifact_name(timestamp, compression, encryptor.is_some());
-
-        // A backup that can not be read back is never uploaded, so the bucket only ever
-        // holds artifacts that passed the same structural checks as `verify-backup`. An
-        // encrypted artifact is decrypted for this, which proves the key opens it.
-        let report = verify_backup_output_async(Arc::clone(&backup_data), compression, encryptor)
-            .await
-            .map_err(|err| {
-                error!(
-                    reasons = ?err.reasons,
-                    "S3 backup {} failed verification and was not uploaded",
-                    object_key
-                );
-                OperationError::InvalidState
-            })?;
-        info!(
-            entries = report.entry_count,
-            version = ?report.version,
-            encryption_key = encryptor.map(BackupEncryptor::key_identifier),
-            "Online backup verified"
-        );
-
-        let metadata = s3_client
-            .upload_backup(
-                &backup_data,
-                &object_key,
-                timestamp,
-                compression,
-                encryptor.map(BackupEncryptor::key_identifier),
-            )
-            .await
-            .map_err(|e| {
-                error!("S3 backup upload failed: {}", e);
-                OperationError::InvalidState
-            })?;
-
-        info!("S3 backup uploaded successfully: {}", object_key);
-
-        // The backup itself has succeeded at this point: neither replication nor retention
-        // may turn it into a failure. Both only log.
-        //
-        // Replication copies the object and its sidecar, as uploaded, to every configured
-        // region. A region that fails is reported and skipped; the replication monitor
-        // copies whatever a region misses every `sync_interval_seconds`, and
-        // `replicate-status` shows what is missing in the meantime. Retention
-        // then runs in the primary and in every region that could be reached, so each
-        // location keeps its newest `versions` backups independently.
-        let mut region_clients = Vec::new();
-        if let Some(replication) = s3_client.replication_config() {
-            for region_config in &replication.regions {
-                if let Err(e) = s3_client
-                    .replicate_backup_with_retries(
-                        &object_key,
-                        &backup_data,
-                        &metadata,
-                        region_config,
-                        replication,
-                    )
-                    .await
-                {
-                    error!(
-                        "S3 backup replication of {} to region {} (bucket {}) failed: {}",
-                        object_key, region_config.region, region_config.bucket, e
-                    );
-                    continue;
-                }
-                match S3ClientWrapper::for_region(region_config).await {
-                    Ok(client) => region_clients.push(client),
-                    Err(e) => error!(
-                        "S3 backup cleanup skipped region {}: unable to create its client: {}",
-                        region_config.region, e
-                    ),
-                }
-            }
-        }
-        drop(backup_data);
-
-        prune_s3_backups(&s3_client, versions).await;
-        for region_client in &region_clients {
-            prune_s3_backups(region_client, versions).await;
-        }
-
-        Ok(OnlineBackupOutcome {
-            key: object_key,
-            timestamp: timestamp.to_string(),
-            report,
+            Ok(backup_data)
         })
+        .await
+        .map_err(|err| {
+            error!(%err, "Online backup failed: the backup task failed");
+            OperationError::InvalidState
+        })?
     }
 
     #[instrument(
@@ -1944,48 +1621,5 @@ impl QueryServerReadV1 {
         idms_prox_read
             .qs_read
             .approval_request_get(&ident, request_uuid)
-    }
-}
-
-/// Apply the `versions` retention to the location `client` writes to: the primary prefix
-/// or the prefix of a replication region. Only automatically generated backup artifacts
-/// are ever deleted, together with their metadata sidecar; the PITR manifest and any other
-/// object under the prefix are kept. Failures are logged and never propagated, because the
-/// backup that triggered the cleanup has already succeeded.
-async fn prune_s3_backups(client: &S3ClientWrapper, versions: usize) {
-    let location = client.location();
-
-    let existing = match client.list_backups().await {
-        Ok(existing) => existing,
-        Err(e) => {
-            error!("S3 backup cleanup failed to list {}: {}", location, e);
-            return;
-        }
-    };
-
-    let to_delete = select_backups_to_delete(&existing, versions);
-    if to_delete.is_empty() {
-        debug!("S3 backup cleanup had no backups to remove in {}", location);
-    } else {
-        info!(
-            "S3 backup cleanup found {} backups in {}, should keep {}, will remove {}",
-            existing
-                .iter()
-                .filter(|key| is_backup_artifact_name(key))
-                .count(),
-            location,
-            versions,
-            to_delete.len()
-        );
-    }
-
-    for key in to_delete {
-        match client.delete_backup(&key).await {
-            Ok(()) => info!("S3 backup cleanup removed {} from {}", key, location),
-            Err(e) => error!(
-                "S3 backup cleanup failed to remove {} from {}: {}",
-                key, location, e
-            ),
-        }
     }
 }

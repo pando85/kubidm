@@ -372,8 +372,6 @@ fn test_replication_config_default() {
     assert!(!config.enabled);
     assert_eq!(config.regions.len(), 0);
     assert_eq!(config.sync_interval_seconds, 300);
-    assert_eq!(config.max_retries, 3);
-    assert_eq!(config.retry_delay_seconds, 30);
 }
 
 #[test]
@@ -414,6 +412,7 @@ fn test_replication_region_status() {
 #[test]
 fn test_replication_region_config_to_s3_config() {
     let region = ReplicationRegionConfig {
+        name: None,
         region: "eu-west-1".to_string(),
         endpoint: Some("https://s3.eu-west-1.example.com".to_string()),
         bucket: "kubidm-backups-eu".to_string(),
@@ -448,6 +447,7 @@ fn test_replication_region_config_to_s3_config() {
 #[test]
 fn test_replication_region_config_to_s3_config_kms_shorthand() {
     let mut region = ReplicationRegionConfig {
+        name: None,
         region: "eu-west-1".to_string(),
         endpoint: None,
         bucket: "kubidm-backups-eu".to_string(),
@@ -483,14 +483,28 @@ fn test_replication_region_config_to_s3_config_kms_shorthand() {
 
     // An explicit block with its own key wins.
     region.server_side_encryption = Some(S3ServerSideEncryption {
-        algorithm: Some(S3EncryptionAlgorithm::Aes256),
+        algorithm: Some(S3EncryptionAlgorithm::AwsKms),
         kms_key_id: Some("explicit".to_string()),
     });
     assert_eq!(
         region.to_s3_config().server_side_encryption,
         Some(S3ServerSideEncryption {
-            algorithm: Some(S3EncryptionAlgorithm::Aes256),
+            algorithm: Some(S3EncryptionAlgorithm::AwsKms),
             kms_key_id: Some("explicit".to_string()),
+        })
+    );
+
+    // AES256 never borrows the shorthand key: S3 rejects a KMS key with AES256, and the
+    // configuration rejects the combination.
+    region.server_side_encryption = Some(S3ServerSideEncryption {
+        algorithm: Some(S3EncryptionAlgorithm::Aes256),
+        kms_key_id: None,
+    });
+    assert_eq!(
+        region.to_s3_config().server_side_encryption,
+        Some(S3ServerSideEncryption {
+            algorithm: Some(S3EncryptionAlgorithm::Aes256),
+            kms_key_id: None,
         })
     );
 }
@@ -616,6 +630,13 @@ impl Display for S3EncryptionAlgorithm {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ReplicationRegionConfig {
+    /// The name of the replica, shown by `replicate-status` and selected by `--region`.
+    /// Defaults to `region`; it only needs to be set when two replicas share a signing
+    /// region, such as two buckets in one AWS region or two S3-compatible stores that both
+    /// sign with the same region.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// The signing region of the requests to the replica's bucket.
     pub region: String,
     #[serde(default)]
     pub endpoint: Option<String>,
@@ -633,6 +654,11 @@ pub struct ReplicationRegionConfig {
 }
 
 impl ReplicationRegionConfig {
+    /// The name of the replica: `name` when set, `region` otherwise.
+    pub fn name(&self) -> &str {
+        self.name.as_deref().unwrap_or(&self.region)
+    }
+
     /// The S3 configuration of this replica: the region's bucket, endpoint, prefix,
     /// credentials, encryption and storage class, with `region` as the signing region.
     /// Everything the server does against the primary bucket (upload, listing, retention,
@@ -640,12 +666,17 @@ impl ReplicationRegionConfig {
     ///
     /// A region level `kms_key_id` is a shorthand for `aws:kms` server-side encryption
     /// with that key. An explicit `server_side_encryption` block wins when both are set
-    /// and only fills its missing `kms_key_id` from the shorthand.
+    /// and only fills its missing `kms_key_id` from the shorthand, and only when it selects
+    /// `aws:kms`: S3 rejects a KMS key together with `AES256`.
     pub fn to_s3_config(&self) -> S3Config {
         let server_side_encryption = match (&self.server_side_encryption, &self.kms_key_id) {
             (Some(sse), kms_key_id) => Some(S3ServerSideEncryption {
                 algorithm: sse.algorithm.clone(),
-                kms_key_id: sse.kms_key_id.clone().or_else(|| kms_key_id.clone()),
+                kms_key_id: sse.kms_key_id.clone().or_else(|| {
+                    kms_key_id
+                        .clone()
+                        .filter(|_| sse.algorithm != Some(S3EncryptionAlgorithm::Aes256))
+                }),
             }),
             (None, Some(kms_key_id)) => Some(S3ServerSideEncryption {
                 algorithm: Some(S3EncryptionAlgorithm::AwsKms),
@@ -671,8 +702,11 @@ impl Display for ReplicationRegionConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "ReplicationRegionConfig {{ region: {}, bucket: {}, endpoint: {:?} }}",
-            self.region, self.bucket, self.endpoint
+            "ReplicationRegionConfig {{ name: {}, region: {}, bucket: {}, endpoint: {:?} }}",
+            self.name(),
+            self.region,
+            self.bucket,
+            self.endpoint
         )
     }
 }
@@ -684,10 +718,6 @@ pub struct ReplicationConfig {
     pub regions: Vec<ReplicationRegionConfig>,
     #[serde(default = "default_replication_sync_interval")]
     pub sync_interval_seconds: u64,
-    #[serde(default = "default_replication_max_retries")]
-    pub max_retries: u32,
-    #[serde(default = "default_replication_retry_delay")]
-    pub retry_delay_seconds: u64,
 }
 
 fn default_replication_enabled() -> bool {
@@ -698,22 +728,12 @@ fn default_replication_sync_interval() -> u64 {
     300
 }
 
-fn default_replication_max_retries() -> u32 {
-    3
-}
-
-fn default_replication_retry_delay() -> u64 {
-    30
-}
-
 impl Default for ReplicationConfig {
     fn default() -> Self {
         Self {
             enabled: default_replication_enabled(),
             regions: Vec::new(),
             sync_interval_seconds: default_replication_sync_interval(),
-            max_retries: default_replication_max_retries(),
-            retry_delay_seconds: default_replication_retry_delay(),
         }
     }
 }

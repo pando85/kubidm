@@ -6,7 +6,8 @@
 
 use cidr::IpCidr;
 use kubidm_proto::backup::{
-    BackupCompression, BackupEncryptionConfig, ReplicationConfig, S3Config, WalArchiveConfig,
+    BackupCompression, BackupEncryptionConfig, ReplicationConfig, S3Config, S3EncryptionAlgorithm,
+    WalArchiveConfig,
 };
 pub use kubidm_proto::config::ServerRole;
 use kubidm_proto::constants::DEFAULT_SERVER_ADDRESS;
@@ -25,7 +26,7 @@ use std::{
 };
 use url::Url;
 
-use crate::backup::{same_s3_location, validate_encryption_config};
+use crate::backup::{same_s3_location, validate_encryption_config, validate_s3_location};
 use crate::repl::config::ReplicationConfiguration;
 
 #[derive(Debug, Deserialize)]
@@ -78,7 +79,8 @@ pub struct OnlineBackup {
     /// (it's very similar to the standard cron syntax, it just allows to specify the seconds at the beginning and the year at the end)
     pub schedule: String,
     #[serde(default = "default_online_backup_versions")]
-    /// How many past backup versions to keep, defaults to 7
+    /// How many past backup versions to keep in every backup location, defaults to 7.
+    /// Must be at least 1.
     pub versions: usize,
     /// Enabled by default
     #[serde(default = "default_online_backup_enabled")]
@@ -128,6 +130,17 @@ impl OnlineBackup {
     /// The WAL directory itself is checked for writability when the server starts (the
     /// backend creates and probes it), not here, since `configtest` must not create it.
     pub fn validate(&self) -> Result<(), String> {
+        if self.versions == 0 {
+            // Retention keeps the newest `versions` backups, so zero would delete every
+            // backup, in every location and region, right after it was taken.
+            return Err(
+                "online_backup.versions must be at least 1: it is the number of backups kept \
+                 in every backup location, and 0 would delete every backup right after it was \
+                 taken"
+                    .to_string(),
+            );
+        }
+
         validate_encryption_config(&self.encryption)
             .map_err(|reason| format!("online_backup.encryption: {reason}"))?;
 
@@ -144,6 +157,8 @@ impl OnlineBackup {
                 .map_err(|reason| format!("online_backup.wal_archive: {reason}"))?;
             // A separate S3 location of the archive may replicate it to regions of its own.
             if let Some(wal_s3) = &wal_archive.s3 {
+                validate_s3_location(wal_s3)
+                    .map_err(|reason| format!("online_backup.wal_archive.s3: {reason}"))?;
                 if let Some(replication) = &wal_s3.replication {
                     validate_replication(wal_s3, replication).map_err(|reason| {
                         reason.replacen("online_backup.s3", "online_backup.wal_archive.s3", 1)
@@ -153,6 +168,7 @@ impl OnlineBackup {
         }
 
         if let Some(s3) = &self.s3 {
+            validate_s3_location(s3).map_err(|reason| format!("online_backup.s3: {reason}"))?;
             if let Some(replication) = &s3.replication {
                 validate_replication(s3, replication)?;
             }
@@ -195,26 +211,57 @@ fn validate_replication(s3: &S3Config, replication: &ReplicationConfig) -> Resul
                 "online_backup.s3.replication.regions[{index}]: region must not be empty"
             ));
         }
+        if region
+            .name
+            .as_ref()
+            .is_some_and(|name| name.trim().is_empty())
+        {
+            return Err(format!(
+                "online_backup.s3.replication.regions[{index}]: name must not be empty; omit it \
+                 to name the region after its signing region"
+            ));
+        }
         if region.bucket.trim().is_empty() {
             return Err(format!(
                 "online_backup.s3.replication.regions[{index}] ({}): bucket must not be empty",
-                region.region
+                region.name()
             ));
         }
-        if !names.insert(region.region.as_str()) {
+        if !names.insert(region.name()) {
             return Err(format!(
                 "online_backup.s3.replication.regions[{index}]: region name {:?} is used by \
-                 more than one entry; region names must be unique",
-                region.region
+                 more than one entry; region names must be unique. Set `name` to tell apart \
+                 replicas that share a signing region",
+                region.name()
+            ));
+        }
+        if region.kms_key_id.is_some()
+            && region
+                .server_side_encryption
+                .as_ref()
+                .is_some_and(|sse| sse.algorithm == Some(S3EncryptionAlgorithm::Aes256))
+        {
+            return Err(format!(
+                "online_backup.s3.replication.regions[{index}] ({}): kms_key_id is a shorthand \
+                 for aws:kms server-side encryption and can not be combined with \
+                 server_side_encryption.algorithm = \"AES256\"",
+                region.name()
             ));
         }
         let location = region.to_s3_config();
+        validate_s3_location(&location).map_err(|reason| {
+            format!(
+                "online_backup.s3.replication.regions[{index}] ({}): {reason}",
+                region.name()
+            )
+        })?;
         if same_s3_location(&location, s3) {
             return Err(format!(
                 "online_backup.s3.replication.regions[{index}] ({}): bucket {:?} with this \
                  endpoint and path_prefix is the primary backup location itself; a replica \
                  must be stored elsewhere",
-                region.region, region.bucket
+                region.name(),
+                region.bucket
             ));
         }
         if let Some(other) = replication
@@ -226,7 +273,9 @@ fn validate_replication(s3: &S3Config, replication: &ReplicationConfig) -> Resul
             return Err(format!(
                 "online_backup.s3.replication.regions[{index}] ({}): bucket {:?} with this \
                  endpoint and path_prefix is already the location of region {:?}",
-                region.region, region.bucket, other.region
+                region.name(),
+                region.bucket,
+                other.name()
             ));
         }
     }
@@ -1280,7 +1329,9 @@ impl ConfigurationBuilder {
 mod tests {
     use super::*;
     use cidr::{IpCidr, Ipv4Cidr, Ipv6Cidr};
-    use kubidm_proto::backup::{EncryptionKeySource, ReplicationRegionConfig};
+    use kubidm_proto::backup::{
+        EncryptionKeySource, ReplicationRegionConfig, S3ServerSideEncryption,
+    };
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     const BASE_V2_CONFIG: &str = r#"
@@ -1308,6 +1359,28 @@ schedule = "@daily"
     #[test]
     fn online_backup_without_unavailable_features_is_accepted() {
         assert!(build_from_toml(BASE_V2_CONFIG).is_some());
+    }
+
+    #[test]
+    fn online_backup_versions_must_keep_at_least_one_backup() {
+        let config = build_from_toml(&format!("{BASE_V2_CONFIG}versions = 1\n"))
+            .expect("one version is accepted");
+        assert_eq!(config.online_backup.map(|backup| backup.versions), Some(1));
+
+        assert!(
+            build_from_toml(&format!("{BASE_V2_CONFIG}versions = 0\n")).is_none(),
+            "versions = 0 must be rejected"
+        );
+
+        // `--online-backup-versions` lands in the same section before `finish` validates
+        // it, so the override is rejected the same way.
+        let err = OnlineBackup {
+            versions: 0,
+            ..OnlineBackup::default()
+        }
+        .validate()
+        .expect_err("versions = 0 must be rejected");
+        assert!(err.starts_with("online_backup.versions"), "{err}");
     }
 
     #[test]
@@ -1602,6 +1675,41 @@ bucket = \"kubidm-backups-eu-2\"
 "
         );
         assert!(build_from_toml(&duplicate).is_none());
+
+        // Two replicas in one signing region (two accounts or buckets in eu-west-1) are
+        // told apart by their names.
+        let named = format!(
+            "{BASE_V2_CONFIG}{S3_SECTION}
+[online_backup.s3.replication]
+enabled = true
+
+[[online_backup.s3.replication.regions]]
+name = \"eu-a\"
+region = \"eu-west-1\"
+bucket = \"kubidm-backups-eu\"
+
+[[online_backup.s3.replication.regions]]
+name = \"eu-b\"
+region = \"eu-west-1\"
+bucket = \"kubidm-backups-eu-2\"
+"
+        );
+        let config = build_from_toml(&named).expect("distinct names are accepted");
+        let regions = config
+            .online_backup
+            .and_then(|backup| backup.s3)
+            .and_then(|s3| s3.replication)
+            .map(|replication| replication.regions)
+            .unwrap_or_default();
+        let names: Vec<&str> = regions.iter().map(|region| region.name()).collect();
+        assert_eq!(names, ["eu-a", "eu-b"]);
+        assert!(regions.iter().all(|region| region.region == "eu-west-1"));
+
+        // A name may not repeat another entry's default name either.
+        let clash = named.replace("name = \"eu-b\"", "name = \"eu-a\"");
+        assert!(build_from_toml(&clash).is_none());
+        let empty = named.replace("name = \"eu-b\"", "name = \" \"");
+        assert!(build_from_toml(&empty).is_none());
     }
 
     #[test]
@@ -1637,6 +1745,7 @@ bucket = \"kubidm-backups-eu\"
 
     fn region(name: &str, bucket: &str) -> ReplicationRegionConfig {
         ReplicationRegionConfig {
+            name: None,
             region: name.to_string(),
             endpoint: None,
             bucket: bucket.to_string(),
@@ -1659,6 +1768,59 @@ bucket = \"kubidm-backups-eu\"
             storage_class: "STANDARD".to_string(),
             replication: None,
         }
+    }
+
+    #[test]
+    fn s3_locations_that_s3_would_reject_are_refused_at_load() {
+        // An archive storage class on the primary: backups that can not be read back.
+        let glacier = format!("{BASE_V2_CONFIG}{S3_SECTION}storage_class = \"GLACIER\"\n");
+        assert!(build_from_toml(&glacier).is_none());
+        // A typo that used to become STANDARD silently.
+        let typo = format!("{BASE_V2_CONFIG}{S3_SECTION}storage_class = \"STANDARD-IA\"\n");
+        assert!(build_from_toml(&typo).is_none());
+
+        let mut online_backup = OnlineBackup {
+            s3: Some(primary_s3()),
+            ..OnlineBackup::default()
+        };
+        assert!(online_backup.validate().is_ok());
+
+        // AES256 with a KMS key on the primary.
+        if let Some(s3) = online_backup.s3.as_mut() {
+            s3.server_side_encryption = Some(S3ServerSideEncryption {
+                algorithm: Some(S3EncryptionAlgorithm::Aes256),
+                kms_key_id: Some("key".to_string()),
+            });
+        }
+        let err = online_backup.validate().expect_err("AES256 with a KMS key");
+        assert!(err.starts_with("online_backup.s3:"), "{err}");
+
+        // On a region: an explicit AES256 block next to the kms_key_id shorthand.
+        let mut eu = region("eu-west-1", "kubidm-backups-eu");
+        eu.kms_key_id = Some("key".to_string());
+        eu.server_side_encryption = Some(S3ServerSideEncryption {
+            algorithm: Some(S3EncryptionAlgorithm::Aes256),
+            kms_key_id: None,
+        });
+        let replication = ReplicationConfig {
+            enabled: true,
+            regions: vec![eu],
+            ..ReplicationConfig::default()
+        };
+        let err = validate_replication(&primary_s3(), &replication).expect_err("AES256 shorthand");
+        assert!(err.contains("regions[0] (eu-west-1)"), "{err}");
+        assert!(err.contains("shorthand"), "{err}");
+
+        // And an archive class on a region.
+        let mut eu = region("eu-west-1", "kubidm-backups-eu");
+        eu.storage_class = "DEEP_ARCHIVE".to_string();
+        let replication = ReplicationConfig {
+            enabled: true,
+            regions: vec![eu],
+            ..ReplicationConfig::default()
+        };
+        let err = validate_replication(&primary_s3(), &replication).expect_err("archive class");
+        assert!(err.contains("archive class"), "{err}");
     }
 
     #[test]

@@ -1,9 +1,9 @@
 //! This contains scheduled tasks/interval tasks that are run inside of the server on a schedule
 //! as background operations.
 
-use std::{fs, path::Path, str::FromStr, sync::Arc};
+use std::{fs, future::Future, path::Path, str::FromStr, sync::Arc};
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use cron::Schedule;
 
 use tokio::{
@@ -12,7 +12,8 @@ use tokio::{
     time::{interval, interval_at, sleep, Duration, Instant, MissedTickBehavior},
 };
 
-use crate::backup::pitr::{BaseLocation, PitrArchive};
+use crate::backup::online::OnlineBackupJob;
+use crate::backup::pitr::PitrArchive;
 use crate::backup::{region_is_healthy, S3ClientWrapper};
 use crate::config::OnlineBackup;
 use crate::{CoreAction, TaskName};
@@ -20,9 +21,7 @@ use crate::{CoreAction, TaskName};
 use crate::actors::{QueryServerReadV1, QueryServerWriteV1};
 use kubidm_proto::backup::{ReplicationConfig, S3Config};
 use kubidmd_lib::constants::PURGE_FREQUENCY;
-use kubidmd_lib::event::{
-    OnlineBackupEvent, PurgeDeleteAfterEvent, PurgeRecycledEvent, PurgeTombstoneEvent,
-};
+use kubidmd_lib::event::{PurgeDeleteAfterEvent, PurgeRecycledEvent, PurgeTombstoneEvent};
 
 pub(crate) struct IntervalActor;
 
@@ -85,7 +84,6 @@ impl IntervalActor {
             return Err(());
         }
 
-        let versions = online_backup_config.versions;
         let crono_expr = online_backup_config.schedule.as_str().to_string();
         let mut crono_expr_values = crono_expr.split_ascii_whitespace().collect::<Vec<&str>>();
         let chrono_expr_uses_standard_syntax = crono_expr_values.len() == 5;
@@ -146,14 +144,14 @@ impl IntervalActor {
             }
         }
 
-        let backup_compression = online_backup_config.compression;
-        let encryption = online_backup_config.encryption.clone();
+        let job = OnlineBackupJob::from_config(online_backup_config, pitr_archive);
         let s3_config = online_backup_config.s3.clone();
 
         let mut handles = Vec::with_capacity(2);
 
-        // The health monitor is a separate task with its own shutdown receiver, so a slow
-        // or unreachable region can never delay the backup schedule.
+        // The replication monitor is a separate task with its own shutdown receiver. It is
+        // the only place that retries the copies to a region: the backup run makes a single
+        // attempt per region and never waits for one.
         if let Some(replication) = s3_config
             .as_ref()
             .and_then(|s3| s3.replication.clone())
@@ -168,86 +166,44 @@ impl IntervalActor {
         }
 
         let handle = tokio::spawn(async move {
-            for next_time in cron_expr.upcoming(Utc) {
-                let wait_seconds = 1 + (next_time - Utc::now()).num_seconds() as u64;
+            let mut last_run = None;
+            loop {
+                let now = Utc::now();
+                let Some(next_time) = next_backup_time(&cron_expr, now, last_run) else {
+                    info!("Online backup schedule '{}' has no further runs", cron_expr);
+                    break;
+                };
+                let wait = wait_until(next_time, now);
                 info!(
                     "Online backup next run on {}, wait_time = {}s",
-                    next_time, wait_seconds
+                    next_time,
+                    wait.as_secs()
                 );
 
                 tokio::select! {
-                    Ok(action) = rx.recv() => {
-                        match action {
-                            CoreAction::Shutdown => break,
-                            CoreAction::Reload => {}
+                    action = rx.recv() => match action {
+                        Ok(CoreAction::Shutdown) | Err(broadcast::error::RecvError::Closed) => {
+                            break
                         }
-                    }
-                    _ = sleep(Duration::from_secs(wait_seconds)) => {
-                        // Perform local backup if path is configured
-                        if let Some(ref path) = outpath {
-                            match server
-                                .handle_online_backup(
-                                    OnlineBackupEvent::new(),
-                                    path,
-                                    versions,
-                                    backup_compression,
-                                    &encryption,
-                                    None,
-                                )
-                                .await
-                            {
-                                Ok(outcome) => {
-                                    // Index the backup as a base for point-in-time recovery.
-                                    if let Some(archive) = &pitr_archive {
-                                        archive
-                                            .register_base_backup_logged(
-                                                &BaseLocation::Local(path.clone()),
-                                                &outcome.key,
-                                                &outcome.timestamp,
-                                                &outcome.report,
-                                            )
-                                            .await;
-                                    }
-                                }
-                                Err(e) => error!(?e, "An online backup error occurred."),
-                            }
+                        // The schedule does not change on a reload: wait for the same run.
+                        Ok(CoreAction::Reload) | Err(broadcast::error::RecvError::Lagged(_)) => {
+                            continue
                         }
+                    },
+                    _ = sleep(wait) => {}
+                }
 
-                        // Perform S3 backup if configured
-                        if let Some(s3_cfg) = &s3_config {
-                            match S3ClientWrapper::new(s3_cfg.clone()).await {
-                                Ok(s3_client) => {
-                                    match server
-                                        .handle_online_backup(
-                                            OnlineBackupEvent::new(),
-                                            &std::path::PathBuf::from("s3://backup"),
-                                            versions,
-                                            backup_compression,
-                                            &encryption,
-                                            Some(s3_client),
-                                        )
-                                        .await
-                                    {
-                                        Ok(outcome) => {
-                                            if let Some(archive) = &pitr_archive {
-                                                archive
-                                                    .register_base_backup_logged(
-                                                        &BaseLocation::S3(s3_cfg.clone()),
-                                                        &outcome.key,
-                                                        &outcome.timestamp,
-                                                        &outcome.report,
-                                                    )
-                                                    .await;
-                                            }
-                                        }
-                                        Err(e) => error!(?e, "An S3 backup error occurred."),
-                                    }
-                                }
-                                Err(e) => {
-                                    error!(?e, "Failed to create S3 client.");
-                                }
-                            }
-                        }
+                last_run = Some(next_time);
+                match run_until_shutdown(job.run(server), &mut rx).await {
+                    Some(Ok(_)) => {}
+                    Some(Err(err)) => error!(?err, "An online backup error occurred."),
+                    None => {
+                        warn!(
+                            "Online backup abandoned: the server is shutting down. The WAL \
+                             archive is still synchronised, and the next scheduled run takes \
+                             a new backup"
+                        );
+                        break;
                     }
                 }
             }
@@ -288,19 +244,7 @@ impl IntervalActor {
                     }
                     _ = ticks.tick() => {
                         let run = sync_and_report_replication(&s3_config, &replication);
-                        tokio::pin!(run);
-                        let shutdown = loop {
-                            tokio::select! {
-                                _ = &mut run => break false,
-                                action = rx.recv() => match action {
-                                    Ok(CoreAction::Shutdown)
-                                    | Err(broadcast::error::RecvError::Closed) => break true,
-                                    Ok(CoreAction::Reload)
-                                    | Err(broadcast::error::RecvError::Lagged(_)) => {}
-                                },
-                            }
-                        };
-                        if shutdown {
+                        if run_until_shutdown(run, &mut rx).await.is_none() {
                             break;
                         }
                     }
@@ -311,15 +255,63 @@ impl IntervalActor {
     }
 }
 
+/// Drive `run` to completion unless the server shuts down first, in which case `run` is
+/// dropped and None is returned. A reload does not interrupt it.
+///
+/// The backup actor and the replication monitor run their work through this so that a
+/// shutdown never waits for a backup, an upload or a region copy in progress: the
+/// shutdown has to reach the final WAL archive synchronisation before the service
+/// manager's stop timeout. Blocking work already handed to the blocking thread pool
+/// finishes on its own.
+async fn run_until_shutdown<F: Future>(
+    run: F,
+    rx: &mut broadcast::Receiver<CoreAction>,
+) -> Option<F::Output> {
+    tokio::pin!(run);
+    loop {
+        tokio::select! {
+            output = &mut run => return Some(output),
+            action = rx.recv() => match action {
+                Ok(CoreAction::Shutdown) | Err(broadcast::error::RecvError::Closed) => {
+                    return None
+                }
+                Ok(CoreAction::Reload) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+            },
+        }
+    }
+}
+
+/// The next scheduled backup: the first time of `schedule` after `now`, and after
+/// `last_run`, the time of the previous run, when there was one.
+///
+/// It is computed from the current time on every iteration rather than taken from an
+/// iterator built once, so a run that outlasted the gap to the next scheduled time skips
+/// the times that are already past instead of falling behind for good. Starting after
+/// `last_run` as well means a wall clock that lags the timer slightly can never run the
+/// same scheduled time twice.
+fn next_backup_time(
+    schedule: &Schedule,
+    now: DateTime<Utc>,
+    last_run: Option<DateTime<Utc>>,
+) -> Option<DateTime<Utc>> {
+    let from = last_run.map_or(now, |last_run| last_run.max(now));
+    schedule.after(&from).next()
+}
+
+/// How long to wait from `now` until `next_time`: zero when it is already past.
+fn wait_until(next_time: DateTime<Utc>, now: DateTime<Utc>) -> Duration {
+    (next_time - now).to_std().unwrap_or(Duration::ZERO)
+}
+
 /// The period of the replication health monitor. The configuration rejects a zero
 /// interval, but a zero period would panic in `interval_at`, so it is clamped here too.
 fn replication_monitor_period(replication: &ReplicationConfig) -> Duration {
     Duration::from_secs(replication.sync_interval_seconds.max(1))
 }
 
-/// One run of the replication monitor: copy what every region misses, then report the
-/// health, a warning per unhealthy region and an info line per healthy one. Never fails;
-/// a primary that can not be listed is a warning too.
+/// One run of the replication monitor: copy what every region misses and report the
+/// resulting health, a warning per unhealthy region and an info line per healthy one.
+/// Never fails; a primary that can not be listed is a warning too.
 async fn sync_and_report_replication(s3_config: &S3Config, replication: &ReplicationConfig) {
     let client = match S3ClientWrapper::new(s3_config.clone()).await {
         Ok(client) => client,
@@ -332,33 +324,14 @@ async fn sync_and_report_replication(s3_config: &S3Config, replication: &Replica
         }
     };
 
-    match client.sync_replication(replication).await {
-        Ok(results) => {
-            for (region, result) in results {
-                match result {
-                    Ok(outcome) => {
-                        if !outcome.copied.is_empty() {
-                            info!(
-                                "Backup replication sync copied {} backup(s) to region {}: {}",
-                                outcome.copied.len(),
-                                region,
-                                outcome.copied.join(", ")
-                            );
-                        }
-                        for (key, err) in &outcome.failed {
-                            warn!(
-                                "Backup replication sync failed to copy {} to region {}: {}",
-                                key, region, err
-                            );
-                        }
-                    }
-                    Err(err) => warn!(
-                        "Backup replication sync skipped region {}: unable to list it: {}",
-                        region, err
-                    ),
-                }
-            }
-        }
+    // One comparison per region serves both the copies and the health report, and every
+    // region client is built once per run.
+    let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let report = match client
+        .sync_and_check_replication(replication, Some(&now))
+        .await
+    {
+        Ok(report) => report,
         Err(err) => {
             warn!(
                 "Backup replication sync skipped: unable to list the primary backups in {}: {}",
@@ -367,25 +340,34 @@ async fn sync_and_report_replication(s3_config: &S3Config, replication: &Replica
             );
             return;
         }
-    }
-
-    let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    let health = match client
-        .check_replication_health(replication, Some(&now))
-        .await
-    {
-        Ok(health) => health,
-        Err(err) => {
-            warn!(
-                "Backup replication health check skipped: unable to list the primary backups \
-                 in {}: {}",
-                client.location(),
-                err
-            );
-            return;
-        }
     };
 
+    for (region, result) in &report.synced {
+        match result {
+            Ok(outcome) => {
+                if !outcome.copied.is_empty() {
+                    info!(
+                        "Backup replication sync copied {} backup(s) to region {}: {}",
+                        outcome.copied.len(),
+                        region,
+                        outcome.copied.join(", ")
+                    );
+                }
+                for (key, err) in &outcome.failed {
+                    warn!(
+                        "Backup replication sync failed to copy {} to region {}: {}",
+                        key, region, err
+                    );
+                }
+            }
+            Err(err) => warn!(
+                "Backup replication sync skipped region {}: unable to list it: {}",
+                region, err
+            ),
+        }
+    }
+
+    let health = report.health;
     for region in &health.regions {
         if region_is_healthy(region) {
             info!(
@@ -431,6 +413,99 @@ async fn sync_and_report_replication(s3_config: &S3Config, replication: &Replica
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
+
+    fn at(hour: u32, minute: u32, second: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 1, 1, hour, minute, second)
+            .single()
+            .expect("valid time")
+    }
+
+    #[test]
+    fn next_backup_time_skips_times_a_long_run_overran() {
+        // Every five minutes.
+        let schedule = Schedule::from_str("0 */5 * * * * *").expect("schedule");
+
+        // The run scheduled at 10:00 took seven minutes, so 10:05 is already past. The
+        // next run is 10:10, three minutes away, not 10:05 with a negative wait.
+        let next = next_backup_time(&schedule, at(10, 7, 0), Some(at(10, 0, 0)));
+        assert_eq!(next, Some(at(10, 10, 0)));
+        assert_eq!(
+            wait_until(at(10, 10, 0), at(10, 7, 0)),
+            Duration::from_secs(180)
+        );
+    }
+
+    #[test]
+    fn next_backup_time_never_repeats_the_last_run() {
+        let schedule = Schedule::from_str("0 */5 * * * * *").expect("schedule");
+
+        // The timer fired a little before the wall clock reached 10:05.
+        let next = next_backup_time(&schedule, at(10, 4, 59), Some(at(10, 5, 0)));
+        assert_eq!(next, Some(at(10, 10, 0)));
+
+        // Without a previous run the next time after now is taken.
+        assert_eq!(
+            next_backup_time(&schedule, at(10, 4, 59), None),
+            Some(at(10, 5, 0))
+        );
+    }
+
+    #[test]
+    fn next_backup_time_is_stable_across_a_reload() {
+        // A reload re-enters the wait: the same pending run must still be the next one.
+        let schedule = Schedule::from_str("0 0 22 * * * *").expect("schedule");
+        let before = next_backup_time(&schedule, at(9, 0, 0), Some(at(8, 0, 0)));
+        let after_reload = next_backup_time(&schedule, at(9, 30, 0), Some(at(8, 0, 0)));
+        assert_eq!(before, Some(at(22, 0, 0)));
+        assert_eq!(after_reload, before);
+    }
+
+    #[tokio::test]
+    async fn run_until_shutdown_abandons_the_run_on_shutdown() {
+        let (tx, mut rx) = broadcast::channel(4);
+        let run = async {
+            // A backup stuck on an unreachable region.
+            std::future::pending::<()>().await;
+            "finished"
+        };
+        let sender = tokio::spawn(async move {
+            tx.send(CoreAction::Reload).expect("send reload");
+            tx.send(CoreAction::Shutdown).expect("send shutdown");
+            tx
+        });
+        let outcome =
+            tokio::time::timeout(Duration::from_secs(10), run_until_shutdown(run, &mut rx))
+                .await
+                .expect("a shutdown must not wait for the run");
+        assert_eq!(outcome, None);
+        drop(sender.await.expect("sender"));
+    }
+
+    #[tokio::test]
+    async fn run_until_shutdown_completes_the_run_across_a_reload() {
+        let (tx, mut rx) = broadcast::channel(4);
+        tx.send(CoreAction::Reload).expect("send reload");
+        let run = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            "finished"
+        };
+        assert_eq!(run_until_shutdown(run, &mut rx).await, Some("finished"));
+
+        // A closed channel means the server is gone.
+        drop(tx);
+        let run = std::future::pending::<()>();
+        assert_eq!(run_until_shutdown(run, &mut rx).await, None);
+    }
+
+    #[test]
+    fn wait_until_a_past_time_is_zero() {
+        // The old computation wrapped a negative wait to about 1.8e19 seconds, or
+        // overflowed at exactly -1s.
+        assert_eq!(wait_until(at(10, 0, 0), at(10, 0, 1)), Duration::ZERO);
+        assert_eq!(wait_until(at(10, 0, 0), at(12, 0, 0)), Duration::ZERO);
+        assert_eq!(wait_until(at(10, 0, 0), at(10, 0, 0)), Duration::ZERO);
+    }
 
     #[test]
     fn replication_monitor_period_follows_the_sync_interval() {

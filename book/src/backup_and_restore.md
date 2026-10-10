@@ -36,9 +36,19 @@ investigation and potentially manual intervention to resolve the underlying data
 
 In addition, every online and manual backup is structurally verified immediately after it is written, with the same
 checks as `kubidmd database verify-backup --level structural`: the artifact is read back, parsed, and checked for
-entries and for the server version that wrote it. A local artifact that fails this check is renamed with an `.invalid`
-suffix so that it is kept for inspection but is neither counted nor deleted by retention, and the backup is reported as
-an error without pruning any older backup. An S3 artifact that fails this check is never uploaded.
+entries and for the server version that wrote it. It is opened the way a restore opens it, so its name counts: a plain
+backup must carry the compression suffix of the compression it was written with (`.json.gz` for gzip, `.json` without
+compression), and only an encrypted backup may end in `.enc`. `kubidmd database backup` refuses a destination whose name
+contradicts the configured compression or encryption before it writes anything. It exits non-zero on every failure,
+including a destination that already exists and a database that can not be opened, so a scheduled job never mistakes a
+backup that was not written for a success.
+
+A local artifact is first written to a hidden `.<name>.partial` file next to its destination, synced to disk and
+verified there, and only then renamed to its final name, so a backup name never holds a partially written backup, even
+after a full disk or a crash, and an existing file is never overwritten. An artifact that fails the verification is
+renamed with an `.invalid` suffix so that it is kept for inspection but is neither counted nor deleted by retention, and
+the backup is reported as an error without pruning any older backup. A `.partial` file left behind by a crash is never
+counted either and can be removed. An S3 artifact that fails this check is never uploaded.
 
 ## Method 1 - Automatic Backup
 
@@ -66,7 +76,9 @@ region = "us-east-1"
 # endpoint = "https://minio.example.com"
 # Optional: Path prefix for organizing backups
 # path_prefix = "production"
-# Optional: Storage class (STANDARD, GLACIER, etc.)
+# Optional: Storage class: STANDARD (default), REDUCED_REDUNDANCY, STANDARD_IA, ONEZONE_IA,
+# INTELLIGENT_TIERING or GLACIER_IR. GLACIER and DEEP_ARCHIVE are refused: their objects
+# can only be read after a restore request.
 # storage_class = "STANDARD"
 
 # For static credentials (not recommended for production)
@@ -76,9 +88,10 @@ secret_access_key = "your-secret-key"
 
 # For IAM role authentication (recommended for EC2/EKS), omit credentials section
 
-# Optional: Server-side encryption
+# Optional: Server-side encryption, applied to the backups and their metadata objects
 [online_backup.s3.server_side_encryption]
 # algorithm = "aws:kms"  # or "AES256"
+# Only with aws:kms; S3 refuses a KMS key with AES256
 # kms_key_id = "arn:aws:kms:us-east-1:123456789:key/..."
 ```
 
@@ -93,8 +106,17 @@ secret_access_key = "your-secret-key"
 `versions` applies independently to each location: the local directory keeps the newest `versions` backups, and the S3
 prefix keeps the newest `versions` backups. After every successful upload the server lists the objects under
 `path_prefix` and deletes the oldest automatically generated backups (`backup-<timestamp>.json[.gz][.enc]` together with
-their `.metadata.json` object) beyond that number. Plain and encrypted backups count alike. No other object under the
-prefix is ever deleted.
+their `.metadata.json` object) beyond that number. Plain and encrypted backups count alike, ordered by the time in their
+name. No other object under the prefix is ever deleted, and neither is the backup the run has just written. `versions`
+must be at least 1; the server and `kubidmd configtest` reject `versions = 0`, also when it is given as
+`--online-backup-versions`.
+
+#### Large Backups
+
+Backups larger than 100 MiB are uploaded in 10 MiB parts. An upload that fails, or that is interrupted by a shutdown, is
+aborted so that its parts are not kept, and billed, by the storage service. Only a crash can leave the parts of an
+unfinished upload behind; a bucket lifecycle rule that aborts incomplete multipart uploads after a day or so removes
+them.
 
 #### Custom Endpoints
 
@@ -129,14 +151,12 @@ Add a `replication` section with one entry per region to `[online_backup.s3]`:
 enabled = true
 # Seconds between two replication sync and health check runs (default 300)
 sync_interval_seconds = 300
-# Further attempts when copying a backup to a region fails (default 3) ...
-max_retries = 3
-# ... and the seconds to wait between attempts (default 30)
-retry_delay_seconds = 30
 
 [[online_backup.s3.replication.regions]]
 region = "eu-west-1"
 bucket = "kubidm-backups-eu"
+# Optional: The name of the replica for replicate-status and --region (default: region)
+# name = "eu-dr"
 # Optional: Custom endpoint for MinIO or other S3-compatible services
 # endpoint = "https://s3.eu-west-1.example.com"
 # Optional: Path prefix inside the region's bucket, independent from the primary's
@@ -161,14 +181,18 @@ region = "ap-southeast-1"
 bucket = "kubidm-backups-ap"
 ```
 
-`region` names the entry: it is shown by `replicate-status`, selected by `--region` on the recovery commands, and used
-as the signing region of the requests to that bucket. Each region has its own `bucket`, and optionally its own
-`endpoint`, `path_prefix`, `credentials`, `storage_class` and server-side encryption, so a replica can live at a
-different provider than the primary. When `enabled = true`, the configuration must list at least one region, region
-names must be unique, every region needs a bucket, no region may point at the primary location or at the location of
-another region (same endpoint, bucket and `path_prefix`), and `sync_interval_seconds` must be greater than zero; the
-server and `kubidmd configtest` reject anything else. With `enabled = false` the section is ignored, but its regions can
-still be targeted with `--region`, so a replica remains a recovery source after replication has been switched off.
+`region` is the signing region of the requests to that bucket and, unless `name` is set, also names the entry: the name
+is shown by `replicate-status` and selected by `--region` on the recovery commands. Set `name` when two replicas share a
+signing region, such as two buckets or accounts in one AWS region, or two S3-compatible stores that both sign with the
+same region. Each region has its own `bucket`, and optionally its own `endpoint`, `path_prefix`, `credentials`,
+`storage_class` and server-side encryption, so a replica can live at a different provider than the primary. When
+`enabled = true`, the configuration must list at least one region, region names (`name`, or `region` without one) must
+be unique, every region needs a bucket, no region may point at the primary location or at the location of another region
+(same bucket and `path_prefix`, and the same endpoint, where every AWS S3 endpoint counts as the default one), every
+region's storage class and server-side encryption must be valid as for the primary (the `kms_key_id` shorthand can not
+be combined with `AES256`), and `sync_interval_seconds` must be greater than zero; the server and `kubidmd configtest`
+reject anything else. With `enabled = false` the section is ignored, but its regions can still be targeted with
+`--region`, so a replica remains a recovery source after replication has been switched off.
 
 #### What Is Replicated, and When
 
@@ -181,9 +205,10 @@ see [Encrypted Backups and Replication](#encrypted-backups-and-replication). The
 when it is uploaded to the same S3 location, is mirrored to the same regions by the archive itself, see
 [The WAL Archive and Replication](#the-wal-archive-and-replication).
 
-A region that can not be written to is retried `max_retries` times, `retry_delay_seconds` apart, then logged at error
-level and skipped. A failing region never fails the primary backup. Backups a region missed this way, and all the
-existing backups of a region added to the configuration, are copied by the replication sync described below.
+Each backup run makes a single attempt per region and never retries or waits: a region that can not be written to is
+logged as a warning and skipped, so a slow or unreachable region can neither fail the primary backup nor delay the
+schedule or a shutdown. The replication sync described below is the only place that retries: backups a region missed
+this way, and all the existing backups of a region added to the configuration, are copied by it.
 
 #### Retention per Region
 
@@ -524,8 +549,10 @@ Abandoned history is never replayed again: after recovering to 10:30, the server
 writes new history, and a later recovery to any point after it replays the recovered state plus the new history, never
 the transactions that were discarded. `kubidmd database restore` and `restore-s3` record abandoned history the same way
 when WAL archiving is configured. They record it in the primary archive only: when that archive can not be reached (for
-example while restoring with `restore-s3 --region` during an outage of the primary), they restore the database but exit
-non-zero with an error saying the history could not be recorded. Prefer `recover --region` in that situation.
+example while restoring with `restore-s3 --region` during an outage of the primary), they restore the database and exit
+with code 2 and an error saying the history could not be recorded: the restore succeeded and must not be repeated or
+rolled back, but a later point-in-time recovery past it could replay the abandoned history until a new online backup is
+taken. A restore that failed exits with code 1. Prefer `recover --region` in that situation.
 
 #### The Encrypted WAL Archive
 
