@@ -19,24 +19,30 @@ use kubidm_client::KubidmClient;
 use kubidm_proto::backup::{
     is_encrypted_backup_name, BackupCompression, BackupEncryptionConfig, EncryptionKeySource,
     KeyDerivationParams, PitrManifest, ReplicationConfig, ReplicationRegionConfig, S3Config,
-    WalArchiveConfig, PITR_MANIFEST_KEY,
+    WalArchiveConfig, WalJournalMode, PITR_MANIFEST_KEY,
 };
 use kubidmd_core::backup::pitr::{
-    pitr_list_server_core, pitr_recover_server_core, PitrArchive, PitrError, PitrSettings,
-    RecoveryTargetSpec,
+    check_wal_replication, pitr_list_server_core, pitr_recover_server_core, PitrArchive, PitrError,
+    PitrSettings, RecoveryTargetSpec, RegionManifestState, HANDED_OVER_BASES_DIR,
 };
 use kubidmd_core::backup::{is_encrypted_artifact, MIN_KDF_M_COST};
 use kubidmd_core::config::{Configuration, OnlineBackup};
-use kubidmd_core::{restore_s3_database, restore_server_core, RestoreStatus};
+use kubidmd_core::{
+    backup_server_core, dbscan_quarantine_id2entry_core, dbscan_restore_quarantined_core,
+    replicate_status_server_core, restore_s3_database, restore_server_core, RestoreStatus,
+};
 use kubidmd_lib::be::SharedWalArchiver;
-use kubidmd_lib::repl::wal::{format_ts_rfc3339, list_segments, read_pending_events, WalArchiver};
+use kubidmd_lib::repl::wal::{
+    format_ts_rfc3339, list_segments, read_local_events, read_pending_events, WalArchiver,
+    WAL_HANDED_OVER_GAPS_DIR, WAL_OPEN_SEGMENT_MARKER,
+};
 use kubidmd_testkit::{login_put_admin_idm_admins, setup_async_test, AsyncTestEnvironment};
 use uuid::Uuid;
 
 use super::backup_common::{
-    assert_directory_state_restored, backup_via_production_path, config_with_db, delete_prefix,
-    ensure_bucket, full_key, object_keys, populate, run, s3_object, sdk_client, test_s3_config,
-    test_s3_region, BACKUP_ENGINEERS_GROUP,
+    assert_directory_state_restored, assert_runtime_stays_free, backup_via_production_path, boxed,
+    config_with_db, delete_prefix, ensure_bucket, full_key, object_keys, populate, run, s3_object,
+    sdk_client, test_s3_config, test_s3_region, BACKUP_ENGINEERS_GROUP,
 };
 
 /// Created after the base backup and before the recovery target.
@@ -72,11 +78,17 @@ fn pitr_config(
     config
 }
 
-fn now_rfc3339() -> String {
-    let now = SystemTime::now()
+fn epoch_now() -> Duration {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("The clock is before the epoch");
-    format_ts_rfc3339(now)
+        .expect("The clock is before the epoch")
+}
+
+/// Long enough for every segment archived by a test to be past the replication tolerance.
+const ONE_DAY: Duration = Duration::from_secs(24 * 60 * 60);
+
+fn now_rfc3339() -> String {
+    format_ts_rfc3339(epoch_now())
 }
 
 async fn person_exists(rsclient: &KubidmClient, name: &str) -> bool {
@@ -221,13 +233,14 @@ fn test_pitr_local_recover_to_time_and_latest() {
             "A dry run must not create the database"
         );
 
-        // Recover to the target time.
-        let outcome = pitr_recover_server_core(
+        // Recover to the target time. The restore, replay, reindex and verification run on
+        // a thread of their own: the single thread of the test runtime stays free.
+        let outcome = assert_runtime_stays_free(pitr_recover_server_core(
             &recovered_config,
             &RecoveryTargetSpec::Time(target),
             false,
             None,
-        )
+        ))
         .await
         .expect("Recovery to the target time failed");
         assert_eq!(outcome.records, dry.records);
@@ -262,8 +275,83 @@ fn test_pitr_local_recover_to_time_and_latest() {
 /// Created after the last archived segment, right before an unclean stop.
 const PITR_USER_LOST: &str = "pitr_user_lost";
 
+/// `config` with the journal of the open segment set to `mode`.
+fn with_journal(mut config: Configuration, mode: WalJournalMode) -> Configuration {
+    if let Some(wal) = config
+        .online_backup
+        .as_mut()
+        .and_then(|backup| backup.wal_archive.as_mut())
+    {
+        wal.open_segment_journal = mode;
+    }
+    config
+}
+
+/// With the journal of the open segment, an unclean stop loses nothing: the next start
+/// closes the open segment from its journal, records no gap, and the latest point is the
+/// last write before the stop.
 #[test]
-fn test_pitr_unclean_stop_leaves_a_gap_recovery_does_not_cross() {
+fn test_pitr_unclean_stop_loses_nothing_with_the_journal() {
+    let workdir = tempfile::tempdir().expect("Failed to create workdir");
+    let backup_dir = workdir.path().join("backups");
+    let wal_dir = workdir.path().join("wal");
+    std::fs::create_dir(&backup_dir).expect("Failed to create backup directory");
+    // The default journal mode, synced by every commit.
+    let config = pitr_config(
+        &workdir.path().join("source.db"),
+        &backup_dir,
+        &wal_dir,
+        None,
+    );
+
+    run(async {
+        let env = setup_async_test(config.clone()).await;
+        populate(&env).await;
+        env.core_handle
+            .trigger_online_backup(&backup_dir, 7, BackupCompression::Gzip, &Default::default())
+            .await
+            .expect("Online backup failed");
+        env.rsclient
+            .idm_person_account_create(PITR_USER_BEFORE, "Before")
+            .await
+            .expect("Failed to create the archived person");
+        archive_now(&env).await;
+        env.rsclient
+            .idm_person_account_create(PITR_USER_LOST, "Journaled")
+            .await
+            .expect("Failed to create the journaled person");
+        // No shutdown: the runtime goes away under the server, as in a crash.
+        std::mem::forget(env);
+    });
+
+    run(async {
+        let mut env = setup_async_test(config.clone()).await;
+        env.core_handle.shutdown().await;
+        let manifest = read_manifest(&wal_dir.join(PITR_MANIFEST_KEY));
+        assert!(manifest.gaps.is_empty(), "{:?}", manifest.gaps);
+
+        let latest_db = workdir.path().join("latest.db");
+        let latest_config = pitr_config(&latest_db, &backup_dir, &wal_dir, None);
+        pitr_recover_server_core(&latest_config, &RecoveryTargetSpec::Latest, false, None)
+            .await
+            .expect("Recovery to the latest point failed");
+        let mut env = setup_async_test(latest_config).await;
+        login_put_admin_idm_admins(&env.rsclient).await;
+        assert!(person_exists(&env.rsclient, PITR_USER_BEFORE).await);
+        assert!(
+            person_exists(&env.rsclient, PITR_USER_LOST).await,
+            "The write of the open segment must survive the unclean stop"
+        );
+        env.core_handle.shutdown().await;
+    });
+}
+
+/// A server that stopped uncleanly may not start again: its database is damaged, which is
+/// when `recover` is needed. Recovery then takes the open segment from the journal itself,
+/// read as it is by a dry run, closed by the recovery, and the latest point is the last
+/// write before the stop.
+#[test]
+fn test_pitr_recover_after_an_unclean_stop_includes_the_journal_without_a_start() {
     let workdir = tempfile::tempdir().expect("Failed to create workdir");
     let backup_dir = workdir.path().join("backups");
     let wal_dir = workdir.path().join("wal");
@@ -273,6 +361,99 @@ fn test_pitr_unclean_stop_leaves_a_gap_recovery_does_not_cross() {
         &backup_dir,
         &wal_dir,
         None,
+    );
+
+    run(async {
+        let env = setup_async_test(config.clone()).await;
+        populate(&env).await;
+        env.core_handle
+            .trigger_online_backup(&backup_dir, 7, BackupCompression::Gzip, &Default::default())
+            .await
+            .expect("Online backup failed");
+        env.rsclient
+            .idm_person_account_create(PITR_USER_BEFORE, "Before")
+            .await
+            .expect("Failed to create the archived person");
+        archive_now(&env).await;
+        env.rsclient
+            .idm_person_account_create(PITR_USER_LOST, "Journaled")
+            .await
+            .expect("Failed to create the journaled person");
+        // No shutdown: the runtime goes away under the server, as in a crash.
+        std::mem::forget(env);
+    });
+
+    let journals = || {
+        std::fs::read_dir(&wal_dir)
+            .expect("Failed to list the WAL directory")
+            .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+            .filter(|name| name.ends_with(".journal"))
+            .count()
+    };
+    assert_eq!(journals(), 1);
+
+    run(async {
+        let latest_db = workdir.path().join("latest.db");
+        let latest_config = pitr_config(&latest_db, &backup_dir, &wal_dir, None);
+        let dry_run =
+            pitr_recover_server_core(&latest_config, &RecoveryTargetSpec::Latest, true, None)
+                .await
+                .expect("Dry run of the recovery failed");
+        assert_eq!(journals(), 1, "a dry run changes nothing");
+        // A recovery that is refused (no base backup that early) changes nothing either:
+        // the server may still be running, and keeps appending to its journal.
+        let marker = std::fs::read(wal_dir.join(WAL_OPEN_SEGMENT_MARKER)).ok();
+        let refused = pitr_recover_server_core(
+            &latest_config,
+            &RecoveryTargetSpec::Time("1970-01-01T00:00:00Z".to_string()),
+            false,
+            None,
+        )
+        .await;
+        assert!(
+            matches!(&refused, Err(PitrError::NotRecoverable(_))),
+            "{refused:?}"
+        );
+        assert_eq!(journals(), 1, "a refused recovery changes nothing");
+        assert_eq!(
+            std::fs::read(wal_dir.join(WAL_OPEN_SEGMENT_MARKER)).ok(),
+            marker
+        );
+        assert!(!latest_db.exists());
+        let recovered =
+            pitr_recover_server_core(&latest_config, &RecoveryTargetSpec::Latest, false, None)
+                .await
+                .expect("Recovery to the latest point failed");
+        assert_eq!(recovered.recovered_ts, dry_run.recovered_ts);
+        assert_eq!(recovered.records, dry_run.records);
+        assert_eq!(journals(), 0);
+
+        let mut env = setup_async_test(latest_config).await;
+        login_put_admin_idm_admins(&env.rsclient).await;
+        assert!(person_exists(&env.rsclient, PITR_USER_BEFORE).await);
+        assert!(
+            person_exists(&env.rsclient, PITR_USER_LOST).await,
+            "The journaled write must be recovered without a start of the stopped server"
+        );
+        env.core_handle.shutdown().await;
+    });
+}
+
+#[test]
+fn test_pitr_unclean_stop_leaves_a_gap_recovery_does_not_cross() {
+    let workdir = tempfile::tempdir().expect("Failed to create workdir");
+    let backup_dir = workdir.path().join("backups");
+    let wal_dir = workdir.path().join("wal");
+    std::fs::create_dir(&backup_dir).expect("Failed to create backup directory");
+    // Without the journal, the open segment lives in memory only.
+    let config = with_journal(
+        pitr_config(
+            &workdir.path().join("source.db"),
+            &backup_dir,
+            &wal_dir,
+            None,
+        ),
+        WalJournalMode::Off,
     );
 
     // A server takes a base backup, archives one write and then stops without shutting
@@ -341,6 +522,191 @@ fn test_pitr_unclean_stop_leaves_a_gap_recovery_does_not_cross() {
         assert!(!person_exists(&env.rsclient, PITR_USER_LOST).await);
         assert!(!person_exists(&env.rsclient, PITR_USER_AFTER).await);
         env.core_handle.shutdown().await;
+    });
+}
+
+/// The `db-scan` repair commands change the database outside any transaction the archive
+/// could record. Each records a gap: recovery stops right before the change, and an online
+/// backup taken after it makes later points recoverable again.
+#[test]
+fn test_pitr_dbscan_repairs_are_gaps_recovery_does_not_cross() {
+    run(async {
+        let workdir = tempfile::tempdir().expect("Failed to create workdir");
+        let backup_dir = workdir.path().join("backups");
+        let wal_dir = workdir.path().join("wal");
+        std::fs::create_dir(&backup_dir).expect("Failed to create backup directory");
+        let config = pitr_config(
+            &workdir.path().join("source.db"),
+            &backup_dir,
+            &wal_dir,
+            None,
+        );
+
+        let mut env = setup_async_test(config.clone()).await;
+        populate(&env).await;
+        env.core_handle
+            .trigger_online_backup(&backup_dir, 7, BackupCompression::Gzip, &Default::default())
+            .await
+            .expect("Online backup failed");
+        env.rsclient
+            .idm_person_account_create(PITR_USER_BEFORE, "Before")
+            .await
+            .expect("Failed to create the person before the repair");
+        env.core_handle.shutdown().await;
+        assert!(read_manifest(&wal_dir.join(PITR_MANIFEST_KEY))
+            .gaps
+            .is_empty());
+
+        // A repair that can not be made fails, and leaves no gap behind: no such entry, an
+        // entry that is not quarantined.
+        assert!(!dbscan_quarantine_id2entry_core(&config, 999_999).await);
+        assert!(!dbscan_restore_quarantined_core(&config, 1).await);
+        assert!(read_local_events(&wal_dir).gaps.is_empty());
+        // A repair whose gap can not be handed over is refused, and the database is left
+        // alone: entry 1 is still there to be quarantined below.
+        let hand_over = wal_dir.join(WAL_HANDED_OVER_GAPS_DIR);
+        std::fs::write(&hand_over, b"not a directory").expect("Failed to block the hand-over");
+        assert!(!dbscan_quarantine_id2entry_core(&config, 1).await);
+        std::fs::remove_file(&hand_over).expect("Failed to unblock the hand-over");
+
+        // The server is stopped: quarantine an entry and put it back. The gaps are handed
+        // over through the WAL directory; the manifest is the server's.
+        assert!(dbscan_quarantine_id2entry_core(&config, 1).await);
+        assert!(dbscan_restore_quarantined_core(&config, 1).await);
+        assert!(read_manifest(&wal_dir.join(PITR_MANIFEST_KEY))
+            .gaps
+            .is_empty());
+        assert_eq!(read_local_events(&wal_dir).gaps.len(), 2);
+
+        // A target past the repairs is refused; the latest point stops before them and
+        // holds everything committed until then.
+        let refused_db = workdir.path().join("refused.db");
+        let refused = pitr_recover_server_core(
+            &pitr_config(&refused_db, &backup_dir, &wal_dir, None),
+            &RecoveryTargetSpec::Time(now_rfc3339()),
+            false,
+            None,
+        )
+        .await;
+        assert!(
+            matches!(&refused, Err(PitrError::NotRecoverable(msg)) if msg.contains("db-scan")),
+            "{refused:?}"
+        );
+        assert!(!refused_db.exists());
+        let before_db = workdir.path().join("before.db");
+        let before_config = pitr_config(&before_db, &backup_dir, &wal_dir, None);
+        pitr_recover_server_core(&before_config, &RecoveryTargetSpec::Latest, false, None)
+            .await
+            .expect("Recovery to the latest point before the repairs failed");
+        let mut recovered = setup_async_test(before_config).await;
+        login_put_admin_idm_admins(&recovered.rsclient).await;
+        assert!(person_exists(&recovered.rsclient, PITR_USER_BEFORE).await);
+        recovered.core_handle.shutdown().await;
+
+        // The recovery recorded the gaps in the manifest with what it abandoned. An online
+        // backup taken after the repairs is a base past them.
+        let manifest = read_manifest(&wal_dir.join(PITR_MANIFEST_KEY));
+        assert_eq!(manifest.gaps.len(), 2, "{:?}", manifest.gaps);
+        assert!(manifest
+            .gaps
+            .iter()
+            .all(|gap| gap.reason.contains("db-scan")));
+        let mut env = setup_async_test(config.clone()).await;
+        login_put_admin_idm_admins(&env.rsclient).await;
+        env.core_handle
+            .trigger_online_backup(&backup_dir, 7, BackupCompression::Gzip, &Default::default())
+            .await
+            .expect("Online backup failed");
+        env.rsclient
+            .idm_person_account_create(PITR_USER_AFTER, "After")
+            .await
+            .expect("Failed to create the person after the repair");
+        env.core_handle.shutdown().await;
+        let after_db = workdir.path().join("after.db");
+        let after_config = pitr_config(&after_db, &backup_dir, &wal_dir, None);
+        pitr_recover_server_core(&after_config, &RecoveryTargetSpec::Latest, false, None)
+            .await
+            .expect("Recovery from the base taken after the repairs failed");
+        let mut recovered = setup_async_test(after_config).await;
+        login_put_admin_idm_admins(&recovered.rsclient).await;
+        assert!(person_exists(&recovered.rsclient, PITR_USER_BEFORE).await);
+        assert!(person_exists(&recovered.rsclient, PITR_USER_AFTER).await);
+        recovered.core_handle.shutdown().await;
+    });
+}
+
+/// A manual `kubidmd database backup` written into the base backup directory under a backup
+/// name is a recovery base like an online backup: recovery can use it right away, and the
+/// server indexes it at its next archive run.
+#[test]
+fn test_pitr_manual_backup_in_the_base_directory_is_a_base() {
+    run(async {
+        let workdir = tempfile::tempdir().expect("Failed to create workdir");
+        let backup_dir = workdir.path().join("backups");
+        let wal_dir = workdir.path().join("wal");
+        std::fs::create_dir(&backup_dir).expect("Failed to create backup directory");
+        let config = pitr_config(
+            &workdir.path().join("source.db"),
+            &backup_dir,
+            &wal_dir,
+            None,
+        );
+
+        // No online backup is ever taken.
+        let mut env = setup_async_test(config.clone()).await;
+        populate(&env).await;
+        env.core_handle.shutdown().await;
+        assert!(!pitr_list_server_core(&config, None).await);
+
+        // A manual backup elsewhere is not a base; one in the base directory is.
+        let key = format!("backup-{}.json.gz", now_rfc3339());
+        let elsewhere = workdir.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).expect("Failed to create a directory");
+        assert!(backup_server_core(&config, Some(&elsewhere.join(&key)), None).await);
+        assert!(!pitr_list_server_core(&config, None).await);
+        assert!(backup_server_core(&config, Some(&backup_dir.join(&key)), None).await);
+        assert!(
+            pitr_list_server_core(&config, None).await,
+            "Recovery can start from the manual backup before the server indexed it"
+        );
+
+        // The server indexes it, and archives what follows.
+        let mut env = setup_async_test(config.clone()).await;
+        login_put_admin_idm_admins(&env.rsclient).await;
+        env.rsclient
+            .idm_person_account_create(PITR_USER_AFTER, "After")
+            .await
+            .expect("Failed to create the person after the manual backup");
+        env.core_handle.shutdown().await;
+        let manifest = read_manifest(&wal_dir.join(PITR_MANIFEST_KEY));
+        assert_eq!(
+            manifest
+                .base_backups
+                .iter()
+                .map(|base| base.key.as_str())
+                .collect::<Vec<_>>(),
+            vec![key.as_str()]
+        );
+        assert!(
+            std::fs::read_dir(wal_dir.join(HANDED_OVER_BASES_DIR))
+                .expect("Failed to read the hand-over directory")
+                .next()
+                .is_none(),
+            "The hand-over file goes once the manifest records the base"
+        );
+
+        let recovered_db = workdir.path().join("recovered.db");
+        let recovered_config = pitr_config(&recovered_db, &backup_dir, &wal_dir, None);
+        let outcome =
+            pitr_recover_server_core(&recovered_config, &RecoveryTargetSpec::Latest, false, None)
+                .await
+                .expect("Recovery from the manual backup failed");
+        assert_eq!(outcome.plan.base.key, key);
+        let mut recovered = setup_async_test(recovered_config).await;
+        login_put_admin_idm_admins(&recovered.rsclient).await;
+        assert_directory_state_restored(&recovered.rsclient).await;
+        assert!(person_exists(&recovered.rsclient, PITR_USER_AFTER).await);
+        recovered.core_handle.shutdown().await;
     });
 }
 
@@ -628,13 +994,14 @@ fn test_pitr_s3_encrypted_replicated_recover_from_region() {
     let region_s3 = region.to_s3_config();
 
     // The scenario is long enough for its future to overflow the stack of the test thread
-    // in a debug build; keep it on the heap.
+    // in a debug build; keep it on the heap, and await its steps through `boxed` so that the
+    // frame polling it stays small too.
     run(Box::pin(async {
-        let sdk = sdk_client(&s3_config).await;
-        ensure_bucket(&sdk, &s3_config.bucket).await;
-        ensure_bucket(&sdk, &region_s3.bucket).await;
-        assert!(object_keys(&sdk, &s3_config).await.is_empty());
-        assert!(object_keys(&sdk, &region_s3).await.is_empty());
+        let sdk = boxed(|| sdk_client(&s3_config)).await;
+        boxed(|| ensure_bucket(&sdk, &s3_config.bucket)).await;
+        boxed(|| ensure_bucket(&sdk, &region_s3.bucket)).await;
+        assert!(boxed(|| object_keys(&sdk, &s3_config)).await.is_empty());
+        assert!(boxed(|| object_keys(&sdk, &region_s3)).await.is_empty());
 
         let source_host = tempfile::tempdir().expect("Failed to create workdir");
         let encryption = pitr_encryption(source_host.path());
@@ -650,28 +1017,34 @@ fn test_pitr_s3_encrypted_replicated_recover_from_region() {
             )
         };
 
-        let env = setup_async_test(host_config(source_host.path(), "source.db")).await;
-        populate(&env).await;
-        env.core_handle
-            .trigger_s3_backup(s3_config.clone(), 7, BackupCompression::Gzip, &encryption)
-            .await
-            .expect("Encrypted, replicated S3 backup failed");
-        let target = write_history(env).await;
+        let env = boxed(|| setup_async_test(host_config(source_host.path(), "source.db"))).await;
+        boxed(|| populate(&env)).await;
+        boxed(|| {
+            env.core_handle.trigger_s3_backup(
+                s3_config.clone(),
+                7,
+                BackupCompression::Gzip,
+                &encryption,
+            )
+        })
+        .await
+        .expect("Encrypted, replicated S3 backup failed");
+        let target = boxed(|| write_history(env)).await;
 
         // The primary and the region hold the same encrypted base, the same encrypted
         // segments and an equivalent manifest.
-        let primary_keys = object_keys(&sdk, &s3_config).await;
-        let region_keys = object_keys(&sdk, &region_s3).await;
+        let primary_keys = boxed(|| object_keys(&sdk, &s3_config)).await;
+        let region_keys = boxed(|| object_keys(&sdk, &region_s3)).await;
         let primary_segments = segment_keys(&primary_keys);
         assert!(primary_segments.len() >= 2, "{primary_keys:?}");
         assert_eq!(primary_segments, segment_keys(&region_keys));
         for key in &primary_segments {
             assert!(key.ends_with(".json.gz.enc"), "{key}");
             assert!(is_encrypted_artifact(
-                &s3_object(&sdk, &s3_config, key).await
+                &boxed(|| s3_object(&sdk, &s3_config, key)).await
             ));
             assert!(is_encrypted_artifact(
-                &s3_object(&sdk, &region_s3, key).await
+                &boxed(|| s3_object(&sdk, &region_s3, key)).await
             ));
         }
         for keys in [&primary_keys, &region_keys] {
@@ -684,8 +1057,8 @@ fn test_pitr_s3_encrypted_replicated_recover_from_region() {
                 "{keys:?}"
             );
         }
-        let primary_manifest = s3_manifest(&sdk, &s3_config).await;
-        let region_manifest = s3_manifest(&sdk, &region_s3).await;
+        let primary_manifest = boxed(|| s3_manifest(&sdk, &s3_config)).await;
+        let region_manifest = boxed(|| s3_manifest(&sdk, &region_s3)).await;
         assert_eq!(primary_manifest.segments, region_manifest.segments);
         assert_eq!(primary_manifest.base_backups, region_manifest.base_backups);
 
@@ -695,12 +1068,15 @@ fn test_pitr_s3_encrypted_replicated_recover_from_region() {
             new_host.path().join("backup-passphrase"),
         )
         .expect("Failed to copy the passphrase");
-        let unknown = pitr_recover_server_core(
-            &host_config(new_host.path(), "unknown.db"),
-            &RecoveryTargetSpec::Latest,
-            true,
-            Some("nowhere"),
-        )
+        let unknown_config = host_config(new_host.path(), "unknown.db");
+        let unknown = boxed(|| {
+            pitr_recover_server_core(
+                &unknown_config,
+                &RecoveryTargetSpec::Latest,
+                true,
+                Some("nowhere"),
+            )
+        })
         .await;
         assert!(matches!(unknown, Err(PitrError::Config(_))), "{unknown:?}");
 
@@ -715,20 +1091,18 @@ fn test_pitr_s3_encrypted_replicated_recover_from_region() {
         {
             s3.bucket = format!("kubidm-test-missing-{}", Uuid::new_v4());
         }
-        assert!(!pitr_list_server_core(&unreachable_primary, None).await);
-        assert!(pitr_list_server_core(&unreachable_primary, Some(PITR_REGION)).await);
-        let outcome = pitr_recover_server_core(
-            &unreachable_primary,
-            &RecoveryTargetSpec::Time(target),
-            false,
-            Some(PITR_REGION),
-        )
+        assert!(!boxed(|| pitr_list_server_core(&unreachable_primary, None)).await);
+        assert!(boxed(|| pitr_list_server_core(&unreachable_primary, Some(PITR_REGION))).await);
+        let at_target = RecoveryTargetSpec::Time(target);
+        let outcome = boxed(|| {
+            pitr_recover_server_core(&unreachable_primary, &at_target, false, Some(PITR_REGION))
+        })
         .await
         .expect("Recovery from the region failed");
         assert!(outcome.records > 0);
-        let region_manifest = s3_manifest(&sdk, &region_s3).await;
+        let region_manifest = boxed(|| s3_manifest(&sdk, &region_s3)).await;
         assert_eq!(region_manifest.timeline_breaks.len(), 1);
-        assert!(s3_manifest(&sdk, &s3_config)
+        assert!(boxed(|| s3_manifest(&sdk, &s3_config))
             .await
             .timeline_breaks
             .is_empty());
@@ -737,28 +1111,34 @@ fn test_pitr_s3_encrypted_replicated_recover_from_region() {
         // the abandoned history from the region into the primary, so that a recovery from
         // the primary never replays it either.
         let recovered_config = host_config(new_host.path(), "recovered.db");
-        let mut env = assert_state_at_target(recovered_config.clone()).await;
-        env.rsclient
-            .idm_person_account_create(PITR_USER_NEW_HISTORY, "New history")
-            .await
-            .expect("Failed to create the person on the recovered server");
-        env.core_handle.shutdown().await;
+        let mut env = boxed(|| assert_state_at_target(recovered_config.clone())).await;
+        boxed(|| {
+            env.rsclient
+                .idm_person_account_create(PITR_USER_NEW_HISTORY, "New history")
+        })
+        .await
+        .expect("Failed to create the person on the recovered server");
+        boxed(|| env.core_handle.shutdown()).await;
         assert_eq!(
-            s3_manifest(&sdk, &s3_config).await.timeline_breaks,
+            boxed(|| s3_manifest(&sdk, &s3_config))
+                .await
+                .timeline_breaks,
             region_manifest.timeline_breaks
         );
         let latest_config = host_config(new_host.path(), "latest.db");
-        pitr_recover_server_core(&latest_config, &RecoveryTargetSpec::Latest, false, None)
-            .await
-            .expect("Recovery from the primary failed");
-        let mut env = assert_state_at_target(latest_config).await;
-        assert!(person_exists(&env.rsclient, PITR_USER_NEW_HISTORY).await);
-        env.core_handle.shutdown().await;
+        boxed(|| {
+            pitr_recover_server_core(&latest_config, &RecoveryTargetSpec::Latest, false, None)
+        })
+        .await
+        .expect("Recovery from the primary failed");
+        let mut env = boxed(|| assert_state_at_target(latest_config)).await;
+        assert!(boxed(|| person_exists(&env.rsclient, PITR_USER_NEW_HISTORY)).await);
+        boxed(|| env.core_handle.shutdown()).await;
 
         // The primary archive is lost. The region still holds everything, including the
         // history written after the recovery, which was replicated at shutdown.
-        let primary_segments = s3_manifest(&sdk, &s3_config).await.segments;
-        delete_prefix(&sdk, &s3_config).await;
+        let primary_segments = boxed(|| s3_manifest(&sdk, &s3_config)).await.segments;
+        boxed(|| delete_prefix(&sdk, &s3_config)).await;
         let last_host = tempfile::tempdir().expect("Failed to create workdir");
         std::fs::copy(
             source_host.path().join("backup-passphrase"),
@@ -766,22 +1146,24 @@ fn test_pitr_s3_encrypted_replicated_recover_from_region() {
         )
         .expect("Failed to copy the passphrase");
         let from_region = host_config(last_host.path(), "from-region.db");
-        pitr_recover_server_core(
-            &from_region,
-            &RecoveryTargetSpec::Latest,
-            false,
-            Some(PITR_REGION),
-        )
+        boxed(|| {
+            pitr_recover_server_core(
+                &from_region,
+                &RecoveryTargetSpec::Latest,
+                false,
+                Some(PITR_REGION),
+            )
+        })
         .await
         .expect("Recovery from the region after the loss of the primary failed");
-        let mut env = assert_state_at_target(from_region.clone()).await;
-        assert!(person_exists(&env.rsclient, PITR_USER_NEW_HISTORY).await);
-        env.core_handle.shutdown().await;
+        let mut env = boxed(|| assert_state_at_target(from_region.clone())).await;
+        assert!(boxed(|| person_exists(&env.rsclient, PITR_USER_NEW_HISTORY)).await);
+        boxed(|| env.core_handle.shutdown()).await;
 
         // The server now archives into an empty primary; the region keeps the segments the
         // primary no longer has.
-        let region_manifest = s3_manifest(&sdk, &region_s3).await;
-        let primary_manifest = s3_manifest(&sdk, &s3_config).await;
+        let region_manifest = boxed(|| s3_manifest(&sdk, &region_s3)).await;
+        let primary_manifest = boxed(|| s3_manifest(&sdk, &s3_config)).await;
         for segment in primary_segments.iter().chain(&primary_manifest.segments) {
             assert!(
                 region_manifest.segments.contains(segment),
@@ -800,12 +1182,14 @@ fn test_pitr_s3_encrypted_replicated_recover_from_region() {
             .clone();
         let region_prefix = region_s3.path_prefix.as_deref().expect("No prefix");
         for key in [region_base.clone(), format!("{region_base}.metadata.json")] {
-            sdk.delete_object()
-                .bucket(&region_s3.bucket)
-                .key(format!("{region_prefix}/{key}"))
-                .send()
-                .await
-                .expect("Failed to delete the region base");
+            boxed(|| {
+                sdk.delete_object()
+                    .bucket(&region_s3.bucket)
+                    .key(format!("{region_prefix}/{key}"))
+                    .send()
+            })
+            .await
+            .expect("Failed to delete the region base");
         }
         let settings = PitrSettings::from_config(&from_region)
             .expect("Invalid PITR settings")
@@ -831,19 +1215,174 @@ fn test_pitr_s3_encrypted_replicated_recover_from_region() {
             .duration_since(UNIX_EPOCH)
             .expect("The clock is before the epoch")
             + Duration::from_secs(60 * 86400);
-        let report = archive
-            .sync(far_future, false)
+        let report = boxed(|| archive.sync(far_future, false))
             .await
             .expect("Synchronisation failed");
         assert_eq!(report.region_errors, 0);
-        let region_manifest = s3_manifest(&sdk, &region_s3).await;
+        let region_manifest = boxed(|| s3_manifest(&sdk, &region_s3)).await;
         assert!(region_manifest.base_backups.is_empty());
         assert!(
             region_manifest.segments.is_empty(),
             "{:?}",
             region_manifest.segments
         );
-        assert!(segment_keys(&object_keys(&sdk, &region_s3).await).is_empty());
+        assert!(segment_keys(&boxed(|| object_keys(&sdk, &region_s3)).await).is_empty());
+
+        boxed(|| delete_prefix(&sdk, &s3_config)).await;
+        boxed(|| delete_prefix(&sdk, &region_s3)).await;
+    }));
+}
+
+/// `replicate-status` reports the replicated WAL archive per region (manifest and every
+/// segment copy), and the archive runs of the server repair what a region lost or holds
+/// damaged, so that a recovery from the region works again.
+#[test]
+fn test_pitr_s3_replicate_status_reports_and_the_archive_repairs_region_copies() {
+    let Some(mut s3_config) = test_s3_config("pitr-status") else {
+        return;
+    };
+    let region = test_s3_region(&s3_config, PITR_REGION, "pitr-status-dr");
+    s3_config.replication = Some(ReplicationConfig {
+        enabled: true,
+        regions: vec![region.clone()],
+        sync_interval_seconds: 3600,
+    });
+    let region_s3 = region.to_s3_config();
+
+    run(Box::pin(async {
+        let sdk = sdk_client(&s3_config).await;
+        ensure_bucket(&sdk, &s3_config.bucket).await;
+        ensure_bucket(&sdk, &region_s3.bucket).await;
+        let workdir = tempfile::tempdir().expect("Failed to create workdir");
+        let config = pitr_config(
+            &workdir.path().join("source.db"),
+            &workdir.path().join("backups"),
+            &workdir.path().join("wal"),
+            Some(s3_config.clone()),
+        );
+        let settings = PitrSettings::from_config(&config)
+            .expect("Invalid PITR settings")
+            .expect("PITR is enabled");
+
+        let mut env = setup_async_test(config.clone()).await;
+        populate(&env).await;
+        env.core_handle
+            .trigger_s3_backup(
+                s3_config.clone(),
+                7,
+                BackupCompression::Gzip,
+                &Default::default(),
+            )
+            .await
+            .expect("Replicated S3 backup failed");
+        env.rsclient
+            .idm_person_account_create(PITR_USER_BEFORE, "Before")
+            .await
+            .expect("Failed to create a person");
+        archive_now(&env).await;
+        env.rsclient
+            .idm_person_account_create(PITR_USER_AFTER, "After")
+            .await
+            .expect("Failed to create a person");
+        env.core_handle.shutdown().await;
+
+        // Everything is replicated: backups and archive.
+        let health = check_wal_replication(&settings, true, epoch_now())
+            .await
+            .expect("Unable to check the WAL archive replication")
+            .expect("The archive is replicated");
+        assert!(health.is_healthy(), "{health:#?}");
+        assert!(health.segments >= 2, "{health:#?}");
+        assert!(replicate_status_server_core(&config, true, true).await);
+
+        // The region loses one segment, holds a truncated copy of another, and its
+        // manifest is overwritten with something unreadable.
+        let segments = segment_keys(&object_keys(&sdk, &region_s3).await);
+        let region_prefix = region_s3.path_prefix.as_deref().expect("No prefix");
+        sdk.delete_object()
+            .bucket(&region_s3.bucket)
+            .key(format!("{region_prefix}/{}", segments[0]))
+            .send()
+            .await
+            .expect("Failed to delete a region segment");
+        for (key, body) in [
+            (segments[1].as_str(), b"truncated".as_slice()),
+            (PITR_MANIFEST_KEY, b"{ not a manifest".as_slice()),
+        ] {
+            sdk.put_object()
+                .bucket(&region_s3.bucket)
+                .key(format!("{region_prefix}/{key}"))
+                .body(ByteStream::from(body.to_vec()))
+                .send()
+                .await
+                .expect("Failed to damage a region object");
+        }
+        let health = check_wal_replication(&settings, true, epoch_now() + ONE_DAY)
+            .await
+            .expect("Unable to check the WAL archive replication")
+            .expect("The archive is replicated");
+        let region_health = &health.regions[0];
+        assert!(!health.is_healthy());
+        assert!(
+            matches!(region_health.manifest, RegionManifestState::Damaged(_)),
+            "{region_health:#?}"
+        );
+        assert_eq!(
+            region_health.segments.missing.len(),
+            1,
+            "{region_health:#?}"
+        );
+        assert_eq!(
+            region_health.segments.damaged.len(),
+            1,
+            "{region_health:#?}"
+        );
+        assert!(!replicate_status_server_core(&config, true, true).await);
+        let unreadable = pitr_recover_server_core(
+            &pitr_config(
+                &workdir.path().join("unused.db"),
+                &workdir.path().join("backups"),
+                &workdir.path().join("wal"),
+                Some(s3_config.clone()),
+            ),
+            &RecoveryTargetSpec::Latest,
+            true,
+            Some(PITR_REGION),
+        )
+        .await;
+        assert!(unreadable.is_err(), "{unreadable:?}");
+
+        // The archive run of the next start repairs the region.
+        let mut env = setup_async_test(config.clone()).await;
+        archive_now(&env).await;
+        env.core_handle.shutdown().await;
+        let health = check_wal_replication(&settings, true, epoch_now())
+            .await
+            .expect("Unable to check the WAL archive replication")
+            .expect("The archive is replicated");
+        assert!(health.is_healthy(), "{health:#?}");
+        assert!(replicate_status_server_core(&config, false, false).await);
+
+        // And the region recovers the latest state again.
+        let recovered_config = pitr_config(
+            &workdir.path().join("recovered.db"),
+            &workdir.path().join("backups"),
+            &workdir.path().join("wal"),
+            Some(s3_config.clone()),
+        );
+        pitr_recover_server_core(
+            &recovered_config,
+            &RecoveryTargetSpec::Latest,
+            false,
+            Some(PITR_REGION),
+        )
+        .await
+        .expect("Recovery from the repaired region failed");
+        let mut env = setup_async_test(recovered_config).await;
+        login_put_admin_idm_admins(&env.rsclient).await;
+        assert!(person_exists(&env.rsclient, PITR_USER_BEFORE).await);
+        assert!(person_exists(&env.rsclient, PITR_USER_AFTER).await);
+        env.core_handle.shutdown().await;
 
         delete_prefix(&sdk, &s3_config).await;
         delete_prefix(&sdk, &region_s3).await;

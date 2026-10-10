@@ -47,6 +47,7 @@ impl Modify for SecurityAddon {
 
     paths(
         super::generic::status,
+        super::generic::metrics,
         super::generic::maintenance_status,
         super::generic::robots_txt,
 
@@ -362,11 +363,19 @@ impl Modify for SecurityAddon {
 )]
 pub(crate) struct ApiDoc;
 
-pub(crate) fn router() -> Router<ServerState> {
+/// The OpenAPI document of the server. Building it is one large synchronous function: in
+/// a debug build it needs between 768 KiB and 1 MiB of stack. It is built on the blocking
+/// thread pool, on a stack of its own, rather than on the stack of whatever task starts
+/// the server, which for a test is a 2 MiB thread already holding the test's futures.
+pub(crate) async fn openapi() -> Result<utoipa::openapi::OpenApi, tokio::task::JoinError> {
+    tokio::task::spawn_blocking(ApiDoc::openapi).await
+}
+
+pub(crate) fn router(openapi: utoipa::openapi::OpenApi) -> Router<ServerState> {
     Router::new()
         .route("/docs", get(Redirect::temporary("/docs/swagger-ui")))
         .route("/docs/", get(Redirect::temporary("/docs/swagger-ui")))
-        .merge(SwaggerUi::new("/docs/swagger-ui").url("/docs/v1/openapi.json", ApiDoc::openapi()))
+        .merge(SwaggerUi::new("/docs/swagger-ui").url("/docs/v1/openapi.json", openapi))
         // overlay the version middleware because the client is sad without it
         .layer(from_fn(super::middleware::version_middleware))
 }

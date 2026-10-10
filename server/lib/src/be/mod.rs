@@ -163,6 +163,24 @@ pub struct BackupStructuralReport {
     pub db_ts_max: Option<Duration>,
     /// Human readable reasons the artifact can not be restored by this server.
     pub errors: Vec<String>,
+    /// The size, in bytes, of the artifact once decompressed (and decrypted): what its
+    /// entries take as JSON, read up to where parsing stopped. A restored database is of
+    /// that order, plus its indexes.
+    pub uncompressed_size: u64,
+}
+
+/// Counts the bytes read through it.
+struct CountingReader<R> {
+    inner: R,
+    count: u64,
+}
+
+impl<R: std::io::Read> std::io::Read for CountingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buf)?;
+        self.count = self.count.saturating_add(read as u64);
+        Ok(read)
+    }
 }
 
 impl BackupStructuralReport {
@@ -181,13 +199,23 @@ pub fn verify_backup_structure<IN>(
 where
     IN: std::io::Read,
 {
-    let dbbak_option: Result<DbBackup, serde_json::Error> = match compression {
-        BackupCompression::NoCompression => serde_json::from_reader(input),
-        BackupCompression::Gzip => {
-            let decoder = flate2::read::GzDecoder::new(input);
-            serde_json::from_reader(decoder)
-        }
-    };
+    let (dbbak_option, uncompressed_size): (Result<DbBackup, serde_json::Error>, u64) =
+        match compression {
+            BackupCompression::NoCompression => {
+                let mut counting = CountingReader {
+                    inner: input,
+                    count: 0,
+                };
+                (serde_json::from_reader(&mut counting), counting.count)
+            }
+            BackupCompression::Gzip => {
+                let mut counting = CountingReader {
+                    inner: flate2::read::GzDecoder::new(input),
+                    count: 0,
+                };
+                (serde_json::from_reader(&mut counting), counting.count)
+            }
+        };
 
     let dbbak = match dbbak_option {
         Ok(dbbak) => dbbak,
@@ -201,6 +229,7 @@ where
                 errors: vec![format!(
                     "artifact could not be parsed as a kubidm backup: {err}"
                 )],
+                uncompressed_size,
             };
         }
     };
@@ -266,7 +295,22 @@ where
         db_s_uuid,
         db_ts_max,
         errors,
+        uncompressed_size,
     }
+}
+
+/// Whether a committing transaction leaves something for the WAL archive to record: records
+/// (`pending`), a truncation, a record that could not be staged, which is recorded as a gap,
+/// or a new server uuid. The archive is then told before the database commits, so that the
+/// open segment marker covers the transaction should the server stop between the commit and
+/// its archiving.
+fn wal_commit_archives(
+    pending: bool,
+    truncate: bool,
+    stage_failed: bool,
+    server_uuid_changed: bool,
+) -> bool {
+    pending || truncate || stage_failed || server_uuid_changed
 }
 
 #[derive(Clone)]
@@ -2340,13 +2384,34 @@ impl<'a> BackendWriteTransaction<'a> {
             wal_stage_failed,
         } = self;
 
-        // write the ruv content back to the db.
-        idlayer.write_db_ruv(ruv.added(), ruv.removed())?;
+        // The archive is told before the database commits a transaction it must archive,
+        // so that an unclean stop between the commit and its archiving is noticed.
+        let archives = wal_commit_archives(
+            !wal_pending.is_empty(),
+            wal_truncate,
+            wal_stage_failed,
+            wal_server_uuid.is_some(),
+        );
+        let prepared = match (&wal, &wal_cid) {
+            (Some(wal), Some(cid)) if archives => {
+                lock_wal(wal).prepare_commit(cid.ts);
+                Some(wal)
+            }
+            _ => None,
+        };
 
-        idlayer.commit().map(|()| {
-            ruv.commit();
-            idxmeta_wr.commit();
-        })?;
+        // write the ruv content back to the db.
+        let committed = idlayer
+            .write_db_ruv(ruv.added(), ruv.removed())
+            .and_then(|()| idlayer.commit());
+        if let Err(err) = committed {
+            if let Some(wal) = prepared {
+                lock_wal(wal).abandon_commit();
+            }
+            return Err(err);
+        }
+        ruv.commit();
+        idxmeta_wr.commit();
 
         // The database commit succeeded. Only now does the archive learn about this
         // transaction, so the WAL never contains uncommitted state. A failure here is
@@ -2375,8 +2440,18 @@ impl<'a> BackendWriteTransaction<'a> {
         wal_pending: BTreeMap<u64, WalPendingOp>,
         wal_stage_failed: bool,
     ) {
-        if wal_pending.is_empty() && !wal_truncate && !wal_stage_failed && wal_server_uuid.is_none()
-        {
+        if !wal_commit_archives(
+            !wal_pending.is_empty(),
+            wal_truncate,
+            wal_stage_failed,
+            wal_server_uuid.is_some(),
+        ) {
+            // Nothing to archive, but the database now records this transaction as its
+            // last one: the journal of the open segment notes it, so that an unclean stop
+            // right after it is known to have lost nothing.
+            if let Some(cid) = wal_cid {
+                lock_wal(wal).note_commit(cid.ts);
+            }
             return;
         }
 
@@ -4702,6 +4777,7 @@ mod tests {
             segment_size_bytes,
             segment_interval_seconds: 3600,
             local_path: Some(dir.join("wal")),
+            ..WalArchiveConfig::default()
         };
         let cfg = BackendConfig::new_test("main").with_wal_archive(Some(wal_cfg));
         Backend::new(cfg, wal_test_idxmeta(), false).expect("Failed to setup backend")
@@ -4742,6 +4818,28 @@ mod tests {
         let be = Backend::new(cfg, wal_test_idxmeta(), false).unwrap();
         assert!(be.wal_archiver().is_none());
         assert!(!dir.path().join("wal").exists());
+    }
+
+    /// A transaction whose only archive event is a record that failed to stage, or a new
+    /// server uuid, is covered by the open segment marker before the database commits it
+    /// too: a stop between the commit and the archiving would otherwise leave no trace of
+    /// it, and recovery would replay across it.
+    #[test]
+    fn test_be_wal_every_archived_commit_is_announced() {
+        assert!(!super::wal_commit_archives(false, false, false, false));
+        for (pending, truncate, stage_failed, server_uuid_changed) in [
+            (true, false, false, false),
+            (false, true, false, false),
+            (false, false, true, false),
+            (false, false, false, true),
+        ] {
+            assert!(super::wal_commit_archives(
+                pending,
+                truncate,
+                stage_failed,
+                server_uuid_changed
+            ));
+        }
     }
 
     #[test]

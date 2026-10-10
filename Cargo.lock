@@ -4673,6 +4673,7 @@ dependencies = [
  "crypto-glue 0.2.1",
  "filetime",
  "flate2",
+ "fs4",
  "futures",
  "futures-util",
  "haproxy-protocol",

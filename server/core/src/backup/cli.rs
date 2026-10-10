@@ -5,6 +5,7 @@
 use std::{
     io::Write,
     path::{Path, PathBuf},
+    sync::Arc,
     time::SystemTime,
 };
 
@@ -18,25 +19,25 @@ use kubidm_proto::{
     internal::OperationError,
 };
 use kubidmd_lib::{
-    be::{verify_backup_structure, BackendTransaction, BackupStructuralReport},
+    be::{BackendTransaction, BackupStructuralReport},
     schema::Schema,
 };
 use time::format_description::well_known::Rfc3339;
 
 use super::{
     backup_identity, backup_name_timestamp, compare_backup_names, is_backup_artifact_name,
-    lag_metrics_from_health, open_backup_file_with_config,
-    pitr::{self, AbandonedHistory},
+    lag_metrics_from_health,
+    pitr::{self, AbandonedHistory, ManualBase},
     region_is_healthy,
     restore::{
-        backup_encryption_config, restore_and_replay_commit, restore_database, CommittedRestore,
-        RestoreOutcome,
+        backup_encryption_config, restore_and_replay_commit, CommittedRestore, RestoreOutcome,
     },
-    run_blocking, s3_location, seal_backup_async, verify_backup_output_async,
-    write_verified_local_backup_async, BackupEncryptor, BackupVerifyError, S3BackupError,
-    S3ClientWrapper,
+    run_blocking, s3_location, seal_backup_async,
+    verify::{verify_backup_restores, verify_backup_structure_at, VerifyError},
+    verify_backup_output_async, write_verified_local_backup_async, BackupEncryptor,
+    BackupVerifyError, S3BackupError, S3ClientWrapper,
 };
-use crate::{config::Configuration, setup_backend, verify_booted_database};
+use crate::{config::Configuration, setup_backend};
 
 /// Take an offline backup of the database described by `config` into `dst_path`, or to
 /// stdout without a path. The backup uses the compression and the client-side encryption
@@ -154,18 +155,22 @@ pub async fn backup_server_core(
         // Written next to the destination, synced and read back before it gets its name,
         // so the destination only ever holds a complete, verified backup. A rejected
         // artifact is kept under an `.invalid` suffix for inspection.
-        if !report_backup_verification(
+        let Some(report) = report_backup_verification(
             write_verified_local_backup_async(dst_path, artifact, compression, encryptor.as_ref())
                 .await,
-        ) {
+        ) else {
             return false;
-        }
+        };
         info!("Backup written to {}", dst_path.display());
+        // The backup has succeeded; whether it is a point-in-time recovery base is reported.
+        report_manual_base(pitr::note_manual_backup(config, dst_path, &report).await);
     } else {
-        if !report_backup_verification(
+        if report_backup_verification(
             verify_backup_output_async(artifact.clone(), name, compression, encryptor.as_ref())
                 .await,
-        ) {
+        )
+        .is_none()
+        {
             return false;
         }
 
@@ -232,9 +237,31 @@ fn check_backup_destination_name(
     Ok(())
 }
 
-/// Print the outcome of the post-write verification of a manual backup. Returns whether
-/// the backup passed; a rejected backup fails the command, as a failed write does.
-fn report_backup_verification(verified: Result<BackupStructuralReport, BackupVerifyError>) -> bool {
+/// Print whether a manual backup became a point-in-time recovery base. The backup itself
+/// succeeded either way.
+fn report_manual_base(noted: Result<ManualBase, pitr::PitrError>) {
+    match noted {
+        Ok(ManualBase::NotConfigured) => {}
+        Ok(ManualBase::HandedOver { watermark }) => eprintln!(
+            "Point-in-time recovery base: yes, watermark {watermark}; the server indexes it at \
+             its next archive run, and recover can use it right away"
+        ),
+        Ok(ManualBase::NotABase(reason)) => {
+            eprintln!("Point-in-time recovery base: no, {reason}")
+        }
+        Err(err) => {
+            error!(%err, "Unable to hand the backup to the WAL archive as a base");
+            eprintln!("Point-in-time recovery base: no, it could not be handed over: {err}");
+        }
+    }
+}
+
+/// Print the outcome of the post-write verification of a manual backup. Returns the
+/// report when the backup passed; a rejected backup fails the command, as a failed write
+/// does.
+fn report_backup_verification(
+    verified: Result<BackupStructuralReport, BackupVerifyError>,
+) -> Option<BackupStructuralReport> {
     match verified {
         Ok(report) => {
             eprintln!(
@@ -242,7 +269,7 @@ fn report_backup_verification(verified: Result<BackupStructuralReport, BackupVer
                 report.entry_count,
                 report.version.as_deref().unwrap_or("unknown")
             );
-            true
+            Some(report)
         }
         Err(err) => {
             error!("Backup failed verification: {err}");
@@ -253,7 +280,7 @@ fn report_backup_verification(verified: Result<BackupStructuralReport, BackupVer
             if let Some(path) = &err.quarantined_to {
                 eprintln!("  The rejected artifact was kept as {}", path.display());
             }
-            false
+            None
         }
     }
 }
@@ -368,28 +395,12 @@ pub async fn verify_backup_server_core(
     backup_path: &Path,
     level: BackupVerifyLevel,
 ) -> bool {
-    let opened =
-        match open_backup_file_with_config(backup_path, backup_encryption_config(config)).await {
-            Ok(opened) => opened,
-            Err(err) => {
-                error!(%err, "Unable to open backup {}", backup_path.display());
-                eprintln!("Backup structural verification: FAIL");
-                eprintln!("  - unable to open {}: {err}", backup_path.display());
-                return false;
-            }
-        };
-    let encryption_key = opened.key_identifier().map(str::to_string);
-
-    // Decompressing and parsing the whole backup is blocking work.
-    let compression = opened.compression;
-    let reader = opened.reader;
-    let parsed =
-        tokio::task::spawn_blocking(move || verify_backup_structure(reader, compression)).await;
-    let report = match parsed {
+    let structural = verify_backup_structure_at(config, backup_path).await;
+    let report = match &structural.report {
         Ok(report) => report,
-        Err(err) => {
+        Err(reason) => {
             eprintln!("Backup structural verification: FAIL");
-            eprintln!("  - the verification task failed: {err}");
+            eprintln!("  - {reason}");
             return false;
         }
     };
@@ -400,7 +411,7 @@ pub async fn verify_backup_server_core(
     );
     eprintln!(
         "  Encrypted: {}",
-        match &encryption_key {
+        match &structural.encryption_key {
             Some(key) => format!("yes, key '{key}'"),
             None => "no".to_string(),
         }
@@ -418,39 +429,25 @@ pub async fn verify_backup_server_core(
         return report.is_valid();
     }
 
-    let scratch_dir = match tempfile::tempdir() {
-        Ok(dir) => dir,
-        Err(err) => {
-            error!(?err, "Unable to create a scratch directory");
-            eprintln!("Backup restore verification: FAIL");
-            eprintln!("  - unable to create a scratch directory: {err}");
+    let consistency_errors = match verify_backup_restores(
+        config,
+        backup_path,
+        report.uncompressed_size,
+        None,
+        Arc::new(|| false),
+    )
+    .await
+    {
+        Ok(errors) => errors,
+        // Not a verdict on the backup: the scratch space was too small or failed.
+        Err(VerifyError::Environment(reason)) => {
+            eprintln!("Backup restore verification: COULD NOT RUN");
+            eprintln!("  - {reason}");
             return false;
         }
-    };
-
-    let mut scratch_config = config.clone();
-    scratch_config.db_path = Some(scratch_dir.path().join("verify.db"));
-
-    info!(
-        "Restoring backup into scratch database in {}",
-        scratch_dir.path().display()
-    );
-
-    if let Err(err) = restore_database(&scratch_config, backup_path).await {
-        eprintln!("Backup restore verification: FAIL");
-        eprintln!("  - restore failed: {err:?}");
-        return false;
-    }
-
-    // Boot the restored database from scratch exactly as a server start would. The
-    // restore above ran in this process, so its backend still carries in-memory state
-    // from before the restore (such as the RUV). A fresh boot is what proves the
-    // database starts into a consistent state.
-    let consistency_errors = match verify_booted_database(&scratch_config).await {
-        Ok(errors) => errors,
-        Err(err) => {
+        Err(reason) => {
             eprintln!("Backup restore verification: FAIL");
-            eprintln!("  - restored database could not be opened: {err:?}");
+            eprintln!("  - {reason}");
             return false;
         }
     };
@@ -582,9 +579,19 @@ pub(crate) async fn fetch_s3_backup(
     key: &str,
 ) -> Result<FetchedS3Backup, S3BackupError> {
     let client = S3ClientWrapper::new(s3_config).await?;
+    let scratch_dir = tempfile::tempdir()?;
+    fetch_s3_backup_into(&client, key, scratch_dir).await
+}
+
+/// [`fetch_s3_backup`] with an S3 client the caller already has, into `scratch_dir`, which
+/// is removed with the returned value.
+pub(crate) async fn fetch_s3_backup_into(
+    client: &S3ClientWrapper,
+    key: &str,
+    scratch_dir: tempfile::TempDir,
+) -> Result<FetchedS3Backup, S3BackupError> {
     let (data, metadata) = client.download_backup(key).await?;
 
-    let scratch_dir = tempfile::tempdir()?;
     // The requested key counts as well as the sidecar: the sidecar is not authenticated, so
     // an object requested as `.enc` must be an encrypted container whatever it says.
     let encryption_suffix = if metadata.encrypted || is_encrypted_backup_name(key) {
@@ -910,22 +917,51 @@ async fn list_s3_backups(config: &Configuration, region: Option<&str>) -> bool {
     ok
 }
 
-/// Report the state of cross-region backup replication: for every configured region,
-/// which of the primary's backups it holds intact, its newest backup and how far it lags
-/// behind the primary. `detailed` adds the lag metrics of every region. The database is
-/// never opened, so the command can run next to a running server.
+/// Report the state of cross-region replication: for every configured region, which of
+/// the primary's backups it holds intact, its newest backup and how far it lags behind the
+/// primary; and, when the WAL archive of point-in-time recovery is replicated, whether
+/// every region holds a current copy of its manifest and an intact copy of every segment.
+/// `detailed` adds the lag metrics of every region and the segments it misses. The WAL
+/// archive is compared by its listings, unless `deep` asks to compare the sidecar of every
+/// segment as well. The database is never opened, so the command can run next to a running
+/// server.
 ///
-/// Returns false when replication is not configured or disabled, when the primary bucket
-/// can not be listed, or when any region is unhealthy, so the exit code of
+/// Returns false when neither backups nor the WAL archive are replicated, when a primary
+/// location can not be read, or when any region is unhealthy, so the exit code of
 /// `replicate-status` is usable from monitoring.
-pub async fn replicate_status_server_core(config: &Configuration, detailed: bool) -> bool {
+pub async fn replicate_status_server_core(
+    config: &Configuration,
+    detailed: bool,
+    deep: bool,
+) -> bool {
+    let backups = backup_replication_status(config, detailed).await;
+    let pitr_settings = match pitr::PitrSettings::from_config(config) {
+        Ok(settings) => settings,
+        Err(err) => {
+            println!("WAL archive replication: invalid configuration: {err}");
+            return false;
+        }
+    };
+    if pitr_settings.is_some() {
+        println!();
+    }
+    let wal = pitr::wal_replication_status(pitr_settings.as_ref(), detailed, deep).await;
+    match (backups, wal) {
+        (None, None) => false,
+        (backups, wal) => backups.unwrap_or(true) && wal.unwrap_or(true),
+    }
+}
+
+/// The backup part of `replicate-status`: prints the report and returns whether every
+/// region is healthy, or None when backup replication is not configured.
+async fn backup_replication_status(config: &Configuration, detailed: bool) -> Option<bool> {
     let Some(s3_config) = config
         .online_backup
         .as_ref()
         .and_then(|backup| backup.s3.clone())
     else {
         println!("Cross-region backup replication: not configured ([online_backup.s3] is absent)");
-        return false;
+        return None;
     };
 
     let Some(replication) = s3_config
@@ -937,7 +973,7 @@ pub async fn replicate_status_server_core(config: &Configuration, detailed: bool
             "Cross-region backup replication: not configured ([online_backup.s3.replication] \
              is absent or disabled)"
         );
-        return false;
+        return None;
     };
 
     let primary = s3_location(&s3_config);
@@ -946,7 +982,7 @@ pub async fn replicate_status_server_core(config: &Configuration, detailed: bool
         Err(err) => {
             error!(%err, "Unable to create the S3 client");
             println!("Cross-region backup replication: unable to create the S3 client: {err}");
-            return false;
+            return Some(false);
         }
     };
 
@@ -962,7 +998,7 @@ pub async fn replicate_status_server_core(config: &Configuration, detailed: bool
                 "Cross-region backup replication: unable to list the primary backups in \
                  {primary}: {err}"
             );
-            return false;
+            return Some(false);
         }
     };
 
@@ -971,7 +1007,7 @@ pub async fn replicate_status_server_core(config: &Configuration, detailed: bool
         format_replication_report(&primary, &health, &replication, detailed)
     );
 
-    !health.regions.is_empty() && health.unhealthy_regions == 0
+    Some(!health.regions.is_empty() && health.unhealthy_regions == 0)
 }
 
 /// The text `replicate-status` prints for a health check.

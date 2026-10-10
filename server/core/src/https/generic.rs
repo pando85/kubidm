@@ -1,13 +1,20 @@
+use std::sync::Arc;
+
 use axum::extract::State;
-use axum::http::{header::CONTENT_TYPE, StatusCode};
-use axum::response::{IntoResponse, Redirect};
+use axum::http::{
+    header::{AUTHORIZATION, CONTENT_TYPE, WWW_AUTHENTICATE},
+    HeaderMap, StatusCode,
+};
+use axum::response::{IntoResponse, Redirect, Response};
 use axum::{Extension, Json};
 use kubidmd_lib::maintenance::{maintenance_public_status, MaintenancePublicStatus};
 use kubidmd_lib::prelude::APPLICATION_JSON;
 use kubidmd_lib::status::{LivenessStatus, ReadinessStatus, ServingReadiness, StatusRequestEvent};
+use sha2::{Digest, Sha256};
 use url::Url;
 
 use super::{middleware::KOpId, views::constants::Urls, ServerState};
+use crate::backup::metrics::{BackupMetrics, PROMETHEUS_TEXT_CONTENT_TYPE};
 
 #[utoipa::path(
     get,
@@ -99,6 +106,81 @@ pub async fn readyz(State(state): State<ServerState>) -> impl IntoResponse {
     (status_code, Json(status))
 }
 
+/// The `/metrics` endpoint: the backup metrics it serves and, when
+/// `online_backup.metrics_token_file` is set, the SHA-256 of the bearer token a scraper
+/// must present.
+#[derive(Clone)]
+pub struct MetricsEndpoint {
+    metrics: Arc<BackupMetrics>,
+    token_sha256: Option<[u8; 32]>,
+}
+
+impl MetricsEndpoint {
+    pub fn new(metrics: Arc<BackupMetrics>, token: Option<String>) -> Self {
+        Self {
+            metrics,
+            token_sha256: token.map(|token| Sha256::digest(token.as_bytes()).into()),
+        }
+    }
+
+    /// Whether the request with `headers` may read the metrics: always without a token,
+    /// otherwise only with `Authorization: Bearer <token>`. The digests of the tokens are
+    /// compared in constant time.
+    fn authorized(&self, headers: &HeaderMap) -> bool {
+        let Some(expected) = &self.token_sha256 else {
+            return true;
+        };
+        let Some(presented) = headers
+            .get(AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(bearer_token)
+        else {
+            return false;
+        };
+        let presented: [u8; 32] = Sha256::digest(presented.trim().as_bytes()).into();
+        expected
+            .iter()
+            .zip(presented.iter())
+            .fold(0u8, |difference, (a, b)| difference | (a ^ b))
+            == 0
+    }
+}
+
+/// The token of the `Authorization` header value `value` when it uses the `Bearer` scheme,
+/// whose name is case-insensitive (RFC 7235): some scrapers and proxies send `bearer`.
+fn bearer_token(value: &str) -> Option<&str> {
+    let (scheme, token) = value.split_once(' ')?;
+    scheme.eq_ignore_ascii_case("bearer").then_some(token)
+}
+
+#[utoipa::path(
+    get,
+    path = "/metrics",
+    responses(
+        (status = 200, description = "Backup metrics in the Prometheus text exposition format", content_type = "text/plain"),
+        (status = 401, description = "online_backup.metrics_token_file is set and the request has no matching bearer token"),
+        (status = 404, description = "online_backup.metrics_endpoint is not enabled"),
+    ),
+    tag = "system",
+    operation_id = "metrics"
+)]
+/// The backup metrics in the Prometheus text exposition format: per backup destination the
+/// time of the last successful and failed backup and of the last full verification, and
+/// the time of the last WAL archive synchronisation. Only served when
+/// `online_backup.metrics_endpoint` is enabled, and only to a bearer of the token of
+/// `online_backup.metrics_token_file` when that is set.
+pub async fn metrics(State(endpoint): State<MetricsEndpoint>, headers: HeaderMap) -> Response {
+    if !endpoint.authorized(&headers) {
+        return (StatusCode::UNAUTHORIZED, [(WWW_AUTHENTICATE, "Bearer")]).into_response();
+    }
+    (
+        StatusCode::OK,
+        [(CONTENT_TYPE, PROMETHEUS_TEXT_CONTENT_TYPE)],
+        endpoint.metrics.render(),
+    )
+        .into_response()
+}
+
 #[utoipa::path(
     get,
     path = "/robots.txt",
@@ -150,4 +232,63 @@ pub async fn passkey_endpoints(State(state): State<ServerState>) -> impl IntoRes
         manage: Some(manage),
         prf_usage_details: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::HeaderValue;
+
+    use super::*;
+
+    fn headers(authorization: Option<&str>) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        if let Some(value) = authorization {
+            headers.insert(
+                AUTHORIZATION,
+                HeaderValue::from_str(value).expect("a header value"),
+            );
+        }
+        headers
+    }
+
+    #[test]
+    fn the_metrics_need_the_bearer_token_when_one_is_configured() {
+        let metrics = Arc::new(BackupMetrics::new(None));
+        let open = MetricsEndpoint::new(metrics.clone(), None);
+        assert!(open.authorized(&headers(None)));
+        assert!(open.authorized(&headers(Some("Bearer anything"))));
+
+        let protected = MetricsEndpoint::new(metrics, Some("s3cret-token".to_string()));
+        assert!(protected.authorized(&headers(Some("Bearer s3cret-token"))));
+        for refused in [
+            None,
+            Some("Bearer wrong"),
+            Some("Bearer "),
+            Some("Bearer s3cret-token-and-more"),
+            Some("Basic s3cret-token"),
+            Some("s3cret-token"),
+        ] {
+            assert!(!protected.authorized(&headers(refused)), "{refused:?}");
+        }
+    }
+
+    /// The scheme name is case-insensitive (RFC 7235): a scraper or proxy that sends
+    /// `bearer` with the right token is let in.
+    #[test]
+    fn the_bearer_scheme_is_matched_without_regard_to_case() {
+        let protected = MetricsEndpoint::new(
+            Arc::new(BackupMetrics::new(None)),
+            Some("s3cret-token".to_string()),
+        );
+        for accepted in [
+            "bearer s3cret-token",
+            "BEARER s3cret-token",
+            "BeArEr s3cret-token",
+        ] {
+            assert!(protected.authorized(&headers(Some(accepted))), "{accepted}");
+        }
+        for refused in ["Bearers3cret-token", "Bear s3cret-token", "bearer wrong"] {
+            assert!(!protected.authorized(&headers(Some(refused))), "{refused}");
+        }
+    }
 }

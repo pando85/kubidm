@@ -752,6 +752,23 @@ impl S3ClientWrapper {
     /// under a sibling prefix that merely starts with the same characters are never
     /// returned.
     async fn list_keys(&self) -> Result<Vec<String>, S3BackupError> {
+        Ok(self
+            .list_objects()
+            .await?
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect())
+    }
+
+    /// Every object under the configured prefix, metadata sidecars included, by key with
+    /// the prefix stripped, with the size the service reports for it. One listing, however
+    /// many objects are compared with it.
+    pub(crate) async fn list_object_sizes(&self) -> Result<BTreeMap<String, u64>, S3BackupError> {
+        Ok(self.list_objects().await?.into_iter().collect())
+    }
+
+    /// [`Self::list_keys`] with the size of every object.
+    async fn list_objects(&self) -> Result<Vec<(String, u64)>, S3BackupError> {
         let prefix = Self::listing_prefix(self.config.path_prefix.as_deref());
 
         let mut pages = self
@@ -777,7 +794,8 @@ impl S3ClientWrapper {
                 // S3 only returns keys starting with the requested prefix; anything else
                 // is not ours and is skipped rather than mangled.
                 if let Some(display_key) = Self::strip_listing_prefix(&prefix, key) {
-                    keys.push(display_key.to_string());
+                    let size = obj.size().and_then(|size| u64::try_from(size).ok());
+                    keys.push((display_key.to_string(), size.unwrap_or_default()));
                 }
             }
         }
@@ -919,7 +937,7 @@ impl S3ClientWrapper {
     /// This catches a missing, truncated, replaced or re-uploaded replica cheaply enough
     /// to run on every health check; a replica whose bytes were corrupted without changing
     /// its size is only caught by `verify-s3 --region`, which downloads it.
-    async fn replica_differs(
+    pub(crate) async fn replica_differs(
         region: &S3ClientWrapper,
         backup_key: &str,
         primary: &S3BackupMetadata,
@@ -1185,7 +1203,7 @@ impl Drop for MultipartAbortGuard {
 }
 
 /// Suffix of the metadata sidecar of a backup object.
-const METADATA_SUFFIX: &str = ".metadata.json";
+pub(crate) const METADATA_SUFFIX: &str = ".metadata.json";
 
 /// The automatically generated backups found under a prefix.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]

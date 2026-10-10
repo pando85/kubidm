@@ -34,6 +34,9 @@
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
 use aws_sdk_s3::Client as SdkClient;
@@ -55,6 +58,57 @@ pub const BACKUP_ENGINEERS_GROUP: &str = "backup_engineers";
 pub const BACKUP_RECYCLED_GROUP: &str = "backup_recycled_group";
 pub const BACKUP_USER_ALICE: &str = "backup_user_alice";
 pub const BACKUP_USER_BOB: &str = "backup_user_bob";
+
+/// Drive `work`, an offline database command, on the current thread runtime of the test
+/// while a task ticks on the same runtime, and check that the runtime stayed free: no
+/// stretch without a tick may be longer than [`MAX_RUNTIME_STALL`], however long the
+/// command takes. A command that ran its database work on the runtime would hold the only
+/// thread of the runtime for the whole of that work.
+pub async fn assert_runtime_stays_free<F: Future>(work: F) -> F::Output {
+    const TICK: Duration = Duration::from_millis(10);
+    /// Many ticks, plus slack for a loaded test machine; far below a restore's database
+    /// work.
+    const MAX_RUNTIME_STALL: Duration = Duration::from_millis(250);
+    let ticks = Arc::new(Mutex::new(Vec::new()));
+    let ticker = {
+        let ticks = Arc::clone(&ticks);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(TICK).await;
+                ticks.lock().expect("ticks").push(Instant::now());
+            }
+        })
+    };
+    let start = Instant::now();
+    let output = work.await;
+    let end = Instant::now();
+    ticker.abort();
+
+    let elapsed = end - start;
+    let mut times = vec![start];
+    times.extend(ticks.lock().expect("ticks").iter().copied());
+    times.push(end);
+    let longest_stall = times
+        .windows(2)
+        .map(|pair| pair[1].saturating_duration_since(pair[0]))
+        .max()
+        .unwrap_or_default();
+    assert!(
+        longest_stall <= MAX_RUNTIME_STALL,
+        "The runtime was blocked for {longest_stall:?} of the {elapsed:?} the command took"
+    );
+    output
+}
+
+/// The future `make` builds, boxed. It is built in this function's frame, not in the
+/// caller's: a debug build gives every future an async block awaits a stack slot of its own
+/// in the frame that polls the block, even when the future is boxed right away, and the
+/// frames of a long scenario then add up past the stack of the test thread, which also runs
+/// the tasks of the servers the scenario starts. Awaited through this, a step costs that
+/// frame a pointer.
+pub fn boxed<F: Future>(make: impl FnOnce() -> F) -> Pin<Box<F>> {
+    Box::pin(make())
+}
 
 pub fn run<F: Future>(future: F) -> F::Output {
     tokio::runtime::Builder::new_current_thread()

@@ -53,10 +53,12 @@ use crate::{
     actors::{QueryServerReadV1, QueryServerWriteV1},
     admin::AdminActor,
     backup::{
+        metrics::{metrics_state_file, BackupMetrics},
         online::OnlineBackupJob,
         pitr::{self, BaseLocation, PitrArchive, PitrError, PitrSettings, PitrSyncReport},
+        verify::{BackupVerifyJob, BackupVerifyRun},
     },
-    config::{Configuration, ServerRole},
+    config::{Configuration, OnlineBackup, ServerRole},
     interval::IntervalActor,
     repl::ReplicationServerHandles,
 };
@@ -70,7 +72,7 @@ use kubidm_proto::{
     scim_v1::client::ScimAssertGeneric,
 };
 use kubidmd_lib::{
-    be::{Backend, BackendConfig},
+    be::{Backend, BackendConfig, BackendWriteTransaction},
     idm::ldap::LdapServer,
     prelude::*,
     schema::Schema,
@@ -244,6 +246,11 @@ async fn setup_qs(
 macro_rules! dbscan_setup_be {
     (
         $config:expr
+    ) => {
+        dbscan_setup_be!($config, ())
+    };
+    (
+        $config:expr, $failed:expr
     ) => {{
         let schema = match Schema::new() {
             Ok(s) => s,
@@ -257,7 +264,7 @@ macro_rules! dbscan_setup_be {
             Ok(be) => be,
             Err(e) => {
                 error!("Failed to setup BE: {:?}", e);
-                return;
+                return $failed;
             }
         }
     }};
@@ -355,8 +362,9 @@ pub fn dbscan_get_id2entry_core(config: &Configuration, id: u64) {
     };
 }
 
-pub fn dbscan_quarantine_id2entry_core(config: &Configuration, id: u64) {
-    let be = dbscan_setup_be!(config);
+/// `db-scan quarantine-id2entry`. Returns false when the entry was not quarantined.
+pub async fn dbscan_quarantine_id2entry_core(config: &Configuration, id: u64) -> bool {
+    let be = dbscan_setup_be!(config, false);
     let mut be_wrtxn = match be.write() {
         Ok(txn) => txn,
         Err(err) => {
@@ -364,21 +372,77 @@ pub fn dbscan_quarantine_id2entry_core(config: &Configuration, id: u64) {
                 ?err,
                 "Unable to proceed, backend write transaction failure."
             );
-            return;
+            return false;
         }
     };
 
-    match be_wrtxn
-        .quarantine_entry(id)
-        .and_then(|_| be_wrtxn.commit())
-    {
-        Ok(()) => {
-            println!("quarantined - {id:>8}")
-        }
-        Err(e) => {
-            error!("Failed to quarantine id2entry value: {:?}", e);
+    if let Err(e) = be_wrtxn.quarantine_entry(id) {
+        error!("Failed to quarantine id2entry value: {:?}", e);
+        return false;
+    }
+    if !commit_dbscan_change(config, be_wrtxn, "db-scan quarantine-id2entry").await {
+        return false;
+    }
+    println!("quarantined - {id:>8}");
+    true
+}
+
+/// Commit the change a `db-scan` command made in `be_wrtxn` outside any transaction the
+/// WAL archive could record. When WAL archiving is configured, the change is first
+/// handed over as a pending gap of the archive, so that point-in-time recovery never
+/// replays across it; the gap is confirmed once the commit succeeded, and taken back when
+/// it failed. Returns false, after logging why, when the gap could not be handed over, in
+/// which case nothing is committed, or when the commit failed.
+async fn commit_dbscan_change(
+    config: &Configuration,
+    mut be_wrtxn: BackendWriteTransaction<'_>,
+    command: &str,
+) -> bool {
+    let db_ts_max = match be_wrtxn.get_db_ts_max(Duration::ZERO) {
+        Ok(db_ts_max) => db_ts_max,
+        Err(err) => {
+            error!(?err, "Unable to read the last transaction of the database");
+            return false;
         }
     };
+    let record = match pitr::note_offline_change(config, db_ts_max, command).await {
+        Ok(record) => record,
+        Err(err) => {
+            error!(
+                %err,
+                "The change could not be handed to the WAL archive, so point-in-time recovery \
+                 could replay across it; the database was not changed"
+            );
+            return false;
+        }
+    };
+    match be_wrtxn.commit() {
+        Ok(()) => {
+            if let Err(err) = pitr::confirm_offline_change(record).await {
+                // Still pending: the server records it once this process exits.
+                warn!(
+                    %err,
+                    "Unable to confirm the WAL archive gap of the change; the server records it \
+                     as an unconfirmed gap"
+                );
+            }
+            true
+        }
+        Err(err) => {
+            error!(
+                ?err,
+                "Failed to commit the change; the database was not changed"
+            );
+            if let Err(err) = pitr::withdraw_offline_change(record).await {
+                error!(
+                    %err,
+                    "Unable to take back the WAL archive gap of the change that did not happen; \
+                     point-in-time recovery stops before it until a new online backup is taken"
+                );
+            }
+            false
+        }
+    }
 }
 
 pub fn dbscan_list_quarantined_core(config: &Configuration) {
@@ -404,8 +468,9 @@ pub fn dbscan_list_quarantined_core(config: &Configuration) {
     };
 }
 
-pub fn dbscan_restore_quarantined_core(config: &Configuration, id: u64) {
-    let be = dbscan_setup_be!(config);
+/// `db-scan restore-quarantined`. Returns false when the entry was not restored.
+pub async fn dbscan_restore_quarantined_core(config: &Configuration, id: u64) -> bool {
+    let be = dbscan_setup_be!(config, false);
     let mut be_wrtxn = match be.write() {
         Ok(txn) => txn,
         Err(err) => {
@@ -413,21 +478,19 @@ pub fn dbscan_restore_quarantined_core(config: &Configuration, id: u64) {
                 ?err,
                 "Unable to proceed, backend write transaction failure."
             );
-            return;
+            return false;
         }
     };
 
-    match be_wrtxn
-        .restore_quarantined(id)
-        .and_then(|_| be_wrtxn.commit())
-    {
-        Ok(()) => {
-            println!("restored - {id:>8}")
-        }
-        Err(e) => {
-            error!("Failed to restore quarantined id2entry value: {:?}", e);
-        }
-    };
+    if let Err(e) = be_wrtxn.restore_quarantined(id) {
+        error!("Failed to restore quarantined id2entry value: {:?}", e);
+        return false;
+    }
+    if !commit_dbscan_change(config, be_wrtxn, "db-scan restore-quarantined").await {
+        return false;
+    }
+    println!("restored - {id:>8}");
+    true
 }
 
 pub async fn reindex_server_core(config: &Configuration) {
@@ -931,6 +994,8 @@ pub(crate) enum TaskName {
     AuditdActor,
     BackupActor,
     BackupReplicationMonitor,
+    BackupVerification,
+    BackupMetrics,
     DelayedActionActor,
     HttpsServer,
     IntervalActor,
@@ -951,6 +1016,8 @@ impl Display for TaskName {
                 TaskName::AuditdActor => "Auditd Actor",
                 TaskName::BackupActor => "Backup Actor",
                 TaskName::BackupReplicationMonitor => "Backup Replication Monitor",
+                TaskName::BackupVerification => "Backup Verification",
+                TaskName::BackupMetrics => "Backup Metrics",
                 TaskName::DelayedActionActor => "Delayed Action Actor",
                 TaskName::HttpsServer => "HTTPS Server",
                 TaskName::IntervalActor => "Interval Actor",
@@ -972,6 +1039,14 @@ pub struct CoreHandle {
     server_read_ref: &'static QueryServerReadV1,
     /// The WAL archive, when point-in-time recovery is enabled.
     pitr_archive: Option<Arc<PitrArchive>>,
+    /// The backup metrics every backup task records into.
+    backup_metrics: Arc<BackupMetrics>,
+    /// The full verification of the newest backup, shared with its schedule.
+    backup_verify: Arc<BackupVerifyJob>,
+    /// The `[online_backup]` section the server runs with.
+    online_backup: Option<OnlineBackup>,
+    /// Held by an online backup or a scheduled verification while it runs.
+    backup_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl CoreHandle {
@@ -996,7 +1071,10 @@ impl CoreHandle {
         // Every task that can write has stopped: close the open WAL segment and archive
         // it, so that a clean shutdown loses no committed transaction.
         if let Some(archive) = &self.pitr_archive {
-            match archive.sync(duration_from_epoch_now(), true).await {
+            let result = archive.sync_at_shutdown(duration_from_epoch_now()).await;
+            self.backup_metrics
+                .record_pitr_sync(&result, duration_from_epoch_now());
+            match result {
                 Ok(report) => debug!(?report, "WAL archive synchronised at shutdown"),
                 Err(err) => error!(
                     %err,
@@ -1007,6 +1085,9 @@ impl CoreHandle {
             }
             archive.persist_pending_events();
         }
+        // The metrics task wrote the state file when it stopped; this keeps the outcome of
+        // the final synchronisation.
+        self.backup_metrics.save_state_file().await;
 
         self.clean_shutdown = true;
     }
@@ -1016,9 +1097,40 @@ impl CoreHandle {
     /// exists so tests can archive on demand.
     pub async fn sync_wal_archive(&self) -> Option<Result<PitrSyncReport, PitrError>> {
         match &self.pitr_archive {
-            Some(archive) => Some(archive.sync(duration_from_epoch_now(), true).await),
+            Some(archive) => {
+                let result = archive.sync(duration_from_epoch_now(), true).await;
+                self.backup_metrics
+                    .record_pitr_sync(&result, duration_from_epoch_now());
+                Some(result)
+            }
             None => None,
         }
+    }
+
+    /// Run the online backup the `[online_backup]` section describes now, to every location
+    /// it configures, exactly as the scheduled online backup does. Fails without an
+    /// `[online_backup]` section. This exists so tests can exercise the scheduled backup on
+    /// demand.
+    pub async fn trigger_configured_online_backup(&self) -> Result<(), OperationError> {
+        let online_backup = self.online_backup.as_ref().ok_or_else(|| {
+            error!("No [online_backup] section is configured");
+            OperationError::InvalidState
+        })?;
+        OnlineBackupJob::from_config(
+            online_backup,
+            self.pitr_archive.clone(),
+            self.backup_metrics.clone(),
+            self.backup_lock.clone(),
+        )
+        .run(self.server_read_ref)
+        .await
+    }
+
+    /// Run the full verification of the newest backup now, the run
+    /// `online_backup.verify_schedule` schedules, recording its result in the backup
+    /// metrics. This exists so tests can exercise the scheduled verification on demand.
+    pub async fn trigger_backup_verification(&self) -> BackupVerifyRun {
+        self.backup_verify.run().await
     }
 
     pub async fn reload(&mut self) {
@@ -1029,7 +1141,8 @@ impl CoreHandle {
 
     /// Run an online backup now, through the same code path the scheduled online backup
     /// uses. `versions` is the number of backups to keep in `outpath`. This exists so
-    /// tests can exercise the production backup path on demand.
+    /// tests can exercise the production backup path on demand; since `outpath` is not a
+    /// location of the configuration, the backup metrics do not record it.
     pub async fn trigger_online_backup(
         &self,
         outpath: &Path,
@@ -1079,6 +1192,8 @@ impl CoreHandle {
             compression,
             encryption: encryption.clone(),
             pitr_archive: self.pitr_archive.clone(),
+            metrics: Arc::new(BackupMetrics::new(None)),
+            backup_lock: self.backup_lock.clone(),
         }
         .run(self.server_read_ref)
         .await
@@ -1173,6 +1288,18 @@ pub async fn create_server_core(
         }
         _ => None,
     };
+    let online_backup = config.online_backup.clone();
+    let backup_metrics = Arc::new(
+        BackupMetrics::new(config.online_backup.as_ref())
+            .with_state_file(metrics_state_file(&config)),
+    );
+    let backup_lock = Arc::new(tokio::sync::Mutex::new(()));
+    let backup_verify = Arc::new(BackupVerifyJob::new(
+        config.clone(),
+        backup_metrics.clone(),
+        backup_lock.clone(),
+    ));
+
     // Start the IDM server.
     let (_qs, idms, idms_delayed, idms_audit) = match setup_qs_idms(be, schema, &config).await {
         Ok(t) => t,
@@ -1290,6 +1417,9 @@ pub async fn create_server_core(
             idms_arc,
             maybe_tls_acceptor,
             pitr_archive.clone(),
+            backup_metrics.clone(),
+            backup_verify.clone(),
+            backup_lock.clone(),
         )
         .await
     };
@@ -1300,6 +1430,10 @@ pub async fn create_server_core(
         handles,
         server_read_ref,
         pitr_archive,
+        backup_metrics,
+        backup_verify,
+        online_backup,
+        backup_lock,
     };
 
     if startup_success.is_ok() {
@@ -1328,6 +1462,9 @@ async fn launch_server_tasks(
     maybe_tls_acceptor: Option<TlsAcceptor>,
 
     pitr_archive: Option<Arc<PitrArchive>>,
+    backup_metrics: Arc<BackupMetrics>,
+    backup_verify: Arc<BackupVerifyJob>,
+    backup_lock: Arc<tokio::sync::Mutex<()>>,
 ) -> Result<(), ()> {
     let status_ref = StatusActor::start();
     let tracker = status_ref.get_tracker_clone();
@@ -1390,10 +1527,47 @@ async fn launch_server_tasks(
 
     handles.push((TaskName::AuditdActor, auditd_handle));
 
+    // The backup metrics start from what the previous run of the server recorded, before
+    // the first scrape; the backups found are read in the background. The scratch
+    // directories a killed verification left behind are removed before one can run.
+    if let Some(online_backup) = config
+        .online_backup
+        .as_ref()
+        .filter(|online_backup| online_backup.enabled)
+    {
+        backup_metrics.load_state_file().await;
+        handles.push((
+            TaskName::BackupMetrics,
+            IntervalActor::start_backup_metrics(
+                backup_metrics.clone(),
+                online_backup.clone(),
+                broadcast_tx.subscribe(),
+            ),
+        ));
+        if let Some(parent) = backup_verify.scratch_parent().map(Path::to_path_buf) {
+            let swept = parent.clone();
+            if let Err(err) =
+                backup::run_blocking(move || backup::verify::remove_stale_scratch_dirs(&swept))
+                    .await
+            {
+                warn!(
+                    %err,
+                    "Unable to look for the scratch directories of an interrupted backup \
+                     verification in {}",
+                    parent.display()
+                );
+            }
+        }
+    }
+
     // WAL archiving runs in every mode, integration tests included: it only ships what
     // the backend already recorded.
     if let Some(archive) = &pitr_archive {
-        let wal_handle = pitr::start_wal_archive_task(archive.clone(), broadcast_tx.subscribe());
+        let wal_handle = pitr::start_wal_archive_task(
+            archive.clone(),
+            backup_metrics.clone(),
+            broadcast_tx.subscribe(),
+        );
         handles.push((TaskName::WalArchive, wal_handle));
     }
 
@@ -1433,6 +1607,8 @@ async fn launch_server_tasks(
                         server_read_ref,
                         online_backup_config,
                         pitr_archive.clone(),
+                        backup_metrics.clone(),
+                        backup_lock,
                         broadcast_tx.subscribe(),
                     )?;
                     handles.extend(backup_handles);
@@ -1488,6 +1664,28 @@ async fn launch_server_tasks(
     } else {
         let replication_configured = config.repl_config.is_some();
         tracker.mark_startup_complete(replication_configured);
+    }
+
+    // The scheduled verification of the newest backup. It only reads backups and restores
+    // them into scratch databases, so unlike the backup itself it also runs in the
+    // integration tests that configure it.
+    if let Some(verify_schedule) = config
+        .online_backup
+        .as_ref()
+        .filter(|online_backup| online_backup.enabled)
+        .and_then(|online_backup| online_backup.verify_schedule.as_deref())
+    {
+        let schedule = interval::parse_backup_schedule(verify_schedule).map_err(|reason| {
+            error!("online_backup.verify_schedule: {reason}");
+        })?;
+        handles.push((
+            TaskName::BackupVerification,
+            IntervalActor::start_backup_verification(
+                backup_verify,
+                schedule,
+                broadcast_tx.subscribe(),
+            ),
+        ));
     }
 
     // Setup a TLS Acceptor Reload trigger.
@@ -1561,6 +1759,29 @@ async fn launch_server_tasks(
         }
     };
 
+    // The metrics endpoint, and the token it requires when one is configured. A token
+    // that can not be read fails the start rather than serving the metrics without it.
+    let metrics_endpoint = match config
+        .online_backup
+        .as_ref()
+        .filter(|online_backup| online_backup.metrics_endpoint)
+    {
+        Some(online_backup) => {
+            let token = match online_backup.metrics_token_file.clone() {
+                Some(token_file) => Some(
+                    backup::run_blocking(move || {
+                        config::read_metrics_token(&token_file).map_err(std::io::Error::other)
+                    })
+                    .await
+                    .map_err(|err| error!(%err, "online_backup.metrics_token_file"))?,
+                ),
+                None => None,
+            };
+            Some(https::generic::MetricsEndpoint::new(backup_metrics, token))
+        }
+        None => None,
+    };
+
     // Finally launch the https tasks.
     let http_handles: Vec<task::JoinHandle<()>> = https::create_https_server(
         config.clone(),
@@ -1570,6 +1791,7 @@ async fn launch_server_tasks(
         broadcast_tx.clone(),
         maybe_tls_acceptor,
         &tls_acceptor_reload_tx,
+        metrics_endpoint,
     )
     .await
     .inspect_err(|err| {

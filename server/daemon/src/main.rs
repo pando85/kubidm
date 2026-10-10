@@ -811,12 +811,28 @@ fn main() -> ExitCode {
 
     // Choose where we go.
 
-    if let KubidmdOpt::Scripting { command } = opt.commands {
+    let exit_code = if let KubidmdOpt::Scripting { command } = opt.commands {
         rt.block_on(scripting_command(command, config))
     } else {
         rt.block_on(start_daemon(opt, config))
+    };
+
+    // Dropping the runtime would wait for every blocking task, however long it runs. The
+    // server has stopped its tasks by now, but a scheduled backup verification abandoned
+    // by the shutdown only stops at its next step, which can be minutes away on a large
+    // database: never hold the exit for it. Its scratch directories are removed at the
+    // next start. Every other command waits for its blocking work, so that a write it
+    // left running is never cut short.
+    if is_server {
+        rt.shutdown_timeout(BLOCKING_TASKS_SHUTDOWN_TIMEOUT);
+    } else {
+        drop(rt);
     }
+    exit_code
 }
+
+/// How long the exit of the server waits for blocking tasks still running once it stopped.
+const BLOCKING_TASKS_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Build and execute the main server. The ServerConfig are the configuration options
 /// that we are processing into the config for the main server.
@@ -1193,7 +1209,9 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
             commands: DbScanOpt::QuarantineId2Entry { id },
         } => {
             info!("☣️  db scan - quarantine id2 entry - {}", id);
-            dbscan_quarantine_id2entry_core(&config, *id);
+            if !dbscan_quarantine_id2entry_core(&config, *id).await {
+                return ExitCode::FAILURE;
+            }
         }
 
         KubidmdOpt::DbScan {
@@ -1207,7 +1225,9 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
             commands: DbScanOpt::RestoreQuarantined { id },
         } => {
             info!("☣️  db scan - restore quarantined entry - {}", id);
-            dbscan_restore_quarantined_core(&config, *id);
+            if !dbscan_restore_quarantined_core(&config, *id).await {
+                return ExitCode::FAILURE;
+            }
         }
 
         KubidmdOpt::DomainSettings {
@@ -1311,10 +1331,10 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
             }
         }
         KubidmdOpt::Database {
-            commands: DbCommands::ReplicateStatus { detailed },
+            commands: DbCommands::ReplicateStatus { detailed, deep },
         } => {
             info!("Running in backup replication status mode ...");
-            if !replicate_status_server_core(&config, *detailed).await {
+            if !replicate_status_server_core(&config, *detailed, *deep).await {
                 return ExitCode::FAILURE;
             }
         }
