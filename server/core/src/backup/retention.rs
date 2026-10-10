@@ -6,6 +6,7 @@
 //! shares the location (metadata sidecars, the PITR manifest, manual backups with other
 //! names) is left alone.
 
+use std::path::Path;
 use std::sync::LazyLock;
 
 use kubidm_proto::backup::{BackupCompression, BACKUP_ENCRYPTED_SUFFIX};
@@ -62,6 +63,77 @@ pub fn select_backups_to_delete(names: &[String], versions: usize) -> Vec<String
     let excess = backups.len().saturating_sub(versions);
     backups.truncate(excess);
     backups
+}
+
+/// Apply the `versions` retention to the local online backup directory `dir` with
+/// [`select_backups_to_delete`], the rule the S3 locations use. Only regular files named
+/// like an automatically generated backup are considered; anything else in the directory,
+/// including names that are not valid UTF-8, is left alone.
+///
+/// Never fails: the backup that triggered the cleanup has already succeeded, so an
+/// unreadable directory or entry, or a file that can not be removed, is logged and the
+/// cleanup carries on or stops, as an S3 cleanup does.
+pub fn prune_local_backups(dir: &Path, versions: usize) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) => {
+            error!(
+                "Online backup cleanup failed to read {}: {}",
+                dir.display(),
+                err
+            );
+            return;
+        }
+    };
+
+    let mut names = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                warn!(
+                    "Online backup cleanup skips an unreadable entry of {}: {}",
+                    dir.display(),
+                    err
+                );
+                continue;
+            }
+        };
+        let Ok(name) = entry.file_name().into_string() else {
+            debug!(
+                "Online backup cleanup ignores {:?}: its name is not valid UTF-8",
+                entry.path()
+            );
+            continue;
+        };
+        if is_backup_artifact_name(&name) && entry.path().is_file() {
+            names.push(name);
+        }
+    }
+
+    let to_delete = select_backups_to_delete(&names, versions);
+    if to_delete.is_empty() {
+        debug!("Online backup cleanup had no files to remove");
+        return;
+    }
+    info!(
+        "Online backup cleanup found {} versions in {}, should keep {}, will remove {}",
+        names.len(),
+        dir.display(),
+        versions,
+        to_delete.len()
+    );
+    for name in to_delete {
+        let path = dir.join(&name);
+        match std::fs::remove_file(&path) {
+            Ok(()) => debug!("Online backup cleanup removed {}", path.display()),
+            Err(err) => error!(
+                "Online backup cleanup failed to remove {}: {}",
+                path.display(),
+                err
+            ),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -224,5 +296,87 @@ mod tests {
     fn test_select_backups_to_delete_empty() {
         assert!(select_backups_to_delete(&[], 3).is_empty());
         assert!(select_backups_to_delete(&names(&["pitr-manifest.json"]), 0).is_empty());
+    }
+
+    fn touch(dir: &Path, name: &str) {
+        std::fs::write(dir.join(name), b"backup").expect("write");
+    }
+
+    fn remaining(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .expect("read_dir")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn test_prune_local_backups_keeps_the_newest_and_everything_else() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for day in 1..=4 {
+            touch(
+                dir.path(),
+                &format!("backup-2024-01-0{day}T22:00:00Z.json.gz"),
+            );
+        }
+        touch(dir.path(), "backup-2024-01-05T22:00:00Z.json.gz.invalid");
+        touch(dir.path(), ".backup-2024-01-06T22:00:00Z.json.gz.partial");
+        touch(dir.path(), "manual.json");
+        // A directory named like a backup is not a backup.
+        std::fs::create_dir(dir.path().join("backup-2024-01-00T22:00:00Z.json.gz")).expect("mkdir");
+
+        prune_local_backups(dir.path(), 2);
+
+        assert_eq!(
+            remaining(dir.path()),
+            names(&[
+                ".backup-2024-01-06T22:00:00Z.json.gz.partial",
+                "backup-2024-01-00T22:00:00Z.json.gz",
+                "backup-2024-01-03T22:00:00Z.json.gz",
+                "backup-2024-01-04T22:00:00Z.json.gz",
+                "backup-2024-01-05T22:00:00Z.json.gz.invalid",
+                "manual.json",
+            ])
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_prune_local_backups_ignores_names_that_are_not_utf8() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        touch(dir.path(), "backup-2024-01-01T22:00:00Z.json.gz");
+        touch(dir.path(), "backup-2024-01-02T22:00:00Z.json.gz");
+        let stray = dir
+            .path()
+            .join(std::ffi::OsStr::from_bytes(b"stray-\xff.json"));
+        std::fs::write(&stray, b"stray").expect("write");
+
+        // Used to fail the whole cleanup, and with it the backup that had succeeded.
+        prune_local_backups(dir.path(), 1);
+
+        assert!(stray.exists());
+        assert!(!dir
+            .path()
+            .join("backup-2024-01-01T22:00:00Z.json.gz")
+            .exists());
+        assert!(dir
+            .path()
+            .join("backup-2024-01-02T22:00:00Z.json.gz")
+            .exists());
+    }
+
+    #[test]
+    fn test_prune_local_backups_survives_a_missing_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        prune_local_backups(&dir.path().join("missing"), 1);
     }
 }

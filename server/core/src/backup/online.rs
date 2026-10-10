@@ -7,7 +7,7 @@
 //! verified, pruned to its newest `versions` backups and indexed as a point-in-time
 //! recovery base on its own, so a failure in one never prevents the other.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use kubidm_proto::backup::{BackupCompression, BackupEncryptionConfig, S3Config};
@@ -18,9 +18,9 @@ use tracing::instrument;
 
 use super::pitr::{BaseLocation, PitrArchive};
 use super::{
-    backup_artifact_name, is_backup_artifact_name, seal_backup_async, select_backups_to_delete,
-    verify_backup_output_async, write_verified_local_backup_async, BackupEncryptor,
-    S3ClientWrapper,
+    backup_artifact_name, is_backup_artifact_name, prune_local_backups, run_blocking,
+    seal_backup_async, select_backups_to_delete, verify_backup_output_async,
+    write_verified_local_backup_async, BackupEncryptor, S3ClientWrapper,
 };
 use crate::actors::QueryServerReadV1;
 use crate::config::OnlineBackup;
@@ -182,7 +182,16 @@ impl OnlineBackupJob {
             "Online backup verified"
         );
 
-        prune_local_backups(dir, self.versions)?;
+        // The backup has succeeded: the cleanup only ever logs.
+        let (dir, versions) = (dir.to_path_buf(), self.versions);
+        if let Err(err) = run_blocking(move || {
+            prune_local_backups(&dir, versions);
+            Ok(())
+        })
+        .await
+        {
+            error!(?err, "Online backup cleanup failed");
+        }
 
         Ok(report)
     }
@@ -294,85 +303,6 @@ impl OnlineBackupJob {
 
         Ok(report)
     }
-}
-
-/// Keep the newest `versions` backups in the local backup directory `outpath`.
-fn prune_local_backups(outpath: &Path, versions: usize) -> Result<(), OperationError> {
-    let mut backup_file_list: Vec<PathBuf> = Vec::new();
-    // get a list of backup files
-    match std::fs::read_dir(outpath) {
-        Ok(rd) => {
-            for entry in rd {
-                // get PathBuf
-                let pb = entry
-                    .map_err(|e| {
-                        error!(?e, "Pathbuf access");
-                        OperationError::InvalidState
-                    })?
-                    .path();
-
-                // skip everything that is not a file
-                if !pb.is_file() {
-                    continue;
-                }
-
-                // get the /some/dir/<file_name> of the file
-                let file_name = pb.file_name().and_then(|f| f.to_str()).ok_or_else(|| {
-                    error!("filename is invalid");
-                    OperationError::InvalidState
-                })?;
-                // check for a online backup file
-                if is_backup_artifact_name(file_name) {
-                    backup_file_list.push(pb.clone());
-                }
-            }
-        }
-        Err(e) => {
-            error!(
-                "Online backup cleanup error read dir {}: {}",
-                outpath.display(),
-                e
-            );
-            return Err(OperationError::InvalidState);
-        }
-    }
-
-    // sort it to have items listed old to new
-    backup_file_list.sort();
-
-    // Versions: OLD 10.9.8.7.6.5.4.3.2.1 NEW
-    //              |----delete----|keep|
-    // 10 items, we want to keep the latest 3
-
-    // if we have more files then we want to keep, me do some cleanup
-    if backup_file_list.len() > versions {
-        let x = backup_file_list.len() - versions;
-        info!(
-            "Online backup cleanup found {} versions, should keep {}, will remove {}",
-            backup_file_list.len(),
-            versions,
-            x
-        );
-        backup_file_list.truncate(x);
-
-        // removing files
-        for file in backup_file_list {
-            debug!("Online backup cleanup: removing {:?}", &file);
-            match std::fs::remove_file(&file) {
-                Ok(_) => {}
-                Err(e) => {
-                    error!(
-                        "Online backup cleanup failed to remove file {:?}: {:?}",
-                        file, e
-                    )
-                }
-            };
-        }
-    } else {
-        debug!("Online backup cleanup had no files to remove");
-    };
-
-    Ok(())
 }
 
 /// Apply the `versions` retention to the location `client` writes to: the primary prefix
