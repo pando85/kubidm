@@ -28,7 +28,7 @@ use super::{
     compare_backup_names, is_backup_artifact_name, lag_metrics_from_health,
     open_backup_file_with_config, pitr, region_is_healthy,
     restore::{backup_encryption_config, restore_and_replay, restore_database},
-    run_blocking, s3_location, seal_backup_async, sort_backup_names, verify_backup_output_async,
+    run_blocking, s3_location, seal_backup_async, verify_backup_output_async,
     write_verified_local_backup_async, BackupEncryptor, BackupVerifyError, S3BackupError,
     S3ClientWrapper,
 };
@@ -757,24 +757,30 @@ async fn list_s3_backups(config: &Configuration, region: Option<&str>) -> bool {
         }
     };
 
-    let mut keys: Vec<String> = match client.list_backups().await {
-        Ok(keys) => keys
-            .into_iter()
-            .filter(|key| is_backup_artifact_name(key))
-            .collect(),
+    let listing = match client.list_backup_listing().await {
+        Ok(listing) => listing,
         Err(err) => {
             error!(%err, "Unable to list S3 backups");
             println!("  error: unable to list {location}: {err}");
             return false;
         }
     };
+    let keys = listing.complete;
+
+    if !listing.incomplete.is_empty() {
+        // Not a failure: the retention of the next backup removes them.
+        println!(
+            "  note: {} backup object(s) without metadata, left by failed uploads, are not \
+             listed: {}",
+            listing.incomplete.len(),
+            listing.incomplete.join(", ")
+        );
+    }
 
     if keys.is_empty() {
         println!("  (no backups)");
         return true;
     }
-
-    sort_backup_names(&mut keys);
 
     // Fetch every sidecar first so that the columns can be sized to the content.
     let mut ok = true;

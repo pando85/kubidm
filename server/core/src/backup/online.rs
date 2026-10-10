@@ -17,8 +17,8 @@ use tracing::instrument;
 
 use super::pitr::{BaseLocation, PitrArchive};
 use super::{
-    backup_artifact_name, backup_timestamp, is_backup_artifact_name, prune_local_backups,
-    run_blocking, seal_backup_async, select_backups_to_delete, verify_backup_output_async,
+    backup_artifact_name, backup_timestamp, prune_local_backups, run_blocking, seal_backup_async,
+    select_backups_to_delete, select_incomplete_backups_to_delete, verify_backup_output_async,
     write_verified_local_backup_async, BackupEncryptor, S3ClientWrapper,
 };
 use crate::actors::QueryServerReadV1;
@@ -304,37 +304,48 @@ impl OnlineBackupJob {
 /// Apply the `versions` retention to the location `client` writes to: the primary prefix
 /// or the prefix of a replication region. Only automatically generated backup artifacts
 /// are ever deleted, together with their metadata sidecar; the PITR manifest and any other
-/// object under the prefix are kept. Failures are logged and never propagated, because the
-/// backup that triggered the cleanup has already succeeded. `keep`, that backup, is never
+/// object under the prefix are kept. Only complete backups, with a sidecar, count towards
+/// `versions`; a backup object left without one by a failed upload is removed once a
+/// newer backup is complete. Failures are logged and never propagated, because the backup
+/// that triggered the cleanup has already succeeded. `keep`, that backup, is never
 /// deleted.
 async fn prune_s3_backups(client: &S3ClientWrapper, versions: usize, keep: &str) {
     let location = client.location();
 
-    let existing = match client.list_backups().await {
-        Ok(existing) => existing,
+    let listing = match client.list_backup_listing().await {
+        Ok(listing) => listing,
         Err(e) => {
             error!("S3 backup cleanup failed to list {}: {}", location, e);
             return;
         }
     };
 
-    let to_delete = select_backups_to_delete(&existing, versions, Some(keep));
+    let to_delete = select_backups_to_delete(&listing.complete, versions, Some(keep));
     if to_delete.is_empty() {
         debug!("S3 backup cleanup had no backups to remove in {}", location);
     } else {
         info!(
             "S3 backup cleanup found {} backups in {}, should keep {}, will remove {}",
-            existing
-                .iter()
-                .filter(|key| is_backup_artifact_name(key))
-                .count(),
+            listing.complete.len(),
             location,
             versions,
             to_delete.len()
         );
     }
 
-    for key in to_delete {
+    let incomplete =
+        select_incomplete_backups_to_delete(&listing.incomplete, &listing.complete, Some(keep));
+    if !incomplete.is_empty() {
+        info!(
+            "S3 backup cleanup removes {} backup object(s) without metadata from {}, left by \
+             failed uploads: {}",
+            incomplete.len(),
+            location,
+            incomplete.join(", ")
+        );
+    }
+
+    for key in to_delete.into_iter().chain(incomplete) {
         match client.delete_backup(&key).await {
             Ok(()) => info!("S3 backup cleanup removed {} from {}", key, location),
             Err(e) => error!(

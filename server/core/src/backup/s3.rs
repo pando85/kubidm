@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::time::Duration;
 
@@ -250,7 +251,19 @@ impl S3ClientWrapper {
             self.upload_single(data, &object_key, metadata).await?;
         }
 
-        self.upload_metadata(&object_key, metadata).await
+        // A backup is only complete with its sidecar, and listings ignore an object without
+        // one. Removing the object right away keeps the prefix clean; should that fail too,
+        // the retention removes it once a newer backup is complete.
+        if let Err(err) = self.upload_metadata(&object_key, metadata).await {
+            if let Err(delete_err) = self.delete_object(&object_key).await {
+                warn!(
+                    "Unable to remove {} after its metadata could not be written: {}",
+                    object_key, delete_err
+                );
+            }
+            return Err(err);
+        }
+        Ok(())
     }
 
     async fn upload_single(
@@ -587,13 +600,13 @@ impl S3ClientWrapper {
         Ok(body.into_bytes().to_vec())
     }
 
-    /// List every object under the configured prefix except metadata sidecars, with the
+    /// List every object under the configured prefix, metadata sidecars included, with the
     /// prefix stripped. All pages of the listing are collected.
     ///
     /// The listing uses the `/`-terminated prefix of `Self::listing_prefix`, so objects
     /// under a sibling prefix that merely starts with the same characters are never
     /// returned.
-    pub async fn list_backups(&self) -> Result<Vec<String>, S3BackupError> {
+    async fn list_keys(&self) -> Result<Vec<String>, S3BackupError> {
         let prefix = Self::listing_prefix(self.config.path_prefix.as_deref());
 
         let mut pages = self
@@ -604,7 +617,7 @@ impl S3ClientWrapper {
             .into_paginator()
             .send();
 
-        let mut backups = Vec::new();
+        let mut keys = Vec::new();
         while let Some(page) = pages.next().await {
             let page = page.map_err(|e| {
                 S3BackupError::SdkError(format!(
@@ -616,36 +629,57 @@ impl S3ClientWrapper {
                 let Some(key) = obj.key() else {
                     continue;
                 };
-                if key.ends_with(".metadata.json") {
-                    continue;
-                }
                 // S3 only returns keys starting with the requested prefix; anything else
                 // is not ours and is skipped rather than mangled.
                 if let Some(display_key) = Self::strip_listing_prefix(&prefix, key) {
-                    backups.push(display_key.to_string());
+                    keys.push(display_key.to_string());
                 }
             }
         }
 
-        Ok(backups)
+        Ok(keys)
+    }
+
+    /// List every object under the configured prefix except metadata sidecars, with the
+    /// prefix stripped. All pages of the listing are collected.
+    pub async fn list_backups(&self) -> Result<Vec<String>, S3BackupError> {
+        Ok(self
+            .list_keys()
+            .await?
+            .into_iter()
+            .filter(|key| !key.ends_with(METADATA_SUFFIX))
+            .collect())
+    }
+
+    /// The automatically generated backups under the configured prefix, split by whether
+    /// their metadata sidecar exists, each sorted oldest first.
+    pub async fn list_backup_listing(&self) -> Result<BackupListing, S3BackupError> {
+        Ok(BackupListing::from_keys(&self.list_keys().await?))
+    }
+
+    /// Delete one object, `object_key` being a full key, prefix included.
+    async fn delete_object(&self, object_key: &str) -> Result<(), S3BackupError> {
+        self.client
+            .delete_object()
+            .bucket(&self.config.bucket)
+            .key(object_key)
+            .send()
+            .await
+            .map_err(|e| {
+                S3BackupError::SdkError(format!(
+                    "Failed to delete {}: {}",
+                    object_key,
+                    DisplayErrorContext(&e)
+                ))
+            })?;
+        Ok(())
     }
 
     pub async fn delete_backup(&self, key: &str) -> Result<(), S3BackupError> {
         let object_key = self.build_object_key(key);
         let metadata_key = format!("{}.metadata.json", object_key);
 
-        self.client
-            .delete_object()
-            .bucket(&self.config.bucket)
-            .key(&object_key)
-            .send()
-            .await
-            .map_err(|e| {
-                S3BackupError::SdkError(format!(
-                    "Failed to delete backup: {}",
-                    DisplayErrorContext(&e)
-                ))
-            })?;
+        self.delete_object(&object_key).await?;
 
         self.client
             .delete_object()
@@ -723,18 +757,13 @@ impl S3ClientWrapper {
         Ok(head.content_length().map(|size| size as u64))
     }
 
-    /// The prefix-relative keys of the automatically generated backups under the
-    /// configured prefix, sorted oldest first. Sidecars, the PITR manifest and manual
-    /// objects are left out, so this is exactly the set replication has to mirror.
+    /// The prefix-relative keys of the complete automatically generated backups under the
+    /// configured prefix, sorted oldest first: those with a metadata sidecar. Sidecars, the
+    /// PITR manifest, manual objects and backup objects whose sidecar is missing (an upload
+    /// that failed half way) are left out, so this is exactly the set replication has to
+    /// mirror and retention counts.
     pub async fn list_backup_artifacts(&self) -> Result<Vec<String>, S3BackupError> {
-        let mut backups: Vec<String> = self
-            .list_backups()
-            .await?
-            .into_iter()
-            .filter(|key| is_backup_artifact_name(key))
-            .collect();
-        sort_backup_names(&mut backups);
-        Ok(backups)
+        Ok(self.list_backup_listing().await?.complete)
     }
 
     /// Copy the backup `backup_key` (relative to the primary prefix), already uploaded to
@@ -1002,6 +1031,40 @@ impl S3ClientWrapper {
             .check_replication_health(replication_config, None)
             .await?;
         Ok(lag_metrics_from_health(&health, replication_config))
+    }
+}
+
+/// Suffix of the metadata sidecar of a backup object.
+const METADATA_SUFFIX: &str = ".metadata.json";
+
+/// The automatically generated backups found under a prefix.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct BackupListing {
+    /// Backups with a metadata sidecar, oldest first.
+    pub complete: Vec<String>,
+    /// Backup objects without a sidecar, oldest first: an upload whose sidecar could not
+    /// be written, or one still in progress.
+    pub incomplete: Vec<String>,
+}
+
+impl BackupListing {
+    /// Split the prefix-relative `keys` of one listing.
+    fn from_keys(keys: &[String]) -> Self {
+        let sidecars: BTreeSet<&str> = keys
+            .iter()
+            .filter_map(|key| key.strip_suffix(METADATA_SUFFIX))
+            .collect();
+        let (mut complete, mut incomplete): (Vec<String>, Vec<String>) = keys
+            .iter()
+            .filter(|key| is_backup_artifact_name(key))
+            .cloned()
+            .partition(|key| sidecars.contains(key.as_str()));
+        sort_backup_names(&mut complete);
+        sort_backup_names(&mut incomplete);
+        Self {
+            complete,
+            incomplete,
+        }
     }
 }
 
@@ -1276,6 +1339,15 @@ pub(crate) mod fake_s3 {
         }
     }
 
+    /// An S3 error answer.
+    pub fn error(status: u16, code: &str) -> Reply {
+        (
+            status,
+            vec![("content-type", "application/xml".to_string())],
+            format!("<Error><Code>{code}</Code><Message>{code}</Message></Error>"),
+        )
+    }
+
     pub struct FakeS3 {
         pub endpoint: String,
         requests: Arc<Mutex<Vec<Recorded>>>,
@@ -1348,6 +1420,75 @@ pub(crate) mod fake_s3 {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn test_a_backup_whose_sidecar_fails_is_removed() {
+        // A bucket policy, throttling or a network error rejects the sidecar after the
+        // object went through.
+        let fake = fake_s3::FakeS3::start(Arc::new(|request: &fake_s3::Recorded| {
+            if request.method == "PUT" && request.path.ends_with(".metadata.json") {
+                fake_s3::error(403, "AccessDenied")
+            } else {
+                fake_s3::ok(request)
+            }
+        }))
+        .await;
+        let client = S3ClientWrapper::new(fake.config("bucket"))
+            .await
+            .expect("client");
+
+        let err = client
+            .upload_backup(
+                b"artifact",
+                "backup-2024-01-01T22:00:00Z.json.gz",
+                "2024-01-01T22:00:00Z",
+                BackupCompression::Gzip,
+                None,
+            )
+            .await
+            .expect_err("a backup without its sidecar must fail");
+        assert!(err.to_string().contains("metadata"), "{err}");
+
+        let requests: Vec<(String, String)> = fake
+            .requests()
+            .into_iter()
+            .map(|request| (request.method, request.path))
+            .collect();
+        assert_eq!(
+            requests.last(),
+            Some(&(
+                "DELETE".to_string(),
+                "/bucket/backup-2024-01-01T22:00:00Z.json.gz".to_string()
+            )),
+            "the object left without a sidecar must be removed: {requests:?}"
+        );
+    }
+
+    #[test]
+    fn test_backup_listing_counts_only_backups_with_a_sidecar() {
+        let keys = [
+            "backup-2024-01-03T22:00:00Z.json.gz",
+            "backup-2024-01-03T22:00:00Z.json.gz.metadata.json",
+            "backup-2024-01-02T22:00:00Z.json.gz",
+            "backup-2024-01-01T22:00:00Z.json.gz",
+            "backup-2024-01-01T22:00:00Z.json.gz.metadata.json",
+            "pitr-manifest.json",
+            "pitr-manifest.json.metadata.json",
+            "wal/segment.bin",
+        ]
+        .map(str::to_string)
+        .to_vec();
+
+        let listing = BackupListing::from_keys(&keys);
+        assert_eq!(
+            listing.complete,
+            [
+                "backup-2024-01-01T22:00:00Z.json.gz",
+                "backup-2024-01-03T22:00:00Z.json.gz"
+            ]
+        );
+        assert_eq!(listing.incomplete, ["backup-2024-01-02T22:00:00Z.json.gz"]);
+    }
 
     #[tokio::test]
     async fn test_every_object_is_written_with_the_configured_encryption() {

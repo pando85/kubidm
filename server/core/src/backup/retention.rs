@@ -117,6 +117,28 @@ pub fn select_backups_to_delete(
         .collect()
 }
 
+/// The incomplete backups of a location (backup objects whose metadata sidecar is missing,
+/// see [`super::BackupListing`]) that retention should delete: those older than the newest
+/// `complete` backup. A newer one may be an upload still in progress, and `keep`, the
+/// backup the run has just written, is never returned. Ordered oldest first.
+pub fn select_incomplete_backups_to_delete(
+    incomplete: &[String],
+    complete: &[String],
+    keep: Option<&str>,
+) -> Vec<String> {
+    let Some(newest_complete) = complete.iter().max_by(|a, b| compare_backup_names(a, b)) else {
+        return Vec::new();
+    };
+    let mut stale: Vec<String> = incomplete
+        .iter()
+        .filter(|name| Some(name.as_str()) != keep)
+        .filter(|name| compare_backup_names(name, newest_complete) == Ordering::Less)
+        .cloned()
+        .collect();
+    sort_backup_names(&mut stale);
+    stale
+}
+
 /// Apply the `versions` retention to the local online backup directory `dir` with
 /// [`select_backups_to_delete`], the rule the S3 locations use. Only regular files named
 /// like an automatically generated backup are considered; anything else in the directory,
@@ -424,6 +446,38 @@ mod tests {
             select_backups_to_delete(&listing, 2, Some("backup-2024-01-01T22:00:00Z.json.gz")),
             names(&["backup-2024-01-02T22:00:00Z.json.gz"])
         );
+    }
+
+    #[test]
+    fn test_select_incomplete_backups_to_delete_only_takes_stale_ones() {
+        let complete = names(&[
+            "backup-2024-01-01T22:00:00Z.json.gz",
+            "backup-2024-01-03T22:00:00Z.json.gz",
+        ]);
+        let incomplete = names(&[
+            "backup-2024-01-04T22:00:00Z.json.gz",
+            "backup-2024-01-02T22:00:00Z.json.gz",
+            "backup-2023-12-31T22:00:00Z.json.gz",
+        ]);
+
+        // The one newer than every complete backup may still be uploading.
+        assert_eq!(
+            select_incomplete_backups_to_delete(&incomplete, &complete, None),
+            names(&[
+                "backup-2023-12-31T22:00:00Z.json.gz",
+                "backup-2024-01-02T22:00:00Z.json.gz",
+            ])
+        );
+        assert_eq!(
+            select_incomplete_backups_to_delete(
+                &incomplete,
+                &complete,
+                Some("backup-2024-01-02T22:00:00Z.json.gz")
+            ),
+            names(&["backup-2023-12-31T22:00:00Z.json.gz"])
+        );
+        // Without a complete backup nothing is known to be stale.
+        assert!(select_incomplete_backups_to_delete(&incomplete, &[], None).is_empty());
     }
 
     #[test]
