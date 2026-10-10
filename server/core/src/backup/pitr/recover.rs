@@ -14,7 +14,7 @@ use kubidmd_lib::be::WalApplyReport;
 use kubidmd_lib::prelude::duration_from_epoch_now;
 use kubidmd_lib::repl::wal::{
     clear_local_events, defer_restore, format_ts_rfc3339, list_segments, parse_recovery_target_cid,
-    parse_recovery_target_time, parse_segment, read_local_events, select_records, WalEntryRecord,
+    parse_recovery_target_time, parse_segment, read_local_events, WalEntryRecord,
     WalOperationRecord, WalPendingEvents, WalRestore,
 };
 use uuid::Uuid;
@@ -163,15 +163,12 @@ pub fn plan_recovery(
     })
 }
 
-/// The records of `file_entries` a recovery to `plan` replays: after the base watermark,
-/// at or before the target, and not part of history a restore or recovery abandoned.
-pub fn records_to_replay<'a>(
-    manifest: &'a PitrManifest,
-    plan: &'a RecoveryPlan,
-    file_entries: &'a [WalEntryRecord],
-) -> impl Iterator<Item = &'a WalEntryRecord> + 'a {
-    select_records(file_entries, plan.base.watermark_ts, plan.target.ts)
-        .filter(|record| !manifest.is_abandoned(record.ts()))
+/// Whether a recovery to `plan` replays `record`: it lies after the base watermark, at or
+/// before the target, and not in history a restore or recovery abandoned.
+pub fn is_replayed(manifest: &PitrManifest, plan: &RecoveryPlan, record: &WalEntryRecord) -> bool {
+    record.ts() > plan.base.watermark_ts
+        && record.ts() <= plan.target.ts
+        && !manifest.is_abandoned(record.ts())
 }
 
 /// The outcome of `recover`.
@@ -599,10 +596,7 @@ async fn load_records(opened: &OpenedArchive, plan: &RecoveryPlan) -> Result<Rep
             )));
         }
         for record in file.entries {
-            if record.ts() > plan.base.watermark_ts
-                && record.ts() <= plan.target.ts
-                && !opened.manifest.is_abandoned(record.ts())
-            {
+            if is_replayed(&opened.manifest, plan, &record) {
                 records.add(record)?;
             }
         }
@@ -1229,7 +1223,7 @@ mod tests {
     }
 
     #[test]
-    fn test_records_to_replay_skip_watermark_target_and_abandoned_history() {
+    fn test_replay_skips_watermark_target_and_abandoned_history() {
         let mut m = manifest();
         let record = |secs: u64| WalEntryRecord {
             cid_ts: Duration::from_secs(secs).as_nanos() as u64,
@@ -1248,7 +1242,9 @@ mod tests {
             &RecoveryTargetSpec::Time(format_ts_rfc3339(Duration::from_secs(350))),
         )
         .unwrap();
-        let ids: Vec<u64> = records_to_replay(&m, &plan, &entries)
+        let ids: Vec<u64> = entries
+            .iter()
+            .filter(|record| is_replayed(&m, &plan, record))
             .map(|r| r.entry_id)
             .collect();
         assert_eq!(ids, vec![150, 250, 350]);
@@ -1267,7 +1263,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(plan.base.key, "backup-1");
-        let ids: Vec<u64> = records_to_replay(&m, &plan, &entries)
+        let ids: Vec<u64> = entries
+            .iter()
+            .filter(|record| is_replayed(&m, &plan, record))
             .map(|r| r.entry_id)
             .collect();
         assert_eq!(ids, vec![150, 350]);

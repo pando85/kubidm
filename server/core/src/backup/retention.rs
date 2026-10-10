@@ -34,11 +34,16 @@ pub fn is_backup_artifact_name(name: &str) -> bool {
     BACKUP_ARTIFACT_NAME.is_match(name)
 }
 
+/// The timestamp in an automatically generated backup name, `backup-<timestamp>.json...`,
+/// or `None` for any other name.
+pub fn backup_name_timestamp(name: &str) -> Option<&str> {
+    Some(BACKUP_ARTIFACT_NAME.captures(name)?.get(1)?.as_str())
+}
+
 /// The time an automatically generated backup was taken, read from its name. None when
 /// `name` is not a backup artifact name.
 pub fn backup_artifact_time(name: &str) -> Option<DateTime<FixedOffset>> {
-    let timestamp = BACKUP_ARTIFACT_NAME.captures(name)?.get(1)?.as_str();
-    DateTime::parse_from_rfc3339(timestamp).ok()
+    DateTime::parse_from_rfc3339(backup_name_timestamp(name)?).ok()
 }
 
 /// Order two backup names oldest first by the time in their name, then by name.

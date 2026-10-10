@@ -24,7 +24,7 @@ use super::encryption::{
     is_encrypted_artifact, read_encryption_header, BackupEncryptionError, BackupEncryptor,
     MAX_HEADER_LEN,
 };
-use super::retention::is_backup_artifact_name;
+use super::retention::backup_name_timestamp;
 
 /// A backup artifact resolved to the plaintext a restore can parse.
 pub struct OpenedBackup {
@@ -115,16 +115,6 @@ impl fmt::Display for BackupOpenError {
 }
 
 impl std::error::Error for BackupOpenError {}
-
-/// The timestamp in an automatically generated backup name, `backup-<timestamp>.json...`,
-/// or `None` for any other name.
-pub fn backup_name_timestamp(file_name: &str) -> Option<&str> {
-    if !is_backup_artifact_name(file_name) {
-        return None;
-    }
-    let rest = file_name.strip_prefix("backup-")?;
-    rest.find(".json").map(|end| &rest[..end])
-}
 
 /// What a backup stored under `name` (a path, file name or object key) is sealed and
 /// opened as: the backup taken at the timestamp of an automatically generated name, or any
