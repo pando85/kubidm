@@ -383,6 +383,10 @@ pub async fn create_https_server(
         .route("/readyz", get(generic::readyz));
 
     // Only served when enabled: without it, /metrics is not found like any other path.
+    let openapi = apidocs::openapi().await.map_err(|err| {
+        error!(?err, "Unable to build the OpenAPI document");
+    })?;
+
     let app = match metrics_endpoint {
         Some(endpoint) => app.merge(
             Router::new()
@@ -403,7 +407,7 @@ pub async fn create_https_server(
             state.clone(),
             middleware::kopid_middleware,
         ))
-        .merge(apidocs::router())
+        .merge(apidocs::router(openapi))
         // Apply Request Timeouts
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,

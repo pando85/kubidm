@@ -1154,15 +1154,6 @@ pub async fn create_server_core(
     config: Configuration,
     config_test: bool,
 ) -> Result<CoreHandle, ()> {
-    // The start of a server is a large future: boxed, it is not held on the stack of every
-    // caller, which matters to the tests, whose futures live on a thread's stack.
-    Box::pin(create_server_core_inner(config, config_test)).await
-}
-
-async fn create_server_core_inner(
-    config: Configuration,
-    config_test: bool,
-) -> Result<CoreHandle, ()> {
     // Until this point, we probably want to write to the log macro fns.
     let (mut broadcast_tx, _broadcast_rx) = broadcast::channel(4);
 
