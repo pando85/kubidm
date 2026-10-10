@@ -158,7 +158,8 @@ sketching = { path = "./libs/sketching", version = "=1.12.0-dev" }
 
 kanidm-hsm-crypto = { version = "^0.4.0" }
 
-aws-config = { version = "1.5.13", default-features = false, features = [
+aws-config = { version = "1.6", default-features = false, features = [
+    "default-https-client",
     "rt-tokio",
     "sso",
 ] }
@@ -208,6 +209,7 @@ dyn-clone = "^1.0.20"
 enum-iterator = "2.3.0"
 fantoccini = "0.22.0"
 filetime = "^0.2.29"
+flate2 = "1.1.9"
 fs4 = "^1.0.2"
 futures = "0.3.34"
 futures-util = { version = "0.3.34", features = ["sink"] }

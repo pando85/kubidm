@@ -2187,10 +2187,20 @@ impl QueryServer {
         // IMPORTANT: While we take a write txn, this does no writes to the
         // actual db, it's only so we can write to the in memory schema
         // structures.
+        //
+        // The domain version must be loaded from the database *before* the
+        // schema is reloaded. A server that was only constructed with
+        // `QueryServer::new` and never initialised still has its in-memory
+        // domain level at DOMAIN_LEVEL_0, which would make the schema reload
+        // take the legacy on-disk schema path and fail on a current database.
+        // Reloading the domain information first mirrors what a real boot does
+        // in `initialise_helper` and, while the server phase is still
+        // `Bootstrap`, only reads the stored level without running migrations.
         if self
             .write(current_time)
             .await
             .and_then(|mut txn| {
+                txn.force_domain_reload();
                 txn.force_schema_reload();
                 txn.commit()
             })
@@ -3083,6 +3093,8 @@ impl<'a> QueryServerWriteTransaction<'a> {
         // Write the cid to the db. If this fails, we can't assume replication
         // will be stable, so return if it fails.
         be_txn.set_db_ts_max(cid.ts)?;
+        // The WAL archive records this transaction's changes under its CID.
+        be_txn.set_wal_cid(&cid);
         cid.commit();
 
         // We don't care if this passes/fails, committing this is fine.

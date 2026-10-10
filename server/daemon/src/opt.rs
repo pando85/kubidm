@@ -39,22 +39,96 @@ struct VerifyBackupOpt {
 }
 
 #[derive(Debug, Args)]
-struct PitrRecoverOpt {
-    /// Target time for recovery (RFC3339 format, e.g., "2024-01-15T10:30:00Z")
+struct RestoreS3Opt {
+    /// Key of the backup to restore, relative to the configured path prefix, for example
+    /// "backup-2024-01-01T22:00:00Z.json.gz". Use "list-backups" to see the available keys.
+    #[clap(long)]
+    key: String,
+
+    /// Override the bucket of the selected S3 location. Required when the configuration
+    /// has no [online_backup.s3] section.
+    #[clap(long)]
+    bucket: Option<String>,
+
+    /// Restore from the replication region of this name, as configured under
+    /// [[online_backup.s3.replication.regions]], instead of the primary bucket. The
+    /// region's bucket, endpoint, path prefix and credentials are used.
+    #[clap(long, value_name = "NAME")]
+    region: Option<String>,
+
+    /// Override the endpoint of the selected S3 location, for S3-compatible services.
+    #[clap(long)]
+    endpoint: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct VerifyS3Opt {
+    /// Key of the backup to verify, relative to the configured path prefix, for example
+    /// "backup-2024-01-01T22:00:00Z.json.gz". Use "list-backups" to see the available keys.
+    #[clap(long)]
+    key: String,
+
+    /// Override the bucket of the selected S3 location. Required when the configuration
+    /// has no [online_backup.s3] section.
+    #[clap(long)]
+    bucket: Option<String>,
+
+    /// Verify the copy held by the replication region of this name, as configured under
+    /// [[online_backup.s3.replication.regions]], instead of the primary bucket. The
+    /// region's bucket, endpoint, path prefix and credentials are used.
+    #[clap(long, value_name = "NAME")]
+    region: Option<String>,
+
+    /// Override the endpoint of the selected S3 location, for S3-compatible services.
+    #[clap(long)]
+    endpoint: Option<String>,
+
+    /// How deeply to verify the backup once its checksum has been confirmed.
+    #[clap(short, long, value_enum, default_value_t = VerifyBackupLevel::Full)]
+    level: VerifyBackupLevel,
+}
+
+#[derive(Debug, Args)]
+#[group(required = true, multiple = false)]
+struct PitrRecoverTarget {
+    /// Recover the state as of this time (RFC3339, for example "2024-01-15T10:30:00Z").
     #[clap(long)]
     target_time: Option<String>,
 
-    /// Target transaction CID for recovery
+    /// Recover the state right after the transaction with this CID
+    /// (`<nanoseconds>-<server uuid>`, as the server logs it).
     #[clap(long)]
     target_cid: Option<String>,
 
-    /// Recover to the latest available point
-    #[clap(long, conflicts_with_all = ["target_time", "target_cid"])]
+    /// Recover the latest state the archive holds.
+    #[clap(long)]
     latest: bool,
+}
 
-    /// Perform a dry run without actually applying changes
+#[derive(Debug, Args)]
+struct PitrRecoverOpt {
+    #[command(flatten)]
+    target: PitrRecoverTarget,
+
+    /// Print the base backup, the segments and the number of records the recovery would
+    /// use, and change nothing.
     #[clap(long)]
     dry_run: bool,
+
+    /// Recover from the copy of the WAL archive (and of the S3 base backups) held by the
+    /// replication region of this name, as configured under
+    /// [[online_backup.s3.replication.regions]] (or the regions of
+    /// [online_backup.wal_archive.s3.replication]), instead of the primary bucket.
+    #[clap(long, value_name = "NAME")]
+    region: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct PitrListOpt {
+    /// List the copy of the WAL archive held by the replication region of this name
+    /// instead of the primary bucket.
+    #[clap(long, value_name = "NAME")]
+    region: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -98,20 +172,52 @@ enum DbCommands {
     #[clap(name = "verify-backup")]
     /// Verify a backup artifact for restorability and consistency.
     VerifyBackup(VerifyBackupOpt),
+    #[clap(name = "restore-s3")]
+    /// Restore the database from a backup stored in S3 (offline)
+    ///
+    /// Uses the [online_backup.s3] section of the configuration, overridable by the flags.
+    RestoreS3(RestoreS3Opt),
+    #[clap(name = "verify-s3")]
+    /// Verify the checksum, restorability and consistency of a backup stored in S3
+    ///
+    /// Uses the [online_backup.s3] section of the configuration, overridable by the flags.
+    VerifyS3(VerifyS3Opt),
+    #[clap(name = "list-backups")]
+    /// List the backups in the local online backup directory and in S3.
+    ListBackups {
+        /// Only list the local online backup directory.
+        #[clap(long, conflicts_with_all = ["s3_only", "region"])]
+        local_only: bool,
+        /// Only list the S3 backups.
+        #[clap(long)]
+        s3_only: bool,
+        /// List the backups held by the replication region of this name, as configured
+        /// under [[online_backup.s3.replication.regions]], instead of the primary bucket.
+        /// Implies --s3-only.
+        #[clap(long, value_name = "NAME")]
+        region: Option<String>,
+    },
     #[clap(name = "reindex")]
     /// Reindex the database (offline)
     Reindex,
-    #[clap(name = "recover", hide = true)]
-    /// Point-in-Time Recovery (PITR) - recover database to a specific point in time.
-    /// Not yet implemented.
+    #[clap(name = "recover")]
+    /// Point-in-time recovery: restore the newest base backup at or before the target and
+    /// replay the WAL archive up to it (offline)
+    ///
+    /// Requires [online_backup.wal_archive] to be enabled, which locates the archive.
     Recover(PitrRecoverOpt),
-    #[clap(name = "pitr-list", hide = true)]
-    /// List available recovery points for Point-in-Time Recovery. Not yet implemented.
-    PitrList,
-    #[clap(name = "replicate-status", hide = true)]
-    /// Check cross-region backup replication status. Not yet implemented.
+    #[clap(name = "pitr-list")]
+    /// List the base backups, WAL segments and the recoverable window of the WAL archive
+    PitrList(PitrListOpt),
+    #[clap(name = "replicate-status")]
+    /// Report the state of cross-region backup replication.
+    ///
+    /// For every region of [online_backup.s3.replication], shows which of the primary's
+    /// backups it holds intact, its newest backup and how far it lags behind the primary.
+    /// Exits non-zero when replication is not configured or when any region is unhealthy.
+    /// Does not open the database.
     ReplicateStatus {
-        /// Output detailed lag metrics for each region
+        /// Also print the lag metrics of every region.
         #[clap(long)]
         detailed: bool,
     },
@@ -191,6 +297,12 @@ enum ScriptingCommand {
     Backup {
         /// The path to backup to. If not set, defaults to stdout.
         path: Option<PathBuf>,
+        /// With stdout: the name the backup will be stored under, such as
+        /// `backup-<timestamp>.json.gz.enc`. It is checked against the configured
+        /// compression and encryption, and an encrypted backup records its timestamp, so
+        /// that it opens under that name.
+        #[clap(long, conflicts_with = "path")]
+        name: Option<String>,
     },
     /// Initiate a server reload.
     Reload,

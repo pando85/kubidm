@@ -27,18 +27,22 @@ use std::fs::{metadata, File};
 // This works on both unix and windows.
 use clap::{Args, Parser, Subcommand};
 use futures::{SinkExt, StreamExt};
+use kubidm_proto::internal::OperationError;
 use kubidmd_core::{
     admin::{
         AdminTaskRequest, AdminTaskResponse, ClientCodec, ProtoDomainInfo,
         ProtoDomainUpgradeCheckReport, ProtoDomainUpgradeCheckStatus,
     },
+    backup::pitr::{pitr_list_server_core, pitr_recover_server_core, RecoveryTargetSpec},
     backup_server_core, cert_generate_core,
     config::{Configuration, ServerConfigUntagged},
     create_server_core, dbscan_get_id2entry_core, dbscan_list_id2entry_core,
     dbscan_list_index_analysis_core, dbscan_list_index_core, dbscan_list_indexes_core,
     dbscan_list_quarantined_core, dbscan_quarantine_id2entry_core, dbscan_restore_quarantined_core,
-    domain_rename_core, reindex_server_core, restore_server_core, vacuum_server_core,
-    verify_backup_server_core, verify_server_core, BackupVerifyLevel, CoreAction,
+    domain_rename_core, list_backups_server_core, reindex_server_core,
+    replicate_status_server_core, restore_s3_database, restore_server_core, s3_config_for_cli,
+    vacuum_server_core, verify_backup_server_core, verify_s3_backup_server_core,
+    verify_server_core, BackupVerifyLevel, CoreAction, RestoreStatus,
 };
 use serde::Serialize;
 use sketching::{pipeline::TracingPipelineGuard, tracing_forest::util::*};
@@ -402,6 +406,37 @@ fn check_file_ownership(opt: &KubidmdParser) -> Result<(), ExitCode> {
     Ok(())
 }
 
+/// What the operator must do after a restore or recovery that ended with `status`.
+fn not_recorded_hint(status: RestoreStatus) -> &'static str {
+    match status {
+        RestoreStatus::AbandonedHistoryNotRecorded => {
+            "; take a new online backup right after starting the server"
+        }
+        RestoreStatus::Complete | RestoreStatus::WalArchiveNotUpdated => "",
+    }
+}
+
+/// The exit code of `database restore` and `restore-s3`: 1 when the restore failed, which
+/// includes a database that was restored but could not be reindexed (its error says so),
+/// otherwise [`RestoreStatus::exit_code`].
+fn restore_exit_code(restored: Result<RestoreStatus, OperationError>) -> ExitCode {
+    match restored.ok() {
+        Some(RestoreStatus::Complete) => {
+            info!("✅ Restore Success!");
+            ExitCode::SUCCESS
+        }
+        Some(status) => {
+            warn!(
+                "Restore finished: the database was restored, but the WAL archive was not \
+                 updated{}",
+                not_recorded_hint(status)
+            );
+            ExitCode::from(status.exit_code())
+        }
+        None => ExitCode::FAILURE,
+    }
+}
+
 async fn scripting_command(cmd: ScriptingCommand, config: Configuration) -> ExitCode {
     match cmd {
         ScriptingCommand::RecoverAccount { name } => {
@@ -414,8 +449,10 @@ async fn scripting_command(cmd: ScriptingCommand, config: Configuration) -> Exit
             .await;
         }
 
-        ScriptingCommand::Backup { path } => {
-            backup_server_core(&config, path.as_deref());
+        ScriptingCommand::Backup { path, name } => {
+            if !backup_server_core(&config, path.as_deref(), name.as_deref()).await {
+                return ExitCode::FAILURE;
+            }
         }
 
         ScriptingCommand::Reload => {
@@ -613,7 +650,13 @@ async fn start_daemon(opt: KubidmdParser, config: Configuration) -> ExitCode {
         | KubidmdOpt::RenewReplicationCertificate
         | KubidmdOpt::RefreshReplicationConsumer { .. }
         | KubidmdOpt::RecoverAccount { .. }
-        | KubidmdOpt::DisableAccount { .. } => None,
+        | KubidmdOpt::DisableAccount { .. }
+        | KubidmdOpt::Database {
+            commands:
+                DbCommands::ListBackups { .. }
+                | DbCommands::PitrList(_)
+                | DbCommands::ReplicateStatus { .. },
+        } => None,
         _ => {
             // Okay - Lets now create our lock and go.
             #[allow(clippy::expect_used)]
@@ -975,13 +1018,15 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
         } => {
             info!("Running in backup mode ...");
 
-            backup_server_core(&config, Some(&bopt.path));
+            if !backup_server_core(&config, Some(&bopt.path), None).await {
+                return ExitCode::FAILURE;
+            }
         }
         KubidmdOpt::Database {
             commands: DbCommands::Restore(ropt),
         } => {
             info!("Running in restore mode ...");
-            restore_server_core(&config, &ropt.path).await;
+            return restore_exit_code(restore_server_core(&config, &ropt.path).await);
         }
         KubidmdOpt::Database {
             commands: DbCommands::Verify,
@@ -998,6 +1043,53 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
                 VerifyBackupLevel::Full => BackupVerifyLevel::Full,
             };
             if !verify_backup_server_core(&config, &vbopt.path, level).await {
+                return ExitCode::FAILURE;
+            }
+        }
+        KubidmdOpt::Database {
+            commands: DbCommands::RestoreS3(ropt),
+        } => {
+            info!("Running in S3 restore mode ...");
+            let Ok(s3_config) = s3_config_for_cli(
+                &config,
+                ropt.bucket.clone(),
+                ropt.region.as_deref(),
+                ropt.endpoint.clone(),
+            ) else {
+                return ExitCode::FAILURE;
+            };
+            return restore_exit_code(restore_s3_database(&config, s3_config, &ropt.key).await);
+        }
+        KubidmdOpt::Database {
+            commands: DbCommands::VerifyS3(vopt),
+        } => {
+            info!("Running in S3 backup verification mode ...");
+            let level = match vopt.level {
+                VerifyBackupLevel::Structural => BackupVerifyLevel::Structural,
+                VerifyBackupLevel::Full => BackupVerifyLevel::Full,
+            };
+            let Ok(s3_config) = s3_config_for_cli(
+                &config,
+                vopt.bucket.clone(),
+                vopt.region.as_deref(),
+                vopt.endpoint.clone(),
+            ) else {
+                return ExitCode::FAILURE;
+            };
+            if !verify_s3_backup_server_core(&config, s3_config, &vopt.key, level).await {
+                return ExitCode::FAILURE;
+            }
+        }
+        KubidmdOpt::Database {
+            commands:
+                DbCommands::ListBackups {
+                    local_only,
+                    s3_only,
+                    region,
+                },
+        } => {
+            info!("Running in backup listing mode ...");
+            if !list_backups_server_core(&config, *local_only, *s3_only, region.as_deref()).await {
                 return ExitCode::FAILURE;
             }
         }
@@ -1174,34 +1266,57 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
             vacuum_server_core(&config);
         }
         KubidmdOpt::Database {
-            commands: DbCommands::Recover(_),
+            commands: DbCommands::Recover(ropt),
         } => {
-            error!(
-                "The 'database recover' command is not implemented in this release. \
-                 Point-in-time recovery is not yet available. \
-                 See the Backup and Restore chapter of the book for the supported procedures."
-            );
-            return ExitCode::FAILURE;
+            let target = match (
+                &ropt.target.target_time,
+                &ropt.target.target_cid,
+                ropt.target.latest,
+            ) {
+                (Some(time), _, _) => RecoveryTargetSpec::Time(time.clone()),
+                (None, Some(cid), _) => RecoveryTargetSpec::Cid(cid.clone()),
+                (None, None, _) => RecoveryTargetSpec::Latest,
+            };
+            match &ropt.region {
+                Some(region) => {
+                    info!("Running point-in-time recovery to {target} from region {region} ...")
+                }
+                None => info!("Running point-in-time recovery to {target} ..."),
+            }
+            match pitr_recover_server_core(&config, &target, ropt.dry_run, ropt.region.as_deref())
+                .await
+            {
+                Ok(_) if ropt.dry_run => {}
+                Ok(outcome) if outcome.archive != RestoreStatus::Complete => {
+                    warn!(
+                        "Recovery finished: the database was recovered, but the WAL archive was \
+                         not updated{}",
+                        not_recorded_hint(outcome.archive)
+                    );
+                    return ExitCode::from(outcome.archive.exit_code());
+                }
+                Ok(_) => info!("✅ Recovery Success!"),
+                Err(err) => {
+                    error!(%err, "Point-in-time recovery failed");
+                    return ExitCode::FAILURE;
+                }
+            }
         }
         KubidmdOpt::Database {
-            commands: DbCommands::PitrList,
+            commands: DbCommands::PitrList(lopt),
         } => {
-            error!(
-                "The 'database pitr-list' command is not implemented in this release. \
-                 Point-in-time recovery is not yet available. \
-                 See the Backup and Restore chapter of the book for the supported procedures."
-            );
-            return ExitCode::FAILURE;
+            info!("Running in PITR listing mode ...");
+            if !pitr_list_server_core(&config, lopt.region.as_deref()).await {
+                return ExitCode::FAILURE;
+            }
         }
         KubidmdOpt::Database {
-            commands: DbCommands::ReplicateStatus { .. },
+            commands: DbCommands::ReplicateStatus { detailed },
         } => {
-            error!(
-                "The 'database replicate-status' command is not implemented in this release. \
-                 Cross-region backup replication is not yet available. \
-                 See the Backup and Restore chapter of the book for the supported procedures."
-            );
-            return ExitCode::FAILURE;
+            info!("Running in backup replication status mode ...");
+            if !replicate_status_server_core(&config, *detailed).await {
+                return ExitCode::FAILURE;
+            }
         }
         KubidmdOpt::Scripting { .. } | KubidmdOpt::Version => {}
     }

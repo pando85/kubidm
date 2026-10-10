@@ -107,6 +107,7 @@ webauthn-rs = { workspace = true, features = [
 ] }
 
 [dev-dependencies]
+flate2 = { workspace = true }
 walkdir = { workspace = true }
 kubidmd_lib = { workspace = true, features = ["test"] }
 

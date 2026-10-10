@@ -41,25 +41,36 @@ mod repl;
 mod tcp;
 mod utils;
 
+pub use crate::backup::{
+    cli::{
+        backup_server_core, list_backups_server_core, replicate_status_server_core,
+        restore_s3_database, restore_server_core, s3_config_for_cli, verify_backup_server_core,
+        verify_s3_backup_server_core, BackupVerifyLevel, RestoreStatus,
+    },
+    restore::restore_database,
+};
 use crate::{
     actors::{QueryServerReadV1, QueryServerWriteV1},
     admin::AdminActor,
+    backup::{
+        online::OnlineBackupJob,
+        pitr::{self, BaseLocation, PitrArchive, PitrError, PitrSettings, PitrSyncReport},
+    },
     config::{Configuration, ServerRole},
     interval::IntervalActor,
     repl::ReplicationServerHandles,
-    utils::touch_file_or_quit,
 };
 use crypto_glue::{
     s256::{Sha256, Sha256Output},
     traits::Digest,
 };
 use kubidm_proto::{
-    backup::BackupCompression,
+    backup::{BackupCompression, BackupEncryptionConfig, S3Config, WalArchiveConfig},
     internal::{ConsistencyError, OperationError},
     scim_v1::client::ScimAssertGeneric,
 };
 use kubidmd_lib::{
-    be::{verify_backup_structure, Backend, BackendConfig, BackendTransaction},
+    be::{Backend, BackendConfig},
     idm::ldap::LdapServer,
     prelude::*,
     schema::Schema,
@@ -93,6 +104,18 @@ fn setup_backend_vacuum(
     schema: &Schema,
     vacuum: bool,
 ) -> Result<Backend, OperationError> {
+    setup_backend_inner(config, schema, vacuum, None)
+}
+
+/// The backend of a running server. With `wal_archive`, every committed write is archived
+/// for point-in-time recovery. The offline tools never archive: what they write is either
+/// discarded or recorded by the recovery itself.
+fn setup_backend_inner(
+    config: &Configuration,
+    schema: &Schema,
+    vacuum: bool,
+    wal_archive: Option<WalArchiveConfig>,
+) -> Result<Backend, OperationError> {
     // Limit the scope of the schema txn.
     // let schema_txn = task::block_on(schema.write());
     let schema_txn = schema.write();
@@ -105,9 +128,55 @@ fn setup_backend_vacuum(
         pool_size,
         config.db_fs_type.unwrap_or_default(),
         config.db_arc_size,
-    );
+    )
+    .with_wal_archive(wal_archive);
 
     Backend::new(cfg, idxmeta, vacuum)
+}
+
+/// The backend of an offline command that commits writes outside of a restore or a
+/// recovery (a domain rename, a reindex that runs migrations). When WAL archiving is
+/// configured those writes are archived exactly like the running server's, so that
+/// point-in-time recovery does not miss them. The returned guard closes the open segment
+/// when the command ends; the next server start archives it. A command that exits the
+/// process early leaves the segment open, which the next start reports as a gap.
+fn setup_backend_archived(
+    config: &Configuration,
+    schema: &Schema,
+) -> Result<(Backend, OfflineWalGuard), OperationError> {
+    let wal = PitrSettings::from_config(config)
+        .map_err(|err| {
+            error!(%err, "Invalid WAL archive configuration");
+            OperationError::InvalidState
+        })?
+        .map(|settings| settings.backend_wal_config());
+    let be = setup_backend_inner(config, schema, false, wal)?;
+    let guard = OfflineWalGuard(be.wal_archiver());
+    Ok((be, guard))
+}
+
+/// Closes the open WAL segment of an offline command when dropped.
+struct OfflineWalGuard(Option<kubidmd_lib::be::SharedWalArchiver>);
+
+impl Drop for OfflineWalGuard {
+    fn drop(&mut self) {
+        if let Some(archiver) = self.0.take() {
+            let mut archiver = archiver
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Err(err) = archiver.flush_current_segment() {
+                error!(
+                    %err,
+                    "Unable to close the WAL segment of this command; the next server start \
+                     reports its transactions as a gap in the archive"
+                );
+            }
+            // Gaps are recorded in the archive index by the running server.
+            if let Err(err) = archiver.persist_pending_events() {
+                error!(%err, "Unable to hand the WAL archive gaps to the next server start");
+            }
+        }
+    }
 }
 
 // TODO #54: We could move most of the be/schema/qs setup and startup
@@ -361,243 +430,6 @@ pub fn dbscan_restore_quarantined_core(config: &Configuration, id: u64) {
     };
 }
 
-pub fn backup_server_core(config: &Configuration, dst_path: Option<&Path>) {
-    let schema = match Schema::new() {
-        Ok(s) => s,
-        Err(e) => {
-            error!("Failed to setup in memory schema: {:?}", e);
-            std::process::exit(1);
-        }
-    };
-
-    let be = match setup_backend(config, &schema) {
-        Ok(be) => be,
-        Err(e) => {
-            error!("Failed to setup BE: {:?}", e);
-            return;
-        }
-    };
-
-    let mut be_ro_txn = match be.read() {
-        Ok(txn) => txn,
-        Err(err) => {
-            error!(?err, "Unable to proceed, backend read transaction failure.");
-            return;
-        }
-    };
-
-    let compression = match config.online_backup.as_ref() {
-        Some(backup_config) => backup_config.compression,
-        None => BackupCompression::default(),
-    };
-
-    if let Some(dst_path) = dst_path {
-        if dst_path.exists() {
-            error!(
-                "backup file {} already exists, will not overwrite it.",
-                dst_path.display()
-            );
-            return;
-        }
-
-        let output = match std::fs::File::create(dst_path) {
-            Ok(output) => output,
-            Err(err) => {
-                error!(?err, "File::create error creating {}", dst_path.display());
-                return;
-            }
-        };
-
-        match be_ro_txn.backup(output, compression) {
-            Ok(_) => info!("Backup success!"),
-            Err(e) => {
-                error!("Backup failed: {:?}", e);
-                std::process::exit(1);
-            }
-        };
-    } else {
-        // No path set, default to stdout
-        let stdout = std::io::stdout().lock();
-
-        match be_ro_txn.backup(stdout, compression) {
-            Ok(_) => info!("Backup success!"),
-            Err(e) => {
-                error!("Backup failed: {:?}", e);
-                std::process::exit(1);
-            }
-        };
-    };
-    // Let the txn abort, even on success.
-}
-
-pub async fn restore_server_core(config: &Configuration, dst_path: &Path) {
-    if restore_database(config, dst_path).await.is_err() {
-        std::process::exit(1);
-    }
-
-    info!("✅ Restore Success!");
-}
-
-/// Restore the backup at `src_path` into the database described by `config` and
-/// reindex it. This is the production restore path. Backup verification shares it so
-/// that a verified backup has been exercised exactly as a real restore would.
-pub async fn restore_database(
-    config: &Configuration,
-    src_path: &Path,
-) -> Result<(), OperationError> {
-    // If it's an in memory database, we don't need to touch anything
-    if let Some(db_path) = config.db_path.as_ref() {
-        touch_file_or_quit(db_path);
-    }
-
-    // First, we provide the in-memory schema so that core attrs are indexed correctly.
-    let schema = Schema::new().inspect_err(|err| {
-        error!(?err, "Failed to setup in memory schema");
-    })?;
-
-    let be = setup_backend(config, &schema).inspect_err(|err| {
-        error!(?err, "Failed to setup backend");
-    })?;
-
-    let mut be_wr_txn = be.write().inspect_err(|err| {
-        error!(
-            ?err,
-            "Unable to proceed, backend write transaction failure."
-        );
-    })?;
-
-    let compression = BackupCompression::identify_file(src_path);
-
-    let input = std::fs::File::open(src_path).map_err(|err| {
-        error!(?err, "File::open error reading {}", src_path.display());
-        OperationError::FsError
-    })?;
-
-    be_wr_txn
-        .restore(input, compression)
-        .and_then(|_| be_wr_txn.commit())
-        .inspect_err(|err| {
-            error!(?err, "Failed to restore database");
-        })?;
-    info!("Database loaded successfully");
-
-    reindex_inner(be, schema, config).await
-}
-
-/// How deeply `verify_backup_server_core` inspects a backup artifact.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BackupVerifyLevel {
-    /// Parse the artifact and check its format, entry count and server version. This
-    /// never opens a database and can not prove that the backup is restorable.
-    Structural,
-    /// Everything in `Structural`, then restore the artifact into a scratch database
-    /// through the production restore path, re-open that database as a server start
-    /// would and run the full database consistency verification on it.
-    Full,
-}
-
-/// Verify a backup artifact. Returns true when the backup passed every check of the
-/// requested level. The database referenced by `config` is never opened: full
-/// verification restores into a temporary directory that is removed afterwards.
-pub async fn verify_backup_server_core(
-    config: &Configuration,
-    backup_path: &Path,
-    level: BackupVerifyLevel,
-) -> bool {
-    let compression = BackupCompression::identify_file(backup_path);
-
-    let input = match std::fs::File::open(backup_path) {
-        Ok(file) => file,
-        Err(err) => {
-            error!(?err, "Unable to open backup {}", backup_path.display());
-            eprintln!("Backup structural verification: FAIL");
-            eprintln!("  - unable to open {}: {err}", backup_path.display());
-            return false;
-        }
-    };
-
-    let report = match verify_backup_structure(input, compression) {
-        Ok(report) => report,
-        Err(err) => {
-            eprintln!("Backup structural verification: FAIL");
-            eprintln!("  - artifact could not be parsed as a kubidm backup: {err:?}");
-            return false;
-        }
-    };
-
-    eprintln!(
-        "Backup structural verification: {}",
-        pass_fail(report.is_valid())
-    );
-    eprintln!("  Entries: {}", report.entry_count);
-    eprintln!(
-        "  Written by server version: {}",
-        report.version.as_deref().unwrap_or("unknown")
-    );
-    for issue in &report.errors {
-        eprintln!("  - {issue}");
-    }
-
-    if !report.is_valid() || level == BackupVerifyLevel::Structural {
-        return report.is_valid();
-    }
-
-    let scratch_dir = match tempfile::tempdir() {
-        Ok(dir) => dir,
-        Err(err) => {
-            error!(?err, "Unable to create a scratch directory");
-            eprintln!("Backup restore verification: FAIL");
-            eprintln!("  - unable to create a scratch directory: {err}");
-            return false;
-        }
-    };
-
-    let mut scratch_config = config.clone();
-    scratch_config.db_path = Some(scratch_dir.path().join("verify.db"));
-
-    info!(
-        "Restoring backup into scratch database in {}",
-        scratch_dir.path().display()
-    );
-
-    if let Err(err) = restore_database(&scratch_config, backup_path).await {
-        eprintln!("Backup restore verification: FAIL");
-        eprintln!("  - restore failed: {err:?}");
-        return false;
-    }
-
-    // Boot the restored database from scratch exactly as a server start would. The
-    // restore above ran in this process, so its backend still carries in-memory state
-    // from before the restore (such as the RUV). A fresh boot is what proves the
-    // database starts into a consistent state.
-    let consistency_errors = match verify_booted_database(&scratch_config).await {
-        Ok(errors) => errors,
-        Err(err) => {
-            eprintln!("Backup restore verification: FAIL");
-            eprintln!("  - restored database could not be opened: {err:?}");
-            return false;
-        }
-    };
-
-    eprintln!(
-        "Backup restore verification: {}",
-        pass_fail(consistency_errors.is_empty())
-    );
-    for err in &consistency_errors {
-        eprintln!("  - {err:?}");
-    }
-
-    consistency_errors.is_empty()
-}
-
-fn pass_fail(ok: bool) -> &'static str {
-    if ok {
-        "PASS"
-    } else {
-        "FAIL"
-    }
-}
-
 pub async fn reindex_server_core(config: &Configuration) {
     // First, we provide the in-memory schema so that core attrs are indexed correctly.
     let schema = match Schema::new() {
@@ -608,7 +440,8 @@ pub async fn reindex_server_core(config: &Configuration) {
         }
     };
 
-    let be = match setup_backend(config, &schema) {
+    // Booting the query server may run migrations, which are archived.
+    let (be, _wal_guard) = match setup_backend_archived(config, &schema) {
         Ok(be) => be,
         Err(e) => {
             error!("Failed to setup BE: {:?}", e);
@@ -705,8 +538,8 @@ pub async fn domain_rename_core(config: &Configuration) {
         }
     };
 
-    // Start the backend.
-    let be = match setup_backend(config, &schema) {
+    // Start the backend. The rename is archived for point-in-time recovery.
+    let (be, _wal_guard) = match setup_backend_archived(config, &schema) {
         Ok(be) => be,
         Err(e) => {
             error!("Failed to setup BE: {:?}", e);
@@ -762,55 +595,9 @@ pub async fn domain_rename_core(config: &Configuration) {
     };
 }
 
-pub async fn verify_server_core(config: &Configuration) {
-    let curtime = duration_from_epoch_now();
-    // setup the qs - without initialise!
-    let schema_mem = match Schema::new() {
-        Ok(sc) => sc,
-        Err(e) => {
-            error!("Failed to setup in memory schema: {:?}", e);
-            return;
-        }
-    };
-    // Setup the be
-    let be = match setup_backend(config, &schema_mem) {
-        Ok(be) => be,
-        Err(e) => {
-            error!("Failed to setup BE: {:?}", e);
-            return;
-        }
-    };
-
-    let server = match QueryServer::new(be, schema_mem, config.domain.clone(), curtime) {
-        Ok(qs) => qs,
-        Err(err) => {
-            error!(?err, "Failed to setup query server");
-            return;
-        }
-    };
-
-    // Run verifications.
-    let r = server.verify().await;
-
-    if r.is_empty() {
-        eprintln!("Verification passed!");
-        std::process::exit(0);
-    } else {
-        for er in r {
-            error!("{:?}", er);
-        }
-        std::process::exit(1);
-    }
-
-    // Now add IDM server verifications?
-}
-
-/// Boot the database described by `config` exactly as a server start would, including
-/// the startup migrations, then run the full consistency verification on it. Returns the
-/// consistency errors found, which is empty for a healthy database.
-pub async fn verify_booted_database(
-    config: &Configuration,
-) -> Result<Vec<ConsistencyError>, OperationError> {
+/// Open the in-memory schema and the backend described by `config` without starting a
+/// server. This is the common first step of the offline database tools.
+fn open_schema_and_backend(config: &Configuration) -> Result<(Schema, Backend), OperationError> {
     let schema = Schema::new().inspect_err(|err| {
         error!(?err, "Failed to setup in memory schema");
     })?;
@@ -819,16 +606,68 @@ pub async fn verify_booted_database(
         error!(?err, "Failed to setup BE");
     })?;
 
+    Ok((schema, be))
+}
+
+/// Collect the consistency errors reported by a query server.
+fn collect_consistency_errors(results: Vec<Result<(), ConsistencyError>>) -> Vec<ConsistencyError> {
+    results.into_iter().filter_map(Result::err).collect()
+}
+
+/// Run the full consistency verification on the database described by `config` without
+/// booting a server: no migrations are run and the stored entries are not modified. This
+/// is the implementation of `kubidmd database verify`. Returns the consistency errors
+/// found, which is empty for a healthy database.
+pub async fn verify_database(
+    config: &Configuration,
+) -> Result<Vec<ConsistencyError>, OperationError> {
+    let curtime = duration_from_epoch_now();
+    // setup the qs - without initialise!
+    let (schema_mem, be) = open_schema_and_backend(config)?;
+
+    let server =
+        QueryServer::new(be, schema_mem, config.domain.clone(), curtime).inspect_err(|err| {
+            error!(?err, "Failed to setup query server");
+        })?;
+
+    // Run verifications.
+    Ok(collect_consistency_errors(server.verify().await))
+
+    // Now add IDM server verifications?
+}
+
+pub async fn verify_server_core(config: &Configuration) {
+    match verify_database(config).await {
+        Ok(errors) if errors.is_empty() => {
+            eprintln!("Verification passed!");
+            std::process::exit(0);
+        }
+        Ok(errors) => {
+            for err in errors {
+                error!("{:?}", err);
+            }
+            std::process::exit(1);
+        }
+        Err(err) => {
+            error!(?err, "Unable to verify the database");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Boot the database described by `config` exactly as a server start would, including
+/// the startup migrations, then run the full consistency verification on it. Returns the
+/// consistency errors found, which is empty for a healthy database.
+pub async fn verify_booted_database(
+    config: &Configuration,
+) -> Result<Vec<ConsistencyError>, OperationError> {
+    let (schema, be) = open_schema_and_backend(config)?;
+
     let server = setup_qs(be, schema, config).await.inspect_err(|err| {
         error!(?err, "Failed to start query server");
     })?;
 
-    Ok(server
-        .verify()
-        .await
-        .into_iter()
-        .filter_map(Result::err)
-        .collect())
+    Ok(collect_consistency_errors(server.verify().await))
 }
 
 pub fn cert_generate_core(config: &Configuration) {
@@ -1091,6 +930,7 @@ pub(crate) enum TaskName {
     AdminSocket,
     AuditdActor,
     BackupActor,
+    BackupReplicationMonitor,
     DelayedActionActor,
     HttpsServer,
     IntervalActor,
@@ -1098,6 +938,7 @@ pub(crate) enum TaskName {
     ReplicationSupervisor,
     TlsAcceptorReload,
     MigrationReload,
+    WalArchive,
 }
 
 impl Display for TaskName {
@@ -1109,6 +950,7 @@ impl Display for TaskName {
                 TaskName::AdminSocket => "Admin Socket",
                 TaskName::AuditdActor => "Auditd Actor",
                 TaskName::BackupActor => "Backup Actor",
+                TaskName::BackupReplicationMonitor => "Backup Replication Monitor",
                 TaskName::DelayedActionActor => "Delayed Action Actor",
                 TaskName::HttpsServer => "HTTPS Server",
                 TaskName::IntervalActor => "Interval Actor",
@@ -1116,6 +958,7 @@ impl Display for TaskName {
                 TaskName::ReplicationSupervisor => "Replication Supervisor",
                 TaskName::TlsAcceptorReload => "TlsAcceptor Reload Monitor",
                 TaskName::MigrationReload => "Migration Reload Monitor",
+                TaskName::WalArchive => "WAL Archive",
             }
         )
     }
@@ -1127,6 +970,8 @@ pub struct CoreHandle {
     /// This stores a name for the handle, and the handle itself so we can tell which failed/succeeded at the end.
     handles: Vec<(TaskName, task::JoinHandle<()>)>,
     server_read_ref: &'static QueryServerReadV1,
+    /// The WAL archive, when point-in-time recovery is enabled.
+    pitr_archive: Option<Arc<PitrArchive>>,
 }
 
 impl CoreHandle {
@@ -1148,7 +993,32 @@ impl CoreHandle {
             }
         }
 
+        // Every task that can write has stopped: close the open WAL segment and archive
+        // it, so that a clean shutdown loses no committed transaction.
+        if let Some(archive) = &self.pitr_archive {
+            match archive.sync(duration_from_epoch_now(), true).await {
+                Ok(report) => debug!(?report, "WAL archive synchronised at shutdown"),
+                Err(err) => error!(
+                    %err,
+                    "WAL archive synchronisation at shutdown failed; the closed segments stay in \
+                     {} and are archived at the next start",
+                    archive.settings().local_dir.display()
+                ),
+            }
+            archive.persist_pending_events();
+        }
+
         self.clean_shutdown = true;
+    }
+
+    /// Close the open WAL segment and archive every closed one now, as the periodic WAL
+    /// archive task and the shutdown do. None when WAL archiving is not enabled. This
+    /// exists so tests can archive on demand.
+    pub async fn sync_wal_archive(&self) -> Option<Result<PitrSyncReport, PitrError>> {
+        match &self.pitr_archive {
+            Some(archive) => Some(archive.sync(duration_from_epoch_now(), true).await),
+            None => None,
+        }
     }
 
     pub async fn reload(&mut self) {
@@ -1165,16 +1035,53 @@ impl CoreHandle {
         outpath: &Path,
         versions: usize,
         compression: BackupCompression,
+        encryption: &BackupEncryptionConfig,
     ) -> Result<(), OperationError> {
-        self.server_read_ref
-            .handle_online_backup(
-                kubidmd_lib::event::OnlineBackupEvent::new(),
-                outpath,
-                versions,
-                compression,
-                None,
-            )
-            .await
+        self.trigger_backup(
+            BaseLocation::Local(outpath.to_path_buf()),
+            versions,
+            compression,
+            encryption,
+        )
+        .await
+    }
+
+    /// Run an online backup to S3 now, through the same code path the scheduled S3 backup
+    /// uses, including replication and retention of `versions` backups under the
+    /// configured prefix. This exists so tests can exercise the production S3 backup path
+    /// on demand.
+    pub async fn trigger_s3_backup(
+        &self,
+        s3_config: S3Config,
+        versions: usize,
+        compression: BackupCompression,
+        encryption: &BackupEncryptionConfig,
+    ) -> Result<(), OperationError> {
+        self.trigger_backup(
+            BaseLocation::S3(s3_config),
+            versions,
+            compression,
+            encryption,
+        )
+        .await
+    }
+
+    async fn trigger_backup(
+        &self,
+        target: BaseLocation,
+        versions: usize,
+        compression: BackupCompression,
+        encryption: &BackupEncryptionConfig,
+    ) -> Result<(), OperationError> {
+        OnlineBackupJob {
+            targets: vec![target],
+            versions,
+            compression,
+            encryption: encryption.clone(),
+            pitr_archive: self.pitr_archive.clone(),
+        }
+        .run(self.server_read_ref)
+        .await
     }
 }
 
@@ -1233,13 +1140,38 @@ pub async fn create_server_core(
         }
     };
 
+    // Point-in-time recovery: the backend archives every committed write. A config test
+    // validates the settings but must not create the WAL directory.
+    let pitr_settings = match PitrSettings::from_config(&config) {
+        Ok(settings) => settings,
+        Err(err) => {
+            error!(%err, "Invalid WAL archive configuration");
+            return Err(());
+        }
+    };
+    let backend_wal_config = match (&pitr_settings, config_test) {
+        (Some(settings), false) => Some(settings.backend_wal_config()),
+        _ => None,
+    };
+
     // Setup the be for the qs.
-    let be = match setup_backend(&config, &schema) {
+    let be = match setup_backend_inner(&config, &schema, false, backend_wal_config) {
         Ok(be) => be,
         Err(e) => {
             error!("Failed to setup BE -> {:?}", e);
             return Err(());
         }
+    };
+    let pitr_archive = match (pitr_settings, be.wal_archiver()) {
+        (Some(settings), Some(archiver)) => {
+            info!(
+                location = %settings.location,
+                bases = %settings.bases,
+                "Point-in-time recovery: archiving committed writes"
+            );
+            Some(Arc::new(PitrArchive::new(settings, archiver)))
+        }
+        _ => None,
     };
     // Start the IDM server.
     let (_qs, idms, idms_delayed, idms_audit) = match setup_qs_idms(be, schema, &config).await {
@@ -1357,6 +1289,7 @@ pub async fn create_server_core(
             server_write_ref,
             idms_arc,
             maybe_tls_acceptor,
+            pitr_archive.clone(),
         )
         .await
     };
@@ -1366,6 +1299,7 @@ pub async fn create_server_core(
         tx: broadcast_tx,
         handles,
         server_read_ref,
+        pitr_archive,
     };
 
     if startup_success.is_ok() {
@@ -1392,6 +1326,8 @@ async fn launch_server_tasks(
     idms_arc: Arc<IdmServer>,
 
     maybe_tls_acceptor: Option<TlsAcceptor>,
+
+    pitr_archive: Option<Arc<PitrArchive>>,
 ) -> Result<(), ()> {
     let status_ref = StatusActor::start();
     let tracker = status_ref.get_tracker_clone();
@@ -1454,6 +1390,13 @@ async fn launch_server_tasks(
 
     handles.push((TaskName::AuditdActor, auditd_handle));
 
+    // WAL archiving runs in every mode, integration tests included: it only ships what
+    // the backend already recorded.
+    if let Some(archive) = &pitr_archive {
+        let wal_handle = pitr::start_wal_archive_task(archive.clone(), broadcast_tx.subscribe());
+        handles.push((TaskName::WalArchive, wal_handle));
+    }
+
     // Run the migrations *once*, only in production though.
     let migration_path = config
         .migration_path
@@ -1486,12 +1429,13 @@ async fn launch_server_tasks(
         match &config.online_backup {
             Some(online_backup_config) => {
                 if online_backup_config.enabled {
-                    let backup_handle = IntervalActor::start_online_backup(
+                    let backup_handles = IntervalActor::start_online_backup(
                         server_read_ref,
                         online_backup_config,
+                        pitr_archive.clone(),
                         broadcast_tx.subscribe(),
                     )?;
-                    handles.push((TaskName::BackupActor, backup_handle));
+                    handles.extend(backup_handles);
                 } else {
                     debug!("Backups disabled");
                 }

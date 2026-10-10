@@ -155,7 +155,7 @@ schedule = "00 22 * * *"
 #   sec  min   hour   day of month   month   day of week   year
 #   (it's very similar to the standard cron syntax, it just allows to specify the seconds
 #   at the beginning and the year at the end)
-#   Number of backups to keep (default 7)
+#   Number of backups to keep in every backup location (default 7, at least 1)
 # versions = 7
 
 # Compression can either be "gzip" or "nocompression".
@@ -173,7 +173,9 @@ compression = "gzip"
 # endpoint = "https://minio.example.com"
 #   Optional: Path prefix for organizing backups
 # path_prefix = "production"
-#   Optional: Storage class (STANDARD, GLACIER, DEEP_ARCHIVE, etc.)
+#   Optional: Storage class: STANDARD (default), REDUCED_REDUNDANCY, STANDARD_IA,
+#   ONEZONE_IA, INTELLIGENT_TIERING or GLACIER_IR. GLACIER and DEEP_ARCHIVE are refused:
+#   their objects can only be read after a restore request.
 # storage_class = "STANDARD"
 #
 #   Authentication: Static credentials (for testing)
@@ -186,11 +188,125 @@ compression = "gzip"
 #   Authentication: IAM role (recommended for EC2/EKS)
 #   Omit credentials section to use IAM role authentication
 #
-#   Optional: Server-side encryption
+#   Optional: Server-side encryption, applied to the backups and their metadata objects
 # [online_backup.s3.server_side_encryption]
 # algorithm = "aws:kms"  # or "AES256"
+#   Only with aws:kms; S3 refuses a KMS key with AES256
 # kms_key_id = "arn:aws:kms:us-east-1:123456789:key/..."
 #
-#   Cross-region replication ([online_backup.s3.replication]), point-in-time recovery
-#   ([online_backup.wal_archive]) and client-side encryption ([online_backup.encryption])
-#   are not available yet. Enabling any of these keys is rejected at startup.
+#   Optional: Cross-region replication of the S3 backups.
+#   After every successful upload, the backup object and its .metadata.json sidecar are
+#   copied to every region listed here, and each region keeps its newest `versions`
+#   backups (the same retention as the primary bucket). The backup makes one attempt
+#   per region and never retries: a region that can not be written to is logged and
+#   skipped, and the primary backup still succeeds.
+#   Every `sync_interval_seconds`, the server copies to each region the primary
+#   backups it misses (or holds a differing copy of), then checks that each region
+#   holds all the primary's backups and logs a warning per region that does not.
+#   `kubidmd database replicate-status` prints the same check on demand, and
+#   `restore-s3`, `verify-s3` and `list-backups` take `--region <name>` to work on a
+#   region's copies instead of the primary bucket.
+#   Client-side encrypted backups (see [online_backup.encryption] below) are copied as
+#   they are: a region holds the same `.enc` objects and sidecars as the primary, and
+#   restoring or verifying from a region needs the same encryption key.
+#   The WAL archive of point-in-time recovery (see [online_backup.wal_archive] below),
+#   when it is uploaded here, is mirrored to the same regions after every archive run;
+#   `pitr-list` and `recover` take `--region <name>` as well.
+#   Requires at least one region, unique region names (name, or region without one),
+#   a bucket per region, a location (endpoint, bucket, path_prefix) per region distinct
+#   from the primary and from every other region, and a positive sync_interval_seconds
+#   when enabled.
+#
+# [online_backup.s3.replication]
+# enabled = true
+#   Seconds between two replication sync and health check runs (default 300)
+# sync_interval_seconds = 300
+#
+#   One entry per region. `region` is the signing region of its requests and, unless
+#   `name` is set, names the entry (for replicate-status and --region); `bucket` is
+#   required. Names must be unique: set `name` when two replicas share a region.
+# [[online_backup.s3.replication.regions]]
+# region = "eu-west-1"
+# bucket = "kubidm-backups-eu"
+#   Optional: The name of the replica (default: region)
+# name = "eu-dr"
+#   Optional: Custom endpoint for MinIO or other S3-compatible services
+# endpoint = "https://s3.eu-west-1.example.com"
+#   Optional: Path prefix inside the region's bucket (independent from the primary's)
+# path_prefix = "dr"
+#   Optional: Storage class for the copies (default STANDARD)
+# storage_class = "STANDARD_IA"
+#   Optional: Shorthand for aws:kms server-side encryption with this key. An explicit
+#   [online_backup.s3.replication.regions.server_side_encryption] block takes precedence.
+# kms_key_id = "arn:aws:kms:eu-west-1:123456789:key/..."
+#   Optional: Credentials for this region. Omit to use the SDK default provider chain
+#   (environment variables, profile, instance role).
+# [online_backup.s3.replication.regions.credentials]
+# access_key_id = "eu-region-access-key-id"
+# secret_access_key = "eu-region-secret-access-key"
+#
+# [[online_backup.s3.replication.regions]]
+# region = "ap-southeast-1"
+# bucket = "kubidm-backups-ap"
+#
+#   Client-side backup encryption (optional)
+#   When enabled, every backup made from this configuration (online, S3 and
+#   `kubidmd database backup`) is encrypted with AES-256-GCM under a key derived from the
+#   key source below, and gets the extra file suffix ".enc". `restore`, `verify-backup`,
+#   `restore-s3` and `verify-s3` decrypt with the same settings. Keep the key outside of
+#   the server: a backup can only be restored by whoever holds it. This is independent
+#   of S3 server_side_encryption / kms_key_id, which the bucket applies at rest; replicated
+#   copies stay encrypted with this key in every region. With point-in-time recovery, the
+#   archived WAL segments (which hold credentials too) are encrypted the same way
+#   ("<segment>.enc", in S3 and in local_path) and `recover` decrypts them.
+#
+# [online_backup.encryption]
+# enabled = true
+#   Where the secret comes from. "Passphrase" reads the KUBIDM_BACKUP_PASSPHRASE
+#   environment variable, or the file named by passphrase_file when set.
+# key_source = "Passphrase"
+# passphrase_file = "/etc/kubidm/backup-passphrase"
+#   Alternatively a key file, used byte for byte (for example 32 random bytes) ...
+# key_source = { File = { path = "/etc/kubidm/backup.key" } }
+#   ... or an HTTPS endpoint whose raw response body is the key material and must be the
+#   same bytes on every request (plain http is only accepted for a loopback address; no
+#   proxy, no redirects).
+# key_source = { HttpEndpoint = { url = "https://secrets.example.com/kubidm-backup-key" } }
+#   Name recorded in every artifact and in the S3 metadata sidecar so that a restore can
+#   tell which key an artifact needs. Defaults to a fingerprint of a key file or key
+#   endpoint, and to "passphrase" for a passphrase.
+# key_identifier = "prod-2026"
+#   Argon2id parameters of the key derivation (memory in KiB, iterations, parallelism).
+#   The defaults are 19 MiB, 2 and 1; m_cost must be between 8192 and 1048576, t_cost and
+#   p_cost between 1 and 16, and m_cost * t_cost at most 4194304.
+# [online_backup.encryption.key_derivation]
+# m_cost = 19456
+# t_cost = 2
+# p_cost = 1
+#
+#   Point-in-time recovery (optional)
+#   Archive every committed write so that `kubidmd database recover` can rebuild the
+#   database as of any moment since the oldest base backup. Requires the online backup
+#   above, whose backups are the bases (the S3 ones when [online_backup.s3] is set).
+#   Segments are uploaded to [online_backup.s3] (or [online_backup.wal_archive.s3]) or,
+#   without S3, kept in local_path. They are encrypted when [online_backup.encryption] is
+#   enabled, and mirrored to the regions of the replication section of their S3 location.
+#   See the Backup and Restore chapter of the book.
+#
+# [online_backup.wal_archive]
+# enabled = true
+#   Close the open segment at least this often; also the upload period (default 300)
+# segment_interval_seconds = 300
+#   Close a segment once its records reach this size (default 16 MiB)
+# segment_size_bytes = 16777216
+#   Keep archived segments at least this many days. Segments the oldest remaining
+#   base backup needs are always kept (default 7)
+# retention_days = 7
+#   Where segments are written before upload (default: "wal" next to db_path)
+# local_path = "/var/lib/private/kubidm/wal"
+#   Optional: archive to another S3 location than [online_backup.s3]. Its own
+#   [online_backup.wal_archive.s3.replication] section, if any, replicates the archive;
+#   base backups then stay in [online_backup.s3] (or online_backup.path).
+# [online_backup.wal_archive.s3]
+# bucket = "kubidm-wal"
+# region = "us-east-1"

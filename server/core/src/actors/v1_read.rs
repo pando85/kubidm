@@ -14,7 +14,7 @@ use kubidm_proto::{
 };
 use kubidmd_lib::{
     be::BackendTransaction,
-    event::{OnlineBackupEvent, SearchEvent, SearchResult, WhoamiResult},
+    event::{SearchEvent, SearchResult, WhoamiResult},
     filter::{Filter, FilterInvalid},
     idm::{
         account::ListUserAuthTokenEvent,
@@ -39,19 +39,11 @@ use kubidmd_lib::{
     prelude::*,
 };
 use ldap3_proto::simple::*;
-use regex::Regex;
-use std::{
-    convert::TryFrom,
-    fs,
-    net::IpAddr,
-    path::{Path, PathBuf},
-    str::FromStr,
-};
-use tracing::{error, info, instrument, trace};
+use std::{convert::TryFrom, net::IpAddr, str::FromStr};
+use tracing::{error, instrument, trace};
 use uuid::Uuid;
 
 use super::QueryServerReadV1;
-use crate::backup::S3ClientWrapper;
 
 // ===========================================================
 
@@ -194,182 +186,17 @@ impl QueryServerReadV1 {
         res
     }
 
-    #[instrument(
-        level = "info",
-        name = "online_backup",
-        skip_all,
-        fields(uuid = ?msg.eventid)
-    )]
-    pub async fn handle_online_backup(
-        &self,
-        msg: OnlineBackupEvent,
-        outpath: &Path,
-        versions: usize,
+    /// Serialise and compress the whole database inside one read transaction: the
+    /// consistent snapshot an online backup is made of. The transaction is opened here and
+    /// the serialisation, which reads and compresses every entry, runs on the blocking
+    /// thread pool so that it never stalls the workers serving LDAP and HTTPS.
+    pub(crate) async fn backup_database(
+        &'static self,
         compression: BackupCompression,
-        s3_client: Option<S3ClientWrapper>,
-    ) -> Result<(), OperationError> {
-        trace!(eventid = ?msg.eventid, "Begin online backup event");
-
-        #[allow(clippy::disallowed_methods)]
-        // Allowed as this timestamp is only used for the filename creation.
-        let now = time::OffsetDateTime::now_utc();
-
-        #[allow(clippy::unwrap_used)]
-        let timestamp = now.format(&Rfc3339).unwrap();
-
-        // Handle S3 backup
-        if let Some(s3) = s3_client {
-            return self
-                .handle_s3_backup(&msg, &timestamp, compression, s3)
-                .await;
-        }
-
-        // Handle local file backup
-        let dest_file = outpath.join(format!("backup-{timestamp}.json{}", compression.suffix()));
-
-        if dest_file.exists() {
-            error!(
-                "Online backup file {} already exists, will not overwrite it.",
-                dest_file.display()
-            );
-            return Err(OperationError::InvalidState);
-        }
-
-        let output = std::fs::File::create(&dest_file).map_err(|err| {
-            error!(?err, "File::create error creating {}", dest_file.display());
-            OperationError::FsError
-        })?;
-
-        // Scope to limit the read txn.
-        {
-            let mut idms_prox_read = self.idms.proxy_read().await?;
-            idms_prox_read
-                .qs_read
-                .get_be_txn()
-                .backup(output, compression)
-                .map(|()| {
-                    info!("Online backup created {} successfully", dest_file.display());
-                })
-                .map_err(|e| {
-                    error!(
-                        "Online backup failed to create {}: {:?}",
-                        dest_file.display(),
-                        e
-                    );
-                    OperationError::InvalidState
-                })?;
-        }
-
-        // TODO: make the file rotation a separate function
-
-        // pattern to find automatically generated backup files
-        let re = Regex::new(r"^backup-\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?Z\.json")
-            .map_err(|error| {
-                error!(
-                    "Failed to parse regexp for online backup files: {:?}",
-                    error
-                );
-                OperationError::InvalidState
-            })?;
-
-        // cleanup of maximum backup versions to keep
-        let mut backup_file_list: Vec<PathBuf> = Vec::new();
-        // get a list of backup files
-        match fs::read_dir(outpath) {
-            Ok(rd) => {
-                for entry in rd {
-                    // get PathBuf
-                    let pb = entry
-                        .map_err(|e| {
-                            error!(?e, "Pathbuf access");
-                            OperationError::InvalidState
-                        })?
-                        .path();
-
-                    // skip everything that is not a file
-                    if !pb.is_file() {
-                        continue;
-                    }
-
-                    // get the /some/dir/<file_name> of the file
-                    let file_name = pb.file_name().and_then(|f| f.to_str()).ok_or_else(|| {
-                        error!("filename is invalid");
-                        OperationError::InvalidState
-                    })?;
-                    // check for a online backup file
-                    if re.is_match(file_name) {
-                        backup_file_list.push(pb.clone());
-                    }
-                }
-            }
-            Err(e) => {
-                error!(
-                    "Online backup cleanup error read dir {}: {}",
-                    outpath.display(),
-                    e
-                );
-                return Err(OperationError::InvalidState);
-            }
-        }
-
-        // sort it to have items listed old to new
-        backup_file_list.sort();
-
-        // Versions: OLD 10.9.8.7.6.5.4.3.2.1 NEW
-        //              |----delete----|keep|
-        // 10 items, we want to keep the latest 3
-
-        // if we have more files then we want to keep, me do some cleanup
-        if backup_file_list.len() > versions {
-            let x = backup_file_list.len() - versions;
-            info!(
-                "Online backup cleanup found {} versions, should keep {}, will remove {}",
-                backup_file_list.len(),
-                versions,
-                x
-            );
-            backup_file_list.truncate(x);
-
-            // removing files
-            for file in backup_file_list {
-                debug!("Online backup cleanup: removing {:?}", &file);
-                match fs::remove_file(&file) {
-                    Ok(_) => {}
-                    Err(e) => {
-                        error!(
-                            "Online backup cleanup failed to remove file {:?}: {:?}",
-                            file, e
-                        )
-                    }
-                };
-            }
-        } else {
-            debug!("Online backup cleanup had no files to remove");
-        };
-
-        Ok(())
-    }
-
-    #[instrument(
-        level = "info",
-        name = "s3_backup",
-        skip_all,
-        fields(uuid = ?msg.eventid)
-    )]
-    async fn handle_s3_backup(
-        &self,
-        msg: &OnlineBackupEvent,
-        timestamp: &str,
-        compression: BackupCompression,
-        s3_client: S3ClientWrapper,
-    ) -> Result<(), OperationError> {
-        trace!(eventid = ?msg.eventid, "Begin S3 backup event");
-
-        let mut backup_data = Vec::new();
-
-        // Scope to limit the read txn and collect backup data
-        {
-            let mut idms_prox_read = self.idms.proxy_read().await?;
+    ) -> Result<Vec<u8>, OperationError> {
+        let mut idms_prox_read = self.idms.proxy_read().await?;
+        tokio::task::spawn_blocking(move || {
+            let mut backup_data = Vec::new();
             idms_prox_read
                 .qs_read
                 .get_be_txn()
@@ -378,20 +205,13 @@ impl QueryServerReadV1 {
                     error!("Online backup failed to create backup data: {:?}", e);
                     OperationError::InvalidState
                 })?;
-        }
-
-        let object_key = format!("backup-{timestamp}.json{}", compression.suffix());
-
-        s3_client
-            .upload_backup(backup_data, &object_key, timestamp, compression)
-            .await
-            .map_err(|e| {
-                error!("S3 backup upload failed: {}", e);
-                OperationError::InvalidState
-            })?;
-
-        info!("S3 backup uploaded successfully: {}", object_key);
-        Ok(())
+            Ok(backup_data)
+        })
+        .await
+        .map_err(|err| {
+            error!(%err, "Online backup failed: the backup task failed");
+            OperationError::InvalidState
+        })?
     }
 
     #[instrument(

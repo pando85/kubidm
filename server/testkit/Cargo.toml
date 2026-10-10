@@ -50,10 +50,13 @@ url = { workspace = true, features = ["serde"] }
 kubidm_build_profiles = { workspace = true }
 
 [dev-dependencies]
+aws-config = { workspace = true }
+aws-sdk-s3 = { workspace = true }
 base64 = { workspace = true }
 cidr = { workspace = true }
 compact_jwt = { workspace = true, features = ["unsafe_release_without_verify"] }
 escargot = "0.5.15"
+flate2 = { workspace = true }
 futures = { workspace = true }
 hex = { workspace = true }
 hyper = { workspace = true }

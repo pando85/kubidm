@@ -1,6 +1,9 @@
 mod apidocs;
 mod authorization_test;
+mod backup_common;
+mod backup_encryption_test;
 mod backup_verify_test;
+mod database_verify_test;
 mod delegation;
 mod domain;
 mod group;
@@ -16,6 +19,8 @@ mod person;
 mod pitr_test;
 mod proto_v1_test;
 mod s3_backup_test;
+mod s3_recovery_test;
+mod s3_replication_test;
 mod scim_test;
 mod service_account;
 mod stepup_auth_test;
