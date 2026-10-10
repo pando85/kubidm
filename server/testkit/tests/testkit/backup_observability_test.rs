@@ -6,22 +6,25 @@
 //! runs from its schedule inside the server. The S3 variant needs an S3-compatible service;
 //! see `backup_common` for how it is found, when it is skipped and how to run it locally.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use kubidm_proto::backup::{
     BackupCompression, BackupEncryptionConfig, EncryptionKeySource, KeyDerivationParams,
     ReplicationConfig, S3Config, WalArchiveConfig,
 };
-use kubidmd_core::backup::metrics::BackupDestination;
-use kubidmd_core::backup::verify::{BackupVerifyOutcome, BackupVerifyRun};
+use kubidmd_core::backup::metrics::{BackupDestination, METRICS_STATE_FILE_NAME};
+use kubidmd_core::backup::verify::{
+    BackupVerifyOutcome, BackupVerifyRun, DestinationVerification, SCRATCH_DIR_PREFIX,
+};
 use kubidmd_core::backup::MIN_KDF_M_COST;
 use kubidmd_core::config::{Configuration, OnlineBackup};
 use kubidmd_testkit::AsyncTestEnvironment;
+use serde_json::Value;
 
 use super::backup_common::{
-    backup_via_production_path, config_with_db, delete_prefix, ensure_bucket, populate, run,
-    sdk_client, start_server, test_s3_config, test_s3_region,
+    config_with_db, delete_prefix, ensure_bucket, populate, run, sdk_client, start_server,
+    test_s3_config, test_s3_region, BACKUP_USER_ALICE,
 };
 
 /// How long the scheduled verification may take to pass on a backup. It runs every
@@ -29,18 +32,16 @@ use super::backup_common::{
 const SCHEDULED_VERIFICATION_TIMEOUT: Duration = Duration::from_secs(180);
 
 const LOCAL: &str = "destination=\"local\"";
-const LOCAL_STRUCTURAL: &str = "destination=\"local\",level=\"structural\"";
-const LOCAL_FULL: &str = "destination=\"local\",level=\"full\"";
 const S3: &str = "destination=\"s3\"";
-const S3_STRUCTURAL: &str = "destination=\"s3\",level=\"structural\"";
-const S3_FULL: &str = "destination=\"s3\",level=\"full\"";
 
 const LAST_SUCCESS: &str = "kubidm_backup_last_success_timestamp_seconds";
 const LAST_FAILURE: &str = "kubidm_backup_last_failure_timestamp_seconds";
 const FAILURES: &str = "kubidm_backup_failures_total";
-const LAST_VERIFIED: &str = "kubidm_backup_last_verified_timestamp_seconds";
+const VERIFIED: &str = "kubidm_backup_verification_last_success_timestamp_seconds";
+const VERIFICATION_LAST_FAILURE: &str = "kubidm_backup_verification_last_failure_timestamp_seconds";
 const VERIFICATION_FAILURES: &str = "kubidm_backup_verification_failures_total";
-const PITR_LAST_SYNC: &str = "kubidm_backup_pitr_last_sync_timestamp_seconds";
+const VERIFICATION_ERRORS: &str = "kubidm_backup_verification_errors_total";
+const PITR_LAST_SUCCESS: &str = "kubidm_backup_pitr_sync_last_success_timestamp_seconds";
 
 fn now_secs() -> f64 {
     SystemTime::now()
@@ -49,15 +50,14 @@ fn now_secs() -> f64 {
         .as_secs_f64()
 }
 
-/// GET `/metrics` of the server of `env`: its status and body.
-async fn get_metrics(env: &AsyncTestEnvironment) -> (u16, String) {
-    let response = env
-        .rsclient
-        .client()
-        .get(env.rsclient.make_url("/metrics"))
-        .send()
-        .await
-        .expect("Failed to request /metrics");
+/// GET `/metrics` of the server of `env`, with `token` as bearer token: its status and
+/// body.
+async fn get_metrics_with(env: &AsyncTestEnvironment, token: Option<&str>) -> (u16, String) {
+    let mut request = env.rsclient.client().get(env.rsclient.make_url("/metrics"));
+    if let Some(token) = token {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().await.expect("Failed to request /metrics");
     let status = response.status().as_u16();
     let content_type = response
         .headers()
@@ -73,6 +73,10 @@ async fn get_metrics(env: &AsyncTestEnvironment) -> (u16, String) {
         );
     }
     (status, body)
+}
+
+async fn get_metrics(env: &AsyncTestEnvironment) -> (u16, String) {
+    get_metrics_with(env, None).await
 }
 
 /// The value of the sample `name{labels}` in a Prometheus text exposition.
@@ -112,21 +116,65 @@ async fn wait_for_metric(env: &AsyncTestEnvironment, name: &str, labels: &str, a
 }
 
 /// Run the scheduled verification now, waiting for a scheduled run in progress to end.
-async fn verify_now(env: &AsyncTestEnvironment) -> Vec<(BackupDestination, BackupVerifyOutcome)> {
+async fn verify_now(env: &AsyncTestEnvironment) -> Vec<DestinationVerification> {
     loop {
         match env.core_handle.trigger_backup_verification().await {
-            BackupVerifyRun::Completed(results) => {
-                return results
-                    .into_iter()
-                    .map(|result| (result.destination, result.outcome))
-                    .collect()
-            }
+            BackupVerifyRun::Completed(results) => return results,
             BackupVerifyRun::Skipped(reason) => {
                 assert!(reason.contains("already running"), "{reason}");
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
         }
     }
+}
+
+/// The destinations and outcomes of a verification run.
+fn outcomes(results: &[DestinationVerification]) -> Vec<(BackupDestination, BackupVerifyOutcome)> {
+    results
+        .iter()
+        .map(|result| (result.destination.clone(), result.outcome.clone()))
+        .collect()
+}
+
+/// Take an online backup now through the scheduled backup path, to every location of the
+/// configuration, and return the newest local artifact.
+async fn backup_now(env: &AsyncTestEnvironment, backup_dir: &Path) -> PathBuf {
+    env.core_handle
+        .trigger_configured_online_backup()
+        .await
+        .expect("Online backup failed");
+    newest_backup(backup_dir)
+}
+
+/// The newest backup artifact in `dir`, by name.
+fn newest_backup(dir: &Path) -> PathBuf {
+    let mut backups: Vec<PathBuf> = std::fs::read_dir(dir)
+        .expect("Failed to read backup directory")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("backup-"))
+        })
+        .collect();
+    backups.sort();
+    backups.pop().expect("No backup artifact")
+}
+
+/// The scratch directories of a verification in `dir`.
+fn scratch_dirs(dir: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(dir)
+        .expect("Failed to read directory")
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(SCRATCH_DIR_PREFIX))
+        })
+        .map(|entry| entry.path())
+        .collect()
 }
 
 /// Client-side encryption with a passphrase file and the cheapest key derivation the
@@ -155,6 +203,15 @@ fn config_with_online_backup(db_path: &Path, online_backup: OnlineBackup) -> Con
     }
 }
 
+/// Assert that the sample `name{labels}` of `text` is a time within `[from, to]`.
+fn assert_time_within(text: &str, name: &str, labels: &str, from: f64, to: f64) {
+    let value = sample(text, name, labels).unwrap_or_else(|| panic!("{name}{{{labels}}} missing"));
+    assert!(
+        value >= from.floor() && value <= to.ceil(),
+        "{name}{{{labels}}} = {value}, expected within [{from}, {to}] in\n{text}"
+    );
+}
+
 #[test]
 fn test_metrics_endpoint_is_not_served_unless_enabled() {
     run(async {
@@ -180,10 +237,41 @@ fn test_metrics_endpoint_is_not_served_unless_enabled() {
 }
 
 #[test]
+fn test_metrics_endpoint_requires_the_configured_bearer_token() {
+    run(async {
+        let workdir = tempfile::tempdir().expect("Failed to create workdir");
+        let token_file = workdir.path().join("metrics-token");
+        std::fs::write(&token_file, "e2e-metrics-token\n").expect("Failed to write token");
+        let config = config_with_online_backup(
+            &workdir.path().join("source.db"),
+            OnlineBackup {
+                path: Some(workdir.path().join("backups")),
+                metrics_endpoint: true,
+                metrics_token_file: Some(token_file),
+                ..OnlineBackup::default()
+            },
+        );
+        let mut env = kubidmd_testkit::setup_async_test(config).await;
+
+        for token in [None, Some("wrong")] {
+            let (status, body) = get_metrics_with(&env, token).await;
+            assert_eq!(status, 401, "{token:?}");
+            assert!(!body.contains("kubidm_backup"), "{body}");
+        }
+        let (status, body) = get_metrics_with(&env, Some("e2e-metrics-token")).await;
+        assert_eq!(status, 200);
+        assert_eq!(sample(&body, LAST_SUCCESS, LOCAL), Some(0.0), "{body}");
+
+        env.core_handle.shutdown().await;
+    });
+}
+
+#[test]
 fn test_metrics_endpoint_reports_backup_and_wal_archive_timestamps() {
     run(async {
         let workdir = tempfile::tempdir().expect("Failed to create workdir");
         let backup_dir = workdir.path().join("backups");
+        std::fs::create_dir_all(&backup_dir).expect("Failed to create backup directory");
         let config = config_with_online_backup(
             &workdir.path().join("source.db"),
             OnlineBackup {
@@ -206,51 +294,48 @@ fn test_metrics_endpoint_reports_backup_and_wal_archive_timestamps() {
         let (_, text) = get_metrics(&env).await;
         assert_eq!(sample(&text, LAST_SUCCESS, LOCAL), Some(0.0), "{text}");
         assert_eq!(sample(&text, FAILURES, LOCAL), Some(0.0));
-        assert_eq!(sample(&text, LAST_VERIFIED, LOCAL_STRUCTURAL), Some(0.0));
         // The full verification is not scheduled, so it is not reported.
-        assert_eq!(sample(&text, LAST_VERIFIED, LOCAL_FULL), None);
-        assert!(sample(&text, PITR_LAST_SYNC, "").is_some(), "{text}");
+        assert_eq!(sample(&text, VERIFIED, LOCAL), None);
+        assert!(sample(&text, PITR_LAST_SUCCESS, "").is_some(), "{text}");
 
-        // A backup through the online backup path updates the success and the structural
-        // verification of its destination.
+        // A backup through the scheduled backup path updates the success of its
+        // destination.
         let before = now_secs();
-        backup_via_production_path(
-            &env,
-            &backup_dir,
-            BackupCompression::Gzip,
-            &BackupEncryptionConfig::default(),
-        )
-        .await;
+        backup_now(&env, &backup_dir).await;
         let after = now_secs();
         let (_, text) = get_metrics(&env).await;
-        for (name, labels) in [(LAST_SUCCESS, LOCAL), (LAST_VERIFIED, LOCAL_STRUCTURAL)] {
-            let value = sample(&text, name, labels).expect("sample");
-            assert!(
-                value >= before.floor() && value <= after.ceil(),
-                "{name}{{{labels}}} = {value}, expected within [{before}, {after}]"
-            );
-        }
+        assert_time_within(&text, LAST_SUCCESS, LOCAL, before, after);
         assert_eq!(sample(&text, FAILURES, LOCAL), Some(0.0));
         assert_eq!(sample(&text, LAST_FAILURE, LOCAL), Some(0.0));
 
         // A backup that can not be stored is a failure of its destination, and leaves the
         // last success alone.
         let last_success = sample(&text, LAST_SUCCESS, LOCAL).expect("sample");
-        let not_a_directory = workdir.path().join("not-a-directory");
-        std::fs::write(&not_a_directory, b"x").expect("Failed to write file");
+        std::fs::rename(&backup_dir, workdir.path().join("moved-backups"))
+            .expect("Failed to move the backups");
+        std::fs::write(&backup_dir, b"x").expect("Failed to write file");
         env.core_handle
-            .trigger_online_backup(
-                &not_a_directory,
-                1,
-                BackupCompression::Gzip,
-                &BackupEncryptionConfig::default(),
-            )
+            .trigger_configured_online_backup()
             .await
             .expect_err("A backup into a file must fail");
         let (_, text) = get_metrics(&env).await;
         assert_eq!(sample(&text, FAILURES, LOCAL), Some(1.0));
         assert!(sample(&text, LAST_FAILURE, LOCAL).expect("sample") >= before.floor());
         assert_eq!(sample(&text, LAST_SUCCESS, LOCAL), Some(last_success));
+
+        // A backup to a location the configuration does not name is not counted.
+        let elsewhere = workdir.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).expect("Failed to create directory");
+        env.core_handle
+            .trigger_online_backup(
+                &elsewhere,
+                1,
+                BackupCompression::Gzip,
+                &BackupEncryptionConfig::default(),
+            )
+            .await
+            .expect("Online backup failed");
+        assert_eq!(metric(&env, LAST_SUCCESS, LOCAL).await, last_success);
 
         // The WAL archive synchronisation is recorded too.
         let before = now_secs();
@@ -259,8 +344,74 @@ fn test_metrics_endpoint_reports_backup_and_wal_archive_timestamps() {
             .await
             .expect("The WAL archive is enabled")
             .expect("WAL archive synchronisation failed");
-        assert!(metric(&env, PITR_LAST_SYNC, "").await >= before.floor());
+        assert!(metric(&env, PITR_LAST_SUCCESS, "").await >= before.floor());
 
+        env.core_handle.shutdown().await;
+    });
+}
+
+#[test]
+fn test_metrics_survive_a_restart() {
+    run(async {
+        let workdir = tempfile::tempdir().expect("Failed to create workdir");
+        let backup_dir = workdir.path().join("backups");
+        std::fs::create_dir_all(&backup_dir).expect("Failed to create backup directory");
+        let config = config_with_online_backup(
+            &workdir.path().join("source.db"),
+            OnlineBackup {
+                path: Some(backup_dir.clone()),
+                metrics_endpoint: true,
+                // Never during the test: the runs are triggered.
+                verify_schedule: Some("0 0 0 1 1 * 2099".to_string()),
+                ..OnlineBackup::default()
+            },
+        );
+        let mut env = kubidmd_testkit::setup_async_test(config.clone()).await;
+        populate(&env).await;
+        backup_now(&env, &backup_dir).await;
+        assert_eq!(
+            outcomes(&verify_now(&env).await),
+            vec![(BackupDestination::Local, BackupVerifyOutcome::Passed)]
+        );
+        let (_, before_restart) = get_metrics(&env).await;
+        let last_success = sample(&before_restart, LAST_SUCCESS, LOCAL).expect("sample");
+        let verified = sample(&before_restart, VERIFIED, LOCAL).expect("sample");
+        assert!(last_success > 0.0 && verified > 0.0, "{before_restart}");
+        env.core_handle.shutdown().await;
+        assert!(workdir.path().join(METRICS_STATE_FILE_NAME).is_file());
+
+        // The restarted server reports the backup and the verification of the previous
+        // run: an alert on their age does not fire because of the restart.
+        let mut env = kubidmd_testkit::setup_async_test(config.clone()).await;
+        let (_, text) = get_metrics(&env).await;
+        assert_eq!(
+            sample(&text, LAST_SUCCESS, LOCAL),
+            Some(last_success),
+            "{text}"
+        );
+        assert_eq!(sample(&text, VERIFIED, LOCAL), Some(verified), "{text}");
+        // The counters restart, as Prometheus expects of a restarted process.
+        assert_eq!(sample(&text, FAILURES, LOCAL), Some(0.0));
+        env.core_handle.shutdown().await;
+
+        // Without the state file (a first start after an upgrade), the last success comes
+        // from the newest backup in the directory, by the time in its name.
+        std::fs::remove_file(workdir.path().join(METRICS_STATE_FILE_NAME))
+            .expect("Failed to remove the state file");
+        let mut env = kubidmd_testkit::setup_async_test(config).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let seeded = loop {
+            let value = metric(&env, LAST_SUCCESS, LOCAL).await;
+            if value > 0.0 || tokio::time::Instant::now() > deadline {
+                break value;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        // The name has the time the backup was taken, to the millisecond or better.
+        assert!(
+            (seeded - last_success).abs() < 1.0,
+            "seeded {seeded}, recorded {last_success}"
+        );
         env.core_handle.shutdown().await;
     });
 }
@@ -287,12 +438,10 @@ fn test_scheduled_full_verification_of_an_encrypted_backup_updates_last_verified
         populate(&env).await;
 
         // Scheduled, so reported from the start; nothing to verify is not a failure.
-        assert_eq!(metric(&env, LAST_VERIFIED, LOCAL_FULL).await, 0.0);
+        assert_eq!(metric(&env, VERIFIED, LOCAL).await, 0.0);
 
         let before = now_secs();
-        let backup =
-            backup_via_production_path(&env, &backup_dir, BackupCompression::Gzip, &encryption)
-                .await;
+        let backup = backup_now(&env, &backup_dir).await;
         let name = backup
             .file_name()
             .and_then(|name| name.to_str())
@@ -301,16 +450,19 @@ fn test_scheduled_full_verification_of_an_encrypted_backup_updates_last_verified
         assert!(name.ends_with(".enc"), "{name}");
 
         // The schedule verifies the encrypted backup without any help.
-        wait_for_metric(&env, LAST_VERIFIED, LOCAL_FULL, before.floor()).await;
-        assert_eq!(metric(&env, VERIFICATION_FAILURES, LOCAL_FULL).await, 0.0);
+        wait_for_metric(&env, VERIFIED, LOCAL, before.floor()).await;
+        assert_eq!(metric(&env, VERIFICATION_FAILURES, LOCAL).await, 0.0);
 
         // An on demand run takes the same path and reports what it verified.
+        let results = verify_now(&env).await;
         assert_eq!(
-            verify_now(&env).await,
+            outcomes(&results),
             vec![(BackupDestination::Local, BackupVerifyOutcome::Passed)]
         );
-        // The scheduled verification never touches the backups.
-        let mut names: Vec<String> = std::fs::read_dir(&backup_dir)
+        assert_eq!(results[0].artifact.as_deref(), Some(name.as_str()));
+        // The scheduled verification never touches the backups, and leaves no scratch
+        // directory behind.
+        let names: Vec<String> = std::fs::read_dir(&backup_dir)
             .expect("Failed to read backup directory")
             .map(|entry| {
                 entry
@@ -320,18 +472,18 @@ fn test_scheduled_full_verification_of_an_encrypted_backup_updates_last_verified
                     .to_string()
             })
             .collect();
-        names.sort();
         assert_eq!(names, vec![name.clone()]);
 
-        // A newer artifact that can not be restored fails the verification loudly and is
-        // counted, by the schedule as by an on demand run.
-        let damaged = "backup-2099-01-01T00:00:00Z.json.gz.enc";
+        // The same artifact, with one byte of its ciphertext changed under its own name:
+        // only the authenticated decryption can tell, and the verification fails loudly
+        // and is counted, by the schedule as by an on demand run.
         let mut bytes = std::fs::read(&backup).expect("Failed to read backup");
         let middle = bytes.len() / 2;
         bytes[middle] ^= 0xff;
-        std::fs::write(backup_dir.join(damaged), bytes).expect("Failed to write backup");
-        let failures = metric(&env, VERIFICATION_FAILURES, LOCAL_FULL).await;
-        let outcome = verify_now(&env).await;
+        std::fs::write(&backup, bytes).expect("Failed to write backup");
+        let failures = metric(&env, VERIFICATION_FAILURES, LOCAL).await;
+        let before = now_secs();
+        let outcome = outcomes(&verify_now(&env).await);
         assert!(
             matches!(
                 outcome.as_slice(),
@@ -340,9 +492,187 @@ fn test_scheduled_full_verification_of_an_encrypted_backup_updates_last_verified
             ),
             "{outcome:?}"
         );
-        wait_for_metric(&env, VERIFICATION_FAILURES, LOCAL_FULL, failures + 1.0).await;
+        wait_for_metric(&env, VERIFICATION_FAILURES, LOCAL, failures + 1.0).await;
+        assert!(metric(&env, VERIFICATION_LAST_FAILURE, LOCAL).await >= before.floor());
+        // An artifact that fails is not an error of the verification.
+        assert_eq!(metric(&env, VERIFICATION_ERRORS, LOCAL).await, 0.0);
 
         env.core_handle.shutdown().await;
+        assert!(scratch_dirs(workdir.path()).is_empty());
+    });
+}
+
+/// The point of the full verification: an artifact that passes every structural check
+/// but can not be restored.
+#[test]
+fn test_scheduled_full_verification_detects_what_the_structural_check_can_not() {
+    run(async {
+        let workdir = tempfile::tempdir().expect("Failed to create workdir");
+        let backup_dir = workdir.path().join("backups");
+        std::fs::create_dir_all(&backup_dir).expect("Failed to create backup directory");
+        let config = config_with_online_backup(
+            &workdir.path().join("source.db"),
+            OnlineBackup {
+                path: Some(backup_dir.clone()),
+                metrics_endpoint: true,
+                compression: BackupCompression::NoCompression,
+                verify_schedule: Some("0 0 0 1 1 * 2099".to_string()),
+                ..OnlineBackup::default()
+            },
+        );
+        let mut env = kubidmd_testkit::setup_async_test(config).await;
+        populate(&env).await;
+        let backup = backup_now(&env, &backup_dir).await;
+
+        // Strip the uuid from one entry: the artifact still parses as a backup, with the
+        // same entry count and version, but the entry can no longer be restored.
+        let mut document: Value =
+            serde_json::from_slice(&std::fs::read(&backup).expect("Failed to read backup"))
+                .expect("Backup is not JSON");
+        let alice = document
+            .get_mut("entries")
+            .and_then(Value::as_array_mut)
+            .expect("Backup has no entries")
+            .iter_mut()
+            .filter_map(|entry| entry.pointer_mut("/ent/V3/attrs"))
+            .filter_map(Value::as_object_mut)
+            .find(|attrs| {
+                attrs
+                    .get("name")
+                    .is_some_and(|name| name.to_string().contains(BACKUP_USER_ALICE))
+            })
+            .expect("Alice is not in the backup");
+        alice.remove("uuid").expect("Alice has no uuid");
+        std::fs::write(
+            &backup,
+            serde_json::to_vec(&document).expect("Failed to serialise backup"),
+        )
+        .expect("Failed to write backup");
+
+        let outcome = outcomes(&verify_now(&env).await);
+        assert!(
+            matches!(
+                outcome.as_slice(),
+                [(BackupDestination::Local, BackupVerifyOutcome::Failed(reasons))]
+                    if reasons.iter().any(|reason| reason.contains("restore failed"))
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(metric(&env, VERIFICATION_FAILURES, LOCAL).await, 1.0);
+        assert_eq!(metric(&env, VERIFIED, LOCAL).await, 0.0);
+
+        env.core_handle.shutdown().await;
+    });
+}
+
+/// A verification that can not run says so, without calling the backup unrestorable.
+#[test]
+fn test_scheduled_verification_that_can_not_run_is_an_error() {
+    run(async {
+        let workdir = tempfile::tempdir().expect("Failed to create workdir");
+        let backup_dir = workdir.path().join("backups");
+        std::fs::create_dir_all(&backup_dir).expect("Failed to create backup directory");
+        // The scratch space is unusable: a file stands where its directory should be.
+        let scratch = workdir.path().join("scratch");
+        std::fs::write(&scratch, b"x").expect("Failed to write file");
+        let config = config_with_online_backup(
+            &workdir.path().join("source.db"),
+            OnlineBackup {
+                path: Some(backup_dir.clone()),
+                metrics_endpoint: true,
+                verify_schedule: Some("0 0 0 1 1 * 2099".to_string()),
+                verify_temp_path: Some(scratch),
+                ..OnlineBackup::default()
+            },
+        );
+        let mut env = kubidmd_testkit::setup_async_test(config).await;
+        populate(&env).await;
+        let backup = backup_now(&env, &backup_dir).await;
+
+        let results = verify_now(&env).await;
+        assert!(
+            matches!(
+                outcomes(&results).as_slice(),
+                [(BackupDestination::Local, BackupVerifyOutcome::Error(_))]
+            ),
+            "{results:?}"
+        );
+        assert_eq!(
+            results[0].artifact.as_deref(),
+            backup.file_name().and_then(|name| name.to_str())
+        );
+        let (_, text) = get_metrics(&env).await;
+        assert_eq!(
+            sample(&text, VERIFICATION_ERRORS, LOCAL),
+            Some(1.0),
+            "{text}"
+        );
+        assert_eq!(sample(&text, VERIFICATION_FAILURES, LOCAL), Some(0.0));
+        assert_eq!(sample(&text, VERIFICATION_LAST_FAILURE, LOCAL), Some(0.0));
+
+        env.core_handle.shutdown().await;
+    });
+}
+
+/// A shutdown during a verification neither waits for the whole restore nor leaves the
+/// restored database behind, and the scratch directories of a run that was killed are
+/// removed at the next start.
+#[test]
+fn test_shutdown_during_a_verification_leaves_no_scratch_data() {
+    run(async {
+        let workdir = tempfile::tempdir().expect("Failed to create workdir");
+        let backup_dir = workdir.path().join("backups");
+        std::fs::create_dir_all(&backup_dir).expect("Failed to create backup directory");
+
+        // What a killed run leaves behind, in the default scratch location: the
+        // directory of the database.
+        let stale = workdir.path().join(format!("{SCRATCH_DIR_PREFIX}killed"));
+        std::fs::create_dir_all(&stale).expect("Failed to create directory");
+        std::fs::write(stale.join("verify.db"), b"restored data").expect("Failed to write");
+
+        let config = config_with_online_backup(
+            &workdir.path().join("source.db"),
+            OnlineBackup {
+                path: Some(backup_dir.clone()),
+                metrics_endpoint: true,
+                verify_schedule: Some("* * * * * * *".to_string()),
+                ..OnlineBackup::default()
+            },
+        );
+        let mut env = kubidmd_testkit::setup_async_test(config).await;
+        assert!(
+            !stale.exists(),
+            "the start must remove the stale scratch data"
+        );
+        populate(&env).await;
+        backup_now(&env, &backup_dir).await;
+
+        // Shut down while a scheduled run has its scratch data on disk.
+        let deadline = tokio::time::Instant::now() + SCHEDULED_VERIFICATION_TIMEOUT;
+        while scratch_dirs(workdir.path()).is_empty() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no scheduled verification started"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        env.core_handle.shutdown().await;
+
+        // The abandoned run stops before its next step and removes its scratch data.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        while !scratch_dirs(workdir.path()).is_empty() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "scratch data left behind: {:?}",
+                scratch_dirs(workdir.path())
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // An abandoned run is neither a failure nor an error.
+        let state = std::fs::read_to_string(workdir.path().join(METRICS_STATE_FILE_NAME))
+            .unwrap_or_default();
+        assert!(!state.contains("verification_last_failure"), "{state}");
+        assert!(!state.contains("verification_last_error"), "{state}");
     });
 }
 
@@ -371,17 +701,19 @@ fn test_s3_metrics_and_scheduled_verification() {
         let workdir = tempfile::tempdir().expect("Failed to create workdir");
         let backup_dir = workdir.path().join("backups");
         std::fs::create_dir_all(&backup_dir).expect("Failed to create backup directory");
+        let encryption = encryption(workdir.path());
         let config = config_with_online_backup(
             &workdir.path().join("source.db"),
             OnlineBackup {
                 path: Some(backup_dir.clone()),
                 s3: Some(primary.clone()),
                 metrics_endpoint: true,
-                encryption: encryption(workdir.path()),
+                encryption: encryption.clone(),
+                verify_schedule: Some("0 0 0 1 1 * 2099".to_string()),
                 ..OnlineBackup::default()
             },
         );
-        let mut env = kubidmd_testkit::setup_async_test(config).await;
+        let mut env = kubidmd_testkit::setup_async_test(config.clone()).await;
         populate(&env).await;
 
         let (_, text) = get_metrics(&env).await;
@@ -391,39 +723,30 @@ fn test_s3_metrics_and_scheduled_verification() {
 
         // The scheduled backup run stores one artifact locally, in S3 and in the region.
         let before = now_secs();
-        env.core_handle
-            .trigger_configured_online_backup()
-            .await
-            .expect("Online backup failed");
+        backup_now(&env, &backup_dir).await;
+        let after = now_secs();
         let (_, text) = get_metrics(&env).await;
-        for (name, labels) in [
-            (LAST_SUCCESS, LOCAL),
-            (LAST_SUCCESS, S3),
-            (LAST_SUCCESS, region_labels.as_str()),
-            (LAST_VERIFIED, LOCAL_STRUCTURAL),
-            (LAST_VERIFIED, S3_STRUCTURAL),
-        ] {
-            assert!(
-                sample(&text, name, labels).expect("sample") >= before.floor(),
-                "{name}{{{labels}}} in\n{text}"
-            );
-        }
         for labels in [LOCAL, S3, region_labels.as_str()] {
+            assert_time_within(&text, LAST_SUCCESS, labels, before, after);
             assert_eq!(sample(&text, FAILURES, labels), Some(0.0), "{text}");
         }
 
         // The full verification of the newest local and S3 artifacts, the same backup:
-        // the download is checked against its sidecar and counts as verified as well.
+        // the download is checked against its sidecar, and the verification of the local
+        // copy counts for it instead of a second restore.
         let before = now_secs();
+        let results = verify_now(&env).await;
         assert_eq!(
-            verify_now(&env).await,
+            outcomes(&results),
             vec![
                 (BackupDestination::Local, BackupVerifyOutcome::Passed),
                 (BackupDestination::S3, BackupVerifyOutcome::Passed),
             ]
         );
-        for labels in [LOCAL_FULL, S3_FULL] {
-            assert!(metric(&env, LAST_VERIFIED, labels).await >= before.floor());
+        assert!(!results[0].reused_local);
+        assert!(results[1].reused_local, "{results:?}");
+        for labels in [LOCAL, S3] {
+            assert!(metric(&env, VERIFIED, labels).await >= before.floor());
             assert_eq!(metric(&env, VERIFICATION_FAILURES, labels).await, 0.0);
         }
 
@@ -438,15 +761,72 @@ fn test_s3_metrics_and_scheduled_verification() {
             )
             .await
             .expect("S3 backup failed");
+        let results = verify_now(&env).await;
         assert_eq!(
-            verify_now(&env).await,
+            outcomes(&results),
             vec![
                 (BackupDestination::Local, BackupVerifyOutcome::Passed),
                 (BackupDestination::S3, BackupVerifyOutcome::Passed),
             ]
         );
+        assert!(!results[1].reused_local, "{results:?}");
 
+        // An artifact that can not be produced (the key is gone) fails every destination,
+        // the region it never reached included.
+        let last_success = metric(&env, LAST_SUCCESS, region_labels.as_str()).await;
+        let passphrase_file = encryption
+            .passphrase_file
+            .clone()
+            .expect("A passphrase file");
+        std::fs::remove_file(&passphrase_file).expect("Failed to remove the passphrase");
+        env.core_handle
+            .trigger_configured_online_backup()
+            .await
+            .expect_err("A backup without its key must fail");
+        let (_, text) = get_metrics(&env).await;
+        for labels in [LOCAL, S3, region_labels.as_str()] {
+            assert_eq!(
+                sample(&text, FAILURES, labels),
+                Some(1.0),
+                "{labels}: {text}"
+            );
+        }
+        assert_eq!(
+            sample(&text, LAST_SUCCESS, region_labels.as_str()),
+            Some(last_success)
+        );
         env.core_handle.shutdown().await;
+
+        // Without a state file, a restarted server takes the last success of S3 and of the
+        // region from the newest backup each holds.
+        std::fs::remove_file(workdir.path().join(METRICS_STATE_FILE_NAME))
+            .expect("Failed to remove the state file");
+        std::fs::write(&passphrase_file, "observability e2e passphrase\n")
+            .expect("Failed to write the passphrase");
+        let mut env = kubidmd_testkit::setup_async_test(config).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let (_, text) = get_metrics(&env).await;
+            let seeded = [S3, region_labels.as_str()]
+                .iter()
+                .all(|labels| sample(&text, LAST_SUCCESS, labels).is_some_and(|v| v > 0.0));
+            if seeded {
+                // Both hold the newest backup, the one copied to the region on upload.
+                assert_eq!(
+                    sample(&text, LAST_SUCCESS, S3),
+                    sample(&text, LAST_SUCCESS, &region_labels),
+                    "{text}"
+                );
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "S3 last success never seeded:\n{text}"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        env.core_handle.shutdown().await;
+
         delete_prefix(&sdk, &primary).await;
         delete_prefix(&sdk, &region.to_s3_config()).await;
     });
