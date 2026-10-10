@@ -14,6 +14,8 @@ The automatic backup is built from parts that can be combined freely:
 - **[Client-side encryption](#client-side-backup-encryption)** of everything that leaves the server.
 - **[Point-in-time recovery](#point-in-time-recovery)** (PITR), which archives every committed write so that the
   database can be rebuilt as of any moment between backups.
+- **[Monitoring](#monitoring-backups)**: a scheduled full verification of the newest backup, and Prometheus metrics of
+  when every backup location last received, failed and verified a backup.
 
 [How the Features Combine](#how-the-features-combine) summarises what each combination does and how to recover from it.
 
@@ -753,7 +755,8 @@ kubidmd database verify-backup -c /data/server.toml /backup/backup-2024-01-01T22
 
 Full verification is the default level. It loads the whole backup into a temporary database, so it needs disk space and
 time proportional to the size of the backup. The command exits non-zero and prints the reasons when verification fails,
-which makes it suitable for backup automation.
+which makes it suitable for backup automation. The running server can also run it on a schedule, see
+[Scheduled Full Verification](#scheduled-full-verification).
 
 ### Verifying S3 Backups
 
@@ -772,6 +775,123 @@ the configuration, and `--bucket` is required when the configuration has no `[on
 `--region <name>` verifies the copy held by a replication region instead, see
 [Recovering from a Region](#recovering-from-a-region). The command exits non-zero when the checksum does not match or
 when verification at the requested level fails.
+
+## Monitoring Backups
+
+A backup that silently stopped being taken, or that can no longer be restored, is only noticed when it is needed. The
+server can prove the restorability of its newest backup on a schedule, and expose when every backup location last
+received, failed and verified a backup, so that both can be alerted on.
+
+### Scheduled Full Verification
+
+With `verify_schedule` set, the server runs the [full verification](#full-verification) of its newest backup on that
+schedule, using the same cron syntax as `schedule`. It is off by default and requires `enabled = true`.
+
+```toml
+[online_backup]
+path = "/var/lib/kubidm/backups"
+schedule = "00 22 * * *"
+# Every Sunday at 03:30 UTC
+verify_schedule = "30 3 * * Sun"
+```
+
+A run verifies the newest backup of the local backup directory and, when `[online_backup.s3]` is configured, the newest
+complete backup of the S3 prefix, each picked by the time in its name:
+
+- A local backup is first copied into a temporary directory, so that retention removing it meanwhile can not fail the
+  run. An S3 backup is downloaded and checked against the SHA-256 of its metadata sidecar.
+- The artifact is opened as a restore opens it (an encrypted backup is decrypted with the configured key), checked
+  structurally, restored into a temporary database through the production restore and reindex code, booted as a server
+  start would boot it, and checked with the consistency checks of `kubidmd database verify`.
+- When the newest S3 backup holds exactly the bytes of the local backup the same run just verified (the same name and
+  SHA-256, as it does when one online backup stored both), that verification counts for both instead of restoring the
+  same backup twice. The download is still checked.
+- The result is logged: an info line when the backup passed, an error with the reasons when it failed. It updates the
+  `level="full"` verification metrics below.
+
+The live database is never opened. The temporary files, the copied or downloaded artifact and the scratch database, live
+in the directory named by `TMPDIR` (`/tmp` by default) and are removed when the run ends. The scratch database is not
+encrypted, like the one of `kubidmd database verify-backup`; keep `TMPDIR` as private as the database directory.
+
+Things to plan for:
+
+- **Resources.** The verification boots a second database inside the server process: it needs the disk space, memory and
+  time of a restore, proportional to the size of the database. Schedule it outside busy hours, and less often than the
+  backups for a large directory.
+- **Never in the way of a backup.** The verification runs in its own task, so a scheduled backup is never delayed or
+  skipped by it, and the blocking work runs on the blocking thread pool, never on the threads that serve requests.
+- **No overlap.** A run that outlasts the gap to its next scheduled time skips the times that are already past; two runs
+  never overlap.
+- **Nothing to verify yet** (no backup was taken) is logged as a warning, not counted as a failure: the last success
+  metric already shows it.
+- **Maintenance and shutdown.** A run is skipped while the node is in maintenance (drained or fenced), since the scratch
+  server writes while it boots. On shutdown, a run in progress stops at its next step and removes its temporary files;
+  neither is counted as a failure.
+
+### Backup Metrics
+
+With `metrics_endpoint = true` the server serves its backup metrics in the Prometheus text exposition format on
+`GET /metrics`, on the HTTPS listener and without authentication. It is off by default: the metrics reveal when backups
+run, where they are stored (the names of the replication regions) and whether they fail. Without it, `/metrics` answers
+404 like any other unknown path.
+
+```toml
+[online_backup]
+path = "/var/lib/kubidm/backups"
+metrics_endpoint = true
+```
+
+| Metric                                                      | Type    | Labels                  | Meaning                                                            |
+| ----------------------------------------------------------- | ------- | ----------------------- | ------------------------------------------------------------------ |
+| `kubidm_backup_last_success_timestamp_seconds`              | gauge   | `destination`, `region` | Unix time of the last backup stored in the destination             |
+| `kubidm_backup_last_failure_timestamp_seconds`              | gauge   | `destination`, `region` | Unix time of the last backup that could not be stored there        |
+| `kubidm_backup_failures_total`                              | counter | `destination`, `region` | Backups that could not be stored there                             |
+| `kubidm_backup_last_verified_timestamp_seconds`             | gauge   | `destination`, `level`  | Unix time the newest artifact last passed a verification           |
+| `kubidm_backup_verification_last_failure_timestamp_seconds` | gauge   | `destination`, `level`  | Unix time the newest artifact last failed a scheduled verification |
+| `kubidm_backup_verification_failures_total`                 | counter | `destination`, `level`  | Scheduled verifications the newest artifact failed                 |
+| `kubidm_backup_pitr_last_sync_timestamp_seconds`            | gauge   |                         | Unix time of the last successful WAL archive synchronisation       |
+| `kubidm_backup_pitr_last_sync_failure_timestamp_seconds`    | gauge   |                         | Unix time of the last failed WAL archive synchronisation           |
+| `kubidm_backup_pitr_sync_failures_total`                    | counter |                         | Failed WAL archive synchronisations                                |
+
+- `destination` is `local` (`online_backup.path`), `s3` (`[online_backup.s3]`) or `s3_region`, with `region` set to the
+  name of the replication region. A region counts a backup as stored when the copy made by the backup run, or later by
+  the replication monitor, succeeded; it counts a failure when such a copy failed or the region could not be listed.
+- `level` is `structural` for the check every online backup runs on its artifact before it is stored (so it moves with
+  the last success; an artifact that fails it is a failed backup), and `full` for the
+  [scheduled full verification](#scheduled-full-verification). Regions are not verified on their own: they hold copies
+  of the verified S3 artifact. The `full` series exist when `verify_schedule` is set.
+- The values are kept in memory since the server started. Every destination the configuration names is reported from the
+  start, with `0` for "not since the server started", so an alert on a stale timestamp also fires for a destination that
+  never received a backup. The WAL archive series exist when `[online_backup.wal_archive]` is enabled.
+- Backups taken by `kubidmd database backup` and verifications by `kubidmd database verify-backup` run in another
+  process and are not counted.
+
+A scrape configuration and alert rules for a daily backup and a weekly verification:
+
+```yaml
+scrape_configs:
+  - job_name: kubidm
+    scheme: https
+    static_configs:
+      - targets: ["idm.example.com:8443"]
+
+groups:
+  - name: kubidm-backups
+    rules:
+      - alert: KubidmBackupStale
+        expr: time() - kubidm_backup_last_success_timestamp_seconds > 26 * 3600
+      - alert: KubidmBackupFailing
+        expr: increase(kubidm_backup_failures_total[1d]) > 0
+      - alert: KubidmBackupNotVerified
+        expr: time() - kubidm_backup_last_verified_timestamp_seconds{level="full"} > 8 * 86400
+      - alert: KubidmBackupVerificationFailing
+        expr: increase(kubidm_backup_verification_failures_total[8d]) > 0
+      - alert: KubidmWalArchiveStale
+        expr: time() - kubidm_backup_pitr_last_sync_timestamp_seconds > 3 * 300
+```
+
+Since the values restart at `0` with the server, a stale alert fires after a restart until the next backup; give it a
+`for:` duration, or a threshold above the backup interval, that covers this.
 
 ## Method 2 - Manual Backup
 

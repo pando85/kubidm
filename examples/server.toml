@@ -162,6 +162,19 @@ schedule = "00 22 * * *"
 # Defaults to "gzip" if unspecified.
 compression = "gzip"
 
+#   Scheduled full verification of the newest backup (optional, off by default). On this
+#   schedule (same syntax as `schedule`) the server restores the newest local backup, and
+#   the newest S3 backup when [online_backup.s3] is set, into a temporary database in
+#   $TMPDIR, boots it and checks it exactly as `kubidmd database verify-backup` does. It
+#   never opens the live database, never delays a backup, and needs the disk space, memory
+#   and time of a restore. A failure is logged as an error and counted in the metrics.
+#   Requires enabled = true.
+# verify_schedule = "30 3 * * Sun"
+#   Serve the backup metrics (last success, last failure and last verification time per
+#   backup destination, WAL archive synchronisation) in the Prometheus text format on
+#   GET /metrics, without authentication (default false).
+# metrics_endpoint = true
+
 #   S3-compatible backup storage (optional)
 #   If configured, backups will also be uploaded to S3.
 #   Supports AWS S3, MinIO, Ceph, GCS, Azure Blob via S3 API.
