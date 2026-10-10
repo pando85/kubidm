@@ -2362,7 +2362,7 @@ impl<'a> BackendWriteTransaction<'a> {
         let mut archiver = wal.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 
         if wal_stage_failed {
-            archiver.note_failure();
+            archiver.note_failure(wal_cid.as_ref().map(|cid| cid.ts));
             error!(
                 "WAL ARCHIVE HOLE: a committed transaction could not be fully recorded; \
                  point-in-time recovery can not reproduce it. Take a new base backup."
@@ -2370,7 +2370,7 @@ impl<'a> BackendWriteTransaction<'a> {
         }
 
         let Some(cid) = wal_cid else {
-            archiver.note_failure();
+            archiver.note_failure(None);
             error!(
                 records = wal_pending.len(),
                 "WAL ARCHIVE HOLE: a committed transaction carried no CID and its records were \
@@ -2383,7 +2383,7 @@ impl<'a> BackendWriteTransaction<'a> {
         match archiver.append_transaction(&cid, wal_truncate, wal_pending) {
             Ok(_) => trace!(%cid, records = record_count, "WAL records archived"),
             Err(err) => {
-                archiver.note_failure();
+                archiver.note_failure(Some(cid.ts));
                 error!(
                     ?err,
                     %cid,
@@ -2427,7 +2427,13 @@ impl<'a> BackendWriteTransaction<'a> {
                 return;
             }
         };
-        let op = if create && !self.wal_pending.contains_key(&e.get_id()) {
+        // An entry created earlier in this transaction stays a create when a later step
+        // of the same transaction (a plugin, for example) modifies it again.
+        let created_in_txn = matches!(
+            self.wal_pending.get(&e.get_id()),
+            Some(WalPendingOp::Create { .. })
+        );
+        let op = if (create && !self.wal_pending.contains_key(&e.get_id())) || created_in_txn {
             WalPendingOp::Create {
                 entry_uuid,
                 entry_data,
@@ -4637,15 +4643,15 @@ mod tests {
     fn wal_test_idxmeta() -> Vec<IdxKey> {
         vec![
             IdxKey {
-                attr: Attribute::Name.into(),
+                attr: Attribute::Name,
                 itype: IndexType::Equality,
             },
             IdxKey {
-                attr: Attribute::Uuid.into(),
+                attr: Attribute::Uuid,
                 itype: IndexType::Equality,
             },
             IdxKey {
-                attr: Attribute::Uuid.into(),
+                attr: Attribute::Uuid,
                 itype: IndexType::Presence,
             },
         ]
@@ -4853,6 +4859,48 @@ mod tests {
         let segments = crate::repl::wal::list_segments(locked.segments_path()).unwrap();
         assert_eq!(segments.len(), 1);
         assert_eq!(segments[0].entry_count, 1);
+    }
+
+    #[test]
+    fn test_be_wal_create_then_modify_in_one_transaction_stays_a_create() {
+        let dir = tempfile::tempdir().unwrap();
+        let be = wal_backend(dir.path(), 1024 * 1024);
+        let archiver = be.wal_archiver().unwrap();
+
+        let mut be_txn = be.write().unwrap();
+        let e1 = wal_test_entry("william", "db237e8a-0079-4b8c-8a56-593b22aa44d1");
+        let created = be_txn
+            .create(&CID_ZERO, vec![e1.into_sealed_new()])
+            .unwrap();
+        let c1 = created[0].clone();
+        let mut modified = wal_test_entry("william", "db237e8a-0079-4b8c-8a56-593b22aa44d1");
+        modified.add_ava(Attribute::DisplayName, Value::new_utf8s("William"));
+        let modified = modified
+            .into_sealed_new()
+            .into_sealed_committed_id(c1.get_id());
+        be_txn
+            .modify(&CID_ZERO, &[Arc::new(c1)], std::slice::from_ref(&modified))
+            .unwrap();
+        assert_eq!(be_txn.wal_pending_len(), 1);
+        be_txn.commit().unwrap();
+
+        let segment = archiver
+            .lock()
+            .unwrap()
+            .flush_current_segment()
+            .unwrap()
+            .unwrap();
+        let file =
+            crate::repl::wal::read_segment_file(&dir.path().join("wal").join(&segment.segment_id))
+                .unwrap();
+        assert_eq!(file.entries.len(), 1);
+        assert_eq!(
+            file.entries[0].operation,
+            WalOperationRecord::Create {
+                entry_data: wal_entry_bytes(&modified)
+            },
+            "the record holds the final state and keeps the create"
+        );
     }
 
     #[test]
