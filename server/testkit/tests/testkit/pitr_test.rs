@@ -22,14 +22,14 @@ use kubidm_proto::backup::{
     WalArchiveConfig, PITR_MANIFEST_KEY,
 };
 use kubidmd_core::backup::pitr::{
-    pitr_list_server_core, pitr_recover_server_core, PitrArchive, PitrError, PitrSettings,
-    RecoveryTargetSpec, HANDED_OVER_BASES_DIR,
+    check_wal_replication, pitr_list_server_core, pitr_recover_server_core, PitrArchive, PitrError,
+    PitrSettings, RecoveryTargetSpec, RegionManifestState, HANDED_OVER_BASES_DIR,
 };
 use kubidmd_core::backup::{is_encrypted_artifact, MIN_KDF_M_COST};
 use kubidmd_core::config::{Configuration, OnlineBackup};
 use kubidmd_core::{
-    backup_server_core, dbscan_quarantine_id2entry_core, dbscan_restore_quarantined_core, restore_s3_database,
-    restore_server_core, RestoreStatus,
+    backup_server_core, dbscan_quarantine_id2entry_core, dbscan_restore_quarantined_core,
+    replicate_status_server_core, restore_s3_database, restore_server_core, RestoreStatus,
 };
 use kubidmd_lib::be::SharedWalArchiver;
 use kubidmd_lib::repl::wal::{format_ts_rfc3339, list_segments, read_pending_events, WalArchiver};
@@ -376,7 +376,9 @@ fn test_pitr_dbscan_repairs_are_gaps_recovery_does_not_cross() {
             .await
             .expect("Failed to create the person before the repair");
         env.core_handle.shutdown().await;
-        assert!(read_manifest(&wal_dir.join(PITR_MANIFEST_KEY)).gaps.is_empty());
+        assert!(read_manifest(&wal_dir.join(PITR_MANIFEST_KEY))
+            .gaps
+            .is_empty());
 
         // The server is stopped: quarantine an entry and put it back.
         dbscan_quarantine_id2entry_core(&config, 1).await;
@@ -500,14 +502,10 @@ fn test_pitr_manual_backup_in_the_base_directory_is_a_base() {
 
         let recovered_db = workdir.path().join("recovered.db");
         let recovered_config = pitr_config(&recovered_db, &backup_dir, &wal_dir, None);
-        let outcome = pitr_recover_server_core(
-            &recovered_config,
-            &RecoveryTargetSpec::Latest,
-            false,
-            None,
-        )
-        .await
-        .expect("Recovery from the manual backup failed");
+        let outcome =
+            pitr_recover_server_core(&recovered_config, &RecoveryTargetSpec::Latest, false, None)
+                .await
+                .expect("Recovery from the manual backup failed");
         assert_eq!(outcome.plan.base.key, key);
         let mut recovered = setup_async_test(recovered_config).await;
         login_put_admin_idm_admins(&recovered.rsclient).await;
@@ -1017,6 +1015,162 @@ fn test_pitr_s3_encrypted_replicated_recover_from_region() {
             region_manifest.segments
         );
         assert!(segment_keys(&object_keys(&sdk, &region_s3).await).is_empty());
+
+        delete_prefix(&sdk, &s3_config).await;
+        delete_prefix(&sdk, &region_s3).await;
+    }));
+}
+
+/// `replicate-status` reports the replicated WAL archive per region (manifest and every
+/// segment copy), and the archive runs of the server repair what a region lost or holds
+/// damaged, so that a recovery from the region works again.
+#[test]
+fn test_pitr_s3_replicate_status_reports_and_the_archive_repairs_region_copies() {
+    let Some(mut s3_config) = test_s3_config("pitr-status") else {
+        return;
+    };
+    let region = test_s3_region(&s3_config, PITR_REGION, "pitr-status-dr");
+    s3_config.replication = Some(ReplicationConfig {
+        enabled: true,
+        regions: vec![region.clone()],
+        sync_interval_seconds: 3600,
+    });
+    let region_s3 = region.to_s3_config();
+
+    run(Box::pin(async {
+        let sdk = sdk_client(&s3_config).await;
+        ensure_bucket(&sdk, &s3_config.bucket).await;
+        ensure_bucket(&sdk, &region_s3.bucket).await;
+        let workdir = tempfile::tempdir().expect("Failed to create workdir");
+        let config = pitr_config(
+            &workdir.path().join("source.db"),
+            &workdir.path().join("backups"),
+            &workdir.path().join("wal"),
+            Some(s3_config.clone()),
+        );
+        let settings = PitrSettings::from_config(&config)
+            .expect("Invalid PITR settings")
+            .expect("PITR is enabled");
+
+        let mut env = setup_async_test(config.clone()).await;
+        populate(&env).await;
+        env.core_handle
+            .trigger_s3_backup(
+                s3_config.clone(),
+                7,
+                BackupCompression::Gzip,
+                &Default::default(),
+            )
+            .await
+            .expect("Replicated S3 backup failed");
+        env.rsclient
+            .idm_person_account_create(PITR_USER_BEFORE, "Before")
+            .await
+            .expect("Failed to create a person");
+        archive_now(&env).await;
+        env.rsclient
+            .idm_person_account_create(PITR_USER_AFTER, "After")
+            .await
+            .expect("Failed to create a person");
+        env.core_handle.shutdown().await;
+
+        // Everything is replicated: backups and archive.
+        let health = check_wal_replication(&settings)
+            .await
+            .expect("Unable to check the WAL archive replication")
+            .expect("The archive is replicated");
+        assert!(health.is_healthy(), "{health:#?}");
+        assert!(health.segments >= 2, "{health:#?}");
+        assert!(replicate_status_server_core(&config, true).await);
+
+        // The region loses one segment, holds a truncated copy of another, and its
+        // manifest is overwritten with something unreadable.
+        let segments = segment_keys(&object_keys(&sdk, &region_s3).await);
+        let region_prefix = region_s3.path_prefix.as_deref().expect("No prefix");
+        sdk.delete_object()
+            .bucket(&region_s3.bucket)
+            .key(format!("{region_prefix}/{}", segments[0]))
+            .send()
+            .await
+            .expect("Failed to delete a region segment");
+        for (key, body) in [
+            (segments[1].as_str(), b"truncated".as_slice()),
+            (PITR_MANIFEST_KEY, b"{ not a manifest".as_slice()),
+        ] {
+            sdk.put_object()
+                .bucket(&region_s3.bucket)
+                .key(format!("{region_prefix}/{key}"))
+                .body(ByteStream::from(body.to_vec()))
+                .send()
+                .await
+                .expect("Failed to damage a region object");
+        }
+        let health = check_wal_replication(&settings)
+            .await
+            .expect("Unable to check the WAL archive replication")
+            .expect("The archive is replicated");
+        let region_health = &health.regions[0];
+        assert!(!health.is_healthy());
+        assert!(
+            matches!(region_health.manifest, RegionManifestState::Damaged(_)),
+            "{region_health:#?}"
+        );
+        assert_eq!(
+            region_health.segments.missing.len(),
+            1,
+            "{region_health:#?}"
+        );
+        assert_eq!(
+            region_health.segments.damaged.len(),
+            1,
+            "{region_health:#?}"
+        );
+        assert!(!replicate_status_server_core(&config, true).await);
+        let unreadable = pitr_recover_server_core(
+            &pitr_config(
+                &workdir.path().join("unused.db"),
+                &workdir.path().join("backups"),
+                &workdir.path().join("wal"),
+                Some(s3_config.clone()),
+            ),
+            &RecoveryTargetSpec::Latest,
+            true,
+            Some(PITR_REGION),
+        )
+        .await;
+        assert!(unreadable.is_err(), "{unreadable:?}");
+
+        // The archive run of the next start repairs the region.
+        let mut env = setup_async_test(config.clone()).await;
+        archive_now(&env).await;
+        env.core_handle.shutdown().await;
+        let health = check_wal_replication(&settings)
+            .await
+            .expect("Unable to check the WAL archive replication")
+            .expect("The archive is replicated");
+        assert!(health.is_healthy(), "{health:#?}");
+        assert!(replicate_status_server_core(&config, false).await);
+
+        // And the region recovers the latest state again.
+        let recovered_config = pitr_config(
+            &workdir.path().join("recovered.db"),
+            &workdir.path().join("backups"),
+            &workdir.path().join("wal"),
+            Some(s3_config.clone()),
+        );
+        pitr_recover_server_core(
+            &recovered_config,
+            &RecoveryTargetSpec::Latest,
+            false,
+            Some(PITR_REGION),
+        )
+        .await
+        .expect("Recovery from the repaired region failed");
+        let mut env = setup_async_test(recovered_config).await;
+        login_put_admin_idm_admins(&env.rsclient).await;
+        assert!(person_exists(&env.rsclient, PITR_USER_BEFORE).await);
+        assert!(person_exists(&env.rsclient, PITR_USER_AFTER).await);
+        env.core_handle.shutdown().await;
 
         delete_prefix(&sdk, &s3_config).await;
         delete_prefix(&sdk, &region_s3).await;

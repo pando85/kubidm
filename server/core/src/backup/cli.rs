@@ -936,22 +936,45 @@ async fn list_s3_backups(config: &Configuration, region: Option<&str>) -> bool {
     ok
 }
 
-/// Report the state of cross-region backup replication: for every configured region,
-/// which of the primary's backups it holds intact, its newest backup and how far it lags
-/// behind the primary. `detailed` adds the lag metrics of every region. The database is
-/// never opened, so the command can run next to a running server.
+/// Report the state of cross-region replication: for every configured region, which of
+/// the primary's backups it holds intact, its newest backup and how far it lags behind the
+/// primary; and, when the WAL archive of point-in-time recovery is replicated, whether
+/// every region holds a current copy of its manifest and an intact copy of every segment.
+/// `detailed` adds the lag metrics of every region and the segments it misses. The database
+/// is never opened, so the command can run next to a running server.
 ///
-/// Returns false when replication is not configured or disabled, when the primary bucket
-/// can not be listed, or when any region is unhealthy, so the exit code of
+/// Returns false when neither backups nor the WAL archive are replicated, when a primary
+/// location can not be read, or when any region is unhealthy, so the exit code of
 /// `replicate-status` is usable from monitoring.
 pub async fn replicate_status_server_core(config: &Configuration, detailed: bool) -> bool {
+    let backups = backup_replication_status(config, detailed).await;
+    let pitr_settings = match pitr::PitrSettings::from_config(config) {
+        Ok(settings) => settings,
+        Err(err) => {
+            println!("WAL archive replication: invalid configuration: {err}");
+            return false;
+        }
+    };
+    if pitr_settings.is_some() {
+        println!();
+    }
+    let wal = pitr::wal_replication_status(pitr_settings.as_ref(), detailed).await;
+    match (backups, wal) {
+        (None, None) => false,
+        (backups, wal) => backups.unwrap_or(true) && wal.unwrap_or(true),
+    }
+}
+
+/// The backup part of `replicate-status`: prints the report and returns whether every
+/// region is healthy, or None when backup replication is not configured.
+async fn backup_replication_status(config: &Configuration, detailed: bool) -> Option<bool> {
     let Some(s3_config) = config
         .online_backup
         .as_ref()
         .and_then(|backup| backup.s3.clone())
     else {
         println!("Cross-region backup replication: not configured ([online_backup.s3] is absent)");
-        return false;
+        return None;
     };
 
     let Some(replication) = s3_config
@@ -963,7 +986,7 @@ pub async fn replicate_status_server_core(config: &Configuration, detailed: bool
             "Cross-region backup replication: not configured ([online_backup.s3.replication] \
              is absent or disabled)"
         );
-        return false;
+        return None;
     };
 
     let primary = s3_location(&s3_config);
@@ -972,7 +995,7 @@ pub async fn replicate_status_server_core(config: &Configuration, detailed: bool
         Err(err) => {
             error!(%err, "Unable to create the S3 client");
             println!("Cross-region backup replication: unable to create the S3 client: {err}");
-            return false;
+            return Some(false);
         }
     };
 
@@ -988,7 +1011,7 @@ pub async fn replicate_status_server_core(config: &Configuration, detailed: bool
                 "Cross-region backup replication: unable to list the primary backups in \
                  {primary}: {err}"
             );
-            return false;
+            return Some(false);
         }
     };
 
@@ -997,7 +1020,7 @@ pub async fn replicate_status_server_core(config: &Configuration, detailed: bool
         format_replication_report(&primary, &health, &replication, detailed)
     );
 
-    !health.regions.is_empty() && health.unhealthy_regions == 0
+    Some(!health.regions.is_empty() && health.unhealthy_regions == 0)
 }
 
 /// The text `replicate-status` prints for a health check.

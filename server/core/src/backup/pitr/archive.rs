@@ -19,9 +19,7 @@ use tokio::sync::broadcast;
 use tokio::time::{interval, MissedTickBehavior};
 use uuid::Uuid;
 
-use super::offline::{
-    adopt_handed_over_bases, forget_handed_over_bases, read_handed_over_bases,
-};
+use super::offline::{adopt_handed_over_bases, forget_handed_over_bases, read_handed_over_bases};
 use super::recover::{apply_restore, RestoreRecord};
 use super::store::{read_local_segment, PitrStore};
 use super::{blocking, BaseLocation, PitrError, PitrLocation, PitrSettings};
@@ -189,6 +187,9 @@ pub struct PitrArchive {
     store: tokio::sync::OnceCell<PitrStore>,
     /// The stores of the replication regions, by region name, built once.
     pub(super) region_stores: tokio::sync::Mutex<BTreeMap<String, PitrStore>>,
+    /// When the replication last compared the sidecars of every segment copy, see
+    /// [`Self::replicate`].
+    pub(super) last_deep_check: std::sync::Mutex<Option<Duration>>,
     /// The encryptor segments were last sealed with. It is kept while the configured key
     /// stays the same, so that the segments of a server run share one encryption session.
     encryptor: tokio::sync::Mutex<Option<BackupEncryptor>>,
@@ -202,6 +203,7 @@ impl PitrArchive {
             manifest_lock: tokio::sync::Mutex::new(()),
             store: tokio::sync::OnceCell::new(),
             region_stores: tokio::sync::Mutex::new(BTreeMap::new()),
+            last_deep_check: std::sync::Mutex::new(None),
             encryptor: tokio::sync::Mutex::new(None),
         }
     }

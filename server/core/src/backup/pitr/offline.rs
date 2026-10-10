@@ -213,12 +213,13 @@ fn same_directory(a: &Path, b: &Path) -> bool {
 
 /// The base record of the manual backup `key` whose content `report` describes.
 fn manual_base(key: &str, report: &BackupStructuralReport) -> Result<PitrBaseBackup, PitrError> {
-    let watermark_ts = report.db_ts_max.ok_or_else(|| {
-        PitrError::Manifest(format!("backup {key} records no CID watermark"))
-    })?;
-    let server_version = report.version.clone().ok_or_else(|| {
-        PitrError::Manifest(format!("backup {key} records no server version"))
-    })?;
+    let watermark_ts = report
+        .db_ts_max
+        .ok_or_else(|| PitrError::Manifest(format!("backup {key} records no CID watermark")))?;
+    let server_version = report
+        .version
+        .clone()
+        .ok_or_else(|| PitrError::Manifest(format!("backup {key} records no server version")))?;
     Ok(PitrBaseBackup {
         key: key.to_string(),
         timestamp: backup_name_timestamp(key).unwrap_or_default().to_string(),
@@ -234,7 +235,11 @@ fn hand_over_base(local_dir: &Path, base: &PitrBaseBackup) -> Result<(), PitrErr
     fs::create_dir_all(&dir)?;
     let data = serde_json::to_vec_pretty(base)
         .map_err(|err| PitrError::Manifest(format!("unable to serialise: {err}")))?;
-    Ok(write_file_durably(&dir, &format!("{}.json", base.key), &data)?)
+    Ok(write_file_durably(
+        &dir,
+        &format!("{}.json", base.key),
+        &data,
+    )?)
 }
 
 /// The bases handed over in the WAL directory `local_dir`, with the file each came from.
@@ -285,7 +290,9 @@ pub(super) fn adopt_handed_over_bases(
 ) -> Vec<PathBuf> {
     let mut settled = Vec::new();
     for (path, base) in handed_over {
-        if let Some(server_uuid) = base.server_uuid.filter(|uuid| !manifest.knows_server(*uuid))
+        if let Some(server_uuid) = base
+            .server_uuid
+            .filter(|uuid| !manifest.knows_server(*uuid))
         {
             error!(
                 key = %base.key,

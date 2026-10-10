@@ -1022,7 +1022,11 @@ mod tests {
         assert!(headers.iter().all(|header| header.salt == headers[0].salt));
         let nonces: std::collections::BTreeSet<&Vec<u8>> =
             headers.iter().map(|header| &header.nonce).collect();
-        assert_eq!(nonces.len(), sealed.len(), "every segment has its own nonce");
+        assert_eq!(
+            nonces.len(),
+            sealed.len(),
+            "every segment has its own nonce"
+        );
 
         // A reader that never saw the session derives its key once, for the first segment.
         let reader = encryptor(b"pw", None);
@@ -1055,13 +1059,19 @@ mod tests {
             read_encryption_header(&single).expect("header").0.salt,
             headers[0].salt
         );
-        assert_eq!(reader.decrypt(&single, &backup_id()).expect("decrypt").0, b"one");
+        assert_eq!(
+            reader.decrypt(&single, &backup_id()).expect("decrypt").0,
+            b"one"
+        );
         assert_eq!(reader.cached_keys(), 2);
 
         // A key that opens nothing is not kept.
         let stranger = encryptor(b"other", None);
         assert!(stranger
-            .decrypt(&sealed[0], &BackupArtifactIdentity::wal_segment(&segment_ids[0]))
+            .decrypt(
+                &sealed[0],
+                &BackupArtifactIdentity::wal_segment(&segment_ids[0])
+            )
             .is_err());
         assert_eq!(stranger.cached_keys(), 0);
     }

@@ -250,9 +250,17 @@ The output shows the overall status, the primary location, the time of the check
 bucket, status (`Completed`, `Degraded` or `Failed`), the number of backups replicated and pending, its newest backup
 and its lag. The reason is printed under every region that is not `Completed`. `--detailed` adds the lag metrics of
 every region: lag, pending backups, the timestamp of the newest replicated backup, the bytes replicated, the check
-interval, and the last error of a region that could not be reached. The command exits non-zero when replication is not
-configured or disabled, when the primary bucket can not be listed, or when any region is not `Completed`, which makes it
-suitable for monitoring.
+interval, and the last error of a region that could not be reached.
+
+When the [WAL archive](#the-wal-archive-and-replication) of point-in-time recovery is replicated, a second report
+follows for it: the primary archive with the time its `pitr-manifest.json` was last updated and the number of segments
+it names, and one line per region with the state of the region's manifest (`current` when it records every segment, gap
+and abandoned history of the primary's, `behind`, `damaged` when it can not be read or does not match its checksum,
+`missing`, or `unreachable`), the segments it holds intact, those it misses (object or `.metadata.json`) and those whose
+copy differs from the primary's (size, or checksum and size in the sidecar, as for backups), and the lag of its manifest:
+how much older the newest segment it names is than the primary's newest. `--detailed` names every missing or differing
+segment. The command exits non-zero when neither backups nor the WAL archive are replicated, when a primary location can
+not be read, or when any region of either is not healthy, which makes it suitable for monitoring.
 
 #### Recovering from a Region
 
@@ -691,10 +699,14 @@ When the S3 location the archive is uploaded to has an enabled replication secti
 when the archive shares `[online_backup.s3]`, or `[online_backup.wal_archive.s3.replication]` for a separate location),
 every archive run mirrors the archive to every region of that section, after its own work is done:
 
-1. the segments a region misses are copied from the primary (checked against the primary's checksum; bytes and sidecar
-   unchanged, so encrypted segments stay encrypted and a region never needs the key);
+1. the segments a region misses, or holds a differing copy of, are copied from the primary (checked against the
+   primary's checksum; bytes and sidecar unchanged, so encrypted segments stay encrypted and a region never needs the
+   key). Every run compares the listings: a copy whose object or `.metadata.json` is missing, or whose size differs from
+   the primary's, is copied again. Once per `sync_interval_seconds` of the replication section the sidecars are compared
+   as well, which catches a copy replaced by one of the same size;
 2. the region's `pitr-manifest.json` is written: the primary's manifest, plus whatever only the region still records (so
-   that a region keeps the history a primary that lost its archive no longer has);
+   that a region keeps the history a primary that lost its archive no longer has). A region manifest that can not be
+   read, or does not match its checksum, is written again from the primary's;
 3. the region applies the archive retention rules to its own copy: base backups it no longer holds drop out of its
    index, and segments older than `retention_days` that its oldest remaining base backup does not need, and that the
    primary no longer lists, are deleted.
@@ -705,7 +717,8 @@ right after it is indexed. The base backups themselves reach the regions through
 separate WAL location only has base backups when `[online_backup.s3]` replicates to a region of the same name, which
 `recover --region` requires. When the base backups are local, recovering from a region needs the local backup directory.
 Without an S3 archive location there is nothing to replicate: a local archive is never replicated. `replicate-status`
-reports the backups only, not the WAL archive; `pitr-list --region <name>` shows what a region's archive holds.
+reports the state of every region's copy of the archive, see [Checking Replication Status](#checking-replication-status),
+and `pitr-list --region <name>` shows what a region's archive holds.
 
 `pitr-list --region <name>` and `recover --region <name>` read the copy of the archive held by the configured region of
 that name (looked up whether or not replication is still enabled), and the base backups from the same region when they

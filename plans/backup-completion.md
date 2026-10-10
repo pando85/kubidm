@@ -86,7 +86,10 @@ Recovery restores the newest base backup at or before the target, then applies l
 
 ### Known limitations, follow-ups
 
-- [ ] `replicate-status` reports backups only, not the WAL archive (`pitr-list --region` shows a region's archive)
+- [x] `replicate-status` reported backups only: it now reports the WAL archive per region too (manifest presence,
+      readability and freshness, lag, missing and differing segments), and every archive run repairs region copies:
+      missing or resized segments and missing sidecars every run, differing sidecars once per `sync_interval_seconds`,
+      and a damaged region manifest is written again from the primary's
 - [x] Per-segment key derivation (Argon2id with a fresh salt per segment) made decrypting large WAL archives slow:
       segments are sealed in an encryption session (one salt and derived key per server run, up to 2^20 segments, a
       random nonce and the segment id per segment) and decryption keeps derived keys by salt and parameters, zeroized
