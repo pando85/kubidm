@@ -281,17 +281,18 @@ pub fn validate_encryption_config(config: &BackupEncryptionConfig) -> Result<(),
             warn_on_insecure_permissions(Path::new(path), "key file");
             read_key_file(Path::new(path)).map(|_| ())
         }
-        EncryptionKeySource::HttpEndpoint { url } => validate_key_endpoint(url),
+        EncryptionKeySource::HttpEndpoint { url } => validate_key_endpoint(url).map(|_| ()),
     }
 }
 
 /// The key endpoint must be an `https` URL. Plain `http` would send the key material in
 /// the clear, so it is only accepted for a loopback address such as a local secrets agent.
-fn validate_key_endpoint(url: &str) -> Result<(), String> {
+/// Returns the parsed URL.
+fn validate_key_endpoint(url: &str) -> Result<Url, String> {
     let parsed = Url::parse(url)
         .map_err(|err| format!("key_source endpoint '{url}' is not a valid URL: {err}"))?;
     match parsed.scheme() {
-        "https" => Ok(()),
+        "https" => Ok(parsed),
         "http" => {
             let loopback = match parsed.host() {
                 Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
@@ -300,7 +301,7 @@ fn validate_key_endpoint(url: &str) -> Result<(), String> {
                 None => false,
             };
             if loopback {
-                Ok(())
+                Ok(parsed)
             } else {
                 Err(format!(
                     "key_source endpoint '{url}' must use https; plain http is only accepted \
@@ -381,6 +382,23 @@ fn read_key_file(path: &Path) -> Result<Zeroizing<Vec<u8>>, String> {
     Ok(key)
 }
 
+/// The HTTP client of a key endpoint. The check of [`validate_key_endpoint`] only holds for
+/// the URL that is actually contacted, so the key must never travel anywhere else:
+///
+/// - no proxy: an environment proxy (`HTTP_PROXY`, `ALL_PROXY`) would otherwise receive the
+///   request to a loopback `http` endpoint, and with it the key, in the clear;
+/// - no redirects: a redirect from an `https` endpoint to a plain `http` URL would send the
+///   key in the clear, and one to any other host would hand it to that host;
+/// - `https` only when the endpoint is `https`, as a second line of defence.
+fn key_endpoint_client(url: &Url) -> reqwest::Result<Client> {
+    Client::builder()
+        .timeout(KEY_ENDPOINT_TIMEOUT)
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .https_only(url.scheme() == "https")
+        .build()
+}
+
 /// Obtain the key material from the configured source. This is the only place that reads
 /// secrets: the passphrase file or environment variable, the key file, or the HTTP key
 /// endpoint.
@@ -394,17 +412,24 @@ pub async fn resolve_key_material(
             read_key_file(Path::new(path)).map_err(BackupEncryptionError::KeySourceError)
         }
         EncryptionKeySource::HttpEndpoint { url } => {
-            validate_key_endpoint(url).map_err(BackupEncryptionError::KeySourceError)?;
-            let client = Client::builder()
-                .timeout(KEY_ENDPOINT_TIMEOUT)
-                .build()
+            let parsed =
+                validate_key_endpoint(url).map_err(BackupEncryptionError::KeySourceError)?;
+            let client = key_endpoint_client(&parsed)
                 .map_err(|e| BackupEncryptionError::HttpError(e.to_string()))?;
             let mut response = client
-                .get(url)
+                .get(parsed)
                 .send()
                 .await
-                .and_then(|response| response.error_for_status())
                 .map_err(|e| BackupEncryptionError::HttpError(e.to_string()))?;
+            // Redirects are not followed, so a 3xx is refused here like any other status
+            // that does not deliver the key.
+            if !response.status().is_success() {
+                return Err(BackupEncryptionError::HttpError(format!(
+                    "key endpoint {url} answered {}; only a 2xx response carries the key, \
+                     redirects are not followed",
+                    response.status()
+                )));
+            }
             let mut key = Zeroizing::new(Vec::new());
             while let Some(chunk) = response
                 .chunk()
@@ -1492,6 +1517,41 @@ mod tests {
             resolve_key_material(&remote).await,
             Err(BackupEncryptionError::KeySourceError(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn test_http_key_endpoint_does_not_follow_redirects() {
+        // The redirect target would hand out a key: following it would send the request,
+        // and with plain http the key, somewhere the configuration never named.
+        let target = serve_key_endpoint(vec![http_response("200 OK", &[0x5au8; 32])]).await;
+        let redirect = format!(
+            "HTTP/1.1 302 Found\r\nlocation: http://{target}/backup-key\r\n\
+             content-length: 0\r\nconnection: close\r\n\r\n"
+        )
+        .into_bytes();
+        let addr = serve_key_endpoint(vec![redirect]).await;
+        let endpoint = BackupEncryptionConfig {
+            key_source: EncryptionKeySource::HttpEndpoint {
+                url: format!("http://{addr}/backup-key"),
+            },
+            ..config(None)
+        };
+        match resolve_key_material(&endpoint).await {
+            Err(BackupEncryptionError::HttpError(msg)) => {
+                assert!(msg.contains("302") && msg.contains("redirects"), "{msg}")
+            }
+            other => panic!("expected HttpError, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    #[test]
+    fn test_key_endpoint_client_builds_for_both_schemes() {
+        for url in ["https://vault.example.com/key", "http://127.0.0.1:8200/key"] {
+            assert!(
+                key_endpoint_client(&Url::parse(url).unwrap()).is_ok(),
+                "{url}"
+            );
+        }
     }
 
     #[test]
