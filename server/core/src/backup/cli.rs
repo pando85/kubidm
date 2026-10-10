@@ -18,25 +18,25 @@ use kubidm_proto::{
     internal::OperationError,
 };
 use kubidmd_lib::{
-    be::{verify_backup_structure, BackendTransaction, BackupStructuralReport},
+    be::{BackendTransaction, BackupStructuralReport},
     schema::Schema,
 };
 use time::format_description::well_known::Rfc3339;
 
 use super::{
     backup_identity, backup_name_timestamp, compare_backup_names, is_backup_artifact_name,
-    lag_metrics_from_health, open_backup_file_with_config,
+    lag_metrics_from_health,
     pitr::{self, AbandonedHistory},
     region_is_healthy,
     restore::{
-        backup_encryption_config, restore_and_replay_commit, restore_database, CommittedRestore,
-        RestoreOutcome,
+        backup_encryption_config, restore_and_replay_commit, CommittedRestore, RestoreOutcome,
     },
-    run_blocking, s3_location, seal_backup_async, verify_backup_output_async,
-    write_verified_local_backup_async, BackupEncryptor, BackupVerifyError, S3BackupError,
-    S3ClientWrapper,
+    run_blocking, s3_location, seal_backup_async,
+    verify::{verify_backup_restores, verify_backup_structure_at},
+    verify_backup_output_async, write_verified_local_backup_async, BackupEncryptor,
+    BackupVerifyError, S3BackupError, S3ClientWrapper,
 };
-use crate::{config::Configuration, setup_backend, verify_booted_database};
+use crate::{config::Configuration, setup_backend};
 
 /// Take an offline backup of the database described by `config` into `dst_path`, or to
 /// stdout without a path. The backup uses the compression and the client-side encryption
@@ -368,28 +368,12 @@ pub async fn verify_backup_server_core(
     backup_path: &Path,
     level: BackupVerifyLevel,
 ) -> bool {
-    let opened =
-        match open_backup_file_with_config(backup_path, backup_encryption_config(config)).await {
-            Ok(opened) => opened,
-            Err(err) => {
-                error!(%err, "Unable to open backup {}", backup_path.display());
-                eprintln!("Backup structural verification: FAIL");
-                eprintln!("  - unable to open {}: {err}", backup_path.display());
-                return false;
-            }
-        };
-    let encryption_key = opened.key_identifier().map(str::to_string);
-
-    // Decompressing and parsing the whole backup is blocking work.
-    let compression = opened.compression;
-    let reader = opened.reader;
-    let parsed =
-        tokio::task::spawn_blocking(move || verify_backup_structure(reader, compression)).await;
-    let report = match parsed {
+    let structural = verify_backup_structure_at(config, backup_path).await;
+    let report = match &structural.report {
         Ok(report) => report,
-        Err(err) => {
+        Err(reason) => {
             eprintln!("Backup structural verification: FAIL");
-            eprintln!("  - the verification task failed: {err}");
+            eprintln!("  - {reason}");
             return false;
         }
     };
@@ -400,7 +384,7 @@ pub async fn verify_backup_server_core(
     );
     eprintln!(
         "  Encrypted: {}",
-        match &encryption_key {
+        match &structural.encryption_key {
             Some(key) => format!("yes, key '{key}'"),
             None => "no".to_string(),
         }
@@ -418,39 +402,11 @@ pub async fn verify_backup_server_core(
         return report.is_valid();
     }
 
-    let scratch_dir = match tempfile::tempdir() {
-        Ok(dir) => dir,
-        Err(err) => {
-            error!(?err, "Unable to create a scratch directory");
-            eprintln!("Backup restore verification: FAIL");
-            eprintln!("  - unable to create a scratch directory: {err}");
-            return false;
-        }
-    };
-
-    let mut scratch_config = config.clone();
-    scratch_config.db_path = Some(scratch_dir.path().join("verify.db"));
-
-    info!(
-        "Restoring backup into scratch database in {}",
-        scratch_dir.path().display()
-    );
-
-    if let Err(err) = restore_database(&scratch_config, backup_path).await {
-        eprintln!("Backup restore verification: FAIL");
-        eprintln!("  - restore failed: {err:?}");
-        return false;
-    }
-
-    // Boot the restored database from scratch exactly as a server start would. The
-    // restore above ran in this process, so its backend still carries in-memory state
-    // from before the restore (such as the RUV). A fresh boot is what proves the
-    // database starts into a consistent state.
-    let consistency_errors = match verify_booted_database(&scratch_config).await {
+    let consistency_errors = match verify_backup_restores(config, backup_path, &|| false).await {
         Ok(errors) => errors,
-        Err(err) => {
+        Err(reason) => {
             eprintln!("Backup restore verification: FAIL");
-            eprintln!("  - restored database could not be opened: {err:?}");
+            eprintln!("  - {reason}");
             return false;
         }
     };

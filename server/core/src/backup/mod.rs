@@ -8,6 +8,7 @@ pub mod pitr;
 pub mod restore;
 pub mod retention;
 pub mod s3;
+pub mod verify;
 
 pub use artifact::*;
 pub use encryption::*;
