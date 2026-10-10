@@ -25,10 +25,10 @@ use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client as SdkClient;
 use kubidm_proto::backup::{
-    BackupCompression, BackupEncryptionConfig, ReplicationConfig, ReplicationRegionConfig, ReplicationStatus, S3Config,
-    S3Credentials,
+    BackupCompression, BackupEncryptionConfig, EncryptionKeySource, KeyDerivationParams,
+    ReplicationConfig, ReplicationRegionConfig, ReplicationStatus, S3Config, S3Credentials,
 };
-use kubidmd_core::backup::S3ClientWrapper;
+use kubidmd_core::backup::{is_encrypted_artifact, S3ClientWrapper, MIN_KDF_M_COST};
 use kubidmd_core::config::{Configuration, OnlineBackup};
 use kubidmd_core::{
     replicate_status_server_core, restore_s3_database, s3_config_for_cli,
@@ -36,7 +36,11 @@ use kubidmd_core::{
 };
 use uuid::Uuid;
 
-use super::backup_common::{config_with_db, populate, run, start_server};
+use kubidmd_testkit::login_put_admin_idm_admins;
+
+use super::backup_common::{
+    assert_directory_state_restored, config_with_db, populate, run, start_server,
+};
 
 const ENDPOINT_ENV: &str = "KUBIDM_TEST_S3_ENDPOINT";
 const BUCKET_ENV: &str = "KUBIDM_TEST_S3_BUCKET";
@@ -653,5 +657,196 @@ fn test_s3_backup_replication_retention_status_and_recovery() {
             with_sidecars(&primary_backups),
             "The late region must hold exactly the backups and sidecars of the primary"
         );
+    });
+}
+
+/// A server configuration with `s3_config` as its `[online_backup.s3]` section and
+/// `encryption` as its `[online_backup.encryption]` section, as the `kubidmd database`
+/// commands of a host that recovers encrypted backups read it.
+fn config_with_s3_and_encryption(
+    db_path: &std::path::Path,
+    s3_config: &S3Config,
+    encryption: &BackupEncryptionConfig,
+) -> Configuration {
+    let mut config = config_with_s3(db_path, s3_config);
+    if let Some(online_backup) = config.online_backup.as_mut() {
+        online_backup.enabled = false;
+        online_backup.encryption = encryption.clone();
+    }
+    config
+}
+
+#[test]
+fn test_s3_replication_of_encrypted_backups() {
+    let Some(setup) = test_setup() else {
+        return;
+    };
+
+    run(async {
+        let sdk = sdk_client(&setup.primary).await;
+        ensure_bucket(&sdk, &setup.primary.bucket).await;
+        ensure_bucket(&sdk, &setup.replica.bucket).await;
+
+        let workdir = tempfile::tempdir().expect("Failed to create workdir");
+        let passphrase_file = workdir.path().join("passphrase");
+        std::fs::write(&passphrase_file, "replicated backup passphrase\n")
+            .expect("Failed to write the passphrase");
+        let encryption = BackupEncryptionConfig {
+            enabled: true,
+            key_source: EncryptionKeySource::Passphrase,
+            // The cheapest derivation the server accepts; this test is about replication.
+            key_derivation: KeyDerivationParams {
+                m_cost: MIN_KDF_M_COST,
+                t_cost: 1,
+                p_cost: 1,
+            },
+            key_identifier: Some("replicated-key".to_string()),
+            passphrase_file: Some(passphrase_file),
+        };
+
+        // a. One encrypted backup through the production S3 backup path, replicated.
+        let mut env = start_server(&workdir.path().join("source.db")).await;
+        populate(&env).await;
+        env.core_handle
+            .trigger_s3_backup(
+                setup.primary.clone(),
+                RETAINED_VERSIONS,
+                BackupCompression::Gzip,
+                &encryption,
+            )
+            .await
+            .expect("Encrypted S3 backup with replication failed");
+        env.core_handle.shutdown().await;
+
+        let primary = S3ClientWrapper::new(setup.primary.clone())
+            .await
+            .expect("Failed to create the primary client");
+        let replica = S3ClientWrapper::for_region(&setup.replica)
+            .await
+            .expect("Failed to create the region client");
+        let primary_backups = primary
+            .list_backup_artifacts()
+            .await
+            .expect("Failed to list the primary backups");
+        assert_eq!(primary_backups.len(), 1, "{primary_backups:?}");
+        let key = primary_backups[0].clone();
+        assert!(
+            key.ends_with(".json.gz.enc"),
+            "An encrypted backup must carry the .enc suffix: {key}"
+        );
+
+        // b. The region holds the same encrypted object and the same sidecar, which says
+        //    encrypted and names the key.
+        assert_eq!(
+            raw_region_keys(&sdk, &setup.replica).await,
+            with_sidecars(&primary_backups),
+            "The region must hold the .enc object and its sidecar, nothing else"
+        );
+        let (primary_data, primary_metadata) = primary
+            .download_backup(&key)
+            .await
+            .expect("Failed to download the primary backup");
+        let (replica_data, replica_metadata) = replica
+            .download_backup(&key)
+            .await
+            .expect("Failed to download the replicated backup");
+        assert_eq!(
+            replica_data, primary_data,
+            "The replica must be byte identical"
+        );
+        assert!(is_encrypted_artifact(&replica_data));
+        assert_eq!(replica_metadata, primary_metadata);
+        assert!(replica_metadata.encrypted);
+        assert_eq!(
+            replica_metadata.key_identifier.as_deref(),
+            Some("replicated-key")
+        );
+
+        // c. A damaged .enc copy is detected and repaired by the sync without the key.
+        sdk.put_object()
+            .bucket(&setup.replica.bucket)
+            .key(region_full_key(&setup.replica, &key))
+            .body(ByteStream::from(b"truncated".to_vec()))
+            .send()
+            .await
+            .expect("Failed to overwrite the replicated object");
+        let replication = setup
+            .primary
+            .replication
+            .as_ref()
+            .expect("Test config has no replication");
+        let health = primary
+            .check_replication_health(replication, None)
+            .await
+            .expect("Health check failed");
+        assert_eq!(health.regions[0].pending_backups, 1);
+        let results = primary
+            .sync_replication(replication)
+            .await
+            .expect("Replication sync failed");
+        let outcome = results
+            .into_iter()
+            .next()
+            .and_then(|(_, outcome)| outcome.ok())
+            .expect("The region must be synced");
+        assert_eq!(outcome.copied, primary_backups);
+        assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+        let health = primary
+            .check_replication_health(replication, None)
+            .await
+            .expect("Health check failed");
+        assert_eq!(health.overall_status, ReplicationStatus::Completed);
+
+        // d. The replica verifies and restores with the key, through --region, and is
+        //    refused without it.
+        let untouched_db = workdir.path().join("untouched.db");
+        let server_config =
+            config_with_s3_and_encryption(&untouched_db, &setup.primary, &encryption);
+        let replica_s3 = s3_config_for_cli(&server_config, None, Some(REPLICA_REGION), None)
+            .expect("--region must resolve the configured replication region");
+        assert!(
+            verify_s3_backup_server_core(
+                &server_config,
+                replica_s3.clone(),
+                &key,
+                BackupVerifyLevel::Full,
+            )
+            .await,
+            "Full verification of the replicated encrypted backup must pass with the key"
+        );
+        assert!(!untouched_db.exists());
+
+        let no_key_db = workdir.path().join("no-key.db");
+        assert!(
+            !verify_s3_backup_server_core(
+                &config_with_s3(&no_key_db, &setup.primary),
+                replica_s3.clone(),
+                &key,
+                BackupVerifyLevel::Structural,
+            )
+            .await,
+            "verify-s3 --region must fail without the key"
+        );
+        assert!(
+            restore_s3_database(&config_with_db(&no_key_db), replica_s3.clone(), &key)
+                .await
+                .is_err(),
+            "restore-s3 --region must fail without the key"
+        );
+        assert!(!no_key_db.exists());
+
+        let restored_db = workdir.path().join("restored-from-region.db");
+        restore_s3_database(
+            &config_with_s3_and_encryption(&restored_db, &setup.primary, &encryption),
+            replica_s3,
+            &key,
+        )
+        .await
+        .expect("Restore of the encrypted backup from the region failed");
+
+        let mut env = start_server(&restored_db).await;
+        login_put_admin_idm_admins(&env.rsclient).await;
+        assert_directory_state_restored(&env.rsclient).await;
+        env.core_handle.shutdown().await;
     });
 }

@@ -1687,6 +1687,46 @@ path_prefix = \"dr\"
     }
 
     #[test]
+    fn online_backup_encryption_and_replication_are_validated_together() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let passphrase_file = dir.path().join("passphrase");
+        std::fs::write(&passphrase_file, "correct horse battery staple\n").expect("write");
+
+        let config = |passphrase_file: &Path, replica_bucket: &str| {
+            format!(
+                "{BASE_V2_CONFIG}{S3_SECTION}
+[online_backup.s3.replication]
+enabled = true
+
+[[online_backup.s3.replication.regions]]
+region = \"eu-west-1\"
+bucket = {replica_bucket:?}
+
+[online_backup.encryption]
+enabled = true
+passphrase_file = {passphrase_file:?}
+"
+            )
+        };
+
+        // Both features enabled and coherent: accepted, both sections kept.
+        let accepted = build_from_toml(&config(&passphrase_file, "kubidm-backups-eu"))
+            .expect("encryption and replication together must be accepted");
+        let online_backup = accepted.online_backup.expect("online backup");
+        assert!(online_backup.encryption.enabled);
+        assert!(online_backup
+            .s3
+            .and_then(|s3| s3.replication)
+            .is_some_and(|replication| replication.enabled));
+
+        // Either one being wrong rejects the whole configuration.
+        assert!(
+            build_from_toml(&config(&dir.path().join("missing"), "kubidm-backups-eu")).is_none()
+        );
+        assert!(build_from_toml(&config(&passphrase_file, "")).is_none());
+    }
+
+    #[test]
     fn assert_cidr_parsing_behaviour() {
         // Assert that we can parse individual hosts, and ranges
         let parsed_ip_cidr: IpCidr = serde_json::from_str("\"127.0.0.1\"").unwrap();
