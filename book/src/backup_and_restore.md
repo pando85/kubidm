@@ -74,7 +74,9 @@ region = "us-east-1"
 # endpoint = "https://minio.example.com"
 # Optional: Path prefix for organizing backups
 # path_prefix = "production"
-# Optional: Storage class (STANDARD, GLACIER, etc.)
+# Optional: Storage class: STANDARD (default), REDUCED_REDUNDANCY, STANDARD_IA, ONEZONE_IA,
+# INTELLIGENT_TIERING or GLACIER_IR. GLACIER and DEEP_ARCHIVE are refused: their objects
+# can only be read after a restore request.
 # storage_class = "STANDARD"
 
 # For static credentials (not recommended for production)
@@ -84,9 +86,10 @@ secret_access_key = "your-secret-key"
 
 # For IAM role authentication (recommended for EC2/EKS), omit credentials section
 
-# Optional: Server-side encryption
+# Optional: Server-side encryption, applied to the backups and their metadata objects
 [online_backup.s3.server_side_encryption]
 # algorithm = "aws:kms"  # or "AES256"
+# Only with aws:kms; S3 refuses a KMS key with AES256
 # kms_key_id = "arn:aws:kms:us-east-1:123456789:key/..."
 ```
 
@@ -179,9 +182,11 @@ as the signing region of the requests to that bucket. Each region has its own `b
 `endpoint`, `path_prefix`, `credentials`, `storage_class` and server-side encryption, so a replica can live at a
 different provider than the primary. When `enabled = true`, the configuration must list at least one region, region
 names must be unique, every region needs a bucket, no region may point at the primary location or at the location of
-another region (same endpoint, bucket and `path_prefix`), and `sync_interval_seconds` must be greater than zero; the
-server and `kubidmd configtest` reject anything else. With `enabled = false` the section is ignored, but its regions can
-still be targeted with `--region`, so a replica remains a recovery source after replication has been switched off.
+another region (same bucket and `path_prefix`, and the same endpoint, where every AWS S3 endpoint counts as the default
+one), every region's storage class and server-side encryption must be valid as for the primary (the `kms_key_id`
+shorthand can not be combined with `AES256`), and `sync_interval_seconds` must be greater than zero; the server and
+`kubidmd configtest` reject anything else. With `enabled = false` the section is ignored, but its regions can still be
+targeted with `--region`, so a replica remains a recovery source after replication has been switched off.
 
 #### What Is Replicated, and When
 

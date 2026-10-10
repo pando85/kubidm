@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::io::{Read, Write};
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use aws_config::{timeout::TimeoutConfig, BehaviorVersion, Region, SdkConfig};
@@ -20,6 +21,7 @@ use kubidm_proto::backup::{
     ReplicationRegionConfig, ReplicationRegionStatus, ReplicationStatus, S3BackupMetadata,
     S3Config, S3EncryptionAlgorithm,
 };
+use regex::Regex;
 use sha2::{Digest, Sha256};
 
 use super::retention::{is_backup_artifact_name, sort_backup_names};
@@ -304,7 +306,7 @@ impl S3ClientWrapper {
             .metadata("checksum-sha256", &metadata.checksum_sha256)
             .metadata("backup-timestamp", &metadata.timestamp)
             .metadata("backup-size", metadata.size_bytes.to_string())
-            .storage_class(parse_storage_class(self.config.storage_class.as_str()));
+            .storage_class(self.storage_class()?);
 
         let (sse, kms_key_id) = self.server_side_encryption();
         builder = builder
@@ -404,7 +406,7 @@ impl S3ClientWrapper {
             .metadata("checksum-sha256", &metadata.checksum_sha256)
             .metadata("backup-timestamp", &metadata.timestamp)
             .metadata("backup-size", metadata.size_bytes.to_string())
-            .storage_class(parse_storage_class(self.config.storage_class.as_str()));
+            .storage_class(self.storage_class()?);
 
         let (sse, kms_key_id) = self.server_side_encryption();
         builder = builder
@@ -504,6 +506,12 @@ impl S3ClientWrapper {
             })?;
 
         Ok(())
+    }
+
+    /// The storage class of the backup objects this client writes. The configuration
+    /// rejects an unknown or archive class at load time.
+    fn storage_class(&self) -> Result<StorageClass, S3BackupError> {
+        parse_storage_class(&self.config.storage_class).map_err(S3BackupError::ConfigError)
     }
 
     /// The server-side encryption every object this client writes is stored with: the
@@ -1196,17 +1204,40 @@ pub struct RegionSyncOutcome {
 /// Whether two S3 configurations address the same objects: same endpoint, same bucket and
 /// same normalised path prefix. A replication region at the primary's own location would
 /// copy every backup onto itself and report perfect health without any redundancy.
+///
+/// Endpoints are compared without their scheme and trailing `/`, and every AWS S3 endpoint
+/// (`s3.amazonaws.com`, `s3.<region>.amazonaws.com`, ...) counts as no endpoint at all: a
+/// bucket name is unique across AWS, so the same bucket reached through another AWS
+/// endpoint is the same location.
 pub fn same_s3_location(a: &S3Config, b: &S3Config) -> bool {
-    let endpoint = |config: &S3Config| {
-        config
-            .endpoint
-            .as_deref()
-            .map(|endpoint| endpoint.trim_end_matches('/').to_ascii_lowercase())
-    };
     a.bucket == b.bucket
-        && endpoint(a) == endpoint(b)
+        && normalized_endpoint(a.endpoint.as_deref()) == normalized_endpoint(b.endpoint.as_deref())
         && S3ClientWrapper::listing_prefix(a.path_prefix.as_deref())
             == S3ClientWrapper::listing_prefix(b.path_prefix.as_deref())
+}
+
+/// Pattern of the host of an AWS S3 endpoint, regional, dual-stack or accelerated, in the
+/// global and the China partitions.
+static AWS_S3_ENDPOINT_HOST: LazyLock<Regex> = LazyLock::new(|| {
+    #[allow(clippy::expect_used)]
+    Regex::new(r"^s3([.-][a-z0-9-]+)*\.amazonaws\.com(\.cn)?$")
+        .expect("AWS endpoint regex is a constant and must compile")
+});
+
+/// The endpoint `endpoint` addresses, for comparing locations: lower case, without scheme
+/// and trailing `/`, and None for AWS S3, see [`same_s3_location`].
+fn normalized_endpoint(endpoint: Option<&str>) -> Option<String> {
+    let endpoint = endpoint?.trim().trim_end_matches('/').to_ascii_lowercase();
+    let host = endpoint
+        .strip_prefix("https://")
+        .or_else(|| endpoint.strip_prefix("http://"))
+        .unwrap_or(&endpoint)
+        .to_string();
+    if host.is_empty() || AWS_S3_ENDPOINT_HOST.is_match(&host) {
+        None
+    } else {
+        Some(host)
+    }
 }
 
 /// Whether a region is healthy for the purpose of monitoring and the exit code of
@@ -1404,23 +1435,48 @@ impl<R: Read> Read for ChecksumReader<R> {
     }
 }
 
-fn parse_storage_class(s: &str) -> StorageClass {
-    match s.to_uppercase().as_str() {
-        "STANDARD" => StorageClass::Standard,
-        "REDUCED_REDUNDANCY" => StorageClass::ReducedRedundancy,
-        "STANDARD_IA" => StorageClass::StandardIa,
-        "ONEZONE_IA" => StorageClass::OnezoneIa,
-        "INTELLIGENT_TIERING" => StorageClass::IntelligentTiering,
-        "GLACIER" => StorageClass::Glacier,
-        "DEEP_ARCHIVE" => StorageClass::DeepArchive,
-        "GLACIER_IR" => StorageClass::GlacierIr,
-        _ => StorageClass::Standard,
+/// The storage class `name` selects. Archive classes are refused: their objects can only
+/// be read after a restore request, so restore, verification, the replication sync and
+/// point-in-time recovery could not read the backups, while the replication status, which
+/// only reads metadata, would report them as healthy.
+fn parse_storage_class(name: &str) -> Result<StorageClass, String> {
+    match name.to_uppercase().as_str() {
+        "STANDARD" => Ok(StorageClass::Standard),
+        "REDUCED_REDUNDANCY" => Ok(StorageClass::ReducedRedundancy),
+        "STANDARD_IA" => Ok(StorageClass::StandardIa),
+        "ONEZONE_IA" => Ok(StorageClass::OnezoneIa),
+        "INTELLIGENT_TIERING" => Ok(StorageClass::IntelligentTiering),
+        "GLACIER_IR" => Ok(StorageClass::GlacierIr),
+        "GLACIER" | "DEEP_ARCHIVE" => Err(format!(
+            "storage_class {name:?} is an archive class whose objects can only be read after \
+             a restore request, so the backups could neither be restored nor verified nor \
+             replicated; use GLACIER_IR for an archive class that is readable at once"
+        )),
+        _ => Err(format!(
+            "storage_class {name:?} is not a known S3 storage class; use one of STANDARD, \
+             REDUCED_REDUNDANCY, STANDARD_IA, ONEZONE_IA, INTELLIGENT_TIERING or GLACIER_IR"
+        )),
     }
 }
 
-/// A minimal S3 endpoint for tests: it records every request and answers it with what the
-/// test's responder returns, so that the requests the client sends, and its reaction to
-/// failures, can be checked without a real object store.
+/// Check the settings of an S3 location that S3 would otherwise only reject at the first
+/// upload, or that would silently not do what they say: the storage class must be known
+/// and readable without a restore request, and a KMS key needs `aws:kms` server-side
+/// encryption. Returns the reason, without the location's configuration key.
+pub fn validate_s3_location(config: &S3Config) -> Result<(), String> {
+    parse_storage_class(&config.storage_class)?;
+    if let Some(sse) = &config.server_side_encryption {
+        if sse.algorithm == Some(S3EncryptionAlgorithm::Aes256) && sse.kms_key_id.is_some() {
+            return Err(
+                "server_side_encryption: kms_key_id requires algorithm = \"aws:kms\"; S3 \
+                 rejects a KMS key together with AES256"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 pub(crate) mod fake_s3 {
     use std::collections::BTreeMap;
@@ -1770,29 +1826,65 @@ mod tests {
 
     #[test]
     fn test_storage_class_conversion() {
-        assert_eq!(parse_storage_class("STANDARD"), StorageClass::Standard);
-        assert_eq!(parse_storage_class("standard"), StorageClass::Standard);
-        assert_eq!(parse_storage_class("GLACIER"), StorageClass::Glacier);
-        assert_eq!(parse_storage_class("unknown"), StorageClass::Standard);
+        assert_eq!(parse_storage_class("STANDARD"), Ok(StorageClass::Standard));
+        assert_eq!(parse_storage_class("standard"), Ok(StorageClass::Standard));
         assert_eq!(
             parse_storage_class("REDUCED_REDUNDANCY"),
-            StorageClass::ReducedRedundancy
+            Ok(StorageClass::ReducedRedundancy)
         );
         assert_eq!(
             parse_storage_class("reduced_redundancy"),
-            StorageClass::ReducedRedundancy
+            Ok(StorageClass::ReducedRedundancy)
         );
-        assert_eq!(parse_storage_class("STANDARD_IA"), StorageClass::StandardIa);
-        assert_eq!(parse_storage_class("ONEZONE_IA"), StorageClass::OnezoneIa);
+        assert_eq!(
+            parse_storage_class("STANDARD_IA"),
+            Ok(StorageClass::StandardIa)
+        );
+        assert_eq!(
+            parse_storage_class("ONEZONE_IA"),
+            Ok(StorageClass::OnezoneIa)
+        );
         assert_eq!(
             parse_storage_class("INTELLIGENT_TIERING"),
-            StorageClass::IntelligentTiering
+            Ok(StorageClass::IntelligentTiering)
         );
         assert_eq!(
-            parse_storage_class("DEEP_ARCHIVE"),
-            StorageClass::DeepArchive
+            parse_storage_class("GLACIER_IR"),
+            Ok(StorageClass::GlacierIr)
         );
-        assert_eq!(parse_storage_class("GLACIER_IR"), StorageClass::GlacierIr);
+
+        // A typo no longer silently becomes STANDARD.
+        let err = parse_storage_class("STANDARD-IA").expect_err("unknown class");
+        assert!(err.contains("not a known"), "{err}");
+        // Archive classes can not be read back without a restore request.
+        for archive in ["GLACIER", "deep_archive"] {
+            let err = parse_storage_class(archive).expect_err("archive class");
+            assert!(err.contains("archive class"), "{err}");
+        }
+    }
+
+    #[test]
+    fn test_validate_s3_location() {
+        let mut config = S3Config::with_bucket("backups".to_string());
+        assert!(validate_s3_location(&config).is_ok());
+
+        config.storage_class = "DEEP_ARCHIVE".to_string();
+        assert!(validate_s3_location(&config).is_err());
+        config.storage_class = "STANDARD".to_string();
+
+        config.server_side_encryption = Some(S3ServerSideEncryption {
+            algorithm: Some(S3EncryptionAlgorithm::AwsKms),
+            kms_key_id: Some("key".to_string()),
+        });
+        assert!(validate_s3_location(&config).is_ok());
+
+        // S3 rejects every upload that sends both.
+        config.server_side_encryption = Some(S3ServerSideEncryption {
+            algorithm: Some(S3EncryptionAlgorithm::Aes256),
+            kms_key_id: Some("key".to_string()),
+        });
+        let err = validate_s3_location(&config).expect_err("AES256 with a KMS key");
+        assert!(err.contains("aws:kms"), "{err}");
     }
 
     #[test]
@@ -2130,6 +2222,30 @@ mod tests {
             &with(|c| c.endpoint = Some("https://s3.eu.example.com".to_string()))
         ));
         assert!(!same_s3_location(&base, &with(|c| c.endpoint = None)));
+
+        // On AWS, the default endpoint and any explicit AWS endpoint reach the same bucket.
+        let aws = with(|c| c.endpoint = None);
+        for endpoint in [
+            "https://s3.amazonaws.com",
+            "https://s3.eu-west-1.amazonaws.com/",
+            "s3.dualstack.us-east-1.amazonaws.com",
+            "https://s3-accelerate.amazonaws.com",
+            "https://s3.cn-north-1.amazonaws.com.cn",
+        ] {
+            let mut explicit = aws.clone();
+            explicit.endpoint = Some(endpoint.to_string());
+            assert!(same_s3_location(&aws, &explicit), "{endpoint}");
+        }
+        // The scheme does not make another location either.
+        assert!(same_s3_location(
+            &base,
+            &with(|c| c.endpoint = Some("http://s3.example.com".to_string()))
+        ));
+        // A look-alike host is not AWS.
+        assert!(!same_s3_location(
+            &aws,
+            &with(|c| c.endpoint = Some("https://s3.amazonaws.com.example.com".to_string()))
+        ));
     }
 
     #[test]

@@ -481,14 +481,28 @@ fn test_replication_region_config_to_s3_config_kms_shorthand() {
 
     // An explicit block with its own key wins.
     region.server_side_encryption = Some(S3ServerSideEncryption {
-        algorithm: Some(S3EncryptionAlgorithm::Aes256),
+        algorithm: Some(S3EncryptionAlgorithm::AwsKms),
         kms_key_id: Some("explicit".to_string()),
     });
     assert_eq!(
         region.to_s3_config().server_side_encryption,
         Some(S3ServerSideEncryption {
-            algorithm: Some(S3EncryptionAlgorithm::Aes256),
+            algorithm: Some(S3EncryptionAlgorithm::AwsKms),
             kms_key_id: Some("explicit".to_string()),
+        })
+    );
+
+    // AES256 never borrows the shorthand key: S3 rejects a KMS key with AES256, and the
+    // configuration rejects the combination.
+    region.server_side_encryption = Some(S3ServerSideEncryption {
+        algorithm: Some(S3EncryptionAlgorithm::Aes256),
+        kms_key_id: None,
+    });
+    assert_eq!(
+        region.to_s3_config().server_side_encryption,
+        Some(S3ServerSideEncryption {
+            algorithm: Some(S3EncryptionAlgorithm::Aes256),
+            kms_key_id: None,
         })
     );
 }
@@ -638,12 +652,17 @@ impl ReplicationRegionConfig {
     ///
     /// A region level `kms_key_id` is a shorthand for `aws:kms` server-side encryption
     /// with that key. An explicit `server_side_encryption` block wins when both are set
-    /// and only fills its missing `kms_key_id` from the shorthand.
+    /// and only fills its missing `kms_key_id` from the shorthand, and only when it selects
+    /// `aws:kms`: S3 rejects a KMS key together with `AES256`.
     pub fn to_s3_config(&self) -> S3Config {
         let server_side_encryption = match (&self.server_side_encryption, &self.kms_key_id) {
             (Some(sse), kms_key_id) => Some(S3ServerSideEncryption {
                 algorithm: sse.algorithm.clone(),
-                kms_key_id: sse.kms_key_id.clone().or_else(|| kms_key_id.clone()),
+                kms_key_id: sse.kms_key_id.clone().or_else(|| {
+                    kms_key_id
+                        .clone()
+                        .filter(|_| sse.algorithm != Some(S3EncryptionAlgorithm::Aes256))
+                }),
             }),
             (None, Some(kms_key_id)) => Some(S3ServerSideEncryption {
                 algorithm: Some(S3EncryptionAlgorithm::AwsKms),

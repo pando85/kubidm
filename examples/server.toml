@@ -173,7 +173,9 @@ compression = "gzip"
 # endpoint = "https://minio.example.com"
 #   Optional: Path prefix for organizing backups
 # path_prefix = "production"
-#   Optional: Storage class (STANDARD, GLACIER, DEEP_ARCHIVE, etc.)
+#   Optional: Storage class: STANDARD (default), REDUCED_REDUNDANCY, STANDARD_IA,
+#   ONEZONE_IA, INTELLIGENT_TIERING or GLACIER_IR. GLACIER and DEEP_ARCHIVE are refused:
+#   their objects can only be read after a restore request.
 # storage_class = "STANDARD"
 #
 #   Authentication: Static credentials (for testing)
@@ -186,9 +188,10 @@ compression = "gzip"
 #   Authentication: IAM role (recommended for EC2/EKS)
 #   Omit credentials section to use IAM role authentication
 #
-#   Optional: Server-side encryption
+#   Optional: Server-side encryption, applied to the backups and their metadata objects
 # [online_backup.s3.server_side_encryption]
 # algorithm = "aws:kms"  # or "AES256"
+#   Only with aws:kms; S3 refuses a KMS key with AES256
 # kms_key_id = "arn:aws:kms:us-east-1:123456789:key/..."
 #
 #   Optional: Cross-region replication of the S3 backups.
