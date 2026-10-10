@@ -2340,13 +2340,28 @@ impl<'a> BackendWriteTransaction<'a> {
             wal_stage_failed,
         } = self;
 
-        // write the ruv content back to the db.
-        idlayer.write_db_ruv(ruv.added(), ruv.removed())?;
+        // The archive is told before the database commits a transaction it must archive,
+        // so that an unclean stop between the commit and its archiving is noticed.
+        let prepared = match (&wal, &wal_cid) {
+            (Some(wal), Some(cid)) if !wal_pending.is_empty() || wal_truncate => {
+                lock_wal(wal).prepare_commit(cid.ts);
+                Some(wal)
+            }
+            _ => None,
+        };
 
-        idlayer.commit().map(|()| {
-            ruv.commit();
-            idxmeta_wr.commit();
-        })?;
+        // write the ruv content back to the db.
+        let committed = idlayer
+            .write_db_ruv(ruv.added(), ruv.removed())
+            .and_then(|()| idlayer.commit());
+        if let Err(err) = committed {
+            if let Some(wal) = prepared {
+                lock_wal(wal).abandon_commit();
+            }
+            return Err(err);
+        }
+        ruv.commit();
+        idxmeta_wr.commit();
 
         // The database commit succeeded. Only now does the archive learn about this
         // transaction, so the WAL never contains uncommitted state. A failure here is
@@ -2377,6 +2392,12 @@ impl<'a> BackendWriteTransaction<'a> {
     ) {
         if wal_pending.is_empty() && !wal_truncate && !wal_stage_failed && wal_server_uuid.is_none()
         {
+            // Nothing to archive, but the database now records this transaction as its
+            // last one: the journal of the open segment notes it, so that an unclean stop
+            // right after it is known to have lost nothing.
+            if let Some(cid) = wal_cid {
+                lock_wal(wal).note_commit(cid.ts);
+            }
             return;
         }
 
@@ -4702,6 +4723,7 @@ mod tests {
             segment_size_bytes,
             segment_interval_seconds: 3600,
             local_path: Some(dir.join("wal")),
+            ..WalArchiveConfig::default()
         };
         let cfg = BackendConfig::new_test("main").with_wal_archive(Some(wal_cfg));
         Backend::new(cfg, wal_test_idxmeta(), false).expect("Failed to setup backend")

@@ -72,7 +72,7 @@ use kubidm_proto::{
     scim_v1::client::ScimAssertGeneric,
 };
 use kubidmd_lib::{
-    be::{Backend, BackendConfig},
+    be::{Backend, BackendConfig, BackendWriteTransaction},
     idm::ldap::LdapServer,
     prelude::*,
     schema::Schema,
@@ -246,6 +246,11 @@ async fn setup_qs(
 macro_rules! dbscan_setup_be {
     (
         $config:expr
+    ) => {
+        dbscan_setup_be!($config, ())
+    };
+    (
+        $config:expr, $failed:expr
     ) => {{
         let schema = match Schema::new() {
             Ok(s) => s,
@@ -259,7 +264,7 @@ macro_rules! dbscan_setup_be {
             Ok(be) => be,
             Err(e) => {
                 error!("Failed to setup BE: {:?}", e);
-                return;
+                return $failed;
             }
         }
     }};
@@ -357,8 +362,9 @@ pub fn dbscan_get_id2entry_core(config: &Configuration, id: u64) {
     };
 }
 
-pub fn dbscan_quarantine_id2entry_core(config: &Configuration, id: u64) {
-    let be = dbscan_setup_be!(config);
+/// `db-scan quarantine-id2entry`. Returns false when the entry was not quarantined.
+pub async fn dbscan_quarantine_id2entry_core(config: &Configuration, id: u64) -> bool {
+    let be = dbscan_setup_be!(config, false);
     let mut be_wrtxn = match be.write() {
         Ok(txn) => txn,
         Err(err) => {
@@ -366,21 +372,67 @@ pub fn dbscan_quarantine_id2entry_core(config: &Configuration, id: u64) {
                 ?err,
                 "Unable to proceed, backend write transaction failure."
             );
-            return;
+            return false;
         }
     };
 
-    match be_wrtxn
-        .quarantine_entry(id)
-        .and_then(|_| be_wrtxn.commit())
-    {
-        Ok(()) => {
-            println!("quarantined - {id:>8}")
-        }
-        Err(e) => {
-            error!("Failed to quarantine id2entry value: {:?}", e);
+    if let Err(e) = be_wrtxn.quarantine_entry(id) {
+        error!("Failed to quarantine id2entry value: {:?}", e);
+        return false;
+    }
+    if !commit_dbscan_change(config, be_wrtxn, "db-scan quarantine-id2entry").await {
+        return false;
+    }
+    println!("quarantined - {id:>8}");
+    true
+}
+
+/// Commit the change a `db-scan` command made in `be_wrtxn` outside any transaction the
+/// WAL archive could record. When WAL archiving is configured, the change is first
+/// recorded as a gap in the archive, so that point-in-time recovery never replays across
+/// it, and the gap is taken back when the commit fails. Returns false, after logging why,
+/// when the gap could not be recorded, in which case nothing is committed, or when the
+/// commit failed.
+async fn commit_dbscan_change(
+    config: &Configuration,
+    mut be_wrtxn: BackendWriteTransaction<'_>,
+    command: &str,
+) -> bool {
+    let db_ts_max = match be_wrtxn.get_db_ts_max(Duration::ZERO) {
+        Ok(db_ts_max) => db_ts_max,
+        Err(err) => {
+            error!(?err, "Unable to read the last transaction of the database");
+            return false;
         }
     };
+    let record = match pitr::note_offline_change(config, db_ts_max, command).await {
+        Ok(record) => record,
+        Err(err) => {
+            error!(
+                %err,
+                "The change could not be handed to the WAL archive, so point-in-time recovery \
+                 could replay across it; the database was not changed"
+            );
+            return false;
+        }
+    };
+    match be_wrtxn.commit() {
+        Ok(()) => true,
+        Err(err) => {
+            error!(
+                ?err,
+                "Failed to commit the change; the database was not changed"
+            );
+            if let Err(err) = pitr::withdraw_offline_change(record).await {
+                warn!(
+                    %err,
+                    "Unable to take back the WAL archive gap of the change that did not happen; \
+                     recovery stops before it until a new base backup is taken"
+                );
+            }
+            false
+        }
+    }
 }
 
 pub fn dbscan_list_quarantined_core(config: &Configuration) {
@@ -406,8 +458,9 @@ pub fn dbscan_list_quarantined_core(config: &Configuration) {
     };
 }
 
-pub fn dbscan_restore_quarantined_core(config: &Configuration, id: u64) {
-    let be = dbscan_setup_be!(config);
+/// `db-scan restore-quarantined`. Returns false when the entry was not restored.
+pub async fn dbscan_restore_quarantined_core(config: &Configuration, id: u64) -> bool {
+    let be = dbscan_setup_be!(config, false);
     let mut be_wrtxn = match be.write() {
         Ok(txn) => txn,
         Err(err) => {
@@ -415,21 +468,19 @@ pub fn dbscan_restore_quarantined_core(config: &Configuration, id: u64) {
                 ?err,
                 "Unable to proceed, backend write transaction failure."
             );
-            return;
+            return false;
         }
     };
 
-    match be_wrtxn
-        .restore_quarantined(id)
-        .and_then(|_| be_wrtxn.commit())
-    {
-        Ok(()) => {
-            println!("restored - {id:>8}")
-        }
-        Err(e) => {
-            error!("Failed to restore quarantined id2entry value: {:?}", e);
-        }
-    };
+    if let Err(e) = be_wrtxn.restore_quarantined(id) {
+        error!("Failed to restore quarantined id2entry value: {:?}", e);
+        return false;
+    }
+    if !commit_dbscan_change(config, be_wrtxn, "db-scan restore-quarantined").await {
+        return false;
+    }
+    println!("restored - {id:>8}");
+    true
 }
 
 pub async fn reindex_server_core(config: &Configuration) {

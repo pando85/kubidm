@@ -31,7 +31,7 @@ use tempfile::TempDir;
 
 use super::cli::fetch_s3_backup_into;
 use super::metrics::{BackupDestination, BackupMetrics};
-use super::restore::{backup_encryption_config, restore_and_replay_commit};
+use super::restore::{backup_encryption_config, on_database_thread, restore_and_replay_commit};
 use super::{
     compare_backup_names, is_backup_artifact_name, open_backup_file_with_config, run_blocking,
     BackupOpenError, S3BackupError, S3ClientWrapper,
@@ -206,7 +206,7 @@ pub(crate) async fn verify_backup_restores(
     config: &Configuration,
     path: &Path,
     scratch_parent: Option<&Path>,
-    stop: &(dyn Fn() -> bool + Sync),
+    stop: Arc<dyn Fn() -> bool + Send + Sync>,
 ) -> Result<Vec<ConsistencyError>, VerifyError> {
     let parent = scratch_parent.map(Path::to_path_buf);
     let scratch_dir = run_blocking(move || new_scratch_dir(parent.as_deref()))
@@ -246,18 +246,31 @@ pub(crate) async fn verify_backup_restores(
     // Boot the restored database from scratch exactly as a server start would. The
     // restore above ran in this process, so its backend still carries in-memory state
     // from before the restore (such as the RUV). A fresh boot is what proves the
-    // database starts into a consistent state.
-    let not_opened =
-        |err| VerifyError::Artifact(format!("restored database could not be opened: {err:?}"));
-    let (schema, be) = open_schema_and_backend(&scratch_config).map_err(not_opened)?;
-    let server = setup_qs(be, schema, &scratch_config)
-        .await
-        .inspect_err(|err| error!(?err, "Failed to start query server"))
-        .map_err(not_opened)?;
-    if stop() {
-        return abandoned("the consistency checks");
+    // database starts into a consistent state. Like the restore, the boot and the checks
+    // run on the database thread: the outer result says whether that thread ran at all,
+    // the inner one whether the database booted.
+    let booted = on_database_thread(move || async move {
+        let booted = match open_schema_and_backend(&scratch_config) {
+            Ok((schema, be)) => setup_qs(be, schema, &scratch_config)
+                .await
+                .inspect_err(|err| error!(?err, "Failed to start query server")),
+            Err(err) => Err(err),
+        };
+        Ok(match booted {
+            Ok(_) if stop() => Ok(None),
+            Ok(server) => Ok(Some(collect_consistency_errors(server.verify().await))),
+            Err(err) => Err(err),
+        })
+    })
+    .await
+    .map_err(|err| VerifyError::Environment(format!("the database thread failed: {err:?}")))?;
+    match booted {
+        Ok(Some(errors)) => Ok(errors),
+        Ok(None) => abandoned("the consistency checks"),
+        Err(err) => Err(VerifyError::Artifact(format!(
+            "restored database could not be opened: {err:?}"
+        ))),
     }
-    Ok(collect_consistency_errors(server.verify().await))
 }
 
 /// What a scheduled verification found for one destination.
@@ -411,9 +424,9 @@ fn copy_newest_local_backup(dir: &Path, scratch_parent: Option<&Path>) -> LocalP
 /// of the S3 prefix, each as `kubidmd database verify-backup` does, and records the result
 /// in the backup metrics. Two runs never overlap: a run that starts while another is in
 /// progress is skipped. A run never overlaps an online backup either: it waits for the
-/// backup in progress, and a backup waits for it. Every step that blocks (file I/O,
-/// decryption, the restore and the boot of the scratch database) runs on the blocking
-/// thread pool.
+/// backup in progress, and a backup waits for it. Every step that blocks runs off the
+/// async workers: file I/O and decryption on the blocking thread pool, the restore,
+/// reindex and boot of the scratch database on the offline database thread.
 pub struct BackupVerifyJob {
     /// The configuration the scratch databases are restored with.
     config: Configuration,
@@ -747,7 +760,7 @@ async fn verify_artifact(
     config: &Configuration,
     path: &Path,
     scratch_parent: Option<&Path>,
-    stop: &AtomicBool,
+    stop: &Arc<AtomicBool>,
 ) -> BackupVerifyOutcome {
     match verify_backup_structure_at(config, path).await.report {
         Err(error) => return outcome_of(stop, error),
@@ -758,11 +771,9 @@ async fn verify_artifact(
         return BackupVerifyOutcome::Abandoned("the server is shutting down".to_string());
     }
 
-    match verify_backup_restores(config, path, scratch_parent, &|| {
-        stop.load(Ordering::Relaxed)
-    })
-    .await
-    {
+    let flag = Arc::clone(stop);
+    let restore_stop = Arc::new(move || flag.load(Ordering::Relaxed));
+    match verify_backup_restores(config, path, scratch_parent, restore_stop).await {
         Ok(errors) if errors.is_empty() => BackupVerifyOutcome::Passed,
         Ok(errors) => {
             BackupVerifyOutcome::Failed(errors.iter().map(|err| format!("{err:?}")).collect())

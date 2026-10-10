@@ -1,9 +1,19 @@
 //! The production restore path, shared by `kubidmd database restore`, `restore-s3`, the
 //! full backup verification and point-in-time recovery.
+//!
+//! Restoring, replaying, reindexing and booting a database is long, blocking work: it runs
+//! on a dedicated thread (`on_database_thread`), never on the async runtime of the
+//! command, so that the runtime stays free for the S3 transfers and the timers that run
+//! next to it.
 
+use std::future::Future;
+use std::io::Read;
 use std::path::Path;
 
-use kubidm_proto::{backup::BackupEncryptionConfig, internal::OperationError};
+use kubidm_proto::{
+    backup::{BackupCompression, BackupEncryptionConfig},
+    internal::{ConsistencyError, OperationError},
+};
 use kubidmd_lib::{
     be::{Backend, WalApplyReport},
     prelude::*,
@@ -13,6 +23,57 @@ use kubidmd_lib::{
 
 use super::open_backup_file_with_config;
 use crate::{config::Configuration, reindex_inner, setup_backend, utils::touch_file};
+
+/// Name of the thread offline database work runs on.
+const DATABASE_THREAD_NAME: &str = "kubidm-offline-db";
+
+/// Run the database work `work` builds on a dedicated thread with a runtime of its own,
+/// and wait for it without blocking the caller's runtime.
+///
+/// The offline restore, replay, reindex and verification hold write transactions and run
+/// migrations for as long as the database takes, and parts of them are async only in
+/// name. On their own thread they can neither stall the workers of the command's runtime
+/// nor depend on them. `work` is called on that thread, so the future it returns needs
+/// not be `Send`.
+pub(crate) async fn on_database_thread<T, F, Fut>(work: F) -> Result<T, OperationError>
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = Result<T, OperationError>>,
+    T: Send + 'static,
+{
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name(DATABASE_THREAD_NAME.to_string())
+        .spawn(move || {
+            let result = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|err| {
+                    error!(?err, "Unable to start the runtime of the database thread");
+                    OperationError::InvalidState
+                })
+                .and_then(|runtime| runtime.block_on(work()));
+            // The caller only goes away when its own runtime shuts down.
+            let _ = tx.send(result);
+        })
+        .map_err(|err| {
+            error!(?err, "Unable to start the database thread");
+            OperationError::InvalidState
+        })?;
+    rx.await.map_err(|_| {
+        error!("The database thread stopped without a result");
+        OperationError::InvalidState
+    })?
+}
+
+/// Boot the database described by `config` as a server start would and verify it, see
+/// [`crate::verify_booted_database`], on the database thread.
+pub(crate) async fn verify_booted_database_on_thread(
+    config: &Configuration,
+) -> Result<Vec<ConsistencyError>, OperationError> {
+    let config = config.clone();
+    on_database_thread(move || async move { crate::verify_booted_database(&config).await }).await
+}
 
 /// The encryption settings of the server configuration, if any. Backups made from this
 /// configuration are encrypted when they are enabled, and encrypted artifacts are opened
@@ -62,12 +123,18 @@ impl CommittedRestore {
         self,
         config: &Configuration,
     ) -> Result<RestoreOutcome, OperationError> {
-        reindex_inner(self.be, self.schema, config)
+        let Self {
+            outcome,
+            be,
+            schema,
+        } = self;
+        let config = config.clone();
+        on_database_thread(move || async move { reindex_inner(be, schema, &config).await })
             .await
             .inspect_err(|err| {
                 error!(?err, "The database WAS restored, but reindexing it failed");
             })?;
-        Ok(self.outcome)
+        Ok(outcome)
     }
 }
 
@@ -95,6 +162,23 @@ pub(crate) async fn restore_and_replay_commit(
         info!("Backup is encrypted with key '{key_identifier}'");
     }
 
+    // Everything from here on is blocking database work.
+    let config = config.clone();
+    let reader = opened.reader;
+    let compression = opened.compression;
+    on_database_thread(move || async move {
+        restore_and_replay_blocking(&config, reader, compression, records)
+    })
+    .await
+}
+
+/// The database part of [`restore_and_replay_commit`], on the database thread.
+fn restore_and_replay_blocking(
+    config: &Configuration,
+    reader: Box<dyn Read + Send>,
+    compression: BackupCompression,
+    records: Vec<WalEntryRecord>,
+) -> Result<CommittedRestore, OperationError> {
     // If it's an in memory database, we don't need to touch anything. A database file
     // that can not be written fails the restore; it never ends the process, since the
     // scheduled verification restores inside a running server.
@@ -118,11 +202,9 @@ pub(crate) async fn restore_and_replay_commit(
         );
     })?;
 
-    be_wr_txn
-        .restore(opened.reader, opened.compression)
-        .inspect_err(|err| {
-            error!(?err, "Failed to restore database");
-        })?;
+    be_wr_txn.restore(reader, compression).inspect_err(|err| {
+        error!(?err, "Failed to restore database");
+    })?;
     let watermark = be_wr_txn.get_db_ts_max(Duration::ZERO)?;
     let server_uuid = be_wr_txn.get_db_s_uuid()?;
 

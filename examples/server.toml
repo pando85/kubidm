@@ -326,6 +326,12 @@ compression = "gzip"
 # retention_days = 7
 #   Where segments are written before upload (default: "wal" next to db_path)
 # local_path = "/var/lib/private/kubidm/wal"
+#   How the open segment survives an unclean stop. "Commit" (default) journals it and
+#   syncs the journal at every commit; "Interval" syncs it every journal_sync_interval_ms,
+#   so a power loss can lose that much (recorded as a gap); "Off" keeps it in memory
+#   only, and an unclean stop loses it (recorded as a gap).
+# open_segment_journal = "Commit"
+# journal_sync_interval_ms = 1000
 #   Optional: archive to another S3 location than [online_backup.s3]. Its own
 #   [online_backup.wal_archive.s3.replication] section, if any, replicates the archive;
 #   base backups then stay in [online_backup.s3] (or online_backup.path).

@@ -220,6 +220,11 @@ enum DbCommands {
         /// Also print the lag metrics of every region.
         #[clap(long)]
         detailed: bool,
+        /// Also compare the sidecar of every WAL archive segment with the region's copy,
+        /// which reads two objects per segment and region. By default the listings are
+        /// compared, which catches missing and resized copies.
+        #[clap(long)]
+        deep: bool,
     },
 }
 

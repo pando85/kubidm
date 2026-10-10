@@ -86,25 +86,62 @@ Recovery restores the newest base backup at or before the target, then applies l
 
 ### Known limitations, follow-ups
 
-- [ ] `replicate-status` reports backups only, not the WAL archive (`pitr-list --region` shows a region's archive)
-- [ ] Per-segment key derivation (Argon2id with a fresh salt per segment) makes decrypting large WAL archives slower
-- [ ] An unclean stop loses the open segment (up to `segment_interval_seconds` of WAL) from the archive, and more than
-      four closed segments that can not be written are dropped; both are recorded as gaps that recovery does not cross,
-      and only a new base backup makes later points recoverable
+- [x] `replicate-status` reported backups only: it now reports the WAL archive per region too (manifest presence,
+      readability and freshness, lag, missing and differing segments), and every archive run repairs region copies:
+      missing or resized segments and missing sidecars every run, differing sidecars once per `sync_interval_seconds`,
+      and a damaged region manifest is written again from the primary's
+- [x] Per-segment key derivation (Argon2id with a fresh salt per segment) made decrypting large WAL archives slow:
+      segments are sealed in an encryption session (one salt and derived key per server run, up to 2^20 segments, a
+      random nonce and the segment id per segment) and decryption keeps derived keys by salt and parameters, zeroized on
+      drop. The container format is unchanged, so segments sealed one by one still open; no release tag contains the WAL
+      format (checked with `git tag --contains`)
+- [x] An unclean stop lost the open segment (up to `segment_interval_seconds` of WAL): every commit now appends its
+      records to a per-segment journal (`open_segment_journal`: `Commit` syncs it in every archiving commit, the
+      default; `Interval` at most every `journal_sync_interval_ms`; `Off` as before), and the next start closes the open
+      and unwritten segments from their journals. A commit that archives nothing is journaled too, so a start compares
+      the journal with the database's last transaction and records only what the journal misses as a gap. Measured cost:
+      one `fdatasync` per write transaction (about 3 ms on the development disk, the same as the database's own commit
+      sync)
+- [x] Review of the journal: a journal without the open segment marker (a crash between the journal and the marker) is
+      closed, not removed; the marker covers a transaction from before the database commits it, so a crash between the
+      commit and its archiving is a gap; `Commit` syncs the frames of commits without records too, so a power loss
+      leaves no false gap; `Interval` is synced by a timer of the archive task; `recover` closes (or, dry, reads) the
+      journals itself, so a server that can not start loses nothing; journal records keep the commit order
+- [x] Review of `db-scan` and replication: a failed or refused repair exits non-zero and leaves no gap (the change is
+      made before the gap is handed over, and a failed commit takes it back); the gap is handed over through
+      `.handed-over-gaps/` instead of a read, modify and write of the manifest a running server owns; the sidecar
+      comparison runs once per sync interval, 16 at a time, outside the manifest lock, and in `replicate-status` only
+      with `--deep`; a segment the primary lacks is a primary problem, never a damaged region copy, and a failed copy no
+      longer stops the region's manifest; `replicate-status` tolerates a lag up to the sync interval plus two segment
+      intervals (`pending`) and reports an archive without a manifest as not yet archived
+- [ ] `recover` on a host whose server can not start stops at the last commit the journal holds: without the database it
+      can not tell whether more was committed, which the next start settles
+- [ ] A `db-scan` gap reaches the manifest at the next server start or archive run; a recovery on another host before
+      then does not see it
+- [ ] More than four closed segments that can not be written are dropped and recorded as gaps (their journals go with
+      them); only a new base backup makes later points recoverable
 - [ ] A restore whose abandoned history can be recorded neither in the archive nor handed over through the WAL directory
       exits 3; until a new online backup is taken after the start, a recovery past it could replay that history
-- [ ] `db-scan` quarantine commands bypass the WAL archive (documented)
-- [ ] Manual `database backup` files are not PITR bases
-- [ ] The offline `restore` and `recover` still restore and replay inside one write transaction on the CLI's runtime
-      (the online backup snapshot and all checksums now run on the blocking pool)
+- [x] `db-scan` quarantine commands bypassed the WAL archive: `quarantine-id2entry` and `restore-quarantined` record a
+      gap from just after the last committed transaction up to now before they commit (handed to the server through the
+      WAL directory, else they refuse), so recovery never replays across them
+- [x] Manual `database backup` files were not PITR bases: one written into the local base directory under a backup name
+      is handed over through the WAL directory (`.handed-over-bases/`) with the watermark of its content; the server
+      indexes it at its next archive run and recovery uses it meanwhile. With S3 bases a manual backup stays outside the
+      index (documented)
+- [x] The offline `restore` and `recover` ran their write transaction and reindex on the CLI's runtime: the restore,
+      replay, reindex and boot verification now run on a dedicated database thread (`on_database_thread`), checked by a
+      test that the single thread of a current thread runtime keeps ticking through a restore and a recovery
 - [ ] A region of a separate `[online_backup.wal_archive.s3]` location only has base backups when `[online_backup.s3]`
       replicates to a region of the same name, which `recover --region` requires
 
 ### Follow-up issues, not blocking
 
-- [ ] #453 migration schema cleanup filter never matches
-- [ ] #457 backup metrics
-- [ ] #458 scheduled full verification
+- [x] #453 migration schema cleanup filter never matches (fixed by #488)
+- [x] #457 backup metrics: `GET /metrics` behind `metrics_endpoint`, optionally guarded by a bearer token from
+      `metrics_token_file`, with the timestamps persisted across restarts (branch `backup/followups`)
+- [x] #458 scheduled full verification: `verify_schedule` and `verify_temp_path`, serialised with the online backups
+      (branch `backup/followups`)
 
 ## Review rounds
 

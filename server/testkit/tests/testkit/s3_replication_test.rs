@@ -262,7 +262,7 @@ fn test_s3_backup_replication_retention_status_and_recovery() {
         // e. replicate-status reports the region healthy, and reports the broken region
         //    as failed with everything pending while the healthy one stays healthy.
         assert!(
-            replicate_status_server_core(&server_config, true).await,
+            replicate_status_server_core(&server_config, true, false).await,
             "replicate-status must succeed while the region holds every backup"
         );
         let replication = setup
@@ -287,7 +287,7 @@ fn test_s3_backup_replication_retention_status_and_recovery() {
 
         let two_region_config = config_with_s3(&untouched_db, &setup.primary_with_broken_region);
         assert!(
-            !replicate_status_server_core(&two_region_config, true).await,
+            !replicate_status_server_core(&two_region_config, true, false).await,
             "replicate-status must fail while a region is unreachable"
         );
         let health = primary
@@ -332,7 +332,7 @@ fn test_s3_backup_replication_retention_status_and_recovery() {
             .expect("Failed to delete the replicated object");
 
         assert!(
-            !replicate_status_server_core(&server_config, false).await,
+            !replicate_status_server_core(&server_config, false, false).await,
             "replicate-status must fail once a replicated backup is missing"
         );
         let health = primary

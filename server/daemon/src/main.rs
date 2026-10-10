@@ -1204,7 +1204,9 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
             commands: DbScanOpt::QuarantineId2Entry { id },
         } => {
             info!("☣️  db scan - quarantine id2 entry - {}", id);
-            dbscan_quarantine_id2entry_core(&config, *id);
+            if !dbscan_quarantine_id2entry_core(&config, *id).await {
+                return ExitCode::FAILURE;
+            }
         }
 
         KubidmdOpt::DbScan {
@@ -1218,7 +1220,9 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
             commands: DbScanOpt::RestoreQuarantined { id },
         } => {
             info!("☣️  db scan - restore quarantined entry - {}", id);
-            dbscan_restore_quarantined_core(&config, *id);
+            if !dbscan_restore_quarantined_core(&config, *id).await {
+                return ExitCode::FAILURE;
+            }
         }
 
         KubidmdOpt::DomainSettings {
@@ -1322,10 +1326,10 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
             }
         }
         KubidmdOpt::Database {
-            commands: DbCommands::ReplicateStatus { detailed },
+            commands: DbCommands::ReplicateStatus { detailed, deep },
         } => {
             info!("Running in backup replication status mode ...");
-            if !replicate_status_server_core(&config, *detailed).await {
+            if !replicate_status_server_core(&config, *detailed, *deep).await {
                 return ExitCode::FAILURE;
             }
         }

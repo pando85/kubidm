@@ -6,7 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kubidm_proto::backup::{
-    PitrBaseBackup, PitrManifest, PitrServerUuidChange, PitrWalGap, WalSegment, PITR_MANIFEST_KEY,
+    PitrBaseBackup, PitrManifest, PitrServerUuidChange, PitrWalGap, WalJournalMode, WalSegment,
+    PITR_MANIFEST_KEY,
 };
 use kubidmd_lib::be::{lock_wal, BackupStructuralReport, SharedWalArchiver};
 use kubidmd_lib::prelude::duration_from_epoch_now;
@@ -19,6 +20,7 @@ use tokio::sync::broadcast;
 use tokio::time::{interval, MissedTickBehavior};
 use uuid::Uuid;
 
+use super::offline::{adopt_handed_over_bases, forget_handed_over_bases, read_handed_over_bases};
 use super::recover::{apply_restore, RestoreRecord};
 use super::store::{read_local_segment, PitrStore};
 use super::{blocking, BaseLocation, PitrError, PitrLocation, PitrSettings};
@@ -187,6 +189,12 @@ pub struct PitrArchive {
     store: tokio::sync::OnceCell<PitrStore>,
     /// The stores of the replication regions, by region name, built once.
     pub(super) region_stores: tokio::sync::Mutex<BTreeMap<String, PitrStore>>,
+    /// When the replication last compared the sidecars of every segment copy, see
+    /// [`Self::replicate`].
+    pub(super) last_deep_check: std::sync::Mutex<Option<Duration>>,
+    /// The encryptor segments were last sealed with. It is kept while the configured key
+    /// stays the same, so that the segments of a server run share one encryption session.
+    encryptor: tokio::sync::Mutex<Option<BackupEncryptor>>,
 }
 
 impl PitrArchive {
@@ -197,6 +205,29 @@ impl PitrArchive {
             manifest_lock: tokio::sync::Mutex::new(()),
             store: tokio::sync::OnceCell::new(),
             region_stores: tokio::sync::Mutex::new(BTreeMap::new()),
+            last_deep_check: std::sync::Mutex::new(None),
+            encryptor: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    /// The encryptor segments are sealed with: the configured key, obtained again for every
+    /// run so that a rotated key is picked up, and the encryptor of the earlier runs as long
+    /// as it holds the same key, which keeps its encryption session. None when encryption
+    /// is not enabled.
+    async fn segment_encryptor(&self) -> Result<Option<BackupEncryptor>, PitrError> {
+        let Some(configured) = BackupEncryptor::from_config(&self.settings.encryption)
+            .await
+            .map_err(|err| PitrError::Encryption(err.to_string()))?
+        else {
+            return Ok(None);
+        };
+        let mut kept = self.encryptor.lock().await;
+        match kept.as_ref() {
+            Some(kept) if kept.same_key(&configured) => Ok(Some(kept.clone())),
+            _ => {
+                *kept = Some(configured.clone());
+                Ok(Some(configured))
+            }
         }
     }
 
@@ -245,11 +276,12 @@ impl PitrArchive {
         now: Duration,
         force_flush: bool,
     ) -> Result<PitrSyncReport, PitrError> {
-        let _guard = self.manifest_lock.lock().await;
+        let guard = self.manifest_lock.lock().await;
         let mut report = PitrSyncReport::default();
 
         let (sealed, events, server_uuid) = self
             .with_archiver(move |archiver| {
+                archiver.adopt_handed_over_gaps();
                 let sealed = if force_flush {
                     archiver.seal_current()
                 } else {
@@ -303,7 +335,13 @@ impl PitrArchive {
             }
         }
 
-        result?;
+        let manifest = result?;
+        drop(guard);
+        // The sidecars of the region copies are compared without the manifest lock.
+        if let Ok(store) = self.store().await {
+            self.check_region_copies(store, &manifest, now, &mut report)
+                .await;
+        }
         match flush_error {
             Some(err) => Err(err),
             None => Ok(report),
@@ -325,7 +363,7 @@ impl PitrArchive {
     /// One synchronisation, in steps that each say whether they changed the manifest:
     /// record the gaps, archive the pending segments (saving the manifest before any local
     /// copy goes), apply retention, prune the markers no history needs any more, save, and
-    /// mirror the result to the replication regions.
+    /// mirror the result to the replication regions. Returns the manifest as saved.
     async fn sync_locked(
         &self,
         now: Duration,
@@ -333,7 +371,7 @@ impl PitrArchive {
         server_uuid: Uuid,
         events_recorded: &mut bool,
         report: &mut PitrSyncReport,
-    ) -> Result<(), PitrError> {
+    ) -> Result<PitrManifest, PitrError> {
         let scan = {
             let local_dir = self.settings.local_dir.clone();
             blocking(move || Ok(scan_segments(&local_dir)?)).await?
@@ -343,6 +381,8 @@ impl PitrArchive {
             load_or_new_manifest(store, &self.settings.location, server_uuid, events).await?;
 
         changed |= record_gaps(&mut manifest, &events.gaps, now);
+        let settled_bases = self.adopt_manual_bases(&mut manifest).await?;
+        changed |= !settled_bases.is_empty();
         let mut local_segments = scan.segments;
         if !scan.unreadable.is_empty() {
             let repaired = self.repair_local(scan.unreadable, now).await?;
@@ -367,6 +407,13 @@ impl PitrArchive {
             report.archived += archived.segments.len();
             self.cleanup_local(store, &archived.segments).await?;
         }
+        if !settled_bases.is_empty() {
+            blocking(move || {
+                forget_handed_over_bases(&settled_bases);
+                Ok(())
+            })
+            .await?;
+        }
         if let Some(err) = archived.error {
             return Err(err);
         }
@@ -383,7 +430,36 @@ impl PitrArchive {
 
         self.replicate(store, &mut manifest, now, report).await;
 
-        Ok(())
+        Ok(manifest)
+    }
+
+    /// Index the manual backups handed over as bases since the last run, see
+    /// [`super::offline`]. Returns the hand-over files the manifest settles once saved.
+    async fn adopt_manual_bases(
+        &self,
+        manifest: &mut PitrManifest,
+    ) -> Result<Vec<std::path::PathBuf>, PitrError> {
+        let handed_over = {
+            let local_dir = self.settings.local_dir.clone();
+            blocking(move || Ok(read_handed_over_bases(&local_dir))).await?
+        };
+        if handed_over.is_empty() {
+            return Ok(Vec::new());
+        }
+        // A base that can not be checked now is indexed anyway: retention drops it from the
+        // index once its location is listed and it is not there.
+        let held = self
+            .settings
+            .bases
+            .list_keys()
+            .await
+            .inspect_err(|err| warn!(%err, "Unable to list the base backups"))
+            .ok();
+        Ok(adopt_handed_over_bases(
+            manifest,
+            handed_over,
+            held.as_deref(),
+        ))
     }
 
     /// Whether archiving moves a segment out of the local directory: when it is uploaded
@@ -443,7 +519,7 @@ impl PitrArchive {
         let local_dir = &self.settings.local_dir;
         // The key is obtained once per run, and only when there is something to encrypt.
         let encryptor = if self.settings.encryption.enabled {
-            match BackupEncryptor::from_config(&self.settings.encryption).await {
+            match self.segment_encryptor().await {
                 Ok(encryptor) => encryptor,
                 Err(err) => {
                     let err = PitrError::Encryption(format!(
@@ -777,6 +853,7 @@ pub(crate) fn start_wal_archive_task(
     mut rx: broadcast::Receiver<CoreAction>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let journal_sync = start_journal_sync_task(&archive);
         let mut inter = interval(archive.interval());
         inter.set_missed_tick_behavior(MissedTickBehavior::Skip);
         // The first tick completes immediately: archive what a previous run left behind.
@@ -797,8 +874,41 @@ pub(crate) fn start_wal_archive_task(
                 }
             }
         }
+        if let Some(journal_sync) = journal_sync {
+            journal_sync.abort();
+        }
         info!("Stopped {}", crate::TaskName::WalArchive);
     })
+}
+
+/// With `open_segment_journal = "Interval"`, start the task that syncs the journal of the
+/// open segment every `journal_sync_interval_ms`, on its own so that a long archive run
+/// never delays it: a commit waits at most that long for its journal to reach the disk,
+/// whether or not other commits follow it. The archive task aborts it when it stops.
+fn start_journal_sync_task(archive: &Arc<PitrArchive>) -> Option<tokio::task::JoinHandle<()>> {
+    let wal = &archive.settings.wal;
+    if wal.open_segment_journal != WalJournalMode::Interval {
+        return None;
+    }
+    let period = wal.journal_sync_interval().max(Duration::from_millis(10));
+    let archive = archive.clone();
+    Some(tokio::spawn(async move {
+        let mut inter = interval(period);
+        inter.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        loop {
+            inter.tick().await;
+            let now = duration_from_epoch_now();
+            if let Err(err) = archive
+                .with_archiver(move |archiver| {
+                    archiver.sync_journal(now);
+                    Ok(())
+                })
+                .await
+            {
+                warn!(%err, "Unable to sync the WAL segment journal");
+            }
+        }
+    }))
 }
 
 #[cfg(test)]
@@ -869,6 +979,7 @@ mod tests {
             segment_size_bytes: 1024 * 1024,
             segment_interval_seconds: 60,
             local_path: Some(wal_dir.clone()),
+            ..WalArchiveConfig::default()
         };
         let archiver: SharedWalArchiver = Arc::new(Mutex::new(
             WalArchiver::open(wal_cfg.clone(), server, wal_dir.clone(), None).unwrap(),
@@ -1447,6 +1558,61 @@ mod tests {
         assert_eq!(again.server_uuid_changes, manifest.server_uuid_changes);
     }
 
+    /// With the Interval journal mode, the archive task syncs the journal of the open
+    /// segment every `journal_sync_interval_ms`, whether or not another commit follows.
+    #[tokio::test]
+    async fn test_the_archive_task_syncs_an_interval_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("wal");
+        let server = Uuid::new_v4();
+        let wal_cfg = WalArchiveConfig {
+            enabled: true,
+            local_path: Some(wal_dir.clone()),
+            open_segment_journal: WalJournalMode::Interval,
+            journal_sync_interval_ms: 20,
+            ..WalArchiveConfig::default()
+        };
+        let settings = PitrSettings {
+            wal: wal_cfg.clone(),
+            local_dir: wal_dir.clone(),
+            location: PitrLocation::Local(wal_dir.clone()),
+            bases: BaseLocation::Local(dir.path().join("backups")),
+            encryption: BackupEncryptionConfig::default(),
+        };
+        let archiver: SharedWalArchiver = Arc::new(Mutex::new(
+            WalArchiver::open(wal_cfg, server, wal_dir, None).unwrap(),
+        ));
+        // A commit now, well inside the segment interval, which the next commit would sync
+        // only once the interval ran out: there is none.
+        append_create(
+            &archiver,
+            server,
+            duration_from_epoch_now().as_secs(),
+            b"waits for its sync",
+        );
+        assert!(lock_wal(&archiver).has_unsynced_journal());
+
+        let (tx, rx) = broadcast::channel(1);
+        let task = start_wal_archive_task(
+            Arc::new(PitrArchive::new(settings, archiver.clone())),
+            Arc::new(BackupMetrics::new(None)),
+            rx,
+        );
+        let mut synced = false;
+        for _ in 0..250 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let archiver = lock_wal(&archiver);
+            assert!(archiver.has_pending_records(), "the segment stays open");
+            if !archiver.has_unsynced_journal() {
+                synced = true;
+                break;
+            }
+        }
+        tx.send(CoreAction::Shutdown).unwrap();
+        task.await.unwrap();
+        assert!(synced, "the journal was not synced by the archive task");
+    }
+
     #[tokio::test]
     async fn test_a_restore_before_anything_was_archived_discards_the_old_events() {
         let dir = tempfile::tempdir().unwrap();
@@ -1502,7 +1668,19 @@ mod tests {
         let store = PitrStore::open(&settings.location).await.unwrap();
         let manifest = store.load_manifest().await.unwrap().unwrap();
         assert_eq!(manifest.server_uuid, b);
-        assert!(manifest.gaps.is_empty(), "{:?}", manifest.gaps);
+        // The records the old server journaled are archived as the abandoned history they
+        // are; what its journal could not show it holds is a gap inside that history.
+        assert!(
+            manifest.gaps.iter().all(
+                |gap| manifest.is_abandoned(gap.from_ts) && manifest.is_abandoned(gap.until_ts)
+            ),
+            "{manifest:#?}"
+        );
+        assert!(manifest
+            .segments
+            .iter()
+            .filter(|segment| segment.server_uuid != b)
+            .all(|segment| manifest.is_abandoned(segment.start_ts)));
     }
 
     /// A server whose archive was never reachable keeps its closed segments in its WAL
