@@ -32,7 +32,10 @@ use kubidmd_core::{
     replicate_status_server_core, restore_s3_database, restore_server_core, RestoreStatus,
 };
 use kubidmd_lib::be::SharedWalArchiver;
-use kubidmd_lib::repl::wal::{format_ts_rfc3339, list_segments, read_pending_events, WalArchiver};
+use kubidmd_lib::repl::wal::{
+    format_ts_rfc3339, list_segments, read_local_events, read_pending_events, WalArchiver,
+    WAL_HANDED_OVER_GAPS_DIR,
+};
 use kubidmd_testkit::{login_put_admin_idm_admins, setup_async_test, AsyncTestEnvironment};
 use uuid::Uuid;
 
@@ -455,15 +458,26 @@ fn test_pitr_dbscan_repairs_are_gaps_recovery_does_not_cross() {
             .gaps
             .is_empty());
 
-        // The server is stopped: quarantine an entry and put it back.
-        dbscan_quarantine_id2entry_core(&config, 1).await;
-        dbscan_restore_quarantined_core(&config, 1).await;
-        let manifest = read_manifest(&wal_dir.join(PITR_MANIFEST_KEY));
-        assert_eq!(manifest.gaps.len(), 2, "{:?}", manifest.gaps);
-        assert!(manifest
+        // A repair that can not be made fails, and leaves no gap behind: no such entry, an
+        // entry that is not quarantined.
+        assert!(!dbscan_quarantine_id2entry_core(&config, 999_999).await);
+        assert!(!dbscan_restore_quarantined_core(&config, 1).await);
+        assert!(read_local_events(&wal_dir).gaps.is_empty());
+        // A repair whose gap can not be handed over is refused, and the database is left
+        // alone: entry 1 is still there to be quarantined below.
+        let hand_over = wal_dir.join(WAL_HANDED_OVER_GAPS_DIR);
+        std::fs::write(&hand_over, b"not a directory").expect("Failed to block the hand-over");
+        assert!(!dbscan_quarantine_id2entry_core(&config, 1).await);
+        std::fs::remove_file(&hand_over).expect("Failed to unblock the hand-over");
+
+        // The server is stopped: quarantine an entry and put it back. The gaps are handed
+        // over through the WAL directory; the manifest is the server's.
+        assert!(dbscan_quarantine_id2entry_core(&config, 1).await);
+        assert!(dbscan_restore_quarantined_core(&config, 1).await);
+        assert!(read_manifest(&wal_dir.join(PITR_MANIFEST_KEY))
             .gaps
-            .iter()
-            .all(|gap| gap.reason.contains("db-scan")));
+            .is_empty());
+        assert_eq!(read_local_events(&wal_dir).gaps.len(), 2);
 
         // A target past the repairs is refused; the latest point stops before them and
         // holds everything committed until then.
@@ -490,7 +504,14 @@ fn test_pitr_dbscan_repairs_are_gaps_recovery_does_not_cross() {
         assert!(person_exists(&recovered.rsclient, PITR_USER_BEFORE).await);
         recovered.core_handle.shutdown().await;
 
-        // An online backup taken after the repairs is a base past them.
+        // The recovery recorded the gaps in the manifest with what it abandoned. An online
+        // backup taken after the repairs is a base past them.
+        let manifest = read_manifest(&wal_dir.join(PITR_MANIFEST_KEY));
+        assert_eq!(manifest.gaps.len(), 2, "{:?}", manifest.gaps);
+        assert!(manifest
+            .gaps
+            .iter()
+            .all(|gap| gap.reason.contains("db-scan")));
         let mut env = setup_async_test(config.clone()).await;
         login_put_admin_idm_admins(&env.rsclient).await;
         env.core_handle

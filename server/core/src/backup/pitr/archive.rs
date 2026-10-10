@@ -279,6 +279,7 @@ impl PitrArchive {
 
         let (sealed, events, server_uuid) = self
             .with_archiver(move |archiver| {
+                archiver.adopt_handed_over_gaps();
                 let sealed = if force_flush {
                     archiver.seal_current()
                 } else {

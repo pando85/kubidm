@@ -61,6 +61,9 @@ pub const WAL_OPEN_SEGMENT_MARKER: &str = ".open-segment.json";
 pub const WAL_PENDING_EVENTS_FILE: &str = ".pending-events.json";
 /// Suffix of the journal of a segment that is not written yet: `<segment id>.journal`.
 pub const WAL_JOURNAL_SUFFIX: &str = ".journal";
+/// The directory, inside the WAL directory, where offline commands hand gaps over to the
+/// server, one file per gap: see [`hand_over_gap`].
+pub const WAL_HANDED_OVER_GAPS_DIR: &str = ".handed-over-gaps";
 /// Fixed per record overhead assumed when measuring a segment against `segment_size_bytes`.
 const RECORD_OVERHEAD_BYTES: u64 = 96;
 /// How many closed segments that could not be written yet are kept in memory. When the
@@ -211,7 +214,10 @@ impl std::fmt::Display for WalGapReason {
                 write!(f, "a closed segment could not be written and was dropped")
             }
             WalGapReason::OfflineChange => {
-                write!(f, "an offline repair command changed the database")
+                write!(
+                    f,
+                    "an offline repair command (db-scan) changed the database outside the archive"
+                )
             }
         }
     }
@@ -806,8 +812,10 @@ impl WalArchiver {
         })?;
         let _ = fs::remove_file(&probe);
 
-        // Events an earlier run noticed and no synchronisation recorded yet.
+        // Events an earlier run, or an offline command, noticed and no synchronisation
+        // recorded yet.
         let mut pending = read_pending_events(&segments_path);
+        adopt_handed_over_gaps(&segments_path, &mut pending);
 
         // A marker left behind means the previous run stopped with records that were never
         // written to a segment. The gap is made durable before the marker goes, so that a
@@ -970,6 +978,12 @@ impl WalArchiver {
                  archive synchronisation would forget them"
             );
         }
+    }
+
+    /// Take the gaps offline commands handed over (see [`hand_over_gap`]) into the
+    /// pending events, so that the next [`Self::pending_events`] returns them.
+    pub fn adopt_handed_over_gaps(&mut self) {
+        adopt_handed_over_gaps(&self.segments_path, &mut self.pending);
     }
 
     /// The events the archive index must record. Once it did, hand them to
@@ -1553,9 +1567,15 @@ pub fn write_pending_events(dir: &Path, events: &WalPendingEvents) -> Result<(),
 }
 
 /// The events left in `dir` by a server that is not running: those it never had recorded,
-/// and the gap of the open segment it stopped without closing.
+/// the gaps offline commands handed over, and the gap of the open segment it stopped
+/// without closing.
 pub fn read_local_events(dir: &Path) -> WalPendingEvents {
     let mut events = read_pending_events(dir);
+    events.gaps.extend(
+        read_handed_over_gaps(dir)
+            .into_iter()
+            .map(|(_, gap)| gap),
+    );
     events.gaps.extend(read_marker_gap(dir));
     events
 }
@@ -1563,6 +1583,7 @@ pub fn read_local_events(dir: &Path) -> WalPendingEvents {
 /// Forget the events [`read_local_events`] returned, once the archive index records them.
 pub fn clear_local_events(dir: &Path) -> Result<(), WalError> {
     write_pending_events(dir, &WalPendingEvents::default())?;
+    forget_handed_over_gaps(dir)?;
     match fs::remove_file(dir.join(WAL_OPEN_SEGMENT_MARKER)) {
         Ok(()) => sync_dir(dir),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -1581,6 +1602,7 @@ pub fn defer_restore(dir: &Path, restore: WalRestore) -> Result<(), WalError> {
         ..WalPendingEvents::default()
     };
     write_pending_events(dir, &events)?;
+    forget_handed_over_gaps(dir)?;
     match fs::remove_file(dir.join(WAL_OPEN_SEGMENT_MARKER)) {
         Ok(()) => sync_dir(dir),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -1588,14 +1610,122 @@ pub fn defer_restore(dir: &Path, restore: WalRestore) -> Result<(), WalError> {
     }
 }
 
-/// Hand `gap` to the next archiver started on `dir`, for an offline command that changed the
-/// database while the archive could not record it. It is added to the events already
-/// pending there.
-pub fn defer_gap(dir: &Path, gap: WalGap) -> Result<(), WalError> {
-    fs::create_dir_all(dir)?;
-    let mut events = read_pending_events(dir);
-    events.gaps.push(gap);
-    write_pending_events(dir, &events)
+/// Hand `gap` to the server that archives from `dir`, for an offline command that changed
+/// the database outside the archive: one file in [`WAL_HANDED_OVER_GAPS_DIR`], which the
+/// server takes into its pending events when it starts and at every archive run, and
+/// recovery reads meanwhile. A running server rewrites its own files from memory, so the
+/// gap never goes into them. Returns the file, for [`withdraw_handed_over_gap`].
+pub fn hand_over_gap(dir: &Path, gap: &WalGap) -> Result<PathBuf, WalError> {
+    let gaps_dir = dir.join(WAL_HANDED_OVER_GAPS_DIR);
+    fs::create_dir_all(&gaps_dir)?;
+    let name = format!(
+        "gap-{}-{}.json",
+        gap.from_ts.as_nanos(),
+        Uuid::new_v4().simple()
+    );
+    write_file_durably(&gaps_dir, &name, &serde_json::to_vec(gap)?)?;
+    sync_dir(dir)?;
+    Ok(gaps_dir.join(name))
+}
+
+/// Take back the gap [`hand_over_gap`] wrote to `path`: the change it announced did not
+/// happen.
+pub fn withdraw_handed_over_gap(path: &Path) -> Result<(), WalError> {
+    match fs::remove_file(path) {
+        Ok(()) => path.parent().map_or(Ok(()), sync_dir),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// The gaps handed over in `dir` (see [`hand_over_gap`]) with their files. A file that can
+/// not be read is a gap over all of history, since what it held is unknown.
+fn read_handed_over_gaps(dir: &Path) -> Vec<(PathBuf, WalGap)> {
+    let gaps_dir = dir.join(WAL_HANDED_OVER_GAPS_DIR);
+    let entries = match fs::read_dir(&gaps_dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(err) => {
+            error!(%err, path = %gaps_dir.display(), "Unable to read the handed over WAL archive gaps");
+            return unreadable_pending_events()
+                .gaps
+                .into_iter()
+                .map(|gap| (gaps_dir.clone(), gap))
+                .collect();
+        }
+    };
+    let mut gaps = Vec::new();
+    for entry in entries {
+        let path = match entry {
+            Ok(entry) => entry.path(),
+            Err(err) => {
+                error!(%err, path = %gaps_dir.display(), "Unable to read the handed over WAL archive gaps");
+                gaps.extend(
+                    unreadable_pending_events()
+                        .gaps
+                        .into_iter()
+                        .map(|gap| (gaps_dir.clone(), gap)),
+                );
+                continue;
+            }
+        };
+        if path.extension().is_none_or(|extension| extension != "json") {
+            // A file still being written.
+            continue;
+        }
+        let gap = fs::read(&path)
+            .map_err(WalError::from)
+            .and_then(|data| Ok(serde_json::from_slice::<WalGap>(&data)?))
+            .unwrap_or_else(|err| {
+                error!(%err, path = %path.display(), "Unable to read a handed over WAL archive gap");
+                WalGap {
+                    from_ts: Duration::ZERO,
+                    until_ts: None,
+                    reason: WalGapReason::OfflineChange,
+                }
+            });
+        gaps.push((path, gap));
+    }
+    gaps.sort_by_key(|(_, gap)| gap.from_ts);
+    gaps
+}
+
+/// Remove every gap handed over in `dir`.
+fn forget_handed_over_gaps(dir: &Path) -> Result<(), WalError> {
+    let gaps_dir = dir.join(WAL_HANDED_OVER_GAPS_DIR);
+    match fs::remove_dir_all(&gaps_dir) {
+        Ok(()) => sync_dir(dir),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// Move the gaps handed over in `dir` into `pending`, the pending events of `dir`: written
+/// to disk first, then the hand-over files go. A failure is logged, and the files stay for
+/// the next try.
+fn adopt_handed_over_gaps(dir: &Path, pending: &mut WalPendingEvents) {
+    let handed_over = read_handed_over_gaps(dir);
+    if handed_over.is_empty() {
+        return;
+    }
+    let mut adopted = pending.clone();
+    adopted.gaps.extend(handed_over.iter().map(|(_, gap)| *gap));
+    if let Err(err) = write_pending_events(dir, &adopted) {
+        error!(%err, "Unable to take over the WAL archive gaps offline commands handed over; retrying later");
+        return;
+    }
+    *pending = adopted;
+    for (path, gap) in handed_over {
+        warn!(
+            from = %format_ts_rfc3339(gap.from_ts),
+            reason = %gap.reason,
+            "WAL archive gap handed over by an offline command"
+        );
+        if let Err(err) = withdraw_handed_over_gap(&path) {
+            // Taken over again by the next run: recorded twice, which changes nothing.
+            warn!(%err, path = %path.display(), "Unable to remove a handed over WAL archive gap");
+        }
+    }
 }
 
 /// The gap the open segment marker left in `dir` by a run that stopped without closing

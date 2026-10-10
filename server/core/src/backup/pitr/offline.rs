@@ -5,7 +5,7 @@
 //! Replaying the archive across such a change would rebuild a database that disagrees with
 //! the one the server went on with, so the change is recorded as a gap: recovery never
 //! replays across it, and only a base backup taken after it makes later points
-//! recoverable.
+//! recoverable. Like a manual backup, the gap is handed over through the WAL directory.
 //!
 //! A manual `kubidmd database backup` captures the database exactly like an online backup
 //! does: one read transaction, whose last committed transaction is the CID watermark the
@@ -19,14 +19,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use kubidm_proto::backup::{PitrBaseBackup, PitrManifest, PitrWalGap};
+use kubidm_proto::backup::{PitrBaseBackup, PitrManifest};
 use kubidmd_lib::be::BackupStructuralReport;
 use kubidmd_lib::prelude::duration_from_epoch_now;
 use kubidmd_lib::repl::wal::{
-    defer_gap, format_ts_rfc3339, write_file_durably, WalGap, WalGapReason,
+    format_ts_rfc3339, hand_over_gap, withdraw_handed_over_gap, write_file_durably, WalGap,
+    WalGapReason,
 };
 
-use super::store::PitrStore;
 use super::{blocking, BaseLocation, PitrError, PitrSettings};
 use crate::backup::{backup_name_timestamp, is_backup_artifact_name};
 use crate::config::Configuration;
@@ -38,12 +38,9 @@ pub const HANDED_OVER_BASES_DIR: &str = ".handed-over-bases";
 /// Where [`note_offline_change`] recorded the gap of an offline change.
 #[derive(Debug, PartialEq, Eq)]
 pub enum OfflineChangeRecord {
-    /// In the manifest of the archive.
-    Recorded,
-    /// In the WAL directory, for the server to record at its first archive
-    /// synchronisation: the archive has no manifest yet, or could not be updated. Recovery
-    /// honours it from there as well.
-    HandedOver,
+    /// In this file of the WAL directory, for the server to record at its next start or
+    /// archive run. Recovery honours it from there meanwhile.
+    HandedOver(PathBuf),
     /// Nowhere: WAL archiving is not configured.
     NotConfigured,
 }
@@ -52,24 +49,27 @@ pub enum OfflineChangeRecord {
 /// committed a transaction at `db_ts_max`, and the change happened at `now`, before any
 /// later transaction. A base backup whose watermark is `db_ts_max` may have been taken on
 /// either side of the change, so it can not replay past it either.
-fn offline_change_gap(db_ts_max: Duration, now: Duration, command: &str) -> PitrWalGap {
+fn offline_change_gap(db_ts_max: Duration, now: Duration) -> WalGap {
     let from_ts = db_ts_max + Duration::from_nanos(1);
-    PitrWalGap {
+    WalGap {
         from_ts,
-        until_ts: now.max(from_ts),
-        reason: format!("{command} changed the database outside the WAL archive"),
+        until_ts: Some(now.max(from_ts)),
+        reason: WalGapReason::OfflineChange,
     }
 }
 
-/// Before an offline command changes the database described by `config` outside the
-/// archive (see the module documentation): when WAL archiving is configured, record a gap
-/// from just after `db_ts_max`, the last transaction the database committed, up to now, so
-/// that recovery never replays across the change. `command` names the command for the
-/// operator.
+/// Before an offline command commits a change of the database described by `config`
+/// outside the archive (see the module documentation): when WAL archiving is configured,
+/// record a gap from just after `db_ts_max`, the last transaction the database committed,
+/// up to now, so that recovery never replays across the change. `command` names the
+/// command for the operator.
 ///
-/// The gap is recorded in the archive's manifest, or, when the archive has no manifest yet
-/// or can not be updated, handed to the server through its WAL directory. Fails only when
-/// neither worked; the caller must then leave the database alone.
+/// The gap is handed to the server through its WAL directory, never written to the
+/// manifest: a server running next to the command owns the manifest, and a read, modify
+/// and write of it here could undo a save of the server's. The server records it at its
+/// next start or archive run, and `recover` honours it meanwhile. Fails when the gap could
+/// not be handed over; the caller must then leave the database alone. When the change
+/// then does not happen after all, take the gap back with [`withdraw_offline_change`].
 pub async fn note_offline_change(
     config: &Configuration,
     db_ts_max: Duration,
@@ -80,61 +80,39 @@ pub async fn note_offline_change(
     };
     record_offline_change(
         &settings,
-        offline_change_gap(db_ts_max, duration_from_epoch_now(), command),
+        offline_change_gap(db_ts_max, duration_from_epoch_now()),
+        command,
     )
     .await
 }
 
-/// Record `gap` in the archive at `settings`, or hand it over through the WAL directory.
+/// Hand `gap` over through the WAL directory of `settings`.
 pub(super) async fn record_offline_change(
     settings: &PitrSettings,
-    gap: PitrWalGap,
+    gap: WalGap,
+    command: &str,
 ) -> Result<OfflineChangeRecord, PitrError> {
-    let recorded = async {
-        let store = PitrStore::open(&settings.location).await?;
-        let Some(mut manifest) = store.load_manifest().await? else {
-            return Ok(false);
-        };
-        manifest.add_gap(gap.clone());
-        store.save_manifest(&mut manifest, gap.until_ts).await?;
-        Ok::<_, PitrError>(true)
-    }
-    .await;
-    match recorded {
-        Ok(true) => {
-            warn!(
-                from = %format_ts_rfc3339(gap.from_ts),
-                until = %format_ts_rfc3339(gap.until_ts),
-                archive = %settings.location,
-                "Gap recorded in the WAL archive: point-in-time recovery does not replay across \
-                 this change; take an online backup after starting the server"
-            );
-            return Ok(OfflineChangeRecord::Recorded);
-        }
-        Ok(false) => {}
-        Err(err) => warn!(
-            %err,
-            archive = %settings.location,
-            "The WAL archive could not record the change; it is handed to the server through \
-             its WAL directory"
-        ),
-    }
-
     let local_dir = settings.local_dir.clone();
-    let deferred = WalGap {
-        from_ts: gap.from_ts,
-        until_ts: Some(gap.until_ts),
-        reason: WalGapReason::OfflineChange,
-    };
-    blocking(move || Ok(defer_gap(&local_dir, deferred)?)).await?;
+    let path = blocking(move || Ok(hand_over_gap(&local_dir, &gap)?)).await?;
     warn!(
+        command,
         from = %format_ts_rfc3339(gap.from_ts),
-        until = %format_ts_rfc3339(gap.until_ts),
+        until = %format_ts_rfc3339(gap.until_ts.unwrap_or(gap.from_ts)),
         wal_directory = %settings.local_dir.display(),
         "Gap handed to the server: point-in-time recovery does not replay across this change; \
          take an online backup after starting the server"
     );
-    Ok(OfflineChangeRecord::HandedOver)
+    Ok(OfflineChangeRecord::HandedOver(path))
+}
+
+/// The change [`note_offline_change`] recorded did not happen: take its gap back.
+pub async fn withdraw_offline_change(record: OfflineChangeRecord) -> Result<(), PitrError> {
+    match record {
+        OfflineChangeRecord::HandedOver(path) => {
+            blocking(move || Ok(withdraw_handed_over_gap(&path)?)).await
+        }
+        OfflineChangeRecord::NotConfigured => Ok(()),
+    }
 }
 
 /// What [`note_manual_backup`] made of a manual backup.
@@ -339,10 +317,13 @@ mod tests {
     use kubidm_proto::backup::{
         BackupEncryptionConfig, PitrManifest, WalArchiveConfig, PITR_MANIFEST_KEY,
     };
-    use kubidmd_lib::repl::wal::{read_local_events, read_pending_events, segment_file_name};
+    use kubidmd_lib::repl::wal::{
+        read_local_events, read_pending_events, segment_file_name, WalArchiver,
+    };
     use uuid::Uuid;
 
     use super::super::recover::fold_local_events;
+    use super::super::store::PitrStore;
     use super::super::test_util::*;
     use super::super::{plan_recovery, BaseLocation, PitrLocation, RecoveryTargetSpec};
     use super::*;
@@ -396,8 +377,11 @@ mod tests {
         );
     }
 
+    /// The gap of an offline change is handed over through the WAL directory, never written
+    /// to the manifest, which a running server owns: recovery honours it from there, the
+    /// server takes it over when it starts, and a change that did not happen takes it back.
     #[tokio::test]
-    async fn test_offline_change_is_a_gap_in_the_manifest() {
+    async fn test_offline_change_is_handed_over_and_never_written_to_the_manifest() {
         let dir = tempfile::tempdir().unwrap();
         let settings = settings(dir.path());
         let store = PitrStore::open(&settings.location).await.unwrap();
@@ -405,67 +389,68 @@ mod tests {
             .save_manifest(&mut archived(), Duration::from_secs(250))
             .await
             .unwrap();
+        let saved = fs::read(settings.local_dir.join(PITR_MANIFEST_KEY)).unwrap();
 
-        let gap = offline_change_gap(
-            Duration::from_secs(200),
-            Duration::from_secs(300),
-            "db-scan quarantine-id2entry",
-        );
+        let gap = offline_change_gap(Duration::from_secs(200), Duration::from_secs(300));
+        let record = record_offline_change(&settings, gap, "db-scan quarantine-id2entry")
+            .await
+            .unwrap();
+        assert!(matches!(record, OfflineChangeRecord::HandedOver(_)));
         assert_eq!(
-            record_offline_change(&settings, gap).await.unwrap(),
-            OfflineChangeRecord::Recorded
+            fs::read(settings.local_dir.join(PITR_MANIFEST_KEY)).unwrap(),
+            saved,
+            "the manifest is the server's"
         );
-        let manifest = store.load_manifest().await.unwrap().unwrap();
-        assert_eq!(manifest.gaps.len(), 1);
+        let events = read_local_events(&settings.local_dir);
+        assert_eq!(events.gaps, vec![gap]);
         assert_eq!(
-            manifest.gaps[0].from_ts,
+            events.gaps[0].from_ts,
             Duration::from_secs(200) + Duration::from_nanos(1)
         );
-        assert_eq!(manifest.gaps[0].until_ts, Duration::from_secs(300));
+        assert_eq!(events.gaps[0].until_ts, Some(Duration::from_secs(300)));
+
+        // Recovery folds what the WAL directory holds into the archive it reads.
+        let mut manifest = store.load_manifest().await.unwrap().unwrap();
+        fold_local_events(&mut manifest, &events, Duration::from_secs(400));
         assert_change_blocks_recovery(&manifest);
-        assert!(read_pending_events(&settings.local_dir).is_empty());
+
+        // A change that did not happen takes its gap back.
+        let withdrawn = record_offline_change(
+            &settings,
+            offline_change_gap(Duration::from_secs(300), Duration::from_secs(350)),
+            "db-scan restore-quarantined",
+        )
+        .await
+        .unwrap();
+        assert_eq!(read_local_events(&settings.local_dir).gaps.len(), 2);
+        withdraw_offline_change(withdrawn).await.unwrap();
+        assert_eq!(read_local_events(&settings.local_dir).gaps, vec![gap]);
+
+        // The server takes it over into its own pending events when it starts.
+        let archiver = WalArchiver::open(
+            settings.wal.clone(),
+            Uuid::nil(),
+            settings.local_dir.clone(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(archiver.pending_events().gaps, vec![gap]);
+        assert_eq!(read_pending_events(&settings.local_dir).gaps, vec![gap]);
+        assert_eq!(read_local_events(&settings.local_dir).gaps, vec![gap]);
     }
 
     #[tokio::test]
-    async fn test_offline_change_is_handed_over_when_the_archive_can_not_take_it() {
+    async fn test_offline_change_before_the_first_archive_run_is_handed_over() {
         let dir = tempfile::tempdir().unwrap();
         let settings = settings(dir.path());
-        fs::create_dir_all(&settings.local_dir).unwrap();
-        // A manifest that can not be read.
-        fs::write(settings.local_dir.join(PITR_MANIFEST_KEY), b"{ damaged").unwrap();
-
-        let gap = offline_change_gap(
-            Duration::from_secs(200),
-            Duration::from_secs(300),
-            "db-scan restore-quarantined",
-        );
-        assert_eq!(
-            record_offline_change(&settings, gap).await.unwrap(),
-            OfflineChangeRecord::HandedOver
-        );
-        let events = read_local_events(&settings.local_dir);
-        assert_eq!(events.gaps.len(), 1);
-        assert_eq!(events.gaps[0].reason, WalGapReason::OfflineChange);
-
-        // Recovery folds what the WAL directory holds into the archive it reads.
-        let mut manifest = archived();
-        fold_local_events(&mut manifest, &events, Duration::from_secs(400));
+        let gap = offline_change_gap(Duration::from_secs(200), Duration::from_secs(300));
         assert!(matches!(
-            plan_recovery(
-                &manifest,
-                &RecoveryTargetSpec::Time("1970-01-01T00:05:00Z".to_string())
-            ),
-            Err(PitrError::NotRecoverable(_))
+            record_offline_change(&settings, gap, "db-scan quarantine-id2entry")
+                .await
+                .unwrap(),
+            OfflineChangeRecord::HandedOver(_)
         ));
-
-        // A second change adds to the events already pending.
-        let gap = offline_change_gap(
-            Duration::from_secs(300),
-            Duration::from_secs(350),
-            "db-scan quarantine-id2entry",
-        );
-        record_offline_change(&settings, gap).await.unwrap();
-        assert_eq!(read_local_events(&settings.local_dir).gaps.len(), 2);
+        assert_eq!(read_local_events(&settings.local_dir).gaps.len(), 1);
     }
 
     fn config_for(settings: &PitrSettings, db_dir: &std::path::Path) -> Configuration {
@@ -562,21 +547,5 @@ mod tests {
         assert_eq!(manifest.base_backups[0].key, key);
         forget_handed_over_bases(&settled);
         assert!(read_handed_over_bases(&settings.local_dir).is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_offline_change_before_the_first_archive_run_is_handed_over() {
-        let dir = tempfile::tempdir().unwrap();
-        let settings = settings(dir.path());
-        let gap = offline_change_gap(
-            Duration::from_secs(200),
-            Duration::from_secs(300),
-            "db-scan quarantine-id2entry",
-        );
-        assert_eq!(
-            record_offline_change(&settings, gap).await.unwrap(),
-            OfflineChangeRecord::HandedOver
-        );
-        assert_eq!(read_local_events(&settings.local_dir).gaps.len(), 1);
     }
 }
