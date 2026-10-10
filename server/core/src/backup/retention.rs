@@ -1,30 +1,74 @@
 //! Backup retention shared by the local online backup directory and the S3 prefix.
 //!
 //! Both locations are pruned by the same rule: only artifacts named like an automatically
-//! generated backup are ever considered, they are ordered by their RFC3339 timestamp, and
-//! the oldest ones beyond the configured number of versions are removed. Anything else that
+//! generated backup are ever considered, they are ordered by the RFC3339 timestamp in
+//! their name, and the oldest ones beyond the configured number of versions are removed. Anything else that
 //! shares the location (metadata sidecars, the PITR manifest, manual backups with other
 //! names) is left alone.
 
+use std::cmp::Ordering;
 use std::path::Path;
 use std::sync::LazyLock;
 
+use chrono::{DateTime, FixedOffset};
 use kubidm_proto::backup::{BackupCompression, BACKUP_ENCRYPTED_SUFFIX};
 use regex::Regex;
+use time::{OffsetDateTime, UtcOffset};
 
 /// Pattern of the file name / object key of an automatically generated backup, as written
 /// by the online backup: `backup-<RFC3339 UTC timestamp>.json` with an optional compression
 /// suffix and an optional encryption suffix (see [`backup_artifact_name`]).
 static BACKUP_ARTIFACT_NAME: LazyLock<Regex> = LazyLock::new(|| {
     #[allow(clippy::expect_used)]
-    Regex::new(r"^backup-\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?Z\.json(\.gz)?(\.enc)?$")
-        .expect("backup artifact regex is a constant and must compile")
+    Regex::new(
+        r"^backup-(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z)\.json(\.gz)?(\.enc)?$",
+    )
+    .expect("backup artifact regex is a constant and must compile")
 });
 
 /// Whether `name` (a file name or a prefix-stripped object key) is an automatically
 /// generated backup artifact that retention may delete.
 pub fn is_backup_artifact_name(name: &str) -> bool {
     BACKUP_ARTIFACT_NAME.is_match(name)
+}
+
+/// The time an automatically generated backup was taken, read from its name. None when
+/// `name` is not a backup artifact name.
+pub fn backup_artifact_time(name: &str) -> Option<DateTime<FixedOffset>> {
+    let timestamp = BACKUP_ARTIFACT_NAME.captures(name)?.get(1)?.as_str();
+    DateTime::parse_from_rfc3339(timestamp).ok()
+}
+
+/// Order two backup names oldest first by the time in their name, then by name.
+///
+/// The names can not simply be compared as strings: RFC3339 drops trailing zeros of the
+/// fraction and the whole fraction when it is zero, so within one second `...:00.1Z`
+/// sorts after `...:00.12Z` and `...:00.5Z` before `...:00Z`. Names written by older
+/// servers use that format.
+pub fn compare_backup_names(a: &str, b: &str) -> Ordering {
+    (backup_artifact_time(a), a).cmp(&(backup_artifact_time(b), b))
+}
+
+/// Sort backup names oldest first, see [`compare_backup_names`].
+pub fn sort_backup_names<S: AsRef<str>>(names: &mut [S]) {
+    names.sort_by(|a, b| compare_backup_names(a.as_ref(), b.as_ref()));
+}
+
+/// The timestamp of a backup taken at `now`, as it goes into the backup name and the S3
+/// metadata: RFC3339 in UTC with a fixed nine digit fraction, so that names of new backups
+/// also sort chronologically as plain strings, as directory listings show them.
+pub fn backup_timestamp(now: OffsetDateTime) -> String {
+    let now = now.to_offset(UtcOffset::UTC);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:09}Z",
+        now.year(),
+        u8::from(now.month()),
+        now.day(),
+        now.hour(),
+        now.minute(),
+        now.second(),
+        now.nanosecond()
+    )
 }
 
 /// The file name / object key of an automatically generated backup taken at `timestamp`
@@ -49,16 +93,14 @@ pub fn backup_artifact_name(
 
 /// Given the names found in a backup location, return the ones retention should delete so
 /// that at most `versions` backup artifacts remain. Names that are not backup artifacts are
-/// never returned. The result is ordered oldest first.
-///
-/// Backup names embed an RFC3339 UTC timestamp, so lexical order is chronological order.
+/// never returned. The result is ordered oldest first, by the time in the names.
 pub fn select_backups_to_delete(names: &[String], versions: usize) -> Vec<String> {
     let mut backups: Vec<String> = names
         .iter()
         .filter(|name| is_backup_artifact_name(name))
         .cloned()
         .collect();
-    backups.sort();
+    sort_backup_names(&mut backups);
 
     let excess = backups.len().saturating_sub(versions);
     backups.truncate(excess);
@@ -289,6 +331,62 @@ mod tests {
         assert_eq!(
             select_backups_to_delete(&listing, 1),
             names(&["backup-2024-01-01T22:00:00Z.json.gz"])
+        );
+    }
+
+    #[test]
+    fn test_select_backups_to_delete_orders_by_time_within_a_second() {
+        // RFC3339 as older servers wrote it: as strings, .1Z sorts after .12Z and .5Z
+        // before the whole second, which would delete the newest backup.
+        let listing = names(&[
+            "backup-2024-01-01T22:00:00.1Z.json.gz",
+            "backup-2024-01-01T22:00:00.12Z.json.gz",
+            "backup-2024-01-01T22:00:00Z.json.gz",
+            "backup-2024-01-01T22:00:00.5Z.json.gz",
+        ]);
+        assert_eq!(
+            select_backups_to_delete(&listing, 1),
+            names(&[
+                "backup-2024-01-01T22:00:00Z.json.gz",
+                "backup-2024-01-01T22:00:00.1Z.json.gz",
+                "backup-2024-01-01T22:00:00.12Z.json.gz",
+            ])
+        );
+    }
+
+    #[test]
+    fn test_backup_timestamp_has_a_fixed_width_fraction() {
+        let at = |nanos: u32| {
+            OffsetDateTime::from_unix_timestamp(1_704_146_400)
+                .expect("time")
+                .replace_nanosecond(nanos)
+                .expect("nanos")
+        };
+        assert_eq!(backup_timestamp(at(0)), "2024-01-01T22:00:00.000000000Z");
+        assert_eq!(
+            backup_timestamp(at(100_000_000)),
+            "2024-01-01T22:00:00.100000000Z"
+        );
+        assert_eq!(
+            backup_timestamp(at(120_000_000)),
+            "2024-01-01T22:00:00.120000000Z"
+        );
+
+        // New names sort chronologically as strings too, and are backup names.
+        let mut stamps: Vec<String> = [120_000_000, 0, 100_000_000]
+            .into_iter()
+            .map(|nanos| {
+                backup_artifact_name(&backup_timestamp(at(nanos)), BackupCompression::Gzip, false)
+            })
+            .collect();
+        let mut by_time = stamps.clone();
+        sort_backup_names(&mut by_time);
+        stamps.sort();
+        assert_eq!(stamps, by_time);
+        assert!(stamps.iter().all(|name| is_backup_artifact_name(name)));
+        assert_eq!(
+            backup_artifact_time(&stamps[0]).map(|t| t.timestamp()),
+            Some(1_704_146_400)
         );
     }
 

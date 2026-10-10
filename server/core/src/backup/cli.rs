@@ -25,10 +25,10 @@ use kubidmd_lib::{
 use time::format_description::well_known::Rfc3339;
 
 use super::{
-    is_backup_artifact_name, lag_metrics_from_health, open_backup_file_with_config, pitr,
-    region_is_healthy,
+    compare_backup_names, is_backup_artifact_name, lag_metrics_from_health,
+    open_backup_file_with_config, pitr, region_is_healthy,
     restore::{backup_encryption_config, restore_and_replay, restore_database},
-    run_blocking, s3_location, seal_backup_async, verify_backup_output_async,
+    run_blocking, s3_location, seal_backup_async, sort_backup_names, verify_backup_output_async,
     write_verified_local_backup_async, BackupEncryptor, BackupVerifyError, S3BackupError,
     S3ClientWrapper,
 };
@@ -703,7 +703,7 @@ fn list_local_backups(config: &Configuration) -> bool {
         return true;
     }
 
-    rows.sort();
+    rows.sort_by(|a, b| compare_backup_names(&a.0, &b.0));
     let name_width = rows
         .iter()
         .map(|(name, _, _, _)| name.len())
@@ -774,7 +774,7 @@ async fn list_s3_backups(config: &Configuration, region: Option<&str>) -> bool {
         return true;
     }
 
-    keys.sort();
+    sort_backup_names(&mut keys);
 
     // Fetch every sidecar first so that the columns can be sized to the content.
     let mut ok = true;

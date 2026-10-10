@@ -13,13 +13,12 @@ use std::sync::Arc;
 use kubidm_proto::backup::{BackupCompression, BackupEncryptionConfig, S3Config};
 use kubidm_proto::internal::OperationError;
 use kubidmd_lib::be::BackupStructuralReport;
-use time::format_description::well_known::Rfc3339;
 use tracing::instrument;
 
 use super::pitr::{BaseLocation, PitrArchive};
 use super::{
-    backup_artifact_name, is_backup_artifact_name, prune_local_backups, run_blocking,
-    seal_backup_async, select_backups_to_delete, verify_backup_output_async,
+    backup_artifact_name, backup_timestamp, is_backup_artifact_name, prune_local_backups,
+    run_blocking, seal_backup_async, select_backups_to_delete, verify_backup_output_async,
     write_verified_local_backup_async, BackupEncryptor, S3ClientWrapper,
 };
 use crate::actors::QueryServerReadV1;
@@ -80,10 +79,7 @@ impl OnlineBackupJob {
         #[allow(clippy::disallowed_methods)]
         // Allowed as this timestamp is only used for the backup name.
         let now = time::OffsetDateTime::now_utc();
-        let timestamp = now.format(&Rfc3339).map_err(|err| {
-            error!(?err, "Online backup can not format its timestamp");
-            OperationError::InvalidState
-        })?;
+        let timestamp = backup_timestamp(now);
 
         // The key is obtained once per run, before any backup is produced, so that an
         // unavailable key fails the run without leaving a half written artifact behind.

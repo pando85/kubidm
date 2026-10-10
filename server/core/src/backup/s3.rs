@@ -20,7 +20,7 @@ use kubidm_proto::backup::{
 };
 use sha2::{Digest, Sha256};
 
-use super::retention::is_backup_artifact_name;
+use super::retention::{is_backup_artifact_name, sort_backup_names};
 
 /// Limit on establishing a connection to the service. An unreachable endpoint fails
 /// after this instead of the operating system's TCP timeout.
@@ -742,7 +742,7 @@ impl S3ClientWrapper {
             .into_iter()
             .filter(|key| is_backup_artifact_name(key))
             .collect();
-        backups.sort();
+        sort_backup_names(&mut backups);
         Ok(backups)
     }
 
@@ -930,7 +930,7 @@ impl S3ClientWrapper {
 
         // Oldest first, so the last intact backup is the newest one.
         let mut source: Vec<&String> = source_backups.iter().collect();
-        source.sort();
+        sort_backup_names(&mut source);
 
         // The lag is measured against the newest primary backup whether or not the region
         // holds it; a region that misses exactly the newest backup lags by one interval.
