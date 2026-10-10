@@ -3,8 +3,9 @@
 Single source of truth for finishing backup and restore in Kubidm. Goal: replication, client-side encryption and
 WAL/PITR are all functional, tested and documented, delivered in one PR.
 
-Last updated: 2026-10-10. Status: all planned work is implemented and verified on `backup/final`, including the fixes of
-the review rounds below. Only the limitations and follow-ups listed below remain.
+Last updated: 2026-10-11. Status: done. All planned work merged in #480; the follow-ups (#453, #457, #458) and the
+limitations it left were fixed by #488 and #491, both merged. Only the residual limitations left unchecked below remain,
+all by design and documented in the book.
 
 ## Decisions
 
@@ -18,13 +19,14 @@ the review rounds below. Only the limitations and follow-ups listed below remain
 
 ## Branches
 
-| Branch                    | Base              | Content                                                                           | Status                         |
-| ------------------------- | ----------------- | --------------------------------------------------------------------------------- | ------------------------------ |
-| `backup/complete`         | master            | Phase 1 S3 recovery, Phase 2a/2b verification, Silo CI, #459 fix                  | Merged into `backup/final`     |
-| `backup/feat-replication` | `backup/complete` | Replicate to regions, health monitor, `replicate-status`, `--region`              | Merged into `backup/final`     |
-| `backup/feat-encryption`  | `backup/complete` | Encrypt on write, decrypt on restore, `.enc` naming, config checks                | Merged into `backup/final`     |
-| `backup/feat-pitr`        | `backup/complete` | WAL archiver, manifest, `pitr-list`, `recover`                                    | Merged into `backup/final`     |
-| `backup/final`            | master            | Everything above, plus encrypted and replicated WAL archive and the combined docs | Verified, the single PR source |
+| Branch                    | Base              | Content                                                                              | Status                     |
+| ------------------------- | ----------------- | ------------------------------------------------------------------------------------ | -------------------------- |
+| `backup/complete`         | master            | Phase 1 S3 recovery, Phase 2a/2b verification, Silo CI, #459 fix                     | Merged into `backup/final` |
+| `backup/feat-replication` | `backup/complete` | Replicate to regions, health monitor, `replicate-status`, `--region`                 | Merged into `backup/final` |
+| `backup/feat-encryption`  | `backup/complete` | Encrypt on write, decrypt on restore, `.enc` naming, config checks                   | Merged into `backup/final` |
+| `backup/feat-pitr`        | `backup/complete` | WAL archiver, manifest, `pitr-list`, `recover`                                       | Merged into `backup/final` |
+| `backup/final`            | master            | Everything above, plus encrypted and replicated WAL archive and the combined docs    | Merged as #480             |
+| `backup/followups`        | master            | `backup/observability` (#457, #458) and `backup/limitations` (the limitations below) | Merged as #491             |
 
 ## Work items
 
@@ -82,70 +84,89 @@ Recovery restores the newest base backup at or before the target, then applies l
 - [x] Full verification: fmt, clippy `-D warnings`, `cargo metadata --locked`, `cargo test --workspace` (2321 passed),
       codespell, backup e2e tests against Silo (backup 48, `s3_` 43, pitr 5, `database_verify` 2, replication 9,
       encryption 5)
-- [x] Open the single PR, close #460, #461, #462; it closes #454, #455, #456, #459 and #360
+- [x] Open the single PR (#480, merged), close #460, #461, #462; it closed #454, #455, #456, #459 and #360
 
 ### Known limitations, follow-ups
+
+Fixed by #491 (merged):
 
 - [x] `replicate-status` reported backups only: it now reports the WAL archive per region too (manifest presence,
       readability and freshness, lag, missing and differing segments), and every archive run repairs region copies:
       missing or resized segments and missing sidecars every run, differing sidecars once per `sync_interval_seconds`,
-      and a damaged region manifest is written again from the primary's
+      and a damaged region manifest is written again from the primary's (#491)
 - [x] Per-segment key derivation (Argon2id with a fresh salt per segment) made decrypting large WAL archives slow:
       segments are sealed in an encryption session (one salt and derived key per server run, up to 2^20 segments, a
       random nonce and the segment id per segment) and decryption keeps derived keys by salt and parameters, zeroized on
       drop. The container format is unchanged, so segments sealed one by one still open; no release tag contains the WAL
-      format (checked with `git tag --contains`)
+      format (checked with `git tag --contains`) (#491)
 - [x] An unclean stop lost the open segment (up to `segment_interval_seconds` of WAL): every commit now appends its
-      records to a per-segment journal (`open_segment_journal`: `Commit` syncs it in every archiving commit, the
-      default; `Interval` at most every `journal_sync_interval_ms`; `Off` as before), and the next start closes the open
-      and unwritten segments from their journals. A commit that archives nothing is journaled too, so a start compares
-      the journal with the database's last transaction and records only what the journal misses as a gap. Measured cost:
-      one `fdatasync` per write transaction (about 3 ms on the development disk, the same as the database's own commit
-      sync)
+      records to a per-segment journal (`open_segment_journal`: `Commit` syncs it in every write commit, the default;
+      `Interval` at most every `journal_sync_interval_ms`; `Off` as before), and the next start closes the open and
+      unwritten segments from their journals. A commit that archives nothing is journaled too, so a start compares the
+      journal with the database's last transaction and records only what the journal misses as a gap. Measured cost: one
+      `fdatasync` per write transaction (about 3 ms on the development disk, the same as the database's own commit sync)
+      (#491)
 - [x] Review of the journal: a journal without the open segment marker (a crash between the journal and the marker) is
-      closed, not removed; the marker covers a transaction from before the database commits it, so a crash between the
-      commit and its archiving is a gap; `Commit` syncs the frames of commits without records too, so a power loss
-      leaves no false gap; `Interval` is synced by a timer of the archive task; `recover` closes (or, dry, reads) the
-      journals itself, so a server that can not start loses nothing; journal records keep the commit order
+      closed, not removed; the marker covers a transaction from before the database commits it, including a commit that
+      only records a gap or a new server uuid, so a crash between the commit and its archiving is a gap; `Commit` syncs
+      the frames of commits without records too, so a power loss leaves no false gap; `Interval` is synced by a timer of
+      the archive task; `recover` closes (or, dry, reads) the journals itself, only once it restores, so a server that
+      can not start loses nothing and a refused recovery changes nothing; journal records keep the commit order (#491)
 - [x] Review of `db-scan` and replication: a failed or refused repair exits non-zero and leaves no gap (the change is
-      made before the gap is handed over, and a failed commit takes it back); the gap is handed over through
-      `.handed-over-gaps/` instead of a read, modify and write of the manifest a running server owns; the sidecar
-      comparison runs once per sync interval, 16 at a time, outside the manifest lock, and in `replicate-status` only
+      made before the gap is handed over, the gap stays pending and locked until the commit is known, and a failed
+      commit takes it back); the gap is handed over through `.handed-over-gaps/` instead of a read, modify and write of
+      the manifest a running server owns, and a missing WAL directory refuses the repair; the sidecar comparison runs
+      once per sync interval, 16 at a time, outside the manifest lock, never at shutdown, and in `replicate-status` only
       with `--deep`; a segment the primary lacks is a primary problem, never a damaged region copy, and a failed copy no
       longer stops the region's manifest; `replicate-status` tolerates a lag up to the sync interval plus two segment
-      intervals (`pending`) and reports an archive without a manifest as not yet archived
-- [ ] `recover` on a host whose server can not start stops at the last commit the journal holds: without the database it
-      can not tell whether more was committed, which the next start settles
-- [ ] A `db-scan` gap reaches the manifest at the next server start or archive run; a recovery on another host before
-      then does not see it
-- [ ] More than four closed segments that can not be written are dropped and recorded as gaps (their journals go with
-      them); only a new base backup makes later points recoverable
-- [ ] A restore whose abandoned history can be recorded neither in the archive nor handed over through the WAL directory
-      exits 3; until a new online backup is taken after the start, a recovery past it could replay that history
+      intervals (`pending`), leaves segments due for retention out, and reports an archive without a manifest as not yet
+      archived (#491)
 - [x] `db-scan` quarantine commands bypassed the WAL archive: `quarantine-id2entry` and `restore-quarantined` record a
-      gap from just after the last committed transaction up to now before they commit (handed to the server through the
-      WAL directory, else they refuse), so recovery never replays across them
+      gap from just after the last committed transaction up to the time of the command, handed to the server through the
+      WAL directory (else they refuse and leave the database alone), so recovery never replays across them (#491)
 - [x] Manual `database backup` files were not PITR bases: one written into the local base directory under a backup name
       is handed over through the WAL directory (`.handed-over-bases/`) with the watermark of its content; the server
-      indexes it at its next archive run and recovery uses it meanwhile. With S3 bases a manual backup stays outside the
-      index (documented)
+      indexes it at its next archive run and recovery uses it meanwhile (#491)
 - [x] The offline `restore` and `recover` ran their write transaction and reindex on the CLI's runtime: the restore,
       replay, reindex and boot verification now run on a dedicated database thread (`on_database_thread`), checked by a
-      test that the single thread of a current thread runtime keeps ticking through a restore and a recovery
+      test that the single thread of a current thread runtime never stalls more than 250 ms through a restore and a
+      recovery; a restore that can not touch the database file fails with exit code 1 instead of ending the process
+      (#491)
+
+Remaining, by design and documented in the book ("What Can Be Lost", "Recovering", "Manual Backups as Recovery Bases",
+"The WAL Archive and Replication"):
+
+- [ ] `recover` on a host whose server can not start stops `--latest` at the last commit the journal holds: without the
+      database it can not tell whether more was committed, which the next start of a server on that WAL directory
+      settles; `recover` warns about it
+- [ ] A `db-scan` gap reaches the manifest at the next server start or archive run; a recovery on another host before
+      then does not see it (the book says to start the server after a repair before recovering elsewhere)
+- [ ] More than four closed segments that can not be written (`WAL_MAX_UNWRITTEN_SEGMENTS`) are dropped and recorded as
+      gaps, their journals with them, to bound memory; only a new base backup makes later points recoverable
+- [ ] A restore whose abandoned history can be recorded neither in the archive nor handed over through the WAL directory
+      exits 3; until a new online backup is taken after the start, a recovery past it could replay that history
 - [ ] A region of a separate `[online_backup.wal_archive.s3]` location only has base backups when `[online_backup.s3]`
       replicates to a region of the same name, which `recover --region` requires
+- [ ] With S3 base backups a manual backup never becomes a PITR base: the archive pairs its segments with the online
+      backups in S3, and a local file would not be there for a recovery on another host
 
 ### Follow-up issues, not blocking
 
-- [x] #453 migration schema cleanup filter never matches (fixed by #488)
-- [x] #457 backup metrics: `GET /metrics` behind `metrics_endpoint`, optionally guarded by a bearer token from
-      `metrics_token_file`, with the timestamps persisted across restarts (branch `backup/followups`)
-- [x] #458 scheduled full verification: `verify_schedule` and `verify_temp_path`, serialised with the online backups
-      (branch `backup/followups`)
+- [x] #453 migration schema cleanup filter never matches: both migrations delete the database-stored schema with `f_or`
+      through one helper, `delete_db_stored_schema`, with migration tests that fail with the old filter (fixed by #488,
+      merged; issue closed)
+- [x] #457 backup metrics: opt-in `GET /metrics` (`metrics_endpoint`), optionally guarded by a bearer token from
+      `metrics_token_file`, with last success and failure timestamps and failure counters per destination (local, S3,
+      every region), for the verification and for the WAL archive sync; timestamps persist in
+      `<database file>.backup-metrics.json` and are seeded from the newest backups (fixed by #491, merged; issue closed)
+- [x] #458 scheduled full verification: `verify_schedule` and `verify_temp_path` run the `verify-backup --level full`
+      steps on the newest local and S3 artifact, serialised with the online backups, with a free space check, pass, fail
+      and error outcomes in the logs and metrics, and scratch data removed on shutdown and at start (fixed by #491,
+      merged; issue closed)
 
-## Review rounds
+## Review rounds (#480)
 
-After the PR opened, three independent reviews (core and S3, encryption, PITR) and a second fix round found and fixed:
+After #480 opened, three independent reviews (core and S3, encryption, PITR) and a second fix round found and fixed:
 
 - Core and S3:
   - the scheduler built its cron iterator once, so a run longer than the gap to the next time wrapped the wait to about
@@ -202,6 +223,53 @@ After the PR opened, three independent reviews (core and S3, encryption, PITR) a
 - Verification after the rounds: `cargo test --workspace` 2394 passed; e2e against Silo: backup 49, `s3_` 46,
   replication 9, encryption 5, pitr 9, `database_verify` 2
 
+## Follow-up round (#491)
+
+#491 combined `backup/observability` (#457, #458) and `backup/limitations` (the limitations above). Each branch had a
+review round before the merge, and the merged branch one more:
+
+- Observability:
+  - every metric restarted at 0, so stale alerts fired after each restart; timestamps now persist in a state file and
+    are seeded from the newest backup in every location
+  - a verification that could not run (listing, download, key, scratch space) was counted as a failed backup; it is now
+    an error outcome with its own counter
+  - a shutdown waited for a whole scratch restore; the run stops before each step, and the daemon waits at most 5 s for
+    blocking tasks on exit
+  - scratch data moved to `verify_temp_path` (the database directory by default), stale runs are removed at start, and a
+    verification never overlaps an online backup
+  - `/metrics` was unauthenticated; `metrics_token_file` adds an optional bearer token
+  - the boxed server start only hid a debug-build stack overflow of the OpenAPI document generation, which now runs on
+    the blocking pool
+- Limitations:
+  - a restore that could not touch the database file ended the process; it now fails with exit code 1
+  - a `db-scan` repair recorded its gap before the change was validated, exited 0 when refused, and wrote the manifest a
+    running server owns; the change is now validated first and the gap handed over through `.handed-over-gaps/`
+  - the journal review: a journal without its marker is closed, not removed; the in-flight marker precedes the database
+    commit; `Commit` syncs commits without records; `Interval` syncs on a timer; `recover` takes the journal tail
+  - the region copy comparison held the manifest lock for minutes on a large archive; it now runs outside it, 16 at a
+    time, once per sync interval, with `--deep` for the sidecars in `replicate-status` and a lag tolerance
+  - the runtime stall bound of the offline command test was relative; it is now 250 ms absolute
+- After the merge:
+  - the replicated PITR e2e test overflowed its 2 MiB test stack in debug builds; its steps are awaited through
+    `backup_common::boxed`
+  - config validation read `metrics_token_file`, so offline commands failed where the token is not mounted; only the
+    server reads it now
+  - the metrics state file and the scratch sweep were keyed by the database directory, so two servers sharing it mixed
+    their state; both are keyed by the database file now
+  - a full disk failed a verification as a broken backup; a free space check runs first and scratch I/O errors are
+    errors, not failures
+  - `replicate-status` flapped on segments retention was deleting; they are left out and counted on their own
+  - a `db-scan` gap adopted before its commit was known could not be taken back; it stays pending and locked until the
+    commit is known, and a missing WAL directory refuses the repair; a gap confirmed while it is read is skipped
+  - a refused `recover` had already closed the journals; it now only reads them until it restores
+  - a commit that only recorded a gap or a new server uuid had no marker covering it
+  - the shutdown sync ran the deep region comparison and could outlast the stop grace period; it is skipped there
+  - the bearer scheme of the metrics token is matched case-insensitively (RFC 7235)
+  - the 5 s exit bound applied to every subcommand; it now applies to the server only
+- Verification of #491: fmt, clippy `-D warnings`, `cargo doc`, `cargo metadata --locked`, codespell,
+  `deno fmt --check`; `cargo test --workspace` 2461 passed; e2e against Silo: backup 60, `s3_` 48, replication 9,
+  encryption 5, pitr 14, `database_verify` 2, metrics 5, `verif` 19
+
 ## How to resume
 
 Every shell: `unset CARGO_TARGET_DIR`. Run the S3 tests against Silo:
@@ -211,15 +279,17 @@ docker run -d --rm --name silo -p 9000:9000 \
   -e MINIO_ROOT_USER=kubidm-test -e MINIO_ROOT_PASSWORD=kubidm-test-secret \
   pgsty/silo:RELEASE.2026-09-16T00-00-00Z server /data
 KUBIDM_TEST_S3_REQUIRED=1 KUBIDM_TEST_S3_ENDPOINT=http://127.0.0.1:9000 \
-  cargo test -p kubidmd_testkit --test integration_test -- backup s3_ replication encryption pitr database_verify
+  cargo test -p kubidmd_testkit --test integration_test -- backup s3_ replication encryption pitr verif metrics
 ```
 
 ## Known caveats
 
-- The Phase 2a cold-verify test passes with and without its fix. The on-disk schema entries it guards against come from
-  #453.
+- The Phase 2a cold-verify tests pass with and without its fix: they use databases created at the current domain level,
+  which never held the on-disk schema entries it guards against. #488 (#453) removes those entries in the 1.11 to 1.12
+  migration, so the fix only matters for a database or backup from before that migration.
 - `--region` on the S3 recovery commands selects a replication region instead of overriding the signing region.
-- The replication health check compares metadata and sizes. Same-size corruption is only caught by `verify-s3 --region`.
+- The replication health check compares sidecars and sizes, for backups and (with `--deep`, or once per sync interval)
+  for WAL segments. Same-size corruption of a backup copy is only caught by `verify-s3 --region`.
 - An encrypted backup under a name that is not `backup-<timestamp>...` (a manual backup path, a copy on removable media)
   is not bound to a time and opens under any such name.
 - A crash during a multipart upload can leave parts behind; a bucket lifecycle rule removes them.
