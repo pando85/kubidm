@@ -997,10 +997,52 @@ pub struct PitrBaseBackup {
     pub server_version: String,
 }
 
+/// A range of history abandoned by a restore or a point-in-time recovery.
+///
+/// Restoring or recovering the database to the CID timestamp `after_ts` discards everything
+/// the server committed after it. Those transactions are still in the WAL archive, and base
+/// backups may have been taken while they were live, but they no longer describe the
+/// database: replaying them on a later recovery would resurrect state the operator chose to
+/// discard. Every WAL record and base backup watermark in `(after_ts, until_ts]` is
+/// therefore ignored. `until_ts` is at least the time of the restore or recovery, so the
+/// transactions of the server started on the recovered database lie after it.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct PitrTimelineBreak {
+    /// The CID timestamp the database was restored or recovered to.
+    pub after_ts: Duration,
+    /// The end of the abandoned range.
+    pub until_ts: Duration,
+    /// RFC3339 time of the restore or recovery, for display.
+    pub at: String,
+    /// The command that caused it, for display.
+    pub reason: String,
+}
+
+impl PitrTimelineBreak {
+    /// Whether the CID timestamp `ts` lies in the abandoned range.
+    pub fn contains(&self, ts: Duration) -> bool {
+        ts > self.after_ts && ts <= self.until_ts
+    }
+}
+
+/// CID timestamps whose WAL records are missing from the archive, because a committed
+/// transaction could not be recorded or the server stopped without archiving its open
+/// segment. Replaying from a base backup across a gap would silently skip changes, so a
+/// recovery whose replay range overlaps `[from_ts, until_ts]` is refused; a base backup
+/// taken after `until_ts` closes the gap.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct PitrWalGap {
+    pub from_ts: Duration,
+    pub until_ts: Duration,
+    /// Why the records are missing, for display.
+    pub reason: String,
+}
+
 /// Index of the base backups and WAL segments a server has archived.
 ///
 /// The manifest is the source of truth for recovery: it pairs every base backup with its
-/// CID watermark so that the segments that follow it can be selected.
+/// CID watermark so that the segments that follow it can be selected, and records the
+/// ranges of history that a restore or recovery abandoned.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct PitrManifest {
     pub version: u32,
@@ -1009,6 +1051,12 @@ pub struct PitrManifest {
     pub base_backups: Vec<PitrBaseBackup>,
     /// Ordered by `start_ts`.
     pub segments: Vec<WalSegment>,
+    /// Ordered by `until_ts`.
+    #[serde(default)]
+    pub timeline_breaks: Vec<PitrTimelineBreak>,
+    /// Ordered by `from_ts`.
+    #[serde(default)]
+    pub gaps: Vec<PitrWalGap>,
     /// RFC3339 time of the last update, for display.
     pub updated_at: String,
 }
@@ -1020,6 +1068,8 @@ impl PitrManifest {
             server_uuid,
             base_backups: Vec::new(),
             segments: Vec::new(),
+            timeline_breaks: Vec::new(),
+            gaps: Vec::new(),
             updated_at: String::new(),
         }
     }
@@ -1045,6 +1095,55 @@ impl PitrManifest {
         });
     }
 
+    /// Record that a restore or recovery abandoned the history in `(after_ts, until_ts]`.
+    /// The base backups taken during that history are dropped from the index, since they
+    /// hold state that no longer exists; their artifacts are left to backup retention.
+    pub fn add_timeline_break(&mut self, timeline_break: PitrTimelineBreak) {
+        self.base_backups
+            .retain(|base| !timeline_break.contains(base.watermark_ts));
+        self.timeline_breaks.push(timeline_break);
+        self.timeline_breaks.sort_by(|a, b| {
+            a.until_ts
+                .cmp(&b.until_ts)
+                .then(a.after_ts.cmp(&b.after_ts))
+        });
+    }
+
+    /// Record a gap in the archive, ignoring one already recorded.
+    pub fn add_gap(&mut self, gap: PitrWalGap) {
+        if self
+            .gaps
+            .iter()
+            .any(|known| known.from_ts == gap.from_ts && known.until_ts == gap.until_ts)
+        {
+            return;
+        }
+        self.gaps.push(gap);
+        self.gaps
+            .sort_by(|a, b| a.from_ts.cmp(&b.from_ts).then(a.until_ts.cmp(&b.until_ts)));
+    }
+
+    /// The first gap that makes replaying from a base with watermark `watermark_ts` up to
+    /// `target_ts` incomplete: one that overlaps `(watermark_ts, target_ts]`. A gap that
+    /// lies entirely in abandoned history is ignored, since that history is never
+    /// replayed.
+    pub fn gap_blocking(&self, watermark_ts: Duration, target_ts: Duration) -> Option<&PitrWalGap> {
+        self.gaps.iter().find(|gap| {
+            target_ts > watermark_ts
+                && gap.from_ts <= target_ts
+                && gap.until_ts > watermark_ts
+                && !self
+                    .timeline_breaks
+                    .iter()
+                    .any(|b| gap.from_ts > b.after_ts && gap.until_ts <= b.until_ts)
+        })
+    }
+
+    /// Whether the CID timestamp `ts` belongs to history a restore or recovery abandoned.
+    pub fn is_abandoned(&self, ts: Duration) -> bool {
+        self.timeline_breaks.iter().any(|b| b.contains(ts))
+    }
+
     /// Drop the base backups whose key is not in `existing` any more, for example because
     /// backup retention deleted them.
     pub fn retain_base_backups(&mut self, existing: &[String]) {
@@ -1056,16 +1155,46 @@ impl PitrManifest {
         self.segments.retain(|s| s.segment_id != segment_id);
     }
 
+    /// Drop the timeline breaks that no retained base backup or segment precedes: once all
+    /// archived history is newer than a break, it can not affect any recovery.
+    pub fn prune_timeline_breaks(&mut self) {
+        let oldest_base = self.base_backups.iter().map(|b| b.watermark_ts).min();
+        let oldest_segment = self.segments.iter().map(|s| s.start_ts).min();
+        let oldest = match (oldest_base, oldest_segment) {
+            (Some(b), Some(s)) => Some(b.min(s)),
+            (b, s) => b.or(s),
+        };
+        match oldest {
+            Some(oldest) => self.timeline_breaks.retain(|b| oldest <= b.until_ts),
+            None => self.timeline_breaks.clear(),
+        }
+    }
+
+    /// Drop the gaps no retained base backup or segment precedes: a recovery can only start
+    /// from a base taken after them, and replays nothing from before that base.
+    pub fn prune_gaps(&mut self) {
+        let oldest_base = self.base_backups.iter().map(|b| b.watermark_ts).min();
+        let oldest_segment = self.segments.iter().map(|s| s.start_ts).min();
+        let oldest = match (oldest_base, oldest_segment) {
+            (Some(b), Some(s)) => Some(b.min(s)),
+            (b, s) => b.or(s),
+        };
+        match oldest {
+            Some(oldest) => self.gaps.retain(|gap| oldest < gap.until_ts),
+            None => self.gaps.clear(),
+        }
+    }
+
     pub fn oldest_base_backup(&self) -> Option<&PitrBaseBackup> {
         self.base_backups.first()
     }
 
-    /// The newest base backup whose watermark is at or before `target_ts`.
+    /// The newest base backup whose watermark is at or before `target_ts` and does not
+    /// belong to abandoned history.
     pub fn base_backup_for(&self, target_ts: Duration) -> Option<&PitrBaseBackup> {
         self.base_backups
             .iter()
-            .filter(|base| base.watermark_ts <= target_ts)
-            .next_back()
+            .rfind(|base| base.watermark_ts <= target_ts && !self.is_abandoned(base.watermark_ts))
     }
 
     /// The segments that hold records after `watermark_ts` and up to `target_ts`, in CID
@@ -1082,24 +1211,41 @@ impl PitrManifest {
             .collect()
     }
 
-    /// The latest CID timestamp recovery can reach: the end of the last segment, or the
-    /// watermark of the newest base backup when no segment follows it.
+    /// The latest CID timestamp recovery can reach: the end of the last segment, the
+    /// watermark of the newest base backup, or the point an earlier recovery restored to,
+    /// whichever is newest and does not belong to abandoned history, moved back to just
+    /// before any gap the replay from the base backup in use would cross.
     pub fn latest_recoverable_ts(&self) -> Option<Duration> {
-        let last_segment = self.segments.iter().map(|s| s.end_ts).max();
-        let last_base = self.base_backups.iter().map(|b| b.watermark_ts).max();
-        match (last_segment, last_base) {
-            (Some(s), Some(b)) => Some(s.max(b)),
-            (Some(s), None) => Some(s),
-            (None, Some(b)) => Some(b),
-            (None, None) => None,
+        let mut latest = self
+            .segments
+            .iter()
+            .map(|s| s.end_ts)
+            .chain(self.base_backups.iter().map(|b| b.watermark_ts))
+            .chain(self.timeline_breaks.iter().map(|b| b.after_ts))
+            .filter(|ts| !self.is_abandoned(*ts))
+            .max()?;
+        // Each step moves `latest` strictly back past one gap, so this ends.
+        while let Some(base) = self.base_backup_for(latest) {
+            let Some(gap) = self.gap_blocking(base.watermark_ts, latest) else {
+                break;
+            };
+            latest = gap
+                .from_ts
+                .checked_sub(Duration::from_nanos(1))
+                .map_or(base.watermark_ts, |before| before.max(base.watermark_ts));
         }
+        Some(latest)
     }
 
     /// The recoverable window `(earliest, latest)` in CID timestamps: from the watermark of
-    /// the oldest base backup to [`Self::latest_recoverable_ts`]. None without a base
-    /// backup, since segments alone can not be recovered.
+    /// the oldest usable base backup to [`Self::latest_recoverable_ts`]. None without a
+    /// base backup, since segments alone can not be recovered.
     pub fn recoverable_window(&self) -> Option<(Duration, Duration)> {
-        let earliest = self.oldest_base_backup()?.watermark_ts;
+        let earliest = self
+            .base_backups
+            .iter()
+            .map(|b| b.watermark_ts)
+            .find(|ts| !self.is_abandoned(*ts))?;
         let latest = self.latest_recoverable_ts()?;
         Some((earliest, latest.max(earliest)))
     }
@@ -1351,6 +1497,165 @@ mod wal_tests {
             manifest.latest_recoverable_ts(),
             Some(Duration::from_secs(70))
         );
+    }
+
+    #[test]
+    fn test_pitr_manifest_timeline_breaks() {
+        let mut manifest = PitrManifest::new(Uuid::nil());
+        manifest.add_base_backup(base("backup-1", 10));
+        manifest.add_base_backup(base("backup-2", 40));
+        manifest.add_segment(segment("s1", 11, 50));
+        manifest.add_segment(segment("s2", 51, 60));
+
+        // Recovered to 30 at 70: everything in (30, 70] is abandoned, including the base
+        // backup taken at 40.
+        manifest.add_timeline_break(PitrTimelineBreak {
+            after_ts: Duration::from_secs(30),
+            until_ts: Duration::from_secs(70),
+            at: String::new(),
+            reason: "recover".to_string(),
+        });
+        assert_eq!(manifest.base_backups.len(), 1);
+        assert!(!manifest.is_abandoned(Duration::from_secs(30)));
+        assert!(manifest.is_abandoned(Duration::from_secs(31)));
+        assert!(manifest.is_abandoned(Duration::from_secs(70)));
+        assert!(!manifest.is_abandoned(Duration::from_secs(71)));
+        assert_eq!(
+            manifest
+                .base_backup_for(Duration::from_secs(1000))
+                .unwrap()
+                .key,
+            "backup-1"
+        );
+        // The segments end in abandoned history; the latest point is the recovered one.
+        assert_eq!(
+            manifest.latest_recoverable_ts(),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(
+            manifest.recoverable_window(),
+            Some((Duration::from_secs(10), Duration::from_secs(30)))
+        );
+
+        // The new history after the recovery extends the window again.
+        manifest.add_segment(segment("s3", 80, 90));
+        assert_eq!(
+            manifest.latest_recoverable_ts(),
+            Some(Duration::from_secs(90))
+        );
+
+        // A second recovery to an earlier point abandons the first recovered point too.
+        manifest.add_timeline_break(PitrTimelineBreak {
+            after_ts: Duration::from_secs(20),
+            until_ts: Duration::from_secs(100),
+            at: String::new(),
+            reason: "recover".to_string(),
+        });
+        assert_eq!(
+            manifest.latest_recoverable_ts(),
+            Some(Duration::from_secs(20))
+        );
+
+        // Breaks stay while archived history precedes them, and go once it does not.
+        manifest.prune_timeline_breaks();
+        assert_eq!(manifest.timeline_breaks.len(), 2);
+        manifest.retain_base_backups(&[]);
+        manifest.remove_segment("s1");
+        manifest.remove_segment("s2");
+        manifest.remove_segment("s3");
+        manifest.add_segment(segment("s4", 85, 95));
+        manifest.prune_timeline_breaks();
+        assert_eq!(manifest.timeline_breaks.len(), 1);
+        assert_eq!(
+            manifest.timeline_breaks[0].until_ts,
+            Duration::from_secs(100)
+        );
+        manifest.remove_segment("s4");
+        manifest.prune_timeline_breaks();
+        assert!(manifest.timeline_breaks.is_empty());
+
+        // Manifests written before timeline breaks existed still load.
+        let mut json: serde_json::Value = serde_json::to_value(&manifest).unwrap();
+        json.as_object_mut().unwrap().remove("timeline_breaks");
+        let back: PitrManifest = serde_json::from_value(json).unwrap();
+        assert!(back.timeline_breaks.is_empty());
+    }
+
+    #[test]
+    fn test_pitr_manifest_gaps() {
+        let gap = |from: u64, until: u64| PitrWalGap {
+            from_ts: Duration::from_secs(from),
+            until_ts: Duration::from_secs(until),
+            reason: "test".to_string(),
+        };
+        let mut manifest = PitrManifest::new(Uuid::nil());
+        manifest.add_base_backup(base("backup-1", 10));
+        manifest.add_segment(segment("s1", 11, 100));
+
+        // Records from 40 to 50 are missing.
+        manifest.add_gap(gap(40, 50));
+        manifest.add_gap(gap(40, 50));
+        assert_eq!(manifest.gaps.len(), 1);
+
+        let w = Duration::from_secs(10);
+        assert!(manifest.gap_blocking(w, Duration::from_secs(39)).is_none());
+        assert!(manifest.gap_blocking(w, Duration::from_secs(40)).is_some());
+        assert!(manifest.gap_blocking(w, Duration::from_secs(90)).is_some());
+        // A base that already holds the gap's history is not blocked; nor is a replay of
+        // nothing.
+        assert!(manifest
+            .gap_blocking(Duration::from_secs(50), Duration::from_secs(90))
+            .is_none());
+        assert!(manifest
+            .gap_blocking(Duration::from_secs(45), Duration::from_secs(45))
+            .is_none());
+
+        // The latest point stops just before the gap.
+        assert_eq!(
+            manifest.latest_recoverable_ts(),
+            Some(Duration::from_secs(40) - Duration::from_nanos(1))
+        );
+
+        // A base taken after the gap closes it.
+        manifest.add_base_backup(base("backup-2", 60));
+        assert_eq!(
+            manifest.latest_recoverable_ts(),
+            Some(Duration::from_secs(100))
+        );
+        // A gap starting before the base it follows limits the latest point to that base.
+        manifest.add_gap(gap(55, 70));
+        assert_eq!(
+            manifest.latest_recoverable_ts(),
+            Some(Duration::from_secs(60))
+        );
+
+        // A gap inside abandoned history does not matter.
+        manifest.add_timeline_break(PitrTimelineBreak {
+            after_ts: Duration::from_secs(62),
+            until_ts: Duration::from_secs(80),
+            at: String::new(),
+            reason: "recover".to_string(),
+        });
+        manifest.add_segment(segment("s2", 81, 120));
+        assert!(manifest
+            .gap_blocking(Duration::from_secs(60), Duration::from_secs(120))
+            .is_some());
+        manifest
+            .gaps
+            .retain(|g| g.from_ts != Duration::from_secs(55));
+        manifest.add_gap(gap(65, 70));
+        assert!(manifest
+            .gap_blocking(Duration::from_secs(60), Duration::from_secs(120))
+            .is_none());
+
+        // Gaps go once no retained history precedes them.
+        manifest.prune_gaps();
+        assert_eq!(manifest.gaps.len(), 2);
+        manifest.retain_base_backups(&["backup-2".to_string()]);
+        manifest.remove_segment("s1");
+        manifest.prune_gaps();
+        assert_eq!(manifest.gaps.len(), 1);
+        assert_eq!(manifest.gaps[0].from_ts, Duration::from_secs(65));
     }
 
     #[test]
