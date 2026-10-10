@@ -19,8 +19,8 @@ use std::fmt;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
+use bytes::Bytes;
 use kubidm_proto::backup::BackupCompression;
 use kubidmd_lib::be::{verify_backup_structure, BackupStructuralReport};
 
@@ -161,9 +161,9 @@ pub fn verify_backup_output(
 
 /// [`verify_backup_output`] for async callers: the decryption, decompression and parsing
 /// of the whole backup run on the blocking thread pool so that they never stall the async
-/// runtime. `data` is shared rather than moved so that the caller can still upload it.
+/// runtime. `data` is shared rather than copied so that the caller can still upload it.
 pub async fn verify_backup_output_async(
-    data: Arc<Vec<u8>>,
+    data: Bytes,
     name: Option<&Path>,
     compression: BackupCompression,
     encryptor: Option<&BackupEncryptor>,
@@ -341,7 +341,7 @@ fn sync_parent_dir(_path: &Path) -> std::io::Result<()> {
 /// complete under its name or not at all.
 pub async fn write_verified_local_backup_async(
     dest: &Path,
-    artifact: Arc<Vec<u8>>,
+    artifact: Bytes,
     compression: BackupCompression,
     encryptor: Option<&BackupEncryptor>,
 ) -> Result<BackupStructuralReport, BackupVerifyError> {

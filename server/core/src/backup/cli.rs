@@ -5,10 +5,10 @@
 use std::{
     io::Write,
     path::{Path, PathBuf},
-    sync::Arc,
     time::SystemTime,
 };
 
+use bytes::Bytes;
 use kubidm_proto::{
     backup::{
         is_encrypted_backup_name, BackupCompression, ReplicationConfig, ReplicationHealthCheck,
@@ -124,7 +124,7 @@ pub async fn backup_server_core(config: &Configuration, dst_path: Option<&Path>)
         }
     };
 
-    let artifact = Arc::new(artifact);
+    let artifact = Bytes::from(artifact);
     if let Some(dst_path) = dst_path {
         // Written next to the destination, synced and read back before it gets its name,
         // so the destination only ever holds a complete, verified backup. A rejected
@@ -136,13 +136,8 @@ pub async fn backup_server_core(config: &Configuration, dst_path: Option<&Path>)
         info!("Backup written to {}", dst_path.display());
     } else {
         report_backup_verification(
-            verify_backup_output_async(
-                Arc::clone(&artifact),
-                None,
-                compression,
-                encryptor.as_ref(),
-            )
-            .await,
+            verify_backup_output_async(artifact.clone(), None, compression, encryptor.as_ref())
+                .await,
         );
 
         let mut stdout = std::io::stdout().lock();

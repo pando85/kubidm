@@ -10,6 +10,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use kubidm_proto::backup::{BackupCompression, BackupEncryptionConfig, S3Config};
 use kubidm_proto::internal::OperationError;
 use kubidmd_lib::be::BackupStructuralReport;
@@ -74,7 +75,7 @@ impl OnlineBackupJob {
     #[instrument(level = "info", name = "online_backup", skip_all)]
     pub async fn run(
         &self,
-        server: &QueryServerReadV1,
+        server: &'static QueryServerReadV1,
     ) -> Result<Vec<OnlineBackupOutcome>, OperationError> {
         #[allow(clippy::disallowed_methods)]
         // Allowed as this timestamp is only used for the backup name.
@@ -95,7 +96,7 @@ impl OnlineBackupJob {
         let plaintext = server.backup_database(self.compression).await?;
         let artifact = seal_backup_async(plaintext, self.compression, encryptor.as_ref())
             .await
-            .map(Arc::new)
+            .map(Bytes::from)
             .map_err(|err| {
                 error!(%err, "Online backup failed to encrypt the backup");
                 OperationError::CryptographyError
@@ -145,7 +146,7 @@ impl OnlineBackupJob {
         &self,
         dir: &Path,
         key: &str,
-        artifact: &Arc<Vec<u8>>,
+        artifact: &Bytes,
         encryptor: Option<&BackupEncryptor>,
     ) -> Result<BackupStructuralReport, OperationError> {
         let dest_file = dir.join(key);
@@ -157,7 +158,7 @@ impl OnlineBackupJob {
         // an older good backup to be removed.
         let report = write_verified_local_backup_async(
             &dest_file,
-            Arc::clone(artifact),
+            artifact.clone(),
             self.compression,
             encryptor,
         )
@@ -199,7 +200,7 @@ impl OnlineBackupJob {
         s3_config: &S3Config,
         key: &str,
         timestamp: &str,
-        artifact: &Arc<Vec<u8>>,
+        artifact: &Bytes,
         encryptor: Option<&BackupEncryptor>,
     ) -> Result<BackupStructuralReport, OperationError> {
         let s3_client = S3ClientWrapper::new(s3_config.clone())
@@ -213,7 +214,7 @@ impl OnlineBackupJob {
         // holds artifacts that passed the same structural checks as `verify-backup`. An
         // encrypted artifact is decrypted for this, which proves the key opens it.
         let report = verify_backup_output_async(
-            Arc::clone(artifact),
+            artifact.clone(),
             Some(Path::new(key)),
             self.compression,
             encryptor,
@@ -235,8 +236,8 @@ impl OnlineBackupJob {
         );
 
         let metadata = s3_client
-            .upload_backup(
-                artifact,
+            .upload_backup_bytes(
+                artifact.clone(),
                 key,
                 timestamp,
                 self.compression,
@@ -269,7 +270,7 @@ impl OnlineBackupJob {
         {
             let copied = match S3ClientWrapper::for_region(region_config).await {
                 Ok(region) => region
-                    .upload_with_metadata(artifact, key, &metadata)
+                    .upload_with_metadata(artifact.clone(), key, &metadata)
                     .await
                     .map(|()| region),
                 Err(err) => Err(err),

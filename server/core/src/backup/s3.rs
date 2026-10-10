@@ -12,6 +12,7 @@ use aws_sdk_s3::types::{
     CompletedMultipartUpload, CompletedPart, ServerSideEncryption, StorageClass,
 };
 use aws_sdk_s3::Client as S3Client;
+use bytes::Bytes;
 use chrono::DateTime;
 use hex::encode as hex_encode;
 use kubidm_proto::backup::{
@@ -22,6 +23,7 @@ use kubidm_proto::backup::{
 use sha2::{Digest, Sha256};
 
 use super::retention::{is_backup_artifact_name, sort_backup_names};
+use super::run_blocking;
 
 /// Limit on establishing a connection to the service. An unreachable endpoint fails
 /// after this instead of the operating system's TCP timeout.
@@ -216,8 +218,29 @@ impl S3ClientWrapper {
         compression: BackupCompression,
         encryption_key_identifier: Option<&str>,
     ) -> Result<S3BackupMetadata, S3BackupError> {
+        self.upload_backup_bytes(
+            Bytes::copy_from_slice(data),
+            key,
+            timestamp,
+            compression,
+            encryption_key_identifier,
+        )
+        .await
+    }
+
+    /// [`Self::upload_backup`] for an artifact that is already shared as [`Bytes`]: it is
+    /// uploaded without being copied, and its checksum is computed on the blocking thread
+    /// pool.
+    pub async fn upload_backup_bytes(
+        &self,
+        data: Bytes,
+        key: &str,
+        timestamp: &str,
+        compression: BackupCompression,
+        encryption_key_identifier: Option<&str>,
+    ) -> Result<S3BackupMetadata, S3BackupError> {
         let size = data.len() as u64;
-        let checksum = hex_encode(Sha256::digest(data));
+        let checksum = sha256_hex(data.clone()).await?;
         let metadata = match encryption_key_identifier {
             Some(key_identifier) => S3BackupMetadata::new_encrypted(
                 checksum,
@@ -239,7 +262,7 @@ impl S3ClientWrapper {
     /// replication, so a replica carries the very same sidecar as the primary.
     pub(crate) async fn upload_with_metadata(
         &self,
-        data: &[u8],
+        data: Bytes,
         key: &str,
         metadata: &S3BackupMetadata,
     ) -> Result<(), S3BackupError> {
@@ -268,7 +291,7 @@ impl S3ClientWrapper {
 
     async fn upload_single(
         &self,
-        data: &[u8],
+        data: Bytes,
         key: &str,
         metadata: &S3BackupMetadata,
     ) -> Result<(), S3BackupError> {
@@ -277,7 +300,7 @@ impl S3ClientWrapper {
             .put_object()
             .bucket(&self.config.bucket)
             .key(key)
-            .body(ByteStream::from(data.to_vec()))
+            .body(ByteStream::from(data))
             .metadata("checksum-sha256", &metadata.checksum_sha256)
             .metadata("backup-timestamp", &metadata.timestamp)
             .metadata("backup-size", metadata.size_bytes.to_string())
@@ -301,7 +324,7 @@ impl S3ClientWrapper {
 
     async fn upload_multipart(
         &self,
-        data: &[u8],
+        data: Bytes,
         key: &str,
         metadata: &S3BackupMetadata,
     ) -> Result<(), S3BackupError> {
@@ -348,11 +371,14 @@ impl S3ClientWrapper {
         &self,
         key: &str,
         upload_id: &str,
-        data: &[u8],
+        data: Bytes,
     ) -> Result<(), S3BackupError> {
         let mut parts = Vec::new();
 
-        for (part_number, chunk) in (1_i32..).zip(data.chunks(MULTIPART_CHUNK_SIZE)) {
+        let starts = (0..data.len()).step_by(MULTIPART_CHUNK_SIZE);
+        for (part_number, start) in (1_i32..).zip(starts) {
+            // A part shares the artifact's buffer rather than copying it.
+            let chunk = data.slice(start..data.len().min(start + MULTIPART_CHUNK_SIZE));
             let part = self.upload_part(key, upload_id, part_number, chunk).await?;
             parts.push(
                 CompletedPart::builder()
@@ -398,7 +424,7 @@ impl S3ClientWrapper {
         key: &str,
         upload_id: &str,
         part_number: i32,
-        data: &[u8],
+        data: Bytes,
     ) -> Result<aws_sdk_s3::operation::upload_part::UploadPartOutput, S3BackupError> {
         self.client
             .upload_part()
@@ -406,7 +432,7 @@ impl S3ClientWrapper {
             .key(key)
             .upload_id(upload_id)
             .part_number(part_number)
-            .body(ByteStream::from(data.to_vec()))
+            .body(ByteStream::from(data))
             .send()
             .await
             .map_err(|e| {
@@ -501,11 +527,21 @@ impl S3ClientWrapper {
         &self,
         key: &str,
     ) -> Result<(Vec<u8>, S3BackupMetadata), S3BackupError> {
+        let (data, metadata) = self.download_backup_bytes(key).await?;
+        Ok((Vec::from(data), metadata))
+    }
+
+    /// [`Self::download_backup`] as [`Bytes`], which a copy to another location uploads
+    /// as they are. The checksum is computed on the blocking thread pool.
+    pub async fn download_backup_bytes(
+        &self,
+        key: &str,
+    ) -> Result<(Bytes, S3BackupMetadata), S3BackupError> {
         let object_key = self.build_object_key(key);
         let metadata = self.download_metadata(&object_key).await?;
         let data = self.download_object(&object_key).await?;
 
-        let actual_checksum = hex_encode(Sha256::digest(&data));
+        let actual_checksum = sha256_hex(data.clone()).await?;
         if actual_checksum != metadata.checksum_sha256 {
             return Err(S3BackupError::InvalidChecksum {
                 expected: metadata.checksum_sha256.clone(),
@@ -551,7 +587,7 @@ impl S3ClientWrapper {
     }
 
     /// Download the whole object at `object_key` (a full key, prefix included).
-    async fn download_object(&self, object_key: &str) -> Result<Vec<u8>, S3BackupError> {
+    async fn download_object(&self, object_key: &str) -> Result<Bytes, S3BackupError> {
         let output = self
             .client
             .get_object()
@@ -604,11 +640,11 @@ impl S3ClientWrapper {
         Ok(metadata)
     }
 
-    async fn collect_stream(&self, output: GetObjectOutput) -> Result<Vec<u8>, S3BackupError> {
+    async fn collect_stream(&self, output: GetObjectOutput) -> Result<Bytes, S3BackupError> {
         let body = output.body.collect().await.map_err(|e| {
             S3BackupError::DownloadError(format!("Stream error: {}", DisplayErrorContext(&e)))
         })?;
-        Ok(body.into_bytes().to_vec())
+        Ok(body.into_bytes())
     }
 
     /// List every object under the configured prefix, metadata sidecars included, with the
@@ -736,7 +772,7 @@ impl S3ClientWrapper {
         }
 
         let data = self.download_object(&object_key).await?;
-        let actual_checksum = hex_encode(Sha256::digest(&data));
+        let actual_checksum = sha256_hex(data).await?;
         if actual_checksum != metadata.checksum_sha256 {
             warn!(
                 "Backup checksum mismatch for {}: expected {}, got {}",
@@ -792,7 +828,7 @@ impl S3ClientWrapper {
         let region = Self::for_region(region_config).await?;
 
         region
-            .upload_with_metadata(backup_data, backup_key, metadata)
+            .upload_with_metadata(Bytes::copy_from_slice(backup_data), backup_key, metadata)
             .await?;
 
         info!(
@@ -918,9 +954,9 @@ impl S3ClientWrapper {
         region: &S3ClientWrapper,
         backup_key: &str,
     ) -> Result<(), S3BackupError> {
-        let (data, metadata) = self.download_backup(backup_key).await?;
+        let (data, metadata) = self.download_backup_bytes(backup_key).await?;
         region
-            .upload_with_metadata(&data, backup_key, &metadata)
+            .upload_with_metadata(data, backup_key, &metadata)
             .await
     }
 
@@ -1043,6 +1079,12 @@ impl S3ClientWrapper {
             .await?;
         Ok(lag_metrics_from_health(&health, replication_config))
     }
+}
+
+/// The hex encoded SHA-256 of `data`, computed on the blocking thread pool: hashing a whole
+/// backup takes long enough to stall the async runtime.
+async fn sha256_hex(data: Bytes) -> Result<String, S3BackupError> {
+    Ok(run_blocking(move || Ok(hex_encode(Sha256::digest(&data)))).await?)
 }
 
 /// Abort the multipart upload `upload_id` of `key` (a full key, prefix included).
@@ -1563,7 +1605,7 @@ mod tests {
 
         let err = client
             .upload_multipart(
-                b"artifact",
+                Bytes::from_static(b"artifact"),
                 "big",
                 &metadata("checksum", "2024-01-01T22:00:00Z", 8),
             )

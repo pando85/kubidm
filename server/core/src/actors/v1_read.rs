@@ -187,22 +187,31 @@ impl QueryServerReadV1 {
     }
 
     /// Serialise and compress the whole database inside one read transaction: the
-    /// consistent snapshot an online backup is made of.
+    /// consistent snapshot an online backup is made of. The transaction is opened here and
+    /// the serialisation, which reads and compresses every entry, runs on the blocking
+    /// thread pool so that it never stalls the workers serving LDAP and HTTPS.
     pub(crate) async fn backup_database(
-        &self,
+        &'static self,
         compression: BackupCompression,
     ) -> Result<Vec<u8>, OperationError> {
-        let mut backup_data = Vec::new();
         let mut idms_prox_read = self.idms.proxy_read().await?;
-        idms_prox_read
-            .qs_read
-            .get_be_txn()
-            .backup(&mut backup_data, compression)
-            .map_err(|e| {
-                error!("Online backup failed to create backup data: {:?}", e);
-                OperationError::InvalidState
-            })?;
-        Ok(backup_data)
+        tokio::task::spawn_blocking(move || {
+            let mut backup_data = Vec::new();
+            idms_prox_read
+                .qs_read
+                .get_be_txn()
+                .backup(&mut backup_data, compression)
+                .map_err(|e| {
+                    error!("Online backup failed to create backup data: {:?}", e);
+                    OperationError::InvalidState
+                })?;
+            Ok(backup_data)
+        })
+        .await
+        .map_err(|err| {
+            error!(%err, "Online backup failed: the backup task failed");
+            OperationError::InvalidState
+        })?
     }
 
     #[instrument(
