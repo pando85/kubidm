@@ -12,9 +12,10 @@ use tokio::{
     time::{interval, interval_at, sleep, Duration, Instant, MissedTickBehavior},
 };
 
+use crate::backup::metrics::{BackupDestination, BackupMetrics};
 use crate::backup::online::OnlineBackupJob;
 use crate::backup::pitr::PitrArchive;
-use crate::backup::{region_is_healthy, S3ClientWrapper};
+use crate::backup::{region_is_healthy, RegionSyncOutcome, S3BackupError, S3ClientWrapper};
 use crate::config::OnlineBackup;
 use crate::{CoreAction, TaskName};
 
@@ -22,6 +23,7 @@ use crate::actors::{QueryServerReadV1, QueryServerWriteV1};
 use kubidm_proto::backup::{ReplicationConfig, S3Config};
 use kubidmd_lib::constants::PURGE_FREQUENCY;
 use kubidmd_lib::event::{PurgeDeleteAfterEvent, PurgeRecycledEvent, PurgeTombstoneEvent};
+use kubidmd_lib::prelude::duration_from_epoch_now;
 
 pub(crate) struct IntervalActor;
 
@@ -73,6 +75,7 @@ impl IntervalActor {
         server: &'static QueryServerReadV1,
         online_backup_config: &OnlineBackup,
         pitr_archive: Option<Arc<PitrArchive>>,
+        metrics: Arc<BackupMetrics>,
         mut rx: broadcast::Receiver<CoreAction>,
     ) -> Result<Vec<(TaskName, JoinHandle<()>)>, ()> {
         let outpath = online_backup_config.path.to_owned();
@@ -144,7 +147,7 @@ impl IntervalActor {
             }
         }
 
-        let job = OnlineBackupJob::from_config(online_backup_config, pitr_archive);
+        let job = OnlineBackupJob::from_config(online_backup_config, pitr_archive, metrics.clone());
         let s3_config = online_backup_config.s3.clone();
 
         let mut handles = Vec::with_capacity(2);
@@ -160,7 +163,12 @@ impl IntervalActor {
             if let Some(s3_cfg) = &s3_config {
                 handles.push((
                     TaskName::BackupReplicationMonitor,
-                    Self::start_replication_monitor(s3_cfg.clone(), replication, rx.resubscribe()),
+                    Self::start_replication_monitor(
+                        s3_cfg.clone(),
+                        replication,
+                        metrics,
+                        rx.resubscribe(),
+                    ),
                 ));
             }
         }
@@ -221,6 +229,7 @@ impl IntervalActor {
     fn start_replication_monitor(
         s3_config: S3Config,
         replication: ReplicationConfig,
+        metrics: Arc<BackupMetrics>,
         mut rx: broadcast::Receiver<CoreAction>,
     ) -> JoinHandle<()> {
         let period = replication_monitor_period(&replication);
@@ -243,7 +252,7 @@ impl IntervalActor {
                         }
                     }
                     _ = ticks.tick() => {
-                        let run = sync_and_report_replication(&s3_config, &replication);
+                        let run = sync_and_report_replication(&s3_config, &replication, &metrics);
                         if run_until_shutdown(run, &mut rx).await.is_none() {
                             break;
                         }
@@ -312,7 +321,11 @@ fn replication_monitor_period(replication: &ReplicationConfig) -> Duration {
 /// One run of the replication monitor: copy what every region misses and report the
 /// resulting health, a warning per unhealthy region and an info line per healthy one.
 /// Never fails; a primary that can not be listed is a warning too.
-async fn sync_and_report_replication(s3_config: &S3Config, replication: &ReplicationConfig) {
+async fn sync_and_report_replication(
+    s3_config: &S3Config,
+    replication: &ReplicationConfig,
+    metrics: &BackupMetrics,
+) {
     let client = match S3ClientWrapper::new(s3_config.clone()).await {
         Ok(client) => client,
         Err(err) => {
@@ -341,6 +354,8 @@ async fn sync_and_report_replication(s3_config: &S3Config, replication: &Replica
             return;
         }
     };
+
+    record_region_syncs(metrics, &report.synced, duration_from_epoch_now());
 
     for (region, result) in &report.synced {
         match result {
@@ -407,6 +422,28 @@ async fn sync_and_report_replication(s3_config: &S3Config, replication: &Replica
             "Backup replication health: {} ({} regions healthy, max lag {}s)",
             health.overall_status, health.healthy_regions, health.max_lag_seconds
         );
+    }
+}
+
+/// Record in `metrics` what a replication sync did in every region at `now`. A copy is a
+/// backup stored in the region, as the copy of the backup run is; a copy that failed, or a
+/// region that could not be listed, is a failed one. A region that missed nothing is left
+/// as it is.
+fn record_region_syncs(
+    metrics: &BackupMetrics,
+    synced: &[(String, Result<RegionSyncOutcome, S3BackupError>)],
+    now: Duration,
+) {
+    for (region, result) in synced {
+        let destination = BackupDestination::S3Region(region.clone());
+        match result {
+            Ok(outcome) if !outcome.failed.is_empty() => metrics.backup_failed(&destination, now),
+            Ok(outcome) if !outcome.copied.is_empty() => {
+                metrics.backup_succeeded(&destination, now)
+            }
+            Ok(_) => {}
+            Err(_) => metrics.backup_failed(&destination, now),
+        }
     }
 }
 
@@ -496,6 +533,51 @@ mod tests {
         drop(tx);
         let run = std::future::pending::<()>();
         assert_eq!(run_until_shutdown(run, &mut rx).await, None);
+    }
+
+    #[test]
+    fn replication_syncs_record_the_regions_they_copied_to() {
+        let metrics = BackupMetrics::new(None);
+        let outcome = |copied: &[&str], failed: &[&str]| RegionSyncOutcome {
+            copied: copied.iter().map(|key| key.to_string()).collect(),
+            failed: failed
+                .iter()
+                .map(|key| (key.to_string(), "denied".to_string()))
+                .collect(),
+        };
+        let synced = vec![
+            ("copied".to_string(), Ok(outcome(&["backup-a"], &[]))),
+            (
+                "partial".to_string(),
+                Ok(outcome(&["backup-a"], &["backup-b"])),
+            ),
+            ("current".to_string(), Ok(outcome(&[], &[]))),
+            (
+                "unreachable".to_string(),
+                Err(S3BackupError::SdkError("timeout".to_string())),
+            ),
+        ];
+        record_region_syncs(&metrics, &synced, Duration::from_secs(42));
+
+        let text = metrics.render();
+        let success = |region: &str| {
+            format!(
+                "kubidm_backup_last_success_timestamp_seconds{{destination=\"s3_region\",region=\"{region}\"}}"
+            )
+        };
+        let failures = |region: &str| {
+            format!("kubidm_backup_failures_total{{destination=\"s3_region\",region=\"{region}\"}}")
+        };
+        assert!(
+            text.contains(&format!("{} 42.000", success("copied"))),
+            "{text}"
+        );
+        assert!(text.contains(&format!("{} 0", failures("copied"))));
+        assert!(text.contains(&format!("{} 0\n", success("partial"))));
+        assert!(text.contains(&format!("{} 1", failures("partial"))));
+        assert!(text.contains(&format!("{} 1", failures("unreachable"))));
+        // A region that was already current saw no event.
+        assert!(!text.contains("region=\"current\""));
     }
 
     #[test]

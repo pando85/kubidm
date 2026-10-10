@@ -8,6 +8,7 @@ use kubidmd_lib::status::{LivenessStatus, ReadinessStatus, ServingReadiness, Sta
 use url::Url;
 
 use super::{middleware::KOpId, views::constants::Urls, ServerState};
+use crate::backup::metrics::PROMETHEUS_TEXT_CONTENT_TYPE;
 
 #[utoipa::path(
     get,
@@ -97,6 +98,32 @@ pub async fn readyz(State(state): State<ServerState>) -> impl IntoResponse {
         StatusCode::SERVICE_UNAVAILABLE
     };
     (status_code, Json(status))
+}
+
+#[utoipa::path(
+    get,
+    path = "/metrics",
+    responses(
+        (status = 200, description = "Backup metrics in the Prometheus text exposition format", content_type = "text/plain"),
+        (status = 404, description = "online_backup.metrics_endpoint is not enabled"),
+    ),
+    tag = "system",
+    operation_id = "metrics"
+)]
+/// The backup metrics in the Prometheus text exposition format: per backup destination the
+/// time of the last successful and failed backup and of the last verification, and the
+/// time of the last WAL archive synchronisation. Only served when
+/// `online_backup.metrics_endpoint` is enabled.
+pub async fn metrics(State(state): State<ServerState>) -> impl IntoResponse {
+    match &state.backup_metrics {
+        Some(metrics) => (
+            StatusCode::OK,
+            [(CONTENT_TYPE, PROMETHEUS_TEXT_CONTENT_TYPE)],
+            metrics.render(),
+        )
+            .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 #[utoipa::path(

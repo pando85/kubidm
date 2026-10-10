@@ -14,8 +14,10 @@ use bytes::Bytes;
 use kubidm_proto::backup::{BackupCompression, BackupEncryptionConfig, S3Config};
 use kubidm_proto::internal::OperationError;
 use kubidmd_lib::be::BackupStructuralReport;
+use kubidmd_lib::prelude::duration_from_epoch_now;
 use tracing::instrument;
 
+use super::metrics::{BackupDestination, BackupMetrics, VerificationLevel};
 use super::pitr::{BaseLocation, PitrArchive};
 use super::retention::prune_s3_backups;
 use super::{
@@ -27,8 +29,9 @@ use crate::actors::QueryServerReadV1;
 use crate::config::OnlineBackup;
 
 /// What one online backup run does: where it stores the backup, how many backups every
-/// location keeps, how the artifact is compressed and encrypted, and the WAL archive that
-/// indexes every stored backup as a point-in-time recovery base.
+/// location keeps, how the artifact is compressed and encrypted, the WAL archive that
+/// indexes every stored backup as a point-in-time recovery base, and the metrics that
+/// record the outcome in every location.
 #[derive(Clone)]
 pub(crate) struct OnlineBackupJob {
     pub targets: Vec<BaseLocation>,
@@ -36,12 +39,17 @@ pub(crate) struct OnlineBackupJob {
     pub compression: BackupCompression,
     pub encryption: BackupEncryptionConfig,
     pub pitr_archive: Option<Arc<PitrArchive>>,
+    pub metrics: Arc<BackupMetrics>,
 }
 
 impl OnlineBackupJob {
     /// The job the `[online_backup]` section describes: the local directory when a path
     /// is set, then the S3 prefix when S3 is configured.
-    pub fn from_config(config: &OnlineBackup, pitr_archive: Option<Arc<PitrArchive>>) -> Self {
+    pub fn from_config(
+        config: &OnlineBackup,
+        pitr_archive: Option<Arc<PitrArchive>>,
+        metrics: Arc<BackupMetrics>,
+    ) -> Self {
         let mut targets = Vec::with_capacity(2);
         if let Some(path) = &config.path {
             targets.push(BaseLocation::Local(path.clone()));
@@ -55,14 +63,78 @@ impl OnlineBackupJob {
             compression: config.compression,
             encryption: config.encryption.clone(),
             pitr_archive,
+            metrics,
         }
     }
 
     /// Run one online backup. Every target is attempted, and every backup stored is
     /// indexed by the WAL archive. Fails when the artifact can not be produced or when any
-    /// target failed, after every target has been attempted.
+    /// target failed, after every target has been attempted. The outcome in every target
+    /// is recorded in the metrics: an artifact that can not be produced fails them all.
     #[instrument(level = "info", name = "online_backup", skip_all)]
     pub async fn run(&self, server: &'static QueryServerReadV1) -> Result<(), OperationError> {
+        let (key, timestamp, artifact, encryptor) = match self.produce(server).await {
+            Ok(produced) => produced,
+            Err(err) => {
+                let now = duration_from_epoch_now();
+                for target in &self.targets {
+                    self.metrics
+                        .backup_failed(&BackupDestination::from(target), now);
+                }
+                return Err(err);
+            }
+        };
+
+        let mut failure = None;
+        for target in &self.targets {
+            let stored = match target {
+                BaseLocation::Local(dir) => {
+                    self.store_local(dir, &key, &artifact, encryptor.as_ref())
+                        .await
+                }
+                BaseLocation::S3(s3_config) => {
+                    self.store_s3(s3_config, &key, &timestamp, &artifact, encryptor.as_ref())
+                        .await
+                }
+            };
+            let destination = BackupDestination::from(target);
+            match stored {
+                Ok(report) => {
+                    // A target only stores an artifact that passed the structural checks.
+                    let now = duration_from_epoch_now();
+                    self.metrics.backup_succeeded(&destination, now);
+                    self.metrics.verification_succeeded(
+                        &destination,
+                        VerificationLevel::Structural,
+                        now,
+                    );
+                    if let Some(archive) = &self.pitr_archive {
+                        archive
+                            .register_base_backup_logged(target, &key, &timestamp, &report)
+                            .await;
+                    }
+                }
+                Err(err) => {
+                    self.metrics
+                        .backup_failed(&destination, duration_from_epoch_now());
+                    error!(?err, "Online backup to {} failed", target);
+                    failure.get_or_insert(err);
+                }
+            }
+        }
+
+        match failure {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
+
+    /// Take the snapshot and seal it into the artifact every target stores. Returns its
+    /// name, its timestamp, the artifact and the key it was encrypted with.
+    async fn produce(
+        &self,
+        server: &'static QueryServerReadV1,
+    ) -> Result<(String, String, Bytes, Option<BackupEncryptor>), OperationError> {
         #[allow(clippy::disallowed_methods)]
         // Allowed as this timestamp is only used for the backup name.
         let now = time::OffsetDateTime::now_utc();
@@ -94,37 +166,7 @@ impl OnlineBackupJob {
             OperationError::CryptographyError
         })?;
 
-        let mut failure = None;
-        for target in &self.targets {
-            let stored = match target {
-                BaseLocation::Local(dir) => {
-                    self.store_local(dir, &key, &artifact, encryptor.as_ref())
-                        .await
-                }
-                BaseLocation::S3(s3_config) => {
-                    self.store_s3(s3_config, &key, &timestamp, &artifact, encryptor.as_ref())
-                        .await
-                }
-            };
-            match stored {
-                Ok(report) => {
-                    if let Some(archive) = &self.pitr_archive {
-                        archive
-                            .register_base_backup_logged(target, &key, &timestamp, &report)
-                            .await;
-                    }
-                }
-                Err(err) => {
-                    error!(?err, "Online backup to {} failed", target);
-                    failure.get_or_insert(err);
-                }
-            }
-        }
-
-        match failure {
-            Some(err) => Err(err),
-            None => Ok(()),
-        }
+        Ok((key, timestamp, artifact, encryptor))
     }
 
     /// Write the artifact to `dir` as `key`, verify it and apply the retention.
@@ -261,6 +303,15 @@ impl OnlineBackupJob {
                     .map(|()| region),
                 Err(err) => Err(err),
             };
+            let destination = BackupDestination::S3Region(region_config.name().to_string());
+            match &copied {
+                Ok(_) => self
+                    .metrics
+                    .backup_succeeded(&destination, duration_from_epoch_now()),
+                Err(_) => self
+                    .metrics
+                    .backup_failed(&destination, duration_from_epoch_now()),
+            }
             match copied {
                 Ok(region) => {
                     info!(

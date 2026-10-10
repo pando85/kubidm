@@ -1,6 +1,7 @@
 use self::{extractors::ClientConnInfo, javascript::*};
 use crate::{
     actors::{QueryServerReadV1, QueryServerWriteV1},
+    backup::metrics::BackupMetrics,
     config::{AddressSet, Configuration, HttpVersions, ServerRole, TcpAddressInfo},
     tcp::process_client_addr,
     CoreAction,
@@ -87,6 +88,8 @@ pub struct ServerState {
     pub(crate) secure_cookies: bool,
     /// So that we can work out which ID to use for spans
     pub(crate) logging_pipeline: LoggerType,
+    /// The backup metrics, when `online_backup.metrics_endpoint` serves them.
+    pub(crate) backup_metrics: Option<Arc<BackupMetrics>>,
 }
 
 impl ServerState {
@@ -192,6 +195,7 @@ pub async fn create_https_server(
     server_message_tx: broadcast::Sender<CoreAction>,
     maybe_tls_acceptor: Option<TlsAcceptor>,
     tls_acceptor_reload_tx: &broadcast::Sender<TlsAcceptor>,
+    backup_metrics: Option<Arc<BackupMetrics>>,
 ) -> Result<Vec<task::JoinHandle<()>>, ()> {
     let js_checksums = match config.role {
         ServerRole::WriteReplicaNoUI => String::new(),
@@ -300,6 +304,7 @@ pub async fn create_https_server(
         domain: config.domain.clone(),
         secure_cookies: config.integration_test_config.is_none(),
         logging_pipeline,
+        backup_metrics,
     };
 
     let static_routes = match config.role {
@@ -379,7 +384,16 @@ pub async fn create_https_server(
         .route("/status", get(generic::status))
         .route("/healthz", get(generic::healthz))
         .route("/maintenance", get(generic::maintenance_status))
-        .route("/readyz", get(generic::readyz))
+        .route("/readyz", get(generic::readyz));
+
+    // Only served when enabled: without it, /metrics is not found like any other path.
+    let app = if state.backup_metrics.is_some() {
+        app.route("/metrics", get(generic::metrics))
+    } else {
+        app
+    };
+
+    let app = app
         // 404 handler
         .fallback(handler_404)
         // This must be the LAST middleware.

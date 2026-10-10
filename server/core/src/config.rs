@@ -103,6 +103,11 @@ pub struct OnlineBackup {
     /// WAL archive configuration for Point-in-Time Recovery (PITR).
     #[serde(default)]
     pub wal_archive: Option<WalArchiveConfig>,
+
+    /// Serve the backup metrics in the Prometheus text format on `GET /metrics`, without
+    /// authentication. Off by default.
+    #[serde(default)]
+    pub metrics_endpoint: bool,
 }
 
 impl Default for OnlineBackup {
@@ -116,6 +121,7 @@ impl Default for OnlineBackup {
             s3: None,
             encryption: BackupEncryptionConfig::default(),
             wal_archive: None,
+            metrics_endpoint: false,
         }
     }
 }
@@ -801,6 +807,9 @@ impl fmt::Display for Configuration {
                 }
                 if let Some(wal) = bck.wal_archive.as_ref().filter(|wal| wal.enabled) {
                     write!(f, "wal_archive: {}, ", wal)?;
+                }
+                if bck.metrics_endpoint {
+                    write!(f, "metrics_endpoint: enabled, ")?;
                 }
                 write!(f, "")
             }

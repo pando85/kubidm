@@ -2,6 +2,7 @@ pub mod artifact;
 pub mod cli;
 pub mod encryption;
 pub mod finalize;
+pub mod metrics;
 pub mod mock_s3;
 pub mod online;
 pub mod pitr;

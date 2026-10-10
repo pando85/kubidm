@@ -53,10 +53,11 @@ use crate::{
     actors::{QueryServerReadV1, QueryServerWriteV1},
     admin::AdminActor,
     backup::{
+        metrics::BackupMetrics,
         online::OnlineBackupJob,
         pitr::{self, BaseLocation, PitrArchive, PitrError, PitrSettings, PitrSyncReport},
     },
-    config::{Configuration, ServerRole},
+    config::{Configuration, OnlineBackup, ServerRole},
     interval::IntervalActor,
     repl::ReplicationServerHandles,
 };
@@ -972,6 +973,10 @@ pub struct CoreHandle {
     server_read_ref: &'static QueryServerReadV1,
     /// The WAL archive, when point-in-time recovery is enabled.
     pitr_archive: Option<Arc<PitrArchive>>,
+    /// The backup metrics every backup task records into.
+    backup_metrics: Arc<BackupMetrics>,
+    /// The `[online_backup]` section the server runs with.
+    online_backup: Option<OnlineBackup>,
 }
 
 impl CoreHandle {
@@ -996,7 +1001,10 @@ impl CoreHandle {
         // Every task that can write has stopped: close the open WAL segment and archive
         // it, so that a clean shutdown loses no committed transaction.
         if let Some(archive) = &self.pitr_archive {
-            match archive.sync(duration_from_epoch_now(), true).await {
+            let result = archive.sync(duration_from_epoch_now(), true).await;
+            self.backup_metrics
+                .record_pitr_sync(&result, duration_from_epoch_now());
+            match result {
                 Ok(report) => debug!(?report, "WAL archive synchronised at shutdown"),
                 Err(err) => error!(
                     %err,
@@ -1016,9 +1024,32 @@ impl CoreHandle {
     /// exists so tests can archive on demand.
     pub async fn sync_wal_archive(&self) -> Option<Result<PitrSyncReport, PitrError>> {
         match &self.pitr_archive {
-            Some(archive) => Some(archive.sync(duration_from_epoch_now(), true).await),
+            Some(archive) => {
+                let result = archive.sync(duration_from_epoch_now(), true).await;
+                self.backup_metrics
+                    .record_pitr_sync(&result, duration_from_epoch_now());
+                Some(result)
+            }
             None => None,
         }
+    }
+
+    /// Run the online backup the `[online_backup]` section describes now, to every location
+    /// it configures, exactly as the scheduled online backup does. Fails without an
+    /// `[online_backup]` section. This exists so tests can exercise the scheduled backup on
+    /// demand.
+    pub async fn trigger_configured_online_backup(&self) -> Result<(), OperationError> {
+        let online_backup = self.online_backup.as_ref().ok_or_else(|| {
+            error!("No [online_backup] section is configured");
+            OperationError::InvalidState
+        })?;
+        OnlineBackupJob::from_config(
+            online_backup,
+            self.pitr_archive.clone(),
+            self.backup_metrics.clone(),
+        )
+        .run(self.server_read_ref)
+        .await
     }
 
     pub async fn reload(&mut self) {
@@ -1079,6 +1110,7 @@ impl CoreHandle {
             compression,
             encryption: encryption.clone(),
             pitr_archive: self.pitr_archive.clone(),
+            metrics: self.backup_metrics.clone(),
         }
         .run(self.server_read_ref)
         .await
@@ -1182,6 +1214,9 @@ async fn create_server_core_inner(
         }
         _ => None,
     };
+    let online_backup = config.online_backup.clone();
+    let backup_metrics = Arc::new(BackupMetrics::new(config.online_backup.as_ref()));
+
     // Start the IDM server.
     let (_qs, idms, idms_delayed, idms_audit) = match setup_qs_idms(be, schema, &config).await {
         Ok(t) => t,
@@ -1299,6 +1334,7 @@ async fn create_server_core_inner(
             idms_arc,
             maybe_tls_acceptor,
             pitr_archive.clone(),
+            backup_metrics.clone(),
         )
         .await
     };
@@ -1309,6 +1345,8 @@ async fn create_server_core_inner(
         handles,
         server_read_ref,
         pitr_archive,
+        backup_metrics,
+        online_backup,
     };
 
     if startup_success.is_ok() {
@@ -1337,6 +1375,7 @@ async fn launch_server_tasks(
     maybe_tls_acceptor: Option<TlsAcceptor>,
 
     pitr_archive: Option<Arc<PitrArchive>>,
+    backup_metrics: Arc<BackupMetrics>,
 ) -> Result<(), ()> {
     let status_ref = StatusActor::start();
     let tracker = status_ref.get_tracker_clone();
@@ -1402,7 +1441,11 @@ async fn launch_server_tasks(
     // WAL archiving runs in every mode, integration tests included: it only ships what
     // the backend already recorded.
     if let Some(archive) = &pitr_archive {
-        let wal_handle = pitr::start_wal_archive_task(archive.clone(), broadcast_tx.subscribe());
+        let wal_handle = pitr::start_wal_archive_task(
+            archive.clone(),
+            backup_metrics.clone(),
+            broadcast_tx.subscribe(),
+        );
         handles.push((TaskName::WalArchive, wal_handle));
     }
 
@@ -1442,6 +1485,7 @@ async fn launch_server_tasks(
                         server_read_ref,
                         online_backup_config,
                         pitr_archive.clone(),
+                        backup_metrics.clone(),
                         broadcast_tx.subscribe(),
                     )?;
                     handles.extend(backup_handles);
@@ -1579,6 +1623,11 @@ async fn launch_server_tasks(
         broadcast_tx.clone(),
         maybe_tls_acceptor,
         &tls_acceptor_reload_tx,
+        config
+            .online_backup
+            .as_ref()
+            .is_some_and(|online_backup| online_backup.metrics_endpoint)
+            .then_some(backup_metrics),
     )
     .await
     .inspect_err(|err| {
