@@ -27,6 +27,7 @@ use std::{
 use url::Url;
 
 use crate::backup::{same_s3_location, validate_encryption_config, validate_s3_location};
+use crate::interval::parse_backup_schedule;
 use crate::repl::config::ReplicationConfiguration;
 
 #[derive(Debug, Deserialize)]
@@ -103,6 +104,32 @@ pub struct OnlineBackup {
     /// WAL archive configuration for Point-in-Time Recovery (PITR).
     #[serde(default)]
     pub wal_archive: Option<WalArchiveConfig>,
+
+    /// An optional schedule, in the syntax of `schedule`, for the full verification of the
+    /// newest backup: the newest artifact of the local directory, and of the S3 prefix when
+    /// S3 is configured, is restored into a temporary database, booted and checked as
+    /// `kubidmd database verify-backup` does. Off by default. Requires `enabled = true`.
+    #[serde(default)]
+    pub verify_schedule: Option<String>,
+
+    /// Where the scheduled verification creates its scratch directories (the copied or
+    /// downloaded artifact and the restored, unencrypted scratch database), each named
+    /// `kubidm-verify-*`. Defaults to the directory of the database. The server removes the
+    /// `kubidm-verify-*` directories it finds there when it starts, so it must not be
+    /// shared with another server.
+    #[serde(default)]
+    pub verify_temp_path: Option<PathBuf>,
+
+    /// Serve the backup metrics in the Prometheus text format on `GET /metrics`. Off by
+    /// default.
+    #[serde(default)]
+    pub metrics_endpoint: bool,
+
+    /// A file holding the token a scraper must send as `Authorization: Bearer <token>` to
+    /// read `/metrics`. Without it the endpoint needs no authentication. Requires
+    /// `metrics_endpoint = true`.
+    #[serde(default)]
+    pub metrics_token_file: Option<PathBuf>,
 }
 
 impl Default for OnlineBackup {
@@ -116,6 +143,10 @@ impl Default for OnlineBackup {
             s3: None,
             encryption: BackupEncryptionConfig::default(),
             wal_archive: None,
+            verify_schedule: None,
+            verify_temp_path: None,
+            metrics_endpoint: false,
+            metrics_token_file: None,
         }
     }
 }
@@ -174,8 +205,50 @@ impl OnlineBackup {
             }
         }
 
+        if self.enabled {
+            parse_backup_schedule(&self.schedule)
+                .map_err(|reason| format!("online_backup.schedule: {reason}"))?;
+        }
+
+        if let Some(verify_schedule) = &self.verify_schedule {
+            if !self.enabled {
+                return Err(
+                    "online_backup.verify_schedule: the scheduled verification requires \
+                     online_backup.enabled = true; verify the backups of a host that does not \
+                     take them with `kubidmd database verify-backup`"
+                        .to_string(),
+                );
+            }
+            parse_backup_schedule(verify_schedule)
+                .map_err(|reason| format!("online_backup.verify_schedule: {reason}"))?;
+        }
+
+        if let Some(token_file) = &self.metrics_token_file {
+            if !self.metrics_endpoint {
+                return Err(
+                    "online_backup.metrics_token_file: it protects the metrics endpoint, which \
+                     requires online_backup.metrics_endpoint = true"
+                        .to_string(),
+                );
+            }
+            read_metrics_token(token_file)
+                .map_err(|reason| format!("online_backup.metrics_token_file: {reason}"))?;
+        }
+
         Ok(())
     }
+}
+
+/// The token of `online_backup.metrics_token_file`: the content of the file without its
+/// surrounding whitespace. Fails when it can not be read or holds no token.
+pub fn read_metrics_token(path: &Path) -> Result<String, String> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|err| format!("unable to read {}: {err}", path.display()))?;
+    let token = content.trim();
+    if token.is_empty() {
+        return Err(format!("{} holds no token", path.display()));
+    }
+    Ok(token.to_string())
 }
 
 /// Check an enabled `[online_backup.s3.replication]` section of `s3`: it needs at least one
@@ -801,6 +874,23 @@ impl fmt::Display for Configuration {
                 }
                 if let Some(wal) = bck.wal_archive.as_ref().filter(|wal| wal.enabled) {
                     write!(f, "wal_archive: {}, ", wal)?;
+                }
+                if let Some(verify_schedule) = &bck.verify_schedule {
+                    write!(f, "verify_schedule: {}, ", verify_schedule)?;
+                }
+                if let Some(verify_temp_path) = &bck.verify_temp_path {
+                    write!(f, "verify_temp_path: {}, ", verify_temp_path.display())?;
+                }
+                if bck.metrics_endpoint {
+                    write!(
+                        f,
+                        "metrics_endpoint: enabled ({}), ",
+                        if bck.metrics_token_file.is_some() {
+                            "bearer token"
+                        } else {
+                            "no authentication"
+                        }
+                    )?;
                 }
                 write!(f, "")
             }
@@ -1491,6 +1581,118 @@ m_cost = 1024
 "
         );
         assert!(build_from_toml(&weak_kdf).is_none());
+    }
+
+    #[test]
+    fn online_backup_verify_schedule_and_metrics_endpoint_are_off_by_default() {
+        let config = build_from_toml(BASE_V2_CONFIG).expect("config");
+        let online_backup = config.online_backup.expect("online backup");
+        assert_eq!(online_backup.verify_schedule, None);
+        assert!(!online_backup.metrics_endpoint);
+    }
+
+    #[test]
+    fn online_backup_verify_schedule_is_validated() {
+        for schedule in ["@weekly", "30 3 * * Sun", "0 30 3 * * Sun *"] {
+            let config = build_from_toml(&format!(
+                "{BASE_V2_CONFIG}verify_schedule = \"{schedule}\"\nmetrics_endpoint = true\n"
+            ))
+            .unwrap_or_else(|| panic!("{schedule} must be accepted"));
+            let online_backup = config.online_backup.expect("online backup");
+            assert_eq!(online_backup.verify_schedule.as_deref(), Some(schedule));
+            assert!(online_backup.metrics_endpoint);
+        }
+
+        // Not a schedule, or one that never runs.
+        for schedule in ["sometimes", "0 0 0 1 1 * 2001"] {
+            let err = OnlineBackup {
+                verify_schedule: Some(schedule.to_string()),
+                ..OnlineBackup::default()
+            }
+            .validate()
+            .expect_err("an invalid schedule must be rejected");
+            assert!(err.starts_with("online_backup.verify_schedule"), "{err}");
+            assert!(
+                build_from_toml(&format!(
+                    "{BASE_V2_CONFIG}verify_schedule = \"{schedule}\"\n"
+                ))
+                .is_none(),
+                "{schedule} must be rejected"
+            );
+        }
+
+        // A host that does not take backups verifies them with the command instead.
+        let err = OnlineBackup {
+            enabled: false,
+            verify_schedule: Some("@daily".to_string()),
+            ..OnlineBackup::default()
+        }
+        .validate()
+        .expect_err("a disabled online backup must not be verified on a schedule");
+        assert!(err.contains("online_backup.enabled = true"), "{err}");
+    }
+
+    #[test]
+    fn online_backup_metrics_token_file_is_validated() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let token_file = dir.path().join("token");
+        std::fs::write(&token_file, "  s3cret\n").expect("write");
+        assert_eq!(read_metrics_token(&token_file).as_deref(), Ok("s3cret"));
+
+        let with_token = |metrics_endpoint: bool, path: &Path| OnlineBackup {
+            metrics_endpoint,
+            metrics_token_file: Some(path.to_path_buf()),
+            ..OnlineBackup::default()
+        };
+        assert!(with_token(true, &token_file).validate().is_ok());
+
+        // A token for an endpoint that is not served is a mistake.
+        let err = with_token(false, &token_file)
+            .validate()
+            .expect_err("a token without the endpoint must be rejected");
+        assert!(err.contains("metrics_endpoint = true"), "{err}");
+
+        // Never serve the metrics without the token the operator asked for.
+        let err = with_token(true, &dir.path().join("missing"))
+            .validate()
+            .expect_err("a missing token file must be rejected");
+        assert!(err.starts_with("online_backup.metrics_token_file"), "{err}");
+        std::fs::write(&token_file, " \n").expect("write");
+        let err = with_token(true, &token_file)
+            .validate()
+            .expect_err("an empty token must be rejected");
+        assert!(err.contains("holds no token"), "{err}");
+    }
+
+    #[test]
+    fn online_backup_schedule_is_validated_at_load() {
+        for schedule in ["@monthly", "0 30 3 * * Sun", "00 22 * * *"] {
+            assert!(
+                build_from_toml(&BASE_V2_CONFIG.replace(
+                    "schedule = \"@daily\"",
+                    &format!("schedule = \"{schedule}\"")
+                ))
+                .is_some(),
+                "{schedule} must be accepted"
+            );
+        }
+        let err = OnlineBackup {
+            schedule: "whenever".to_string(),
+            ..OnlineBackup::default()
+        }
+        .validate()
+        .expect_err("an invalid schedule must be rejected");
+        assert!(err.starts_with("online_backup.schedule"), "{err}");
+        assert!(err.contains("@monthly"), "{err}");
+
+        // A disabled online backup never runs its schedule.
+        assert!(OnlineBackup {
+            enabled: false,
+            schedule: "whenever".to_string(),
+            ..OnlineBackup::default()
+        }
+        .validate()
+        .is_ok());
     }
 
     #[test]

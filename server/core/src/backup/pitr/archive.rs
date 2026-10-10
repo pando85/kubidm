@@ -22,6 +22,7 @@ use uuid::Uuid;
 use super::recover::{apply_restore, RestoreRecord};
 use super::store::{read_local_segment, PitrStore};
 use super::{blocking, BaseLocation, PitrError, PitrLocation, PitrSettings};
+use crate::backup::metrics::BackupMetrics;
 use crate::backup::BackupEncryptor;
 use crate::CoreAction;
 
@@ -767,11 +768,12 @@ pub fn select_segments_to_delete(
         .collect()
 }
 
-/// Start the task that synchronises the archive every segment interval. The final
-/// synchronisation at shutdown is done by the core handle once every other task, and so
-/// every writer, has stopped.
+/// Start the task that synchronises the archive every segment interval, recording every
+/// outcome in `metrics`. The final synchronisation at shutdown is done by the core handle
+/// once every other task, and so every writer, has stopped.
 pub(crate) fn start_wal_archive_task(
     archive: Arc<PitrArchive>,
+    metrics: Arc<BackupMetrics>,
     mut rx: broadcast::Receiver<CoreAction>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -787,7 +789,9 @@ pub(crate) fn start_wal_archive_task(
                     }
                 }
                 _ = inter.tick() => {
-                    if let Err(err) = archive.sync(duration_from_epoch_now(), false).await {
+                    let result = archive.sync(duration_from_epoch_now(), false).await;
+                    metrics.record_pitr_sync(&result, duration_from_epoch_now());
+                    if let Err(err) = result {
                         error!(%err, "WAL archive synchronisation failed");
                     }
                 }

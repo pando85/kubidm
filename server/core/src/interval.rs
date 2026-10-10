@@ -12,9 +12,11 @@ use tokio::{
     time::{interval, interval_at, sleep, Duration, Instant, MissedTickBehavior},
 };
 
+use crate::backup::metrics::{seed_from_backups, BackupDestination, BackupMetrics};
 use crate::backup::online::OnlineBackupJob;
 use crate::backup::pitr::PitrArchive;
-use crate::backup::{region_is_healthy, S3ClientWrapper};
+use crate::backup::verify::BackupVerifyJob;
+use crate::backup::{region_is_healthy, RegionSyncOutcome, S3BackupError, S3ClientWrapper};
 use crate::config::OnlineBackup;
 use crate::{CoreAction, TaskName};
 
@@ -22,6 +24,7 @@ use crate::actors::{QueryServerReadV1, QueryServerWriteV1};
 use kubidm_proto::backup::{ReplicationConfig, S3Config};
 use kubidmd_lib::constants::PURGE_FREQUENCY;
 use kubidmd_lib::event::{PurgeDeleteAfterEvent, PurgeRecycledEvent, PurgeTombstoneEvent};
+use kubidmd_lib::prelude::duration_from_epoch_now;
 
 pub(crate) struct IntervalActor;
 
@@ -73,7 +76,9 @@ impl IntervalActor {
         server: &'static QueryServerReadV1,
         online_backup_config: &OnlineBackup,
         pitr_archive: Option<Arc<PitrArchive>>,
-        mut rx: broadcast::Receiver<CoreAction>,
+        metrics: Arc<BackupMetrics>,
+        backup_lock: Arc<tokio::sync::Mutex<()>>,
+        rx: broadcast::Receiver<CoreAction>,
     ) -> Result<Vec<(TaskName, JoinHandle<()>)>, ()> {
         let outpath = online_backup_config.path.to_owned();
         let has_local_path = outpath.is_some();
@@ -84,40 +89,11 @@ impl IntervalActor {
             return Err(());
         }
 
-        let crono_expr = online_backup_config.schedule.as_str().to_string();
-        let mut crono_expr_values = crono_expr.split_ascii_whitespace().collect::<Vec<&str>>();
-        let chrono_expr_uses_standard_syntax = crono_expr_values.len() == 5;
-        if chrono_expr_uses_standard_syntax {
-            // we add a 0 element at the beginning to simulate the standard crono syntax which always runs
-            // commands at seconds 00
-            crono_expr_values.insert(0, "0");
-            crono_expr_values.push("*");
-        }
-        let crono_expr_schedule = crono_expr_values.join(" ");
-        if chrono_expr_uses_standard_syntax {
-            info!(
-                "Provided online backup schedule is: {}, now being transformed to: {}",
-                crono_expr, crono_expr_schedule
-            );
-        }
-        // Cron expression handling
-        let cron_expr = Schedule::from_str(crono_expr_schedule.as_str()).map_err(|e| {
-            error!("Online backup schedule parse error: {}", e);
-            error!("valid formats are:");
-            error!("sec  min   hour   day of month   month   day of week   year");
-            error!("min   hour   day of month   month   day of week");
-            error!("@hourly | @daily | @weekly");
-        })?;
-
+        let cron_expr =
+            parse_backup_schedule(&online_backup_config.schedule).map_err(|reason| {
+                error!("Online backup schedule error: {reason}");
+            })?;
         info!("Online backup schedule parsed as: {}", cron_expr);
-
-        if cron_expr.upcoming(Utc).next().is_none() {
-            error!(
-                "Online backup schedule error: '{}' will not match any date.",
-                cron_expr
-            );
-            return Err(());
-        }
 
         // Output path handling - only for local backups
         if let Some(ref path) = outpath {
@@ -144,7 +120,12 @@ impl IntervalActor {
             }
         }
 
-        let job = OnlineBackupJob::from_config(online_backup_config, pitr_archive);
+        let job = OnlineBackupJob::from_config(
+            online_backup_config,
+            pitr_archive,
+            metrics.clone(),
+            backup_lock,
+        );
         let s3_config = online_backup_config.s3.clone();
 
         let mut handles = Vec::with_capacity(2);
@@ -160,54 +141,24 @@ impl IntervalActor {
             if let Some(s3_cfg) = &s3_config {
                 handles.push((
                     TaskName::BackupReplicationMonitor,
-                    Self::start_replication_monitor(s3_cfg.clone(), replication, rx.resubscribe()),
+                    Self::start_replication_monitor(
+                        s3_cfg.clone(),
+                        replication,
+                        metrics,
+                        rx.resubscribe(),
+                    ),
                 ));
             }
         }
 
-        let handle = tokio::spawn(async move {
-            let mut last_run = None;
-            loop {
-                let now = Utc::now();
-                let Some(next_time) = next_backup_time(&cron_expr, now, last_run) else {
-                    info!("Online backup schedule '{}' has no further runs", cron_expr);
-                    break;
-                };
-                let wait = wait_until(next_time, now);
-                info!(
-                    "Online backup next run on {}, wait_time = {}s",
-                    next_time,
-                    wait.as_secs()
-                );
-
-                tokio::select! {
-                    action = rx.recv() => match action {
-                        Ok(CoreAction::Shutdown) | Err(broadcast::error::RecvError::Closed) => {
-                            break
-                        }
-                        // The schedule does not change on a reload: wait for the same run.
-                        Ok(CoreAction::Reload) | Err(broadcast::error::RecvError::Lagged(_)) => {
-                            continue
-                        }
-                    },
-                    _ = sleep(wait) => {}
-                }
-
-                last_run = Some(next_time);
-                match run_until_shutdown(job.run(server), &mut rx).await {
-                    Some(Ok(())) => {}
-                    Some(Err(err)) => error!(?err, "An online backup error occurred."),
-                    None => {
-                        warn!(
-                            "Online backup abandoned: the server is shutting down. The WAL \
-                             archive is still synchronised, and the next scheduled run takes \
-                             a new backup"
-                        );
-                        break;
-                    }
+        let job = Arc::new(job);
+        let handle = spawn_scheduled(TaskName::BackupActor, cron_expr, rx, move || {
+            let job = job.clone();
+            async move {
+                if let Err(err) = job.run(server).await {
+                    error!(?err, "An online backup error occurred.");
                 }
             }
-            info!("Stopped {}", TaskName::BackupActor);
         });
         handles.push((TaskName::BackupActor, handle));
 
@@ -221,6 +172,7 @@ impl IntervalActor {
     fn start_replication_monitor(
         s3_config: S3Config,
         replication: ReplicationConfig,
+        metrics: Arc<BackupMetrics>,
         mut rx: broadcast::Receiver<CoreAction>,
     ) -> JoinHandle<()> {
         let period = replication_monitor_period(&replication);
@@ -243,7 +195,7 @@ impl IntervalActor {
                         }
                     }
                     _ = ticks.tick() => {
-                        let run = sync_and_report_replication(&s3_config, &replication);
+                        let run = sync_and_report_replication(&s3_config, &replication, &metrics);
                         if run_until_shutdown(run, &mut rx).await.is_none() {
                             break;
                         }
@@ -253,6 +205,142 @@ impl IntervalActor {
             info!("Stopped {}", TaskName::BackupReplicationMonitor);
         })
     }
+
+    /// Start the task that keeps the backup metrics across restarts: it first takes the
+    /// last success of every destination of `online_backup` from the newest backup found
+    /// in it (abandoned on shutdown), then writes the state file whenever a timestamp
+    /// changes, and once more when the server shuts down.
+    pub fn start_backup_metrics(
+        metrics: Arc<BackupMetrics>,
+        online_backup: OnlineBackup,
+        mut rx: broadcast::Receiver<CoreAction>,
+    ) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            let seeded = seed_from_backups(&metrics, &online_backup);
+            if run_until_shutdown(seeded, &mut rx).await.is_some() {
+                loop {
+                    tokio::select! {
+                        action = rx.recv() => match action {
+                            Ok(CoreAction::Shutdown) | Err(broadcast::error::RecvError::Closed) => {
+                                break
+                            }
+                            Ok(CoreAction::Reload) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                        },
+                        _ = metrics.changed() => metrics.save_state_file().await,
+                    }
+                }
+            }
+            metrics.save_state_file().await;
+            info!("Stopped {}", TaskName::BackupMetrics);
+        })
+    }
+
+    /// Start the scheduled full verification of the newest backup, `verify_schedule`. It
+    /// is a task of its own, and never runs at the same time as an online backup: the one
+    /// that starts second waits for the other. A run that outlasts the gap to the next
+    /// scheduled time skips the times that are already past, so runs never overlap. On
+    /// shutdown a run in progress is abandoned: the blocking work it handed off stops
+    /// before its next step (restore, reindex, boot, consistency checks) and removes its
+    /// scratch directories; a process killed before then leaves them for the next start
+    /// to remove.
+    pub fn start_backup_verification(
+        job: Arc<BackupVerifyJob>,
+        schedule: Schedule,
+        rx: broadcast::Receiver<CoreAction>,
+    ) -> JoinHandle<()> {
+        info!(
+            "Scheduled backup verification schedule parsed as: {}",
+            schedule
+        );
+        spawn_scheduled(TaskName::BackupVerification, schedule, rx, move || {
+            let job = job.clone();
+            async move {
+                job.run().await;
+            }
+        })
+    }
+}
+
+/// Start the task that runs `run` at every time of `schedule`, until the schedule has no
+/// further times or the server shuts down. A run that outlasts the gap to the next
+/// scheduled time skips the times that are already past, so runs never overlap. On
+/// shutdown a run in progress is abandoned, see [`run_until_shutdown`].
+fn spawn_scheduled<F, Fut>(
+    task: TaskName,
+    schedule: Schedule,
+    mut rx: broadcast::Receiver<CoreAction>,
+    mut run: F,
+) -> JoinHandle<()>
+where
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send,
+{
+    tokio::spawn(async move {
+        let mut last_run = None;
+        loop {
+            let now = Utc::now();
+            let Some(next_time) = next_backup_time(&schedule, now, last_run) else {
+                info!("{task} schedule '{schedule}' has no further runs");
+                break;
+            };
+            let wait = wait_until(next_time, now);
+            info!(
+                "{task} next run on {}, wait_time = {}s",
+                next_time,
+                wait.as_secs()
+            );
+
+            tokio::select! {
+                action = rx.recv() => match action {
+                    Ok(CoreAction::Shutdown) | Err(broadcast::error::RecvError::Closed) => {
+                        break
+                    }
+                    // The schedule does not change on a reload: wait for the same run.
+                    Ok(CoreAction::Reload) | Err(broadcast::error::RecvError::Lagged(_)) => {
+                        continue
+                    }
+                },
+                _ = sleep(wait) => {}
+            }
+
+            last_run = Some(next_time);
+            if run_until_shutdown(run(), &mut rx).await.is_none() {
+                warn!("{task} run abandoned: the server is shutting down");
+                break;
+            }
+        }
+        info!("Stopped {task}");
+    })
+}
+
+/// A cron expression of the `[online_backup]` section in the seven field syntax of the
+/// cron crate: a standard five field expression runs at second 0 of any year.
+fn normalize_cron_expression(expr: &str) -> String {
+    let mut values = expr.split_ascii_whitespace().collect::<Vec<&str>>();
+    if values.len() == 5 {
+        // we add a 0 element at the beginning to simulate the standard crono syntax which always runs
+        // commands at seconds 00
+        values.insert(0, "0");
+        values.push("*");
+    }
+    values.join(" ")
+}
+
+/// Parse a schedule of the `[online_backup]` section, in the syntax `schedule` documents.
+/// Fails when it does not parse or will never run.
+pub(crate) fn parse_backup_schedule(expr: &str) -> Result<Schedule, String> {
+    let schedule = Schedule::from_str(&normalize_cron_expression(expr)).map_err(|err| {
+        format!(
+            "'{expr}' is not a valid schedule ({err}); valid formats are \
+             `min hour day-of-month month day-of-week`, \
+             `sec min hour day-of-month month day-of-week [year]` and @hourly, @daily, \
+             @weekly, @monthly or @yearly"
+        )
+    })?;
+    if schedule.upcoming(Utc).next().is_none() {
+        return Err(format!("'{expr}' will not match any date"));
+    }
+    Ok(schedule)
 }
 
 /// Drive `run` to completion unless the server shuts down first, in which case `run` is
@@ -312,7 +400,11 @@ fn replication_monitor_period(replication: &ReplicationConfig) -> Duration {
 /// One run of the replication monitor: copy what every region misses and report the
 /// resulting health, a warning per unhealthy region and an info line per healthy one.
 /// Never fails; a primary that can not be listed is a warning too.
-async fn sync_and_report_replication(s3_config: &S3Config, replication: &ReplicationConfig) {
+async fn sync_and_report_replication(
+    s3_config: &S3Config,
+    replication: &ReplicationConfig,
+    metrics: &BackupMetrics,
+) {
     let client = match S3ClientWrapper::new(s3_config.clone()).await {
         Ok(client) => client,
         Err(err) => {
@@ -341,6 +433,8 @@ async fn sync_and_report_replication(s3_config: &S3Config, replication: &Replica
             return;
         }
     };
+
+    record_region_syncs(metrics, &report.synced, duration_from_epoch_now());
 
     for (region, result) in &report.synced {
         match result {
@@ -407,6 +501,28 @@ async fn sync_and_report_replication(s3_config: &S3Config, replication: &Replica
             "Backup replication health: {} ({} regions healthy, max lag {}s)",
             health.overall_status, health.healthy_regions, health.max_lag_seconds
         );
+    }
+}
+
+/// Record in `metrics` what a replication sync did in every region at `now`. A copy is a
+/// backup stored in the region, as the copy of the backup run is; a copy that failed, or a
+/// region that could not be listed, is a failed one. A region that missed nothing is left
+/// as it is.
+fn record_region_syncs(
+    metrics: &BackupMetrics,
+    synced: &[(String, Result<RegionSyncOutcome, S3BackupError>)],
+    now: Duration,
+) {
+    for (region, result) in synced {
+        let destination = BackupDestination::S3Region(region.clone());
+        match result {
+            Ok(outcome) if !outcome.failed.is_empty() => metrics.backup_failed(&destination, now),
+            Ok(outcome) if !outcome.copied.is_empty() => {
+                metrics.backup_succeeded(&destination, now)
+            }
+            Ok(_) => {}
+            Err(_) => metrics.backup_failed(&destination, now),
+        }
     }
 }
 
@@ -496,6 +612,81 @@ mod tests {
         drop(tx);
         let run = std::future::pending::<()>();
         assert_eq!(run_until_shutdown(run, &mut rx).await, None);
+    }
+
+    #[test]
+    fn backup_schedules_accept_the_standard_and_the_extended_syntax() {
+        assert_eq!(
+            normalize_cron_expression("00 22 * * *"),
+            "0 00 22 * * * *".to_string()
+        );
+        assert_eq!(normalize_cron_expression("@daily"), "@daily");
+        assert_eq!(
+            normalize_cron_expression("1 2 3 * * Mon *"),
+            "1 2 3 * * Mon *"
+        );
+        assert_eq!(
+            normalize_cron_expression(" 1  2 3 * * Mon * "),
+            "1 2 3 * * Mon *"
+        );
+
+        let standard = parse_backup_schedule("30 3 * * *").expect("standard syntax");
+        assert_eq!(
+            next_backup_time(&standard, at(1, 0, 0), None),
+            Some(at(3, 30, 0))
+        );
+        assert!(parse_backup_schedule("@hourly").is_ok());
+        assert!(parse_backup_schedule("* * * * * * *").is_ok());
+
+        let err = parse_backup_schedule("now and then").expect_err("not a schedule");
+        assert!(err.contains("valid formats"), "{err}");
+        let err = parse_backup_schedule("0 0 0 1 1 * 2001").expect_err("in the past");
+        assert!(err.contains("will not match any date"), "{err}");
+    }
+
+    #[test]
+    fn replication_syncs_record_the_regions_they_copied_to() {
+        let metrics = BackupMetrics::new(None);
+        let outcome = |copied: &[&str], failed: &[&str]| RegionSyncOutcome {
+            copied: copied.iter().map(|key| key.to_string()).collect(),
+            failed: failed
+                .iter()
+                .map(|key| (key.to_string(), "denied".to_string()))
+                .collect(),
+        };
+        let synced = vec![
+            ("copied".to_string(), Ok(outcome(&["backup-a"], &[]))),
+            (
+                "partial".to_string(),
+                Ok(outcome(&["backup-a"], &["backup-b"])),
+            ),
+            ("current".to_string(), Ok(outcome(&[], &[]))),
+            (
+                "unreachable".to_string(),
+                Err(S3BackupError::SdkError("timeout".to_string())),
+            ),
+        ];
+        record_region_syncs(&metrics, &synced, Duration::from_secs(42));
+
+        let text = metrics.render();
+        let success = |region: &str| {
+            format!(
+                "kubidm_backup_last_success_timestamp_seconds{{destination=\"s3_region\",region=\"{region}\"}}"
+            )
+        };
+        let failures = |region: &str| {
+            format!("kubidm_backup_failures_total{{destination=\"s3_region\",region=\"{region}\"}}")
+        };
+        assert!(
+            text.contains(&format!("{} 42.000", success("copied"))),
+            "{text}"
+        );
+        assert!(text.contains(&format!("{} 0", failures("copied"))));
+        assert!(text.contains(&format!("{} 0\n", success("partial"))));
+        assert!(text.contains(&format!("{} 1", failures("partial"))));
+        assert!(text.contains(&format!("{} 1", failures("unreachable"))));
+        // A region that was already current saw no event.
+        assert!(!text.contains("region=\"current\""));
     }
 
     #[test]
