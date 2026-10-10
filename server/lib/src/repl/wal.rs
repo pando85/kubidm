@@ -1920,10 +1920,12 @@ fn remove_handed_over_gap(path: &Path) -> Result<(), WalError> {
 
 /// Whether the handed over gap at `path`, pending, is abandoned: the command that handed it
 /// over no longer holds its lock, so it stopped without confirming or withdrawing it. A
-/// file that can not be opened or locked counts as abandoned, so that its gap is recorded.
+/// file that is gone was just confirmed or withdrawn. One that can not be opened or locked
+/// otherwise counts as abandoned, so that its gap is recorded.
 fn pending_gap_is_abandoned(path: &Path) -> bool {
     let file = match fs::File::open(path) {
         Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return false,
         Err(err) => {
             warn!(%err, path = %path.display(), "Unable to open a pending handed over WAL archive gap");
             return true;
@@ -1990,7 +1992,12 @@ fn read_handed_over_gaps(dir: &Path) -> Vec<(PathBuf, WalGap)> {
             // A file still being written.
             continue;
         }
-        let gap = fs::read(&path)
+        let data = match fs::read(&path) {
+            // An abandoned pending gap a server next to this reader just took over.
+            Err(err) if pending && err.kind() == std::io::ErrorKind::NotFound => continue,
+            data => data,
+        };
+        let gap = data
             .map_err(WalError::from)
             .and_then(|data| Ok(serde_json::from_slice::<WalGap>(&data)?))
             .unwrap_or_else(|err| {
@@ -2347,6 +2354,32 @@ pub fn format_ts_rfc3339(ts: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pending gap read while its command confirms or withdraws it is gone by the time
+    /// it is opened: it is skipped, never taken for an unreadable gap over all of history.
+    /// One whose command still holds its lock is skipped too, and once the command is gone
+    /// it is recorded.
+    #[test]
+    fn test_pending_handed_over_gaps_are_read_only_once_abandoned() {
+        let dir = tempfile::tempdir().unwrap();
+        let gap = WalGap {
+            from_ts: Duration::from_secs(10),
+            until_ts: Some(Duration::from_secs(20)),
+            reason: WalGapReason::OfflineChange,
+        };
+        let handed_over = hand_over_gap(dir.path(), &gap).unwrap();
+        let pending = handed_over.path().to_path_buf();
+        assert!(!pending_gap_is_abandoned(&pending));
+        assert!(read_handed_over_gaps(dir.path()).is_empty());
+        assert!(!pending_gap_is_abandoned(
+            &dir.path().join("gone.json.pending")
+        ));
+        drop(handed_over);
+        assert!(pending_gap_is_abandoned(&pending));
+        let read = read_handed_over_gaps(dir.path());
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].1, gap);
+    }
 
     fn test_config() -> WalArchiveConfig {
         WalArchiveConfig {
