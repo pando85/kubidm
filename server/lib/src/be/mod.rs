@@ -163,6 +163,24 @@ pub struct BackupStructuralReport {
     pub db_ts_max: Option<Duration>,
     /// Human readable reasons the artifact can not be restored by this server.
     pub errors: Vec<String>,
+    /// The size, in bytes, of the artifact once decompressed (and decrypted): what its
+    /// entries take as JSON, read up to where parsing stopped. A restored database is of
+    /// that order, plus its indexes.
+    pub uncompressed_size: u64,
+}
+
+/// Counts the bytes read through it.
+struct CountingReader<R> {
+    inner: R,
+    count: u64,
+}
+
+impl<R: std::io::Read> std::io::Read for CountingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buf)?;
+        self.count = self.count.saturating_add(read as u64);
+        Ok(read)
+    }
 }
 
 impl BackupStructuralReport {
@@ -181,13 +199,23 @@ pub fn verify_backup_structure<IN>(
 where
     IN: std::io::Read,
 {
-    let dbbak_option: Result<DbBackup, serde_json::Error> = match compression {
-        BackupCompression::NoCompression => serde_json::from_reader(input),
-        BackupCompression::Gzip => {
-            let decoder = flate2::read::GzDecoder::new(input);
-            serde_json::from_reader(decoder)
-        }
-    };
+    let (dbbak_option, uncompressed_size): (Result<DbBackup, serde_json::Error>, u64) =
+        match compression {
+            BackupCompression::NoCompression => {
+                let mut counting = CountingReader {
+                    inner: input,
+                    count: 0,
+                };
+                (serde_json::from_reader(&mut counting), counting.count)
+            }
+            BackupCompression::Gzip => {
+                let mut counting = CountingReader {
+                    inner: flate2::read::GzDecoder::new(input),
+                    count: 0,
+                };
+                (serde_json::from_reader(&mut counting), counting.count)
+            }
+        };
 
     let dbbak = match dbbak_option {
         Ok(dbbak) => dbbak,
@@ -201,6 +229,7 @@ where
                 errors: vec![format!(
                     "artifact could not be parsed as a kubidm backup: {err}"
                 )],
+                uncompressed_size,
             };
         }
     };
@@ -266,6 +295,7 @@ where
         db_s_uuid,
         db_ts_max,
         errors,
+        uncompressed_size,
     }
 }
 

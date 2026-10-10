@@ -58,6 +58,7 @@ pub(super) fn report(ts: u64, server: Uuid) -> BackupStructuralReport {
         db_s_uuid: Some(server),
         db_ts_max: Some(Duration::from_secs(ts)),
         errors: Vec::new(),
+        uncompressed_size: 0,
     }
 }
 

@@ -44,6 +44,11 @@ use crate::{collect_consistency_errors, open_schema_and_backend, setup_qs};
 /// can only be left behind by a run that was killed.
 pub const SCRATCH_DIR_PREFIX: &str = "kubidm-verify-";
 
+/// The free space the scratch restore leaves, on top of what it needs, on the filesystem of
+/// its scratch directory: by default that is the filesystem of the live database, whose
+/// writes (every login writes a session) must never run out of space because of it.
+pub const SCRATCH_SPACE_MARGIN: u64 = 256 * 1024 * 1024;
+
 /// The size, in entries, of the entry cache of a scratch database restored by the
 /// scheduled verification: the smallest the backend accepts. The scratch database lives
 /// inside the running server, whose own cache is sized for the live database.
@@ -206,27 +211,97 @@ pub fn verify_scratch_parent(config: &Configuration) -> Option<PathBuf> {
     Some(base.join(name))
 }
 
-/// Restore the artifact at `path` into a scratch database in a new scratch directory in
-/// `scratch_parent` (see [`new_scratch_dir`]) through the production restore path, boot
-/// that database exactly as a server start would and run the full consistency
-/// verification on it. Returns the consistency errors found, empty for a restorable
-/// backup, or why a step failed. The scratch directory is removed when this returns.
+/// The free space the scratch restore of an artifact needs: twice the size of the restored
+/// database, estimated as the larger of the artifact once decompressed (`uncompressed`) and
+/// the live database (`live_database`), plus [`SCRATCH_SPACE_MARGIN`]. Twice, because the
+/// restore writes the whole database in one transaction, whose sqlite write-ahead log can
+/// reach the size of the database again before it is checkpointed into it.
+pub(crate) fn scratch_space_needed(uncompressed: u64, live_database: u64) -> u64 {
+    uncompressed
+        .max(live_database)
+        .saturating_mul(2)
+        .saturating_add(SCRATCH_SPACE_MARGIN)
+}
+
+/// A new scratch directory in `parent` (see [`new_scratch_dir`]) for the restore of an
+/// artifact of `uncompressed` bytes once decompressed, when its filesystem has the space
+/// [`scratch_space_needed`] says, the live database at `live_database` included in the
+/// estimate. Otherwise the restore could fill the filesystem, which is by default the one
+/// of the live database, and fail as if the backup could not be restored: the
+/// verification can not run, and the directory is removed.
+fn new_restore_scratch_dir(
+    parent: Option<&Path>,
+    uncompressed: u64,
+    live_database: Option<&Path>,
+) -> Result<TempDir, VerifyError> {
+    let scratch_dir = new_scratch_dir(parent).map_err(|err| {
+        error!(?err, "Unable to create a scratch directory");
+        VerifyError::Environment(format!("unable to create a scratch directory: {err}"))
+    })?;
+    let live = live_database
+        .and_then(|path| std::fs::metadata(path).ok())
+        .map_or(0, |metadata| metadata.len());
+    let needed = scratch_space_needed(uncompressed, live);
+    let available = fs4::available_space(scratch_dir.path()).map_err(|err| {
+        VerifyError::Environment(format!(
+            "unable to read the free space of the scratch directory {}: {err}",
+            scratch_dir.path().display()
+        ))
+    })?;
+    if available < needed {
+        return Err(VerifyError::Environment(format!(
+            "not enough free space for the scratch database in {}: {available} bytes free, \
+             {needed} needed (twice the estimated size of the restored database, and \
+             {SCRATCH_SPACE_MARGIN} bytes left free); make room there, or move the scratch \
+             data with online_backup.verify_temp_path (TMPDIR for verify-backup)",
+            scratch_dir.path().display()
+        )));
+    }
+    Ok(scratch_dir)
+}
+
+/// What the failure `err` of the step `step` of the scratch restore says. A database or
+/// file error (a full or failing disk, an unwritable scratch directory) is one of the
+/// scratch space: the artifact already parsed in the structural check, and its content
+/// can not make sqlite fail, so the verification could not run. Any other failure, from
+/// the restore's own checks, is the artifact's.
+fn scratch_restore_error(step: &str, err: OperationError) -> VerifyError {
+    match err {
+        OperationError::SqliteError | OperationError::FsError => VerifyError::Environment(format!(
+            "{step} failed: the scratch database could not be written or read ({err:?}), \
+                 for instance because its disk is full; see the log for the cause"
+        )),
+        err => VerifyError::Artifact(format!("{step} failed: {err:?}")),
+    }
+}
+
+/// Restore the artifact at `path`, of `uncompressed` bytes once decompressed, into a
+/// scratch database in a new scratch directory in `scratch_parent` (see
+/// [`new_restore_scratch_dir`]) through the production restore path, boot that database
+/// exactly as a server start would and run the full consistency verification on it.
+/// Returns the consistency errors found, empty for a restorable backup, or why a step
+/// failed. The scratch directory is removed when this returns.
 ///
 /// `stop` is asked between the steps (the restore, the reindex, the boot and the
 /// consistency checks); when it answers true the next step is not started.
 pub(crate) async fn verify_backup_restores(
     config: &Configuration,
     path: &Path,
+    uncompressed: u64,
     scratch_parent: Option<&Path>,
     stop: Arc<dyn Fn() -> bool + Send + Sync>,
 ) -> Result<Vec<ConsistencyError>, VerifyError> {
     let parent = scratch_parent.map(Path::to_path_buf);
-    let scratch_dir = run_blocking(move || new_scratch_dir(parent.as_deref()))
-        .await
-        .map_err(|err| {
-            error!(?err, "Unable to create a scratch directory");
-            VerifyError::Environment(format!("unable to create a scratch directory: {err}"))
-        })?;
+    let live_database = config.db_path.clone();
+    let scratch_dir = run_blocking(move || {
+        Ok(new_restore_scratch_dir(
+            parent.as_deref(),
+            uncompressed,
+            live_database.as_deref(),
+        ))
+    })
+    .await
+    .map_err(|err| VerifyError::Environment(format!("the scratch space task failed: {err}")))??;
     let abandoned = |step: &str| Err(VerifyError::Abandoned(format!("abandoned before {step}")));
 
     let mut scratch_config = config.clone();
@@ -239,18 +314,14 @@ pub(crate) async fn verify_backup_restores(
 
     let committed = restore_and_replay_commit(&scratch_config, path, Vec::new())
         .await
-        .map_err(|err| match err {
-            // The artifact or the scratch database file could not be read or written.
-            OperationError::FsError => VerifyError::Environment(format!("restore failed: {err:?}")),
-            err => VerifyError::Artifact(format!("restore failed: {err:?}")),
-        })?;
+        .map_err(|err| scratch_restore_error("restore", err))?;
     if stop() {
         return abandoned("the restored database was reindexed");
     }
     committed
         .reindex(&scratch_config)
         .await
-        .map_err(|err| VerifyError::Artifact(format!("restore failed: {err:?}")))?;
+        .map_err(|err| scratch_restore_error("reindex of the restored database", err))?;
     if stop() {
         return abandoned("the restored database was booted");
     }
@@ -279,9 +350,7 @@ pub(crate) async fn verify_backup_restores(
     match booted {
         Ok(Some(errors)) => Ok(errors),
         Ok(None) => abandoned("the consistency checks"),
-        Err(err) => Err(VerifyError::Artifact(format!(
-            "restored database could not be opened: {err:?}"
-        ))),
+        Err(err) => Err(scratch_restore_error("boot of the restored database", err)),
     }
 }
 
@@ -774,18 +843,18 @@ async fn verify_artifact(
     scratch_parent: Option<&Path>,
     stop: &Arc<AtomicBool>,
 ) -> BackupVerifyOutcome {
-    match verify_backup_structure_at(config, path).await.report {
+    let uncompressed = match verify_backup_structure_at(config, path).await.report {
         Err(error) => return outcome_of(stop, error),
         Ok(report) if !report.is_valid() => return BackupVerifyOutcome::Failed(report.errors),
-        Ok(_) => {}
-    }
+        Ok(report) => report.uncompressed_size,
+    };
     if stop.load(Ordering::Relaxed) {
         return BackupVerifyOutcome::Abandoned("the server is shutting down".to_string());
     }
 
     let flag = Arc::clone(stop);
     let restore_stop = Arc::new(move || flag.load(Ordering::Relaxed));
-    match verify_backup_restores(config, path, scratch_parent, restore_stop).await {
+    match verify_backup_restores(config, path, uncompressed, scratch_parent, restore_stop).await {
         Ok(errors) if errors.is_empty() => BackupVerifyOutcome::Passed,
         Ok(errors) => {
             BackupVerifyOutcome::Failed(errors.iter().map(|err| format!("{err:?}")).collect())
@@ -939,6 +1008,80 @@ mod tests {
                 BackupVerifyOutcome::Abandoned(reason) if reason.contains("boom")
             ));
         }
+    }
+
+    /// A database or file error of the scratch database (a full disk) says nothing about
+    /// the artifact: the verification could not run, it did not fail.
+    #[test]
+    fn a_scratch_database_that_can_not_be_written_is_not_a_failed_backup() {
+        for err in [OperationError::SqliteError, OperationError::FsError] {
+            let error = scratch_restore_error("restore", err);
+            assert!(
+                matches!(
+                    &error,
+                    VerifyError::Environment(reason) if reason.contains("could not be written")
+                ),
+                "{error:?}"
+            );
+        }
+        for err in [
+            OperationError::SerdeJsonError,
+            OperationError::DB0001MismatchedRestoreVersion,
+            OperationError::ConsistencyError(Vec::new()),
+        ] {
+            let error = scratch_restore_error("restore", err);
+            assert!(matches!(&error, VerifyError::Artifact(_)), "{error:?}");
+        }
+    }
+
+    #[test]
+    fn the_scratch_space_needed_covers_the_restore_twice_and_a_margin() {
+        assert_eq!(scratch_space_needed(0, 0), SCRATCH_SPACE_MARGIN);
+        assert_eq!(scratch_space_needed(10, 4), 20 + SCRATCH_SPACE_MARGIN);
+        assert_eq!(scratch_space_needed(4, 10), 20 + SCRATCH_SPACE_MARGIN);
+        assert_eq!(scratch_space_needed(u64::MAX, 0), u64::MAX);
+    }
+
+    /// The scratch filesystem lacks the space of the restore: the verification refuses to
+    /// start it, so that it never fills the disk of the live database, and reports that it
+    /// could not run, never that the backup can not be restored.
+    #[tokio::test]
+    async fn a_scratch_space_too_small_for_the_restore_is_refused_before_it_starts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let scratch = dir.path().join("scratch");
+        let mut config = Configuration::new_for_test();
+        config.db_path = Some(dir.path().join("kubidm.db"));
+
+        let too_large = fs4::available_space(dir.path()).expect("free space");
+        let result = verify_backup_restores(
+            &config,
+            &dir.path().join("backup-2026-01-01T10:00:00Z.json"),
+            too_large,
+            Some(&scratch),
+            Arc::new(|| false),
+        )
+        .await;
+        assert!(
+            matches!(
+                &result,
+                Err(VerifyError::Environment(reason)) if reason.contains("not enough free space")
+            ),
+            "{result:?}"
+        );
+        // Nothing was restored, and the scratch directory is gone.
+        assert!(entries(&scratch).is_empty());
+        assert!(!config.db_path.as_ref().expect("db path").exists());
+
+        // The live database counts too: a sparse file standing for a database larger than
+        // the free space.
+        let live =
+            std::fs::File::create(config.db_path.as_ref().expect("db path")).expect("create");
+        live.set_len(too_large).expect("sparse database");
+        assert!(matches!(
+            new_restore_scratch_dir(Some(&scratch), 0, config.db_path.as_deref()),
+            Err(VerifyError::Environment(reason)) if reason.contains("not enough free space")
+        ));
+        assert!(entries(&scratch).is_empty());
     }
 
     #[test]

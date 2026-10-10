@@ -908,8 +908,9 @@ complete backup of the S3 prefix, each picked by the time in its name:
     restore, the boot or the consistency checks, or does not match its S3 checksum). An error with the reasons, and the
     verification failure metrics move;
   - **could not run**: the backups could not be listed, copied or downloaded, the encryption key could not be obtained,
-    or the scratch space could not be used. An error that says so, and only the verification error metrics move: it is
-    no verdict on the backup.
+    or the scratch space could not be used: it is too small for the restore, or the scratch database could not be
+    written (a full or failing disk). An error that says so, and only the verification error metrics move: it is no
+    verdict on the backup.
 
 The live database is never opened. Every scratch directory of a run (the copied or downloaded artifact, the scratch
 database) is named `kubidm-verify-*` and created in a directory named after the database file, `<database file>.verify`
@@ -922,12 +923,18 @@ share a `verify_temp_path`, never remove each other's scratch data, as long as t
 
 Things to plan for:
 
-- **Resources.** The verification boots a second database inside the server process. It needs the disk space of the
-  artifact and of a restored database in `verify_temp_path`, memory for the whole artifact while it is checked (and for
-  an S3 download, which is held in memory before it is written), and the time of a restore, all proportional to the size
-  of the database. The scratch database uses the smallest entry cache and a single connection, so it adds little to the
-  memory of the running server beyond the artifact. Schedule it outside busy hours, and less often than the backups for
-  a large directory.
+- **Disk space.** By default the scratch data shares the disk of the live database, and the server writes to that disk
+  on every login, so size it for both. A run holds the copy of the artifact and a restored database; while the restore
+  commits, the sqlite write-ahead log can hold about the size of the database again. Before it restores, a run checks
+  that the scratch directory's filesystem has free at least twice the estimated size of the restored database (the
+  larger of the artifact once decompressed and the live database) plus 256 MiB, and does not run otherwise (an error, as
+  above). Plan for the artifact plus about twice the database free on that disk, or point `verify_temp_path` at a volume
+  sized for it.
+- **Resources.** The verification boots a second database inside the server process. Besides the disk space, it needs
+  memory for the whole artifact while it is checked (and for an S3 download, which is held in memory before it is
+  written), and the time of a restore, all proportional to the size of the database. The scratch database uses the
+  smallest entry cache and a single connection, so it adds little to the memory of the running server beyond the
+  artifact. Schedule it outside busy hours, and less often than the backups for a large directory.
 - **Never at the same time as a backup.** A verification and an online backup each hold a whole artifact in memory, so
   they never run at the same time: a verification that falls due during a backup starts when the backup ends, and a
   backup that falls due during a verification starts when the verification ends. Schedule them apart so that a backup is

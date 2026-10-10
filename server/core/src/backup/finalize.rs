@@ -418,6 +418,19 @@ mod tests {
         encoder.finish().expect("gzip finish")
     }
 
+    /// The full verification sizes its scratch space from what the structural check read:
+    /// the artifact once decompressed.
+    #[test]
+    fn test_structural_check_measures_the_decompressed_artifact() {
+        let raw = minimal_valid_backup();
+        let plain = verify_backup_structure(raw.as_slice(), BackupCompression::NoCompression);
+        let gzipped = verify_backup_structure(gzip(&raw).as_slice(), BackupCompression::Gzip);
+        assert!(plain.is_valid(), "{:?}", plain.errors);
+        assert!(gzipped.is_valid(), "{:?}", gzipped.errors);
+        assert_eq!(plain.uncompressed_size, raw.len() as u64);
+        assert_eq!(gzipped.uncompressed_size, raw.len() as u64);
+    }
+
     #[test]
     fn test_invalid_backup_path_appends_suffix() {
         let path = Path::new("/var/backups/backup-2024-01-01T22:00:00Z.json.gz");

@@ -33,7 +33,7 @@ use super::{
         backup_encryption_config, restore_and_replay_commit, CommittedRestore, RestoreOutcome,
     },
     run_blocking, s3_location, seal_backup_async,
-    verify::{verify_backup_restores, verify_backup_structure_at},
+    verify::{verify_backup_restores, verify_backup_structure_at, VerifyError},
     verify_backup_output_async, write_verified_local_backup_async, BackupEncryptor,
     BackupVerifyError, S3BackupError, S3ClientWrapper,
 };
@@ -429,15 +429,28 @@ pub async fn verify_backup_server_core(
         return report.is_valid();
     }
 
-    let consistency_errors =
-        match verify_backup_restores(config, backup_path, None, Arc::new(|| false)).await {
-            Ok(errors) => errors,
-            Err(reason) => {
-                eprintln!("Backup restore verification: FAIL");
-                eprintln!("  - {reason}");
-                return false;
-            }
-        };
+    let consistency_errors = match verify_backup_restores(
+        config,
+        backup_path,
+        report.uncompressed_size,
+        None,
+        Arc::new(|| false),
+    )
+    .await
+    {
+        Ok(errors) => errors,
+        // Not a verdict on the backup: the scratch space was too small or failed.
+        Err(VerifyError::Environment(reason)) => {
+            eprintln!("Backup restore verification: COULD NOT RUN");
+            eprintln!("  - {reason}");
+            return false;
+        }
+        Err(reason) => {
+            eprintln!("Backup restore verification: FAIL");
+            eprintln!("  - {reason}");
+            return false;
+        }
+    };
 
     eprintln!(
         "Backup restore verification: {}",

@@ -569,7 +569,7 @@ fn test_scheduled_full_verification_detects_what_the_structural_check_can_not() 
             matches!(
                 outcome.as_slice(),
                 [(BackupDestination::Local, BackupVerifyOutcome::Failed(reasons))]
-                    if reasons.iter().any(|reason| reason.contains("restore failed"))
+                    if reasons.iter().any(|reason| reason.contains("reindex of the restored database failed"))
             ),
             "{outcome:?}"
         );

@@ -116,7 +116,8 @@ pub struct OnlineBackup {
     /// downloaded artifact and the restored, unencrypted scratch database), each named
     /// `kubidm-verify-*`: in a `<database file>.verify` directory created here, by default
     /// next to the database. The server removes the `kubidm-verify-*` directories it finds
-    /// in its own `<database file>.verify` when it starts.
+    /// in its own `<database file>.verify` when it starts. A run needs free about twice the
+    /// size of the database there, and does not start without it.
     #[serde(default)]
     pub verify_temp_path: Option<PathBuf>,
 
