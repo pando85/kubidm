@@ -15,6 +15,8 @@ use kubidm_proto::backup::{BackupCompression, BACKUP_ENCRYPTED_SUFFIX};
 use regex::Regex;
 use time::{OffsetDateTime, UtcOffset};
 
+use super::PARTIAL_BACKUP_SUFFIX;
+
 /// Pattern of the file name / object key of an automatically generated backup, as written
 /// by the online backup: `backup-<RFC3339 UTC timestamp>.json` with an optional compression
 /// suffix and an optional encryption suffix (see [`backup_artifact_name`]).
@@ -139,10 +141,22 @@ pub fn select_incomplete_backups_to_delete(
     stale
 }
 
+/// The backup `name` is the partial file of, when it is the `.<backup>.partial` file of a
+/// backup being written, see [`super::partial_backup_path`].
+fn partial_backup_name(name: &str) -> Option<&str> {
+    name.strip_prefix('.')?
+        .strip_suffix(PARTIAL_BACKUP_SUFFIX)
+        .filter(|backup| is_backup_artifact_name(backup))
+}
+
 /// Apply the `versions` retention to the local online backup directory `dir` with
 /// [`select_backups_to_delete`], the rule the S3 locations use. Only regular files named
 /// like an automatically generated backup are considered; anything else in the directory,
 /// including names that are not valid UTF-8, is left alone.
+///
+/// The `.<backup>.partial` file of a backup whose writer was killed or lost power is
+/// removed by the rule S3 applies to incomplete uploads,
+/// [`select_incomplete_backups_to_delete`]: once a newer backup is complete.
 ///
 /// Never fails: the backup that triggered the cleanup has already succeeded, so an
 /// unreadable directory or entry, or a file that can not be removed, is logged and the
@@ -162,6 +176,7 @@ pub fn prune_local_backups(dir: &Path, versions: usize, keep: Option<&str>) {
     };
 
     let mut names = Vec::new();
+    let mut partials = Vec::new();
     for entry in entries {
         let entry = match entry {
             Ok(entry) => entry,
@@ -181,8 +196,28 @@ pub fn prune_local_backups(dir: &Path, versions: usize, keep: Option<&str>) {
             );
             continue;
         };
-        if is_backup_artifact_name(&name) && entry.path().is_file() {
+        if !entry.path().is_file() {
+            continue;
+        }
+        if is_backup_artifact_name(&name) {
             names.push(name);
+        } else if let Some(partial_of) = partial_backup_name(&name) {
+            partials.push(partial_of.to_string());
+        }
+    }
+
+    for stale in select_incomplete_backups_to_delete(&partials, &names, keep) {
+        let path = dir.join(format!(".{stale}{PARTIAL_BACKUP_SUFFIX}"));
+        match std::fs::remove_file(&path) {
+            Ok(()) => info!(
+                "Online backup cleanup removed {}, left by an interrupted backup",
+                path.display()
+            ),
+            Err(err) => error!(
+                "Online backup cleanup failed to remove {}: {}",
+                path.display(),
+                err
+            ),
         }
     }
 
@@ -515,7 +550,13 @@ mod tests {
             );
         }
         touch(dir.path(), "backup-2024-01-05T22:00:00Z.json.gz.invalid");
+        // A backup that may still be written, and one a crash left behind.
         touch(dir.path(), ".backup-2024-01-06T22:00:00Z.json.gz.partial");
+        touch(
+            dir.path(),
+            ".backup-2024-01-02T12:00:00Z.json.gz.enc.partial",
+        );
+        touch(dir.path(), ".manual.json.partial");
         touch(dir.path(), "manual.json");
         // A directory named like a backup is not a backup.
         std::fs::create_dir(dir.path().join("backup-2024-01-00T22:00:00Z.json.gz")).expect("mkdir");
@@ -526,6 +567,7 @@ mod tests {
             remaining(dir.path()),
             names(&[
                 ".backup-2024-01-06T22:00:00Z.json.gz.partial",
+                ".manual.json.partial",
                 "backup-2024-01-00T22:00:00Z.json.gz",
                 "backup-2024-01-03T22:00:00Z.json.gz",
                 "backup-2024-01-04T22:00:00Z.json.gz",

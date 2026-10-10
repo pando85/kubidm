@@ -276,7 +276,19 @@ pub fn write_verified_local_backup(
         .write(true)
         .create_new(true)
         .open(&partial)
-        .map_err(|err| reject(format!("unable to create {}: {err}", partial.display())))?;
+        .map_err(|err| {
+            reject(if err.kind() == std::io::ErrorKind::AlreadyExists {
+                format!(
+                    "{} already exists: another backup to {} is running, or one was \
+                     interrupted (killed, or the host lost power) and left it behind; when no \
+                     backup is running, delete it and try again",
+                    partial.display(),
+                    dest.display()
+                )
+            } else {
+                format!("unable to create {}: {err}", partial.display())
+            })
+        })?;
     let written = file.write_all(artifact).and_then(|()| file.sync_all());
     drop(file);
     if let Err(err) = written {
@@ -843,7 +855,12 @@ mod tests {
             None,
         )
         .expect_err("a concurrent writer must make this backup fail");
-        assert!(err.to_string().contains("unable to create"), "{err}");
+        // The error names the file, and says it may be left by an interrupted backup.
+        assert!(err.to_string().contains("interrupted"), "{err}");
+        assert!(
+            err.to_string().contains(&partial.display().to_string()),
+            "{err}"
+        );
         assert!(!dest.exists());
         assert_eq!(
             std::fs::read(&partial).expect("read"),
