@@ -3,7 +3,7 @@
 
 use std::{fs, path::Path, str::FromStr, sync::Arc};
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use cron::Schedule;
 
 use tokio::{
@@ -166,25 +166,36 @@ impl IntervalActor {
         }
 
         let handle = tokio::spawn(async move {
-            for next_time in cron_expr.upcoming(Utc) {
-                let wait_seconds = 1 + (next_time - Utc::now()).num_seconds() as u64;
+            let mut last_run = None;
+            loop {
+                let now = Utc::now();
+                let Some(next_time) = next_backup_time(&cron_expr, now, last_run) else {
+                    info!("Online backup schedule '{}' has no further runs", cron_expr);
+                    break;
+                };
+                let wait = wait_until(next_time, now);
                 info!(
                     "Online backup next run on {}, wait_time = {}s",
-                    next_time, wait_seconds
+                    next_time,
+                    wait.as_secs()
                 );
 
                 tokio::select! {
-                    Ok(action) = rx.recv() => {
-                        match action {
-                            CoreAction::Shutdown => break,
-                            CoreAction::Reload => {}
+                    action = rx.recv() => match action {
+                        Ok(CoreAction::Shutdown) | Err(broadcast::error::RecvError::Closed) => {
+                            break
                         }
-                    }
-                    _ = sleep(Duration::from_secs(wait_seconds)) => {
-                        if let Err(err) = job.run(server).await {
-                            error!(?err, "An online backup error occurred.");
+                        // The schedule does not change on a reload: wait for the same run.
+                        Ok(CoreAction::Reload) | Err(broadcast::error::RecvError::Lagged(_)) => {
+                            continue
                         }
-                    }
+                    },
+                    _ = sleep(wait) => {}
+                }
+
+                last_run = Some(next_time);
+                if let Err(err) = job.run(server).await {
+                    error!(?err, "An online backup error occurred.");
                 }
             }
             info!("Stopped {}", TaskName::BackupActor);
@@ -245,6 +256,28 @@ impl IntervalActor {
             info!("Stopped {}", TaskName::BackupReplicationMonitor);
         })
     }
+}
+
+/// The next scheduled backup: the first time of `schedule` after `now`, and after
+/// `last_run`, the time of the previous run, when there was one.
+///
+/// It is computed from the current time on every iteration rather than taken from an
+/// iterator built once, so a run that outlasted the gap to the next scheduled time skips
+/// the times that are already past instead of falling behind for good. Starting after
+/// `last_run` as well means a wall clock that lags the timer slightly can never run the
+/// same scheduled time twice.
+fn next_backup_time(
+    schedule: &Schedule,
+    now: DateTime<Utc>,
+    last_run: Option<DateTime<Utc>>,
+) -> Option<DateTime<Utc>> {
+    let from = last_run.map_or(now, |last_run| last_run.max(now));
+    schedule.after(&from).next()
+}
+
+/// How long to wait from `now` until `next_time`: zero when it is already past.
+fn wait_until(next_time: DateTime<Utc>, now: DateTime<Utc>) -> Duration {
+    (next_time - now).to_std().unwrap_or(Duration::ZERO)
 }
 
 /// The period of the replication health monitor. The configuration rejects a zero
@@ -367,6 +400,62 @@ async fn sync_and_report_replication(s3_config: &S3Config, replication: &Replica
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
+
+    fn at(hour: u32, minute: u32, second: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 1, 1, hour, minute, second)
+            .single()
+            .expect("valid time")
+    }
+
+    #[test]
+    fn next_backup_time_skips_times_a_long_run_overran() {
+        // Every five minutes.
+        let schedule = Schedule::from_str("0 */5 * * * * *").expect("schedule");
+
+        // The run scheduled at 10:00 took seven minutes, so 10:05 is already past. The
+        // next run is 10:10, three minutes away, not 10:05 with a negative wait.
+        let next = next_backup_time(&schedule, at(10, 7, 0), Some(at(10, 0, 0)));
+        assert_eq!(next, Some(at(10, 10, 0)));
+        assert_eq!(
+            wait_until(at(10, 10, 0), at(10, 7, 0)),
+            Duration::from_secs(180)
+        );
+    }
+
+    #[test]
+    fn next_backup_time_never_repeats_the_last_run() {
+        let schedule = Schedule::from_str("0 */5 * * * * *").expect("schedule");
+
+        // The timer fired a little before the wall clock reached 10:05.
+        let next = next_backup_time(&schedule, at(10, 4, 59), Some(at(10, 5, 0)));
+        assert_eq!(next, Some(at(10, 10, 0)));
+
+        // Without a previous run the next time after now is taken.
+        assert_eq!(
+            next_backup_time(&schedule, at(10, 4, 59), None),
+            Some(at(10, 5, 0))
+        );
+    }
+
+    #[test]
+    fn next_backup_time_is_stable_across_a_reload() {
+        // A reload re-enters the wait: the same pending run must still be the next one.
+        let schedule = Schedule::from_str("0 0 22 * * * *").expect("schedule");
+        let before = next_backup_time(&schedule, at(9, 0, 0), Some(at(8, 0, 0)));
+        let after_reload = next_backup_time(&schedule, at(9, 30, 0), Some(at(8, 0, 0)));
+        assert_eq!(before, Some(at(22, 0, 0)));
+        assert_eq!(after_reload, before);
+    }
+
+    #[test]
+    fn wait_until_a_past_time_is_zero() {
+        // The old computation wrapped a negative wait to about 1.8e19 seconds, or
+        // overflowed at exactly -1s.
+        assert_eq!(wait_until(at(10, 0, 0), at(10, 0, 1)), Duration::ZERO);
+        assert_eq!(wait_until(at(10, 0, 0), at(12, 0, 0)), Duration::ZERO);
+        assert_eq!(wait_until(at(10, 0, 0), at(10, 0, 0)), Duration::ZERO);
+    }
 
     #[test]
     fn replication_monitor_period_follows_the_sync_interval() {
