@@ -1040,6 +1040,24 @@ pub fn write_pending_events(dir: &Path, events: &WalPendingEvents) -> Result<(),
     write_file_durably(dir, WAL_PENDING_EVENTS_FILE, &serde_json::to_vec(events)?)
 }
 
+/// The events left in `dir` by a server that is not running: those it never had recorded,
+/// and the gap of the open segment it stopped without closing.
+pub fn read_local_events(dir: &Path) -> WalPendingEvents {
+    let mut events = read_pending_events(dir);
+    events.gaps.extend(read_marker_gap(dir));
+    events
+}
+
+/// Forget the events [`read_local_events`] returned, once the archive index records them.
+pub fn clear_local_events(dir: &Path) -> Result<(), WalError> {
+    write_pending_events(dir, &WalPendingEvents::default())?;
+    match fs::remove_file(dir.join(WAL_OPEN_SEGMENT_MARKER)) {
+        Ok(()) => sync_dir(dir),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
 /// Hand `change` to the next archiver started on `dir`, for an offline command that put a
 /// database with another server uuid in place.
 pub fn add_pending_server_uuid_change(

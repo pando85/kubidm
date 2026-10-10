@@ -79,7 +79,7 @@ async fn load_or_new_manifest(
 }
 
 /// The manifest record of a gap the archiver reported at `now`.
-fn manifest_gap(gap: &WalGap, now: Duration) -> PitrWalGap {
+pub(super) fn manifest_gap(gap: &WalGap, now: Duration) -> PitrWalGap {
     PitrWalGap {
         from_ts: gap.from_ts,
         until_ts: gap.until_ts.unwrap_or(now).max(gap.from_ts),
@@ -1256,6 +1256,84 @@ mod tests {
             archive.sync(Duration::from_secs(1400), false).await,
             Err(PitrError::Manifest(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn test_restore_takes_over_what_the_stopped_server_left_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("wal");
+        let backup_dir = dir.path().join("backups");
+        fs::create_dir_all(&backup_dir).unwrap();
+        let server = Uuid::new_v4();
+        let wal_cfg = WalArchiveConfig {
+            enabled: true,
+            local_path: Some(wal_dir.clone()),
+            ..WalArchiveConfig::default()
+        };
+        let settings = PitrSettings {
+            wal: wal_cfg.clone(),
+            local_dir: wal_dir.clone(),
+            location: PitrLocation::Local(wal_dir.clone()),
+            bases: BaseLocation::Local(backup_dir.clone()),
+            encryption: BackupEncryptionConfig::default(),
+        };
+        let archiver: SharedWalArchiver = Arc::new(Mutex::new(
+            WalArchiver::new(wal_cfg.clone(), server, wal_dir.clone()).unwrap(),
+        ));
+        let archive = PitrArchive::new(settings.clone(), archiver.clone());
+        let key = "backup-2024-01-01T00:00:00Z.json";
+        fs::write(backup_dir.join(key), b"{}").unwrap();
+        archive
+            .register_base_backup(&settings.bases, key, "t", &report(1000, server))
+            .await
+            .unwrap();
+        append_create(&archiver, server, 1100, b"archived");
+        archive.sync(Duration::from_secs(1150), true).await.unwrap();
+
+        // The server notices a failed transaction at 1200, keeps records of 1300 in memory,
+        // and dies before any synchronisation.
+        archiver
+            .lock()
+            .unwrap()
+            .note_failure(Some(Duration::from_secs(1200)));
+        append_create(&archiver, server, 1300, b"lost");
+        drop(archive);
+        drop(archiver);
+
+        // A recovery to 1100 abandons everything after it. What the dead server left
+        // behind is recorded as part of that history, and is gone from the directory.
+        let restored = RestoredDatabase {
+            after_ts: Duration::from_secs(1100),
+            server_uuid: server,
+            reason: "recover",
+            now: Duration::from_secs(1400),
+        };
+        record_timeline_break(&settings, &restored).await.unwrap();
+        let store = PitrStore::open(&settings.location).await.unwrap();
+        let manifest = store.load_manifest().await.unwrap().unwrap();
+        let gaps: Vec<(u64, u64)> = manifest
+            .gaps
+            .iter()
+            .map(|gap| (gap.from_ts.as_secs(), gap.until_ts.as_secs()))
+            .collect();
+        assert_eq!(gaps, vec![(1200, 1200), (1300, 1400)]);
+        assert!(manifest.timeline_breaks[0].until_ts >= Duration::from_secs(1400));
+
+        // The server started on the recovered database reports nothing of it.
+        let archiver: SharedWalArchiver = Arc::new(Mutex::new(
+            WalArchiver::new(wal_cfg, server, wal_dir.clone()).unwrap(),
+        ));
+        assert!(archiver.lock().unwrap().pending_events().is_empty());
+
+        // Its new history is recoverable from the old base: those gaps lie in the
+        // abandoned history, which is never replayed.
+        let archive = PitrArchive::new(settings, archiver.clone());
+        append_create(&archiver, server, 1500, b"new history");
+        archive.sync(Duration::from_secs(1600), true).await.unwrap();
+        let manifest = store.load_manifest().await.unwrap().unwrap();
+        let plan = plan_recovery(&manifest, &RecoveryTargetSpec::Latest).unwrap();
+        assert_eq!(plan.base.key, key);
+        assert_eq!(plan.target.ts, Duration::from_secs(1500));
     }
 
     #[tokio::test]

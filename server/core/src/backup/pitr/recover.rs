@@ -12,11 +12,13 @@ use kubidm_proto::internal::OperationError;
 use kubidmd_lib::be::WalApplyReport;
 use kubidmd_lib::prelude::duration_from_epoch_now;
 use kubidmd_lib::repl::wal::{
-    add_pending_server_uuid_change, format_ts_rfc3339, list_segments, parse_recovery_target_cid,
-    parse_recovery_target_time, parse_segment, select_records, WalEntryRecord, WalServerUuidChange,
+    add_pending_server_uuid_change, clear_local_events, format_ts_rfc3339, list_segments,
+    parse_recovery_target_cid, parse_recovery_target_time, parse_segment, read_local_events,
+    select_records, WalEntryRecord, WalPendingEvents, WalServerUuidChange,
 };
 use uuid::Uuid;
 
+use super::archive::{manifest_gap, manifest_uuid_change};
 use super::store::{PitrStore, SegmentKeys};
 use super::{blocking, PitrError, PitrSettings};
 use crate::config::Configuration;
@@ -237,6 +239,14 @@ async fn open_archive(
         }
     }
 
+    // Gaps and changes of identity the server noticed and no manifest records yet still
+    // bound what can be recovered.
+    let local_events = {
+        let local_dir = settings.local_dir.clone();
+        blocking(move || Ok(read_local_events(&local_dir))).await?
+    };
+    fold_local_events(&mut manifest, &local_events, duration_from_epoch_now());
+
     let mut local_only = BTreeSet::new();
     let local_segments = {
         let local_dir = settings.local_dir.clone();
@@ -258,6 +268,24 @@ async fn open_archive(
         manifest,
         local_only,
     })
+}
+
+/// Add the events a server left in its WAL directory to `manifest`. A gap whose end is
+/// unknown ends at `now`. A change of identity that does not follow from the manifest's
+/// is kept as a boundary only.
+fn fold_local_events(manifest: &mut PitrManifest, events: &WalPendingEvents, now: Duration) {
+    for gap in &events.gaps {
+        manifest.add_gap(manifest_gap(gap, now));
+    }
+    let changes = PitrManifest {
+        server_uuid_changes: events
+            .server_uuid_changes
+            .iter()
+            .map(manifest_uuid_change)
+            .collect(),
+        ..PitrManifest::new(manifest.server_uuid)
+    };
+    manifest.merge_markers(&changes);
 }
 
 /// `kubidmd database pitr-list`: print the base backups, segments and the recoverable
@@ -719,6 +747,18 @@ pub(super) async fn record_timeline_break(
         .map(|s| s.end_ts)
         .chain(manifest.base_backups.iter().map(|b| b.watermark_ts))
         .fold(now, Duration::max);
+
+    // What the stopped server left in the WAL directory and no manifest records yet: the
+    // gaps (its unclosed segment included, which ends at the latest now, inside the
+    // abandoned history) and its changes of identity. They belong to the history before
+    // this point, and the server started on the restored database must not report them
+    // again as its own.
+    let local_events = {
+        let local_dir = settings.local_dir.clone();
+        blocking(move || Ok(read_local_events(&local_dir))).await?
+    };
+    fold_local_events(&mut manifest, &local_events, now);
+
     manifest.add_timeline_break(PitrTimelineBreak {
         after_ts: restored.after_ts,
         until_ts,
@@ -745,6 +785,10 @@ pub(super) async fn record_timeline_break(
         identity_change = Some(change);
     }
     store.save_manifest(&mut manifest, now).await?;
+    if !local_events.is_empty() {
+        let local_dir = settings.local_dir.clone();
+        blocking(move || Ok(clear_local_events(&local_dir)?)).await?;
+    }
     info!(
         after = %format_ts_rfc3339(restored.after_ts),
         until = %format_ts_rfc3339(until_ts),
@@ -852,6 +896,32 @@ mod tests {
             resolve_target(&empty, &RecoveryTargetSpec::Latest),
             Err(PitrError::NotRecoverable(_))
         ));
+    }
+
+    #[test]
+    fn test_recovery_honours_gaps_only_the_wal_directory_records() {
+        use kubidmd_lib::repl::wal::{WalGap, WalGapReason};
+        // The server noticed a hole at 300 but could not record it before it stopped.
+        let mut m = manifest();
+        let events = WalPendingEvents {
+            gaps: vec![WalGap {
+                from_ts: Duration::from_secs(300),
+                until_ts: None,
+                reason: WalGapReason::UnclosedSegment,
+            }],
+            server_uuid_changes: Vec::new(),
+        };
+        fold_local_events(&mut m, &events, Duration::from_secs(350));
+        assert!(plan_recovery(
+            &m,
+            &RecoveryTargetSpec::Time(format_ts_rfc3339(Duration::from_secs(320)))
+        )
+        .is_err());
+        plan_recovery(
+            &m,
+            &RecoveryTargetSpec::Time(format_ts_rfc3339(Duration::from_secs(250))),
+        )
+        .unwrap();
     }
 
     #[test]
