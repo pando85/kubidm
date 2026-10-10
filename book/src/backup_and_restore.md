@@ -315,17 +315,16 @@ derivation and never as the cipher key itself.
   the other keeps the key. One of the two must be present, or the server refuses to start.
 - `{ File = { path = "/etc/kubidm/backup.key" } }`: the content of the file is the secret, byte for byte. Generate it
   with for example `head -c 32 /dev/urandom > /etc/kubidm/backup.key` and keep it readable only by the server user.
-- `{ HttpEndpoint = { url = "https://secrets.example.com/kubidm-backup-key" } }`: the raw response body of a GET
-  request to the URL is the secret, byte for byte (at most 64 KiB, within 30 seconds). The request carries no
-  credentials, and the body is not parsed, so the endpoint must return the bare key and exactly the same bytes every
-  time: a JSON envelope with a per-request field, such as a Vault API response, would yield a different key on every
-  call and the backups could never be decrypted again. A local agent or sidecar that renders the secret is the usual
-  way to serve it. The endpoint is called every time a backup is made or restored, and with point-in-time recovery also
-  at every WAL archive run that has segments to archive and at every `recover`, so it has to be reachable from the
-  server and from the host that restores. The URL must use `https`; plain `http` is only accepted for a loopback
-  address such as a local secrets agent, because it would send the secret in the clear. The request never goes through
-  a proxy (`HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` are ignored) and redirects are not followed: any answer but a
-  `2xx` fails.
+- `{ HttpEndpoint = { url = "https://secrets.example.com/kubidm-backup-key" } }`: the raw response body of a GET request
+  to the URL is the secret, byte for byte (at most 64 KiB, within 30 seconds). The request carries no credentials, and
+  the body is not parsed, so the endpoint must return the bare key and exactly the same bytes every time: a JSON
+  envelope with a per-request field, such as a Vault API response, would yield a different key on every call and the
+  backups could never be decrypted again. A local agent or sidecar that renders the secret is the usual way to serve it.
+  The endpoint is called every time a backup is made or restored, and with point-in-time recovery also at every WAL
+  archive run that has segments to archive and at every `recover`, so it has to be reachable from the server and from
+  the host that restores. The URL must use `https`; plain `http` is only accepted for a loopback address such as a local
+  secrets agent, because it would send the secret in the clear. The request never goes through a proxy (`HTTP_PROXY`,
+  `HTTPS_PROXY` and `ALL_PROXY` are ignored) and redirects are not followed: any answer but a `2xx` fails.
 
 At startup, and in `kubidmd configtest`, the key source is checked to be usable: the passphrase file or environment
 variable is present and not empty, the key file exists and is readable, the URL is a well formed `https` URL, or `http`
@@ -576,8 +575,9 @@ that were never archived. It then:
 2. downloads (from S3) or opens the base backup, decrypts it when it is encrypted, restores it into the configured
    database and replays the records after its watermark, in CID order, in the same database transaction, so that a
    failure leaves the database untouched;
-3. reindexes, boots and verifies the recovered database like `verify-backup --level full`;
-4. records in the manifest that the history after the recovered point was **abandoned**.
+3. records in the manifest that the history after the recovered point was **abandoned**, right after the commit, since
+   the database no longer holds that history whatever happens next;
+4. reindexes, boots and verifies the recovered database like `verify-backup --level full`.
 
 Abandoned history is never replayed again: after recovering to 10:30, the server started on the recovered database
 writes new history, and a later recovery to any point after it replays the recovered state plus the new history, never
@@ -586,7 +586,9 @@ when WAL archiving is configured. They record it in the primary archive only: wh
 example while restoring with `restore-s3 --region` during an outage of the primary), they restore the database and exit
 with code 2 and an error saying the history could not be recorded: the restore succeeded and must not be repeated or
 rolled back, but a later point-in-time recovery past it could replay the abandoned history until a new online backup is
-taken. A restore that failed exits with code 1. Prefer `recover --region` in that situation.
+taken. Prefer `recover --region` in that situation. A restore that failed exits with code 1, including one whose reindex
+failed after the commit: its error then says that the database WAS restored, and `kubidmd database reindex` must run
+before the server starts.
 
 #### The Encrypted WAL Archive
 
@@ -614,9 +616,10 @@ plaintext segment, which recovery checks after decrypting.
 nothing, when a segment is encrypted and encryption is not enabled, when the key can not be obtained, or when it does
 not open the segment, naming the key identifier the segment needs. A segment the manifest records as encrypted must be
 an encrypted container, so a plain object can not be swapped in for it, and an encrypted segment must have been sealed
-under the segment id it is stored as, so another segment can not be swapped in either. Base backups are encrypted by the same setting,
-so one secret recovers both. Key rotation works as for backups: keep every previous secret for as long as segments or
-base backups written with it are retained, which is at least `retention_days` and the age of the oldest base backup.
+under the segment id it is stored as, so another segment can not be swapped in either. Base backups are encrypted by the
+same setting, so one secret recovers both. Key rotation works as for backups: keep every previous secret for as long as
+segments or base backups written with it are retained, which is at least `retention_days` and the age of the oldest base
+backup.
 
 #### The WAL Archive and Replication
 
