@@ -14,7 +14,7 @@ use kubidmd_lib::be::WalApplyReport;
 use kubidmd_lib::prelude::duration_from_epoch_now;
 use kubidmd_lib::repl::wal::{
     clear_local_events, defer_restore, format_ts_rfc3339, list_segments, parse_recovery_target_cid,
-    parse_recovery_target_time, parse_segment, read_local_events, WalEntryRecord,
+    parse_recovery_target_time, parse_segment, read_local_events, scan_segments, WalEntryRecord,
     WalOperationRecord, WalPendingEvents, WalRestore,
 };
 use uuid::Uuid;
@@ -874,13 +874,27 @@ pub enum AbandonedHistory {
 
 /// The restore described by `restored`, with what the stopped server left in `local_dir`:
 /// the events no manifest records yet, and the end of its last unarchived segment.
+///
+/// A segment whose sidecar can not be read does not stop the restore from being recorded:
+/// the abandoned history already reaches to the time of the restore, past anything the
+/// stopped server wrote, and the server's next synchronisation rebuilds the sidecar or
+/// sets the segment aside.
 async fn prepare_restore(
     local_dir: &Path,
     restored: &RestoredDatabase<'_>,
 ) -> Result<WalRestore, PitrError> {
     let local_dir = local_dir.to_path_buf();
-    let (abandoned, local_segments) =
-        blocking(move || Ok((read_local_events(&local_dir), list_segments(&local_dir)?))).await?;
+    let (abandoned, scan) =
+        blocking(move || Ok((read_local_events(&local_dir), scan_segments(&local_dir)?))).await?;
+    if !scan.unreadable.is_empty() {
+        warn!(
+            segments = %scan.unreadable.join(", "),
+            "The sidecars of these WAL segments are not readable; the restore abandons \
+             them with the rest of the history, and the server rebuilds the sidecars or sets \
+             the segments aside"
+        );
+    }
+    let local_segments = scan.segments;
     // The identity the history in the WAL directory starts with: the one before the first
     // restore or change of identity it records, or else the one of its oldest segment.
     let local_server_uuid = local_segments.first().map(|oldest| {

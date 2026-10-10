@@ -1618,6 +1618,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_a_restore_is_recorded_despite_an_unreadable_local_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("wal");
+        let backup_dir = dir.path().join("backups");
+        fs::create_dir_all(&backup_dir).unwrap();
+        let (u1, u2) = (Uuid::new_v4(), Uuid::new_v4());
+        let wal_cfg = WalArchiveConfig {
+            enabled: true,
+            local_path: Some(wal_dir.clone()),
+            ..WalArchiveConfig::default()
+        };
+        let settings = PitrSettings {
+            wal: wal_cfg.clone(),
+            local_dir: wal_dir.clone(),
+            location: PitrLocation::Local(wal_dir.clone()),
+            bases: BaseLocation::Local(backup_dir.clone()),
+            encryption: BackupEncryptionConfig::default(),
+        };
+        let archiver: SharedWalArchiver = Arc::new(Mutex::new(
+            WalArchiver::new(wal_cfg.clone(), u2, wal_dir.clone()).unwrap(),
+        ));
+        let archive = PitrArchive::new(settings.clone(), archiver.clone());
+        archive
+            .sync(Duration::from_secs(1000), false)
+            .await
+            .unwrap();
+
+        // The server of U2 stops with a closed segment whose sidecar is damaged.
+        append_create(&archiver, u2, 1100, b"x");
+        let segment = archiver
+            .lock()
+            .unwrap()
+            .flush_current_segment()
+            .unwrap()
+            .unwrap();
+        fs::write(segment_meta_path(&wal_dir, &segment.segment_id), b"{").unwrap();
+        drop(archive);
+        drop(archiver);
+
+        // A backup of U1 is restored: the archive records it and continues under U1.
+        let restored = RestoredDatabase {
+            after_ts: Duration::from_secs(900),
+            server_uuid: u1,
+            reason: "restore",
+            now: Duration::from_secs(1200),
+        };
+        assert!(matches!(
+            record_timeline_break(&settings, &restored).await,
+            Ok(super::super::recover::AbandonedHistory::Recorded)
+        ));
+        let store = PitrStore::open(&settings.location).await.unwrap();
+        let manifest = store.load_manifest().await.unwrap().unwrap();
+        assert_eq!(manifest.server_uuid, u1);
+        assert!(manifest.is_abandoned(Duration::from_secs(1100)));
+
+        // The server started on it archives, its sidecar repaired or the segment set aside.
+        let archiver: SharedWalArchiver = Arc::new(Mutex::new(
+            WalArchiver::new(wal_cfg, u1, wal_dir.clone()).unwrap(),
+        ));
+        let archive = PitrArchive::new(settings, archiver.clone());
+        append_create(&archiver, u1, 1300, b"new history");
+        archive.sync(Duration::from_secs(1400), true).await.unwrap();
+        let manifest = store.load_manifest().await.unwrap().unwrap();
+        assert_eq!(manifest.server_uuid, u1);
+        assert!(manifest
+            .segments
+            .iter()
+            .any(|segment| segment.start_ts == Duration::from_secs(1300)));
+    }
+
+    #[tokio::test]
     async fn test_restore_takes_over_what_the_stopped_server_left_behind() {
         let dir = tempfile::tempdir().unwrap();
         let wal_dir = dir.path().join("wal");
