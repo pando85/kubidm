@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 use super::{blocking, BaseLocation, PitrError, PitrLocation};
 use crate::backup::{
     is_backup_artifact_name, is_encrypted_artifact, read_encryption_header, seal_backup_async,
-    BackupEncryptor, S3ClientWrapper,
+    BackupEncryptor, S3BackupError, S3ClientWrapper,
 };
 
 /// A base backup fetched for recovery. The S3 variant is removed when dropped.
@@ -98,6 +98,24 @@ pub(super) enum PitrStore {
     S3 { client: Box<S3ClientWrapper> },
 }
 
+/// The error of an S3 manifest at `location` whose content does not match the checksum
+/// stored with it, and how to repair it: nothing archives into, or recovers from, the
+/// archive until then.
+fn manifest_checksum_mismatch(location: &str, expected: &str, actual: &str) -> PitrError {
+    let object = format!("{location}/{PITR_MANIFEST_KEY}");
+    PitrError::Manifest(format!(
+        "{object} does not match the checksum-sha256 metadata stored with it (expected \
+         {expected}, its content has {actual}): it was damaged, or edited without updating \
+         that metadata. WAL archiving, base backup indexing and recovery from this archive \
+         stop until it is repaired; the WAL segments stay in the server's WAL directory \
+         meanwhile. To repair it, restore the last version of the object whose content \
+         matches its metadata when the bucket keeps versions. Otherwise check that its \
+         content is the right manifest, then store it again with its checksum: \
+         `aws s3 cp {object} {object} --metadata checksum-sha256={actual} \
+         --metadata-directive REPLACE` (add `--endpoint-url` for a store other than AWS)."
+    ))
+}
+
 impl PitrStore {
     pub(super) async fn open(location: &PitrLocation) -> Result<Self, PitrError> {
         match location {
@@ -129,12 +147,17 @@ impl PitrStore {
                 }
             }
             PitrStore::S3 { client } => {
-                match client
-                    .download_document_if_exists(PITR_MANIFEST_KEY)
-                    .await?
-                {
-                    Some(data) => data,
-                    None => return Ok(None),
+                match client.download_document_if_exists(PITR_MANIFEST_KEY).await {
+                    Ok(Some(data)) => data,
+                    Ok(None) => return Ok(None),
+                    Err(S3BackupError::InvalidChecksum { expected, actual }) => {
+                        return Err(manifest_checksum_mismatch(
+                            &client.location(),
+                            &expected,
+                            &actual,
+                        ))
+                    }
+                    Err(err) => return Err(err.into()),
                 }
             }
         };
@@ -563,6 +586,42 @@ mod tests {
             );
             assert_eq!(warnings.containing(unchecked), loads);
         }
+    }
+
+    #[tokio::test]
+    async fn test_s3_manifest_checksum_mismatch_says_how_to_repair_it() {
+        let objects = Arc::new(Mutex::new(BTreeMap::new()));
+        let fake = fake_s3::FakeS3::start(fake_s3::store(Arc::clone(&objects))).await;
+        let store = PitrStore::open(&PitrLocation::S3(fake.config("bucket")))
+            .await
+            .expect("store");
+        let mut manifest = PitrManifest::new(Uuid::new_v4());
+        store
+            .save_manifest(&mut manifest, Duration::from_secs(10))
+            .await
+            .expect("save");
+
+        // Edited by hand, its metadata left as it was.
+        let path = format!("/bucket/{PITR_MANIFEST_KEY}");
+        let mut edited = PitrManifest::new(manifest.server_uuid);
+        edited.updated_at = "edited".to_string();
+        let edited = serde_json::to_vec(&edited).expect("json");
+        let actual = hex::encode(Sha256::digest(&edited));
+        objects.lock().expect("objects").insert(path, edited);
+
+        let err = store.load_manifest().await.expect_err("mismatch");
+        let message = err.to_string();
+        let object = format!("s3://bucket/{PITR_MANIFEST_KEY}");
+        assert!(matches!(err, PitrError::Manifest(_)), "{message}");
+        assert!(message.contains(&object), "{message}");
+        assert!(message.contains("version"), "{message}");
+        assert!(
+            message.contains(&format!(
+                "aws s3 cp {object} {object} --metadata checksum-sha256={actual} \
+                 --metadata-directive REPLACE"
+            )),
+            "{message}"
+        );
     }
 
     #[tokio::test]
