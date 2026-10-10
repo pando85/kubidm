@@ -299,6 +299,20 @@ where
     }
 }
 
+/// Whether a committing transaction leaves something for the WAL archive to record: records
+/// (`pending`), a truncation, a record that could not be staged, which is recorded as a gap,
+/// or a new server uuid. The archive is then told before the database commits, so that the
+/// open segment marker covers the transaction should the server stop between the commit and
+/// its archiving.
+fn wal_commit_archives(
+    pending: bool,
+    truncate: bool,
+    stage_failed: bool,
+    server_uuid_changed: bool,
+) -> bool {
+    pending || truncate || stage_failed || server_uuid_changed
+}
+
 #[derive(Clone)]
 pub struct BackendConfig {
     path: PathBuf,
@@ -2372,8 +2386,14 @@ impl<'a> BackendWriteTransaction<'a> {
 
         // The archive is told before the database commits a transaction it must archive,
         // so that an unclean stop between the commit and its archiving is noticed.
+        let archives = wal_commit_archives(
+            !wal_pending.is_empty(),
+            wal_truncate,
+            wal_stage_failed,
+            wal_server_uuid.is_some(),
+        );
         let prepared = match (&wal, &wal_cid) {
-            (Some(wal), Some(cid)) if !wal_pending.is_empty() || wal_truncate => {
+            (Some(wal), Some(cid)) if archives => {
                 lock_wal(wal).prepare_commit(cid.ts);
                 Some(wal)
             }
@@ -2420,8 +2440,12 @@ impl<'a> BackendWriteTransaction<'a> {
         wal_pending: BTreeMap<u64, WalPendingOp>,
         wal_stage_failed: bool,
     ) {
-        if wal_pending.is_empty() && !wal_truncate && !wal_stage_failed && wal_server_uuid.is_none()
-        {
+        if !wal_commit_archives(
+            !wal_pending.is_empty(),
+            wal_truncate,
+            wal_stage_failed,
+            wal_server_uuid.is_some(),
+        ) {
             // Nothing to archive, but the database now records this transaction as its
             // last one: the journal of the open segment notes it, so that an unclean stop
             // right after it is known to have lost nothing.
@@ -4794,6 +4818,28 @@ mod tests {
         let be = Backend::new(cfg, wal_test_idxmeta(), false).unwrap();
         assert!(be.wal_archiver().is_none());
         assert!(!dir.path().join("wal").exists());
+    }
+
+    /// A transaction whose only archive event is a record that failed to stage, or a new
+    /// server uuid, is covered by the open segment marker before the database commits it
+    /// too: a stop between the commit and the archiving would otherwise leave no trace of
+    /// it, and recovery would replay across it.
+    #[test]
+    fn test_be_wal_every_archived_commit_is_announced() {
+        assert!(!super::wal_commit_archives(false, false, false, false));
+        for (pending, truncate, stage_failed, server_uuid_changed) in [
+            (true, false, false, false),
+            (false, true, false, false),
+            (false, false, true, false),
+            (false, false, false, true),
+        ] {
+            assert!(super::wal_commit_archives(
+                pending,
+                truncate,
+                stage_failed,
+                server_uuid_changed
+            ));
+        }
     }
 
     #[test]
