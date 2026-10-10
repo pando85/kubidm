@@ -351,8 +351,9 @@ impl S3ClientWrapper {
             upload_id.clone(),
         );
         let uploaded = self.upload_parts_and_complete(key, &upload_id, data).await;
-        abort_guard.disarm();
 
+        // The guard stays armed until the explicit abort returned: should this future be
+        // dropped while the abort is in flight, the guard still aborts the upload.
         if let Err(err) = uploaded {
             if let Err(abort_err) =
                 abort_multipart_upload(&self.client, &self.config.bucket, key, &upload_id).await
@@ -362,8 +363,10 @@ impl S3ClientWrapper {
                     key, abort_err
                 );
             }
+            abort_guard.disarm();
             return Err(err);
         }
+        abort_guard.disarm();
 
         info!("Completed multipart upload to S3: {}", key);
         Ok(())
@@ -1697,7 +1700,11 @@ pub(crate) mod fake_s3 {
                             .collect(),
                         body,
                     };
-                    let (status, headers, body) = responder(&recorded);
+                    // On the blocking pool, so that a responder may hold a request back.
+                    let ((status, headers, body), recorded) =
+                        tokio::task::spawn_blocking(move || (responder(&recorded), recorded))
+                            .await
+                            .expect("responder");
                     recorder.lock().expect("recorder").push(recorded);
                     let mut response = axum::response::Response::builder().status(status);
                     for (name, value) in headers {
@@ -1862,6 +1869,78 @@ mod tests {
             "{:?}",
             aborted[0]
         );
+    }
+
+    #[tokio::test]
+    async fn test_a_failed_multipart_upload_dropped_during_its_abort_is_still_aborted() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Condvar, Mutex};
+
+        // A part fails, and the explicit abort hangs until the test releases it.
+        let aborts = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let fake = {
+            let aborts = Arc::clone(&aborts);
+            let gate = Arc::clone(&gate);
+            fake_s3::FakeS3::start(Arc::new(move |request: &fake_s3::Recorded| {
+                match request.method.as_str() {
+                    "POST" if request.query.starts_with("uploads") => (
+                        200,
+                        vec![("content-type", "application/xml".to_string())],
+                        "<InitiateMultipartUploadResult><Bucket>bucket</Bucket><Key>big</Key>\
+                         <UploadId>id-1</UploadId></InitiateMultipartUploadResult>"
+                            .to_string(),
+                    ),
+                    "PUT" => fake_s3::error(403, "AccessDenied"),
+                    "DELETE" => {
+                        if aborts.fetch_add(1, Ordering::SeqCst) == 0 {
+                            let (released, wakeup) = &*gate;
+                            let released = released.lock().expect("gate");
+                            let _released = wakeup
+                                .wait_timeout_while(released, Duration::from_secs(10), |r| !*r)
+                                .expect("gate");
+                        }
+                        fake_s3::ok(request)
+                    }
+                    _ => fake_s3::ok(request),
+                }
+            }))
+            .await
+        };
+        let client = S3ClientWrapper::new(fake.config("bucket"))
+            .await
+            .expect("client");
+
+        // The upload is dropped, as on shutdown, while its explicit abort is in flight.
+        let metadata = metadata("checksum", "2024-01-01T22:00:00Z", 8);
+        let upload = client.upload_multipart(Bytes::from_static(b"artifact"), "big", &metadata);
+        let abort_in_flight = async {
+            while aborts.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::select! {
+            _ = upload => panic!("the upload must still be aborting"),
+            _ = tokio::time::timeout(Duration::from_secs(10), abort_in_flight) => {}
+        }
+        {
+            let (released, wakeup) = &*gate;
+            *released.lock().expect("gate") = true;
+            wakeup.notify_all();
+        }
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while aborts.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the guard must abort the upload whose explicit abort was dropped");
+        assert!(fake
+            .requests()
+            .iter()
+            .filter(|request| request.method == "DELETE")
+            .all(|request| request.query.contains("uploadId=id-1")));
     }
 
     #[tokio::test]
