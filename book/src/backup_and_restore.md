@@ -257,10 +257,10 @@ follows for it: the primary archive with the time its `pitr-manifest.json` was l
 it names, and one line per region with the state of the region's manifest (`current` when it records every segment, gap
 and abandoned history of the primary's, `behind`, `damaged` when it can not be read or does not match its checksum,
 `missing`, or `unreachable`), the segments it holds intact, those it misses (object or `.metadata.json`) and those whose
-copy differs from the primary's (size, or checksum and size in the sidecar, as for backups), and the lag of its manifest:
-how much older the newest segment it names is than the primary's newest. `--detailed` names every missing or differing
-segment. The command exits non-zero when neither backups nor the WAL archive are replicated, when a primary location can
-not be read, or when any region of either is not healthy, which makes it suitable for monitoring.
+copy differs from the primary's (size, or checksum and size in the sidecar, as for backups), and the lag of its
+manifest: how much older the newest segment it names is than the primary's newest. `--detailed` names every missing or
+differing segment. The command exits non-zero when neither backups nor the WAL archive are replicated, when a primary
+location can not be read, or when any region of either is not healthy, which makes it suitable for monitoring.
 
 #### Recovering from a Region
 
@@ -554,27 +554,27 @@ archive loses nothing. `open_segment_journal` sets how durable the journal is:
 - `Off` keeps the open segment in memory only, as before the journal existed: an unclean stop loses it.
 
 Whatever the journal misses is detected: the database records its last committed transaction, and the journal of the
-open segment records every commit, including those that archived no change. The next start compares them, logs `WAL ARCHIVE HOLE` and records
-a **gap** in the manifest from the first transaction the journal misses (the first record of the open segment with
-`Off`) up to the last transaction the database committed. A journal that can not be written stops journaling for the
-rest of the run, with an error. A committed transaction whose changes could not be recorded is logged and recorded as a
-gap the same way, while a closed segment that could not be written (for example
-on a full disk) is kept in memory and retried at least every `segment_interval_seconds`; once more than four such
-segments wait, the write is tried at once, and when it fails again the oldest are dropped and recorded as gaps. A local
-segment that is found damaged is moved aside as `<segment>.corrupt` and its range recorded as a gap. Gaps are kept in
-the WAL directory until the manifest records them, so repeated crashes never lose one. Replaying across a gap would
-silently skip changes, so `recover` refuses any target whose replay would cross one, and `--latest` stops right before
-it. A base backup taken after the gap makes later points recoverable again; take one after any `WAL ARCHIVE HOLE`. With
-S3, segments that were closed but not yet uploaded are lost with the host, which only shortens the recoverable window.
-After an unclean stop, start the server once before running `recover` on the same host: until a start closed the open
-segment from its journal, `recover` treats it as a gap.
+open segment records every commit, including those that archived no change. The next start compares them, logs
+`WAL ARCHIVE HOLE` and records a **gap** in the manifest from the first transaction the journal misses (the first record
+of the open segment with `Off`) up to the last transaction the database committed. A journal that can not be written
+stops journaling for the rest of the run, with an error. A committed transaction whose changes could not be recorded is
+logged and recorded as a gap the same way, while a closed segment that could not be written (for example on a full disk)
+is kept in memory and retried at least every `segment_interval_seconds`; once more than four such segments wait, the
+write is tried at once, and when it fails again the oldest are dropped and recorded as gaps. A local segment that is
+found damaged is moved aside as `<segment>.corrupt` and its range recorded as a gap. Gaps are kept in the WAL directory
+until the manifest records them, so repeated crashes never lose one. Replaying across a gap would silently skip changes,
+so `recover` refuses any target whose replay would cross one, and `--latest` stops right before it. A base backup taken
+after the gap makes later points recoverable again; take one after any `WAL ARCHIVE HOLE`. With S3, segments that were
+closed but not yet uploaded are lost with the host, which only shortens the recoverable window. After an unclean stop,
+start the server once before running `recover` on the same host: until a start closed the open segment from its journal,
+`recover` treats it as a gap.
 
 The offline `kubidmd domain rename` and `kubidmd database reindex` commands archive their writes like the running server
 does; the next server start uploads them. The `kubidmd db-scan quarantine-id2entry` and `restore-quarantined` repair
 commands move an entry in or out of the database without a transaction the archive could record, so each records a
 **gap** before it changes anything: from just after the last transaction the database committed up to the time of the
-command, with a reason naming the command. It goes into the manifest, or, when the archive has no manifest yet or can not
-be reached, into the WAL directory, from where the server records it at its next start and `recover` honours it
+command, with a reason naming the command. It goes into the manifest, or, when the archive has no manifest yet or can
+not be reached, into the WAL directory, from where the server records it at its next start and `recover` honours it
 meanwhile; when neither works the command refuses to change the database. Recovery then stops right before the repair,
 and an online backup taken after it makes later points recoverable again: take one after using these commands.
 
@@ -680,8 +680,8 @@ recover to another point.
 
 A segment holds the full state of every entry the archived transactions changed, password hashes and other credentials
 included, so it needs the same protection as a backup. When `[online_backup.encryption]` is enabled, the archive task
-encrypts every closed segment with the backup encryption scheme (AES-256-GCM, a key derived with Argon2id, the configured
-`key_identifier` in its header) before it leaves the server's WAL bookkeeping:
+encrypts every closed segment with the backup encryption scheme (AES-256-GCM, a key derived with Argon2id, the
+configured `key_identifier` in its header) before it leaves the server's WAL bookkeeping:
 
 - With S3, the encrypted segment is uploaded as `wal/<segment>.enc`, with `encrypted = true` and the key identifier in
   its `.metadata.json`.
@@ -694,8 +694,8 @@ encrypts every closed segment with the backup encryption scheme (AES-256-GCM, a 
 
 The only plaintext copies of archived changes are the open segment, held in memory and in its journal, and closed
 segments waiting for their archive run (at most `segment_interval_seconds`), all in the WAL directory next to the
-database, which holds the same data. The manifest records for every segment the key identifier it was encrypted with, and keeps the SHA-256 of the
-plaintext segment, which recovery checks after decrypting.
+database, which holds the same data. The manifest records for every segment the key identifier it was encrypted with,
+and keeps the SHA-256 of the plaintext segment, which recovery checks after decrypting.
 
 Argon2id is deliberately slow, and segments are small and many, so one derivation per segment would make reading a large
 archive slow. The segments a server archives are therefore sealed in an encryption session: they share one random salt,
@@ -738,8 +738,9 @@ right after it is indexed. The base backups themselves reach the regions through
 separate WAL location only has base backups when `[online_backup.s3]` replicates to a region of the same name, which
 `recover --region` requires. When the base backups are local, recovering from a region needs the local backup directory.
 Without an S3 archive location there is nothing to replicate: a local archive is never replicated. `replicate-status`
-reports the state of every region's copy of the archive, see [Checking Replication Status](#checking-replication-status),
-and `pitr-list --region <name>` shows what a region's archive holds.
+reports the state of every region's copy of the archive, see
+[Checking Replication Status](#checking-replication-status), and `pitr-list --region <name>` shows what a region's
+archive holds.
 
 `pitr-list --region <name>` and `recover --region <name>` read the copy of the archive held by the configured region of
 that name (looked up whether or not replication is still enabled), and the base backups from the same region when they

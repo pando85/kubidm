@@ -92,30 +92,30 @@ Recovery restores the newest base backup at or before the target, then applies l
       and a damaged region manifest is written again from the primary's
 - [x] Per-segment key derivation (Argon2id with a fresh salt per segment) made decrypting large WAL archives slow:
       segments are sealed in an encryption session (one salt and derived key per server run, up to 2^20 segments, a
-      random nonce and the segment id per segment) and decryption keeps derived keys by salt and parameters, zeroized
-      on drop. The container format is unchanged, so segments sealed one by one still open; no release tag contains
-      the WAL format (checked with `git tag --contains`)
+      random nonce and the segment id per segment) and decryption keeps derived keys by salt and parameters, zeroized on
+      drop. The container format is unchanged, so segments sealed one by one still open; no release tag contains the WAL
+      format (checked with `git tag --contains`)
 - [x] An unclean stop lost the open segment (up to `segment_interval_seconds` of WAL): every commit now appends its
       records to a per-segment journal (`open_segment_journal`: `Commit` syncs it in every archiving commit, the
-      default; `Interval` at most every `journal_sync_interval_ms`; `Off` as before), and the next start closes the
-      open and unwritten segments from their journals. A commit that archives nothing is journaled too, so a start
-      compares the journal with the database's last transaction and records only what the journal misses as a gap.
-      Measured cost: one `fdatasync` per write transaction (about 3 ms on the development disk, the same as the
-      database's own commit sync)
-- [ ] More than four closed segments that can not be written are dropped and recorded as gaps (their journals go
-      with them); only a new base backup makes later points recoverable
+      default; `Interval` at most every `journal_sync_interval_ms`; `Off` as before), and the next start closes the open
+      and unwritten segments from their journals. A commit that archives nothing is journaled too, so a start compares
+      the journal with the database's last transaction and records only what the journal misses as a gap. Measured cost:
+      one `fdatasync` per write transaction (about 3 ms on the development disk, the same as the database's own commit
+      sync)
+- [ ] More than four closed segments that can not be written are dropped and recorded as gaps (their journals go with
+      them); only a new base backup makes later points recoverable
 - [ ] A restore whose abandoned history can be recorded neither in the archive nor handed over through the WAL directory
       exits 3; until a new online backup is taken after the start, a recovery past it could replay that history
 - [x] `db-scan` quarantine commands bypassed the WAL archive: `quarantine-id2entry` and `restore-quarantined` record a
       gap from just after the last committed transaction up to now before they change anything (in the manifest, or
       handed to the server through the WAL directory, else they refuse), so recovery never replays across them
-- [x] Manual `database backup` files were not PITR bases: one written into the local base directory under a backup
-      name is handed over through the WAL directory (`.handed-over-bases/`) with the watermark of its content; the server
+- [x] Manual `database backup` files were not PITR bases: one written into the local base directory under a backup name
+      is handed over through the WAL directory (`.handed-over-bases/`) with the watermark of its content; the server
       indexes it at its next archive run and recovery uses it meanwhile. With S3 bases a manual backup stays outside the
       index (documented)
 - [x] The offline `restore` and `recover` ran their write transaction and reindex on the CLI's runtime: the restore,
-      replay, reindex and boot verification now run on a dedicated database thread (`on_database_thread`), checked by
-      a test that the single thread of a current thread runtime keeps ticking through a restore and a recovery
+      replay, reindex and boot verification now run on a dedicated database thread (`on_database_thread`), checked by a
+      test that the single thread of a current thread runtime keeps ticking through a restore and a recovery
 - [ ] A region of a separate `[online_backup.wal_archive.s3]` location only has base backups when `[online_backup.s3]`
       replicates to a region of the same name, which `recover --region` requires
 
