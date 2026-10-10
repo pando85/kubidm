@@ -582,7 +582,7 @@ impl S3ClientWrapper {
     /// List every object under the configured prefix except metadata sidecars, with the
     /// prefix stripped. All pages of the listing are collected.
     ///
-    /// The listing uses the `/`-terminated prefix of [`Self::listing_prefix`], so objects
+    /// The listing uses the `/`-terminated prefix of `Self::listing_prefix`, so objects
     /// under a sibling prefix that merely starts with the same characters are never
     /// returned.
     pub async fn list_backups(&self) -> Result<Vec<String>, S3BackupError> {

@@ -96,7 +96,7 @@ struct PitrRecoverTarget {
     target_time: Option<String>,
 
     /// Recover the state right after the transaction with this CID
-    /// ("<nanoseconds>-<server uuid>", as the server logs it).
+    /// (`<nanoseconds>-<server uuid>`, as the server logs it).
     #[clap(long)]
     target_cid: Option<String>,
 
