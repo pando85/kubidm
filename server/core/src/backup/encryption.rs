@@ -39,7 +39,7 @@ use std::time::Duration;
 
 use argon2::{Algorithm, Argon2, Params, Version};
 use crypto_glue::aes256::key_from_slice;
-use crypto_glue::aes256gcm::{Aead, Aes256Gcm, Aes256GcmNonce, KeyInit, Payload};
+use crypto_glue::aes256gcm::{Aead, AeadInOut, Aes256Gcm, Aes256GcmNonce, KeyInit, Payload};
 use crypto_glue::traits::Zeroizing;
 use kubidm_proto::backup::{
     BackupArtifactIdentity, BackupCompression, BackupEncryptionConfig, BackupEncryptionHeader,
@@ -78,6 +78,14 @@ pub const MAX_KDF_WORK: u64 = 4 * 1024 * 1024;
 /// precompute a dictionary of passphrase fingerprints once and look up every backup, so
 /// passphrases are never fingerprinted, see [`PASSPHRASE_KEY_IDENTIFIER`].
 const KEY_FINGERPRINT_SALT: &[u8; BACKUP_ENCRYPTION_SALT_LEN] = b"kubidm-bk-keyid1";
+/// Argon2id parameters of the key fingerprint. They are pinned rather than taken from
+/// [`KeyDerivationParams::default`], which may be raised for new artifacts: the fingerprint
+/// is the public identifier of a key, and must stay the same for the same key forever.
+const KEY_FINGERPRINT_PARAMS: KeyDerivationParams = KeyDerivationParams {
+    m_cost: 19 * 1024,
+    t_cost: 2,
+    p_cost: 1,
+};
 /// Number of hex characters of a key fingerprint.
 const KEY_FINGERPRINT_LEN: usize = 16;
 /// Key identifier recorded for a passphrase when no `key_identifier` is configured.
@@ -123,7 +131,8 @@ pub enum BackupEncryptionError {
     InvalidSaltLength,
     /// The key material could not be obtained from the configured source.
     KeySourceError(String),
-    IoError(std::io::Error),
+    /// The encryption configuration can not produce valid artifacts.
+    InvalidConfiguration(String),
     HttpError(String),
     SerializeError(String),
 }
@@ -169,7 +178,9 @@ impl fmt::Display for BackupEncryptionError {
             BackupEncryptionError::KeySourceError(msg) => {
                 write!(f, "unable to obtain the backup encryption key: {msg}")
             }
-            BackupEncryptionError::IoError(e) => write!(f, "IO error: {e}"),
+            BackupEncryptionError::InvalidConfiguration(msg) => {
+                write!(f, "invalid backup encryption configuration: {msg}")
+            }
             BackupEncryptionError::HttpError(msg) => write!(f, "HTTP error: {msg}"),
             BackupEncryptionError::SerializeError(msg) => write!(f, "serialize error: {msg}"),
         }
@@ -177,12 +188,6 @@ impl fmt::Display for BackupEncryptionError {
 }
 
 impl std::error::Error for BackupEncryptionError {}
-
-impl From<std::io::Error> for BackupEncryptionError {
-    fn from(e: std::io::Error) -> Self {
-        BackupEncryptionError::IoError(e)
-    }
-}
 
 /// Whether `data` is an encrypted backup container. Only the magic is inspected, so a
 /// prefix of an artifact is enough.
@@ -228,8 +233,8 @@ pub fn read_encryption_header(
     let header_json = data
         .get(header_start..header_end)
         .ok_or(BackupEncryptionError::InvalidHeader)?;
-    let header: BackupEncryptionHeader = serde_json::from_slice(header_json)
-        .map_err(|e| BackupEncryptionError::SerializeError(e.to_string()))?;
+    let header: BackupEncryptionHeader =
+        serde_json::from_slice(header_json).map_err(|_| BackupEncryptionError::InvalidHeader)?;
 
     if !header.validate_magic() {
         return Err(BackupEncryptionError::InvalidMagic);
@@ -294,11 +299,7 @@ pub fn validate_encryption_config(config: &BackupEncryptionConfig) -> Result<(),
     validate_key_derivation_params(&config.key_derivation)?;
 
     if let Some(id) = &config.key_identifier {
-        if id.trim().is_empty() || id.chars().any(char::is_control) {
-            return Err(
-                "key_identifier must not be empty or contain control characters".to_string(),
-            );
-        }
+        validate_key_identifier(id)?;
     }
 
     if config.passphrase_file.is_some()
@@ -323,6 +324,15 @@ pub fn validate_encryption_config(config: &BackupEncryptionConfig) -> Result<(),
         }
         EncryptionKeySource::HttpEndpoint { url } => validate_key_endpoint(url).map(|_| ()),
     }
+}
+
+/// A configured key identifier is written into every artifact, and a reader refuses a
+/// header whose identifier carries control characters, see [`read_encryption_header`].
+fn validate_key_identifier(id: &str) -> Result<(), String> {
+    if id.trim().is_empty() || id.chars().any(char::is_control) {
+        return Err("key_identifier must not be empty or contain control characters".to_string());
+    }
+    Ok(())
 }
 
 /// The key endpoint must be an `https` URL. Plain `http` would send the key material in
@@ -377,37 +387,47 @@ fn warn_on_insecure_permissions(path: &Path, what: &str) {
     }
 }
 
-/// The passphrase: the content of `passphrase_file` with trailing whitespace removed when
-/// a file is configured, otherwise the [`PASSPHRASE_ENV`] environment variable.
+/// Remove trailing ASCII whitespace from a passphrase, whatever its source: a file
+/// usually ends in a newline, and an environment variable may keep one depending on how it
+/// was set (systemd `Environment=`, `.env` loaders). Moving a passphrase from one source to
+/// the other must not change the key. Truncating keeps the allocation, so the trailing
+/// bytes are wiped on drop too.
+fn normalise_passphrase(mut passphrase: Zeroizing<Vec<u8>>) -> Zeroizing<Vec<u8>> {
+    let trimmed_len = passphrase
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .map(|pos| pos + 1)
+        .unwrap_or(0);
+    passphrase.truncate(trimmed_len);
+    passphrase
+}
+
+/// The passphrase: the content of `passphrase_file` when a file is configured, otherwise
+/// the [`PASSPHRASE_ENV`] environment variable, with trailing whitespace removed either way.
 fn resolve_passphrase(passphrase_file: Option<&Path>) -> Result<Zeroizing<Vec<u8>>, String> {
-    let passphrase = match passphrase_file {
+    match passphrase_file {
         Some(path) => {
-            let mut passphrase = Zeroizing::new(fs::read(path).map_err(|err| {
-                format!("unable to read passphrase_file {}: {err}", path.display())
-            })?);
-            let trimmed_len = passphrase
-                .iter()
-                .rposition(|byte| !byte.is_ascii_whitespace())
-                .map(|pos| pos + 1)
-                .unwrap_or(0);
-            // Truncating keeps the allocation, so the trailing bytes are wiped on drop too.
-            passphrase.truncate(trimmed_len);
+            let passphrase =
+                normalise_passphrase(Zeroizing::new(fs::read(path).map_err(|err| {
+                    format!("unable to read passphrase_file {}: {err}", path.display())
+                })?));
             if passphrase.is_empty() {
                 return Err(format!("passphrase_file {} is empty", path.display()));
             }
-            passphrase
+            Ok(passphrase)
         }
-        None => match std::env::var_os(PASSPHRASE_ENV) {
-            Some(value) if !value.is_empty() => Zeroizing::new(value.into_encoded_bytes()),
-            _ => {
-                return Err(format!(
+        None => {
+            let passphrase = std::env::var_os(PASSPHRASE_ENV)
+                .map(|value| normalise_passphrase(Zeroizing::new(value.into_encoded_bytes())))
+                .filter(|passphrase| !passphrase.is_empty());
+            passphrase.ok_or_else(|| {
+                format!(
                     "key_source is \"Passphrase\" but neither passphrase_file is configured nor \
                      the {PASSPHRASE_ENV} environment variable is set"
-                ))
-            }
-        },
-    };
-    Ok(passphrase)
+                )
+            })
+        }
+    }
 }
 
 /// The bytes of a key file, used exactly as stored.
@@ -570,7 +590,12 @@ impl BackupEncryptor {
         validate_key_derivation_params(&config.key_derivation)
             .map_err(BackupEncryptionError::KeyDerivationFailed)?;
         let key_identifier = match (&config.key_identifier, &config.key_source) {
-            (Some(id), _) => id.clone(),
+            (Some(id), _) => {
+                // However the encryptor was built: an artifact this would write can never
+                // be opened again.
+                validate_key_identifier(id).map_err(BackupEncryptionError::InvalidConfiguration)?;
+                id.clone()
+            }
             (None, EncryptionKeySource::Passphrase) => PASSPHRASE_KEY_IDENTIFIER.to_string(),
             (None, _) => key_fingerprint(&key_material)?,
         };
@@ -619,29 +644,28 @@ impl BackupEncryptor {
             .ok_or_else(|| BackupEncryptionError::SerializeError("header too large".to_string()))?;
 
         // The prefix (magic, length, header) is written first and is the associated data.
+        // The plaintext is then copied behind it and encrypted in place, so that a whole
+        // backup is held once more, not twice more (ciphertext and output).
         let mut output = Vec::with_capacity(
             BACKUP_ENCRYPTION_MAGIC.len() + 4 + header_json.len() + plaintext.len() + 16,
         );
         output.extend_from_slice(BACKUP_ENCRYPTION_MAGIC);
         output.extend_from_slice(&header_len.to_le_bytes());
         output.extend_from_slice(&header_json);
+        let prefix_len = output.len();
+        output.extend_from_slice(plaintext);
 
         let key = key_from_slice(&key).ok_or(BackupEncryptionError::InvalidKeyLength)?;
         let cipher = Aes256Gcm::new(&*key);
         let nonce = <&Aes256GcmNonce>::try_from(nonce_bytes.as_slice())
             .map_err(|_| BackupEncryptionError::InvalidNonceLength)?;
 
-        let ciphertext = cipher
-            .encrypt(
-                nonce,
-                Payload {
-                    msg: plaintext,
-                    aad: &output,
-                },
-            )
+        let (associated_data, buffer) = output.split_at_mut(prefix_len);
+        let tag = cipher
+            .encrypt_inout_detached(nonce, associated_data, buffer.into())
             .map_err(|e| BackupEncryptionError::EncryptionFailed(e.to_string()))?;
 
-        output.extend_from_slice(&ciphertext);
+        output.extend_from_slice(&tag);
         Ok(output)
     }
 
@@ -731,15 +755,11 @@ fn derive_key(
 }
 
 /// A stable, public identifier of key material: Argon2id of the material with a fixed salt
-/// and the default parameters, truncated to [`KEY_FINGERPRINT_LEN`] hex characters. Only
+/// and [`KEY_FINGERPRINT_PARAMS`], truncated to [`KEY_FINGERPRINT_LEN`] hex characters. Only
 /// for high entropy material (key files, key endpoints): with a fixed salt it would be a
 /// precomputable verifier of a passphrase.
 fn key_fingerprint(key_material: &[u8]) -> Result<String, BackupEncryptionError> {
-    let derived = derive_key(
-        key_material,
-        KEY_FINGERPRINT_SALT,
-        &KeyDerivationParams::default(),
-    )?;
+    let derived = derive_key(key_material, KEY_FINGERPRINT_SALT, &KEY_FINGERPRINT_PARAMS)?;
     let mut fingerprint = hex::encode(&*derived);
     fingerprint.truncate(KEY_FINGERPRINT_LEN);
     Ok(fingerprint)
@@ -976,12 +996,7 @@ mod tests {
             .unwrap();
         let (mut header, ciphertext_start) = read_encryption_header(&sealed).unwrap();
         header.salt = vec![0u8; BACKUP_ENCRYPTION_SALT_LEN];
-
-        let header_json = serde_json::to_vec(&header).unwrap();
-        let mut rebuilt = BACKUP_ENCRYPTION_MAGIC.to_vec();
-        rebuilt.extend_from_slice(&(header_json.len() as u32).to_le_bytes());
-        rebuilt.extend_from_slice(&header_json);
-        rebuilt.extend_from_slice(&sealed[ciphertext_start..]);
+        let rebuilt = rebuild(&header, &sealed[ciphertext_start..]);
 
         assert!(matches!(
             enc.decrypt(&rebuilt, &backup_id()),
@@ -1243,14 +1258,17 @@ mod tests {
             Err(BackupEncryptionError::InvalidHeader)
         ));
 
-        // Header is not JSON.
-        let mut data = BACKUP_ENCRYPTION_MAGIC.to_vec();
-        data.extend_from_slice(&4u32.to_le_bytes());
-        data.extend_from_slice(b"xxxx");
-        assert!(matches!(
-            read_encryption_header(&data),
-            Err(BackupEncryptionError::SerializeError(_))
-        ));
+        // Header is not JSON, or JSON that is not a header: malformed like any other
+        // broken container.
+        for json in [&b"xxxx"[..], b"{}"] {
+            let mut data = BACKUP_ENCRYPTION_MAGIC.to_vec();
+            data.extend_from_slice(&(json.len() as u32).to_le_bytes());
+            data.extend_from_slice(json);
+            assert!(matches!(
+                read_encryption_header(&data),
+                Err(BackupEncryptionError::InvalidHeader)
+            ));
+        }
 
         // Header JSON with a wrong magic field.
         let header = BackupEncryptionHeader {
@@ -1291,6 +1309,9 @@ mod tests {
         ));
     }
 
+    /// The fingerprint of `passphrase-a`, see `test_key_fingerprint_is_stable_and_distinct`.
+    const PINNED_FINGERPRINT_A: &str = "4462d5aa655b8cf6";
+
     #[test]
     fn test_key_fingerprint_is_stable_and_distinct() {
         let a1 = key_fingerprint(b"passphrase-a").unwrap();
@@ -1300,6 +1321,9 @@ mod tests {
         assert_ne!(a1, b);
         assert_eq!(a1.len(), KEY_FINGERPRINT_LEN);
         assert!(a1.chars().all(|c| c.is_ascii_hexdigit()));
+        // Pinned: a change here changes the identifier of every existing key file and key
+        // endpoint, so old artifacts would seem to need a different key than new ones.
+        assert_eq!(a1, PINNED_FINGERPRINT_A);
 
         // The fingerprint of key file material does not depend on the configured KDF
         // parameters, so changing them does not change which key an artifact is
@@ -1364,6 +1388,16 @@ mod tests {
             BackupEncryptor::with_key_material(bad, b"pw".to_vec()),
             Err(BackupEncryptionError::KeyDerivationFailed(_))
         ));
+        // An identifier the reader would refuse is refused by the writer too.
+        for id in ["", "  ", "evil\u{1b}[2J", "line\nbreak"] {
+            assert!(
+                matches!(
+                    BackupEncryptor::with_key_material(config(Some(id)), b"pw".to_vec()),
+                    Err(BackupEncryptionError::InvalidConfiguration(_))
+                ),
+                "{id:?}"
+            );
+        }
     }
 
     #[test]
@@ -1445,6 +1479,23 @@ mod tests {
 
         let err = resolve_passphrase(Some(&dir.path().join("missing"))).unwrap_err();
         assert!(err.contains("unable to read passphrase_file"), "{err}");
+    }
+
+    #[test]
+    fn test_passphrase_is_normalised_the_same_for_every_source() {
+        for (raw, normalised) in [
+            (&b"pw"[..], &b"pw"[..]),
+            (b"pw\n", b"pw"),
+            (b"pw \r\n\t", b"pw"),
+            (b"  p w", b"  p w"),
+            (b" \n", b""),
+        ] {
+            assert_eq!(
+                *normalise_passphrase(Zeroizing::new(raw.to_vec())),
+                normalised.to_vec(),
+                "{raw:?}"
+            );
+        }
     }
 
     #[test]
@@ -1871,11 +1922,6 @@ mod tests {
             err.contains("unable to obtain the backup encryption key"),
             "{err}"
         );
-
-        let io: BackupEncryptionError =
-            std::io::Error::new(std::io::ErrorKind::NotFound, "gone").into();
-        assert!(matches!(io, BackupEncryptionError::IoError(_)));
-        assert!(io.to_string().contains("gone"));
 
         let debug = format!("{:?}", encryptor(b"top secret", Some("k")));
         assert!(!debug.contains("top secret"), "{debug}");
