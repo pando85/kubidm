@@ -189,6 +189,11 @@ impl OnlineBackup {
             }
         }
 
+        if self.enabled {
+            parse_backup_schedule(&self.schedule)
+                .map_err(|reason| format!("online_backup.schedule: {reason}"))?;
+        }
+
         if let Some(verify_schedule) = &self.verify_schedule {
             if !self.enabled {
                 return Err(
@@ -1574,6 +1579,37 @@ m_cost = 1024
         .validate()
         .expect_err("a disabled online backup must not be verified on a schedule");
         assert!(err.contains("online_backup.enabled = true"), "{err}");
+    }
+
+    #[test]
+    fn online_backup_schedule_is_validated_at_load() {
+        for schedule in ["@monthly", "0 30 3 * * Sun", "00 22 * * *"] {
+            assert!(
+                build_from_toml(&BASE_V2_CONFIG.replace(
+                    "schedule = \"@daily\"",
+                    &format!("schedule = \"{schedule}\"")
+                ))
+                .is_some(),
+                "{schedule} must be accepted"
+            );
+        }
+        let err = OnlineBackup {
+            schedule: "whenever".to_string(),
+            ..OnlineBackup::default()
+        }
+        .validate()
+        .expect_err("an invalid schedule must be rejected");
+        assert!(err.starts_with("online_backup.schedule"), "{err}");
+        assert!(err.contains("@monthly"), "{err}");
+
+        // A disabled online backup never runs its schedule.
+        assert!(OnlineBackup {
+            enabled: false,
+            schedule: "whenever".to_string(),
+            ..OnlineBackup::default()
+        }
+        .validate()
+        .is_ok());
     }
 
     #[test]

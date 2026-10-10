@@ -77,7 +77,7 @@ impl IntervalActor {
         online_backup_config: &OnlineBackup,
         pitr_archive: Option<Arc<PitrArchive>>,
         metrics: Arc<BackupMetrics>,
-        mut rx: broadcast::Receiver<CoreAction>,
+        rx: broadcast::Receiver<CoreAction>,
     ) -> Result<Vec<(TaskName, JoinHandle<()>)>, ()> {
         let outpath = online_backup_config.path.to_owned();
         let has_local_path = outpath.is_some();
@@ -88,32 +88,11 @@ impl IntervalActor {
             return Err(());
         }
 
-        let crono_expr = online_backup_config.schedule.as_str().to_string();
-        let crono_expr_schedule = normalize_cron_expression(&crono_expr);
-        if crono_expr_schedule != crono_expr {
-            info!(
-                "Provided online backup schedule is: {}, now being transformed to: {}",
-                crono_expr, crono_expr_schedule
-            );
-        }
-        // Cron expression handling
-        let cron_expr = Schedule::from_str(crono_expr_schedule.as_str()).map_err(|e| {
-            error!("Online backup schedule parse error: {}", e);
-            error!("valid formats are:");
-            error!("sec  min   hour   day of month   month   day of week   year");
-            error!("min   hour   day of month   month   day of week");
-            error!("@hourly | @daily | @weekly");
-        })?;
-
+        let cron_expr =
+            parse_backup_schedule(&online_backup_config.schedule).map_err(|reason| {
+                error!("Online backup schedule error: {reason}");
+            })?;
         info!("Online backup schedule parsed as: {}", cron_expr);
-
-        if cron_expr.upcoming(Utc).next().is_none() {
-            error!(
-                "Online backup schedule error: '{}' will not match any date.",
-                cron_expr
-            );
-            return Err(());
-        }
 
         // Output path handling - only for local backups
         if let Some(ref path) = outpath {
@@ -166,49 +145,14 @@ impl IntervalActor {
             }
         }
 
-        let handle = tokio::spawn(async move {
-            let mut last_run = None;
-            loop {
-                let now = Utc::now();
-                let Some(next_time) = next_backup_time(&cron_expr, now, last_run) else {
-                    info!("Online backup schedule '{}' has no further runs", cron_expr);
-                    break;
-                };
-                let wait = wait_until(next_time, now);
-                info!(
-                    "Online backup next run on {}, wait_time = {}s",
-                    next_time,
-                    wait.as_secs()
-                );
-
-                tokio::select! {
-                    action = rx.recv() => match action {
-                        Ok(CoreAction::Shutdown) | Err(broadcast::error::RecvError::Closed) => {
-                            break
-                        }
-                        // The schedule does not change on a reload: wait for the same run.
-                        Ok(CoreAction::Reload) | Err(broadcast::error::RecvError::Lagged(_)) => {
-                            continue
-                        }
-                    },
-                    _ = sleep(wait) => {}
-                }
-
-                last_run = Some(next_time);
-                match run_until_shutdown(job.run(server), &mut rx).await {
-                    Some(Ok(())) => {}
-                    Some(Err(err)) => error!(?err, "An online backup error occurred."),
-                    None => {
-                        warn!(
-                            "Online backup abandoned: the server is shutting down. The WAL \
-                             archive is still synchronised, and the next scheduled run takes \
-                             a new backup"
-                        );
-                        break;
-                    }
+        let job = Arc::new(job);
+        let handle = spawn_scheduled(TaskName::BackupActor, cron_expr, rx, move || {
+            let job = job.clone();
+            async move {
+                if let Err(err) = job.run(server).await {
+                    error!(?err, "An online backup error occurred.");
                 }
             }
-            info!("Stopped {}", TaskName::BackupActor);
         });
         handles.push((TaskName::BackupActor, handle));
 
@@ -264,51 +208,71 @@ impl IntervalActor {
     pub fn start_backup_verification(
         job: Arc<BackupVerifyJob>,
         schedule: Schedule,
-        mut rx: broadcast::Receiver<CoreAction>,
+        rx: broadcast::Receiver<CoreAction>,
     ) -> JoinHandle<()> {
         info!(
             "Scheduled backup verification schedule parsed as: {}",
             schedule
         );
-        tokio::spawn(async move {
-            let mut last_run = None;
-            loop {
-                let now = Utc::now();
-                let Some(next_time) = next_backup_time(&schedule, now, last_run) else {
-                    info!(
-                        "Scheduled backup verification '{}' has no further runs",
-                        schedule
-                    );
-                    break;
-                };
-                let wait = wait_until(next_time, now);
-                debug!(
-                    "Scheduled backup verification next run on {}, wait_time = {}s",
-                    next_time,
-                    wait.as_secs()
-                );
-
-                tokio::select! {
-                    action = rx.recv() => match action {
-                        Ok(CoreAction::Shutdown) | Err(broadcast::error::RecvError::Closed) => {
-                            break
-                        }
-                        Ok(CoreAction::Reload) | Err(broadcast::error::RecvError::Lagged(_)) => {
-                            continue
-                        }
-                    },
-                    _ = sleep(wait) => {}
-                }
-
-                last_run = Some(next_time);
-                if run_until_shutdown(job.run(), &mut rx).await.is_none() {
-                    warn!("Scheduled backup verification abandoned: the server is shutting down");
-                    break;
-                }
+        spawn_scheduled(TaskName::BackupVerification, schedule, rx, move || {
+            let job = job.clone();
+            async move {
+                job.run().await;
             }
-            info!("Stopped {}", TaskName::BackupVerification);
         })
     }
+}
+
+/// Start the task that runs `run` at every time of `schedule`, until the schedule has no
+/// further times or the server shuts down. A run that outlasts the gap to the next
+/// scheduled time skips the times that are already past, so runs never overlap. On
+/// shutdown a run in progress is abandoned, see [`run_until_shutdown`].
+fn spawn_scheduled<F, Fut>(
+    task: TaskName,
+    schedule: Schedule,
+    mut rx: broadcast::Receiver<CoreAction>,
+    mut run: F,
+) -> JoinHandle<()>
+where
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send,
+{
+    tokio::spawn(async move {
+        let mut last_run = None;
+        loop {
+            let now = Utc::now();
+            let Some(next_time) = next_backup_time(&schedule, now, last_run) else {
+                info!("{task} schedule '{schedule}' has no further runs");
+                break;
+            };
+            let wait = wait_until(next_time, now);
+            info!(
+                "{task} next run on {}, wait_time = {}s",
+                next_time,
+                wait.as_secs()
+            );
+
+            tokio::select! {
+                action = rx.recv() => match action {
+                    Ok(CoreAction::Shutdown) | Err(broadcast::error::RecvError::Closed) => {
+                        break
+                    }
+                    // The schedule does not change on a reload: wait for the same run.
+                    Ok(CoreAction::Reload) | Err(broadcast::error::RecvError::Lagged(_)) => {
+                        continue
+                    }
+                },
+                _ = sleep(wait) => {}
+            }
+
+            last_run = Some(next_time);
+            if run_until_shutdown(run(), &mut rx).await.is_none() {
+                warn!("{task} run abandoned: the server is shutting down");
+                break;
+            }
+        }
+        info!("Stopped {task}");
+    })
 }
 
 /// A cron expression of the `[online_backup]` section in the seven field syntax of the
@@ -330,8 +294,9 @@ pub(crate) fn parse_backup_schedule(expr: &str) -> Result<Schedule, String> {
     let schedule = Schedule::from_str(&normalize_cron_expression(expr)).map_err(|err| {
         format!(
             "'{expr}' is not a valid schedule ({err}); valid formats are \
-             `sec min hour day-of-month month day-of-week year`, \
-             `min hour day-of-month month day-of-week` and @hourly, @daily or @weekly"
+             `min hour day-of-month month day-of-week`, \
+             `sec min hour day-of-month month day-of-week [year]` and @hourly, @daily, \
+             @weekly, @monthly or @yearly"
         )
     })?;
     if schedule.upcoming(Utc).next().is_none() {
