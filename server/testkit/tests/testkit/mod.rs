@@ -2,6 +2,7 @@ mod apidocs;
 mod authorization_test;
 mod backup_common;
 mod backup_encryption_test;
+mod backup_observability_test;
 mod backup_verify_test;
 mod database_verify_test;
 mod delegation;
