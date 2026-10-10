@@ -19,7 +19,7 @@ use kubidm_client::KubidmClient;
 use kubidm_proto::backup::{
     is_encrypted_backup_name, BackupCompression, BackupEncryptionConfig, EncryptionKeySource,
     KeyDerivationParams, PitrManifest, ReplicationConfig, ReplicationRegionConfig, S3Config,
-    WalArchiveConfig, PITR_MANIFEST_KEY,
+    WalArchiveConfig, WalJournalMode, PITR_MANIFEST_KEY,
 };
 use kubidmd_core::backup::pitr::{
     check_wal_replication, pitr_list_server_core, pitr_recover_server_core, PitrArchive, PitrError,
@@ -266,17 +266,92 @@ fn test_pitr_local_recover_to_time_and_latest() {
 /// Created after the last archived segment, right before an unclean stop.
 const PITR_USER_LOST: &str = "pitr_user_lost";
 
+/// `config` with the journal of the open segment set to `mode`.
+fn with_journal(mut config: Configuration, mode: WalJournalMode) -> Configuration {
+    if let Some(wal) = config
+        .online_backup
+        .as_mut()
+        .and_then(|backup| backup.wal_archive.as_mut())
+    {
+        wal.open_segment_journal = mode;
+    }
+    config
+}
+
+/// With the journal of the open segment, an unclean stop loses nothing: the next start
+/// closes the open segment from its journal, records no gap, and the latest point is the
+/// last write before the stop.
+#[test]
+fn test_pitr_unclean_stop_loses_nothing_with_the_journal() {
+    let workdir = tempfile::tempdir().expect("Failed to create workdir");
+    let backup_dir = workdir.path().join("backups");
+    let wal_dir = workdir.path().join("wal");
+    std::fs::create_dir(&backup_dir).expect("Failed to create backup directory");
+    // The default journal mode, synced by every commit.
+    let config = pitr_config(
+        &workdir.path().join("source.db"),
+        &backup_dir,
+        &wal_dir,
+        None,
+    );
+
+    run(async {
+        let env = setup_async_test(config.clone()).await;
+        populate(&env).await;
+        env.core_handle
+            .trigger_online_backup(&backup_dir, 7, BackupCompression::Gzip, &Default::default())
+            .await
+            .expect("Online backup failed");
+        env.rsclient
+            .idm_person_account_create(PITR_USER_BEFORE, "Before")
+            .await
+            .expect("Failed to create the archived person");
+        archive_now(&env).await;
+        env.rsclient
+            .idm_person_account_create(PITR_USER_LOST, "Journaled")
+            .await
+            .expect("Failed to create the journaled person");
+        // No shutdown: the runtime goes away under the server, as in a crash.
+        std::mem::forget(env);
+    });
+
+    run(async {
+        let mut env = setup_async_test(config.clone()).await;
+        env.core_handle.shutdown().await;
+        let manifest = read_manifest(&wal_dir.join(PITR_MANIFEST_KEY));
+        assert!(manifest.gaps.is_empty(), "{:?}", manifest.gaps);
+
+        let latest_db = workdir.path().join("latest.db");
+        let latest_config = pitr_config(&latest_db, &backup_dir, &wal_dir, None);
+        pitr_recover_server_core(&latest_config, &RecoveryTargetSpec::Latest, false, None)
+            .await
+            .expect("Recovery to the latest point failed");
+        let mut env = setup_async_test(latest_config).await;
+        login_put_admin_idm_admins(&env.rsclient).await;
+        assert!(person_exists(&env.rsclient, PITR_USER_BEFORE).await);
+        assert!(
+            person_exists(&env.rsclient, PITR_USER_LOST).await,
+            "The write of the open segment must survive the unclean stop"
+        );
+        env.core_handle.shutdown().await;
+    });
+}
+
 #[test]
 fn test_pitr_unclean_stop_leaves_a_gap_recovery_does_not_cross() {
     let workdir = tempfile::tempdir().expect("Failed to create workdir");
     let backup_dir = workdir.path().join("backups");
     let wal_dir = workdir.path().join("wal");
     std::fs::create_dir(&backup_dir).expect("Failed to create backup directory");
-    let config = pitr_config(
-        &workdir.path().join("source.db"),
-        &backup_dir,
-        &wal_dir,
-        None,
+    // Without the journal, the open segment lives in memory only.
+    let config = with_journal(
+        pitr_config(
+            &workdir.path().join("source.db"),
+            &backup_dir,
+            &wal_dir,
+            None,
+        ),
+        WalJournalMode::Off,
     );
 
     // A server takes a base backup, archives one write and then stops without shutting

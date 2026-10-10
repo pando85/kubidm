@@ -2377,6 +2377,12 @@ impl<'a> BackendWriteTransaction<'a> {
     ) {
         if wal_pending.is_empty() && !wal_truncate && !wal_stage_failed && wal_server_uuid.is_none()
         {
+            // Nothing to archive, but the database now records this transaction as its
+            // last one: the journal of the open segment notes it, so that an unclean stop
+            // right after it is known to have lost nothing.
+            if let Some(cid) = wal_cid {
+                lock_wal(wal).note_commit(cid.ts);
+            }
             return;
         }
 
@@ -4702,6 +4708,7 @@ mod tests {
             segment_size_bytes,
             segment_interval_seconds: 3600,
             local_path: Some(dir.join("wal")),
+            ..WalArchiveConfig::default()
         };
         let cfg = BackendConfig::new_test("main").with_wal_archive(Some(wal_cfg));
         Backend::new(cfg, wal_test_idxmeta(), false).expect("Failed to setup backend")

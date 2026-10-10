@@ -95,9 +95,15 @@ Recovery restores the newest base backup at or before the target, then applies l
       random nonce and the segment id per segment) and decryption keeps derived keys by salt and parameters, zeroized
       on drop. The container format is unchanged, so segments sealed one by one still open; no release tag contains
       the WAL format (checked with `git tag --contains`)
-- [ ] An unclean stop loses the open segment (up to `segment_interval_seconds` of WAL) from the archive, and more than
-      four closed segments that can not be written are dropped; both are recorded as gaps that recovery does not cross,
-      and only a new base backup makes later points recoverable
+- [x] An unclean stop lost the open segment (up to `segment_interval_seconds` of WAL): every commit now appends its
+      records to a per-segment journal (`open_segment_journal`: `Commit` syncs it in every archiving commit, the
+      default; `Interval` at most every `journal_sync_interval_ms`; `Off` as before), and the next start closes the
+      open and unwritten segments from their journals. A commit that archives nothing is journaled too, so a start
+      compares the journal with the database's last transaction and records only what the journal misses as a gap.
+      Measured cost: one `fdatasync` per write transaction (about 3 ms on the development disk, the same as the
+      database's own commit sync)
+- [ ] More than four closed segments that can not be written are dropped and recorded as gaps (their journals go
+      with them); only a new base backup makes later points recoverable
 - [ ] A restore whose abandoned history can be recorded neither in the archive nor handed over through the WAL directory
       exits 3; until a new online backup is taken after the start, a recovery past it could replay that history
 - [x] `db-scan` quarantine commands bypassed the WAL archive: `quarantine-id2entry` and `restore-quarantined` record a

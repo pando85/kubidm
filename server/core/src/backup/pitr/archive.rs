@@ -933,6 +933,7 @@ mod tests {
             segment_size_bytes: 1024 * 1024,
             segment_interval_seconds: 60,
             local_path: Some(wal_dir.clone()),
+            ..WalArchiveConfig::default()
         };
         let archiver: SharedWalArchiver = Arc::new(Mutex::new(
             WalArchiver::open(wal_cfg.clone(), server, wal_dir.clone(), None).unwrap(),

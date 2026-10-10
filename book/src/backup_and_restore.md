@@ -485,6 +485,10 @@ enabled = true
 # retention_days = 7
 # Where segments are written before they are uploaded. Default: "wal" next to db_path.
 # local_path = "/var/lib/kubidm/wal"
+# How the open segment survives an unclean stop: "Commit" (default), "Interval" or "Off".
+# open_segment_journal = "Commit"
+# With "Interval": sync the journal at most this often. Default 1000.
+# journal_sync_interval_ms = 1000
 # Archive in another S3 location than [online_backup.s3]:
 # [online_backup.wal_archive.s3]
 # bucket = "kubidm-wal"
@@ -535,11 +539,26 @@ backup still present, so the archive always reaches back to the oldest base back
 
 #### What Can Be Lost
 
-Records live in memory until their segment is closed. If the server stops without shutting down (a crash, a kill, a
-power loss) the open segment is lost from the archive, although the transactions themselves are safely committed in the
-database. The next start notices this, logs `WAL ARCHIVE HOLE`, and records a **gap** in the manifest, from the first
-record that was lost up to the last transaction the database committed. A committed transaction whose changes could not
-be recorded is logged and recorded as a gap the same way, while a closed segment that could not be written (for example
+Records live in memory until their segment is closed, and every commit also appends them to the journal of the open
+segment, `<segment>.journal` in the WAL directory. If the server stops without shutting down (a crash, a kill, a power
+loss), the next start closes the open segment, and any closed segment that was not written yet, from its journal, so the
+archive loses nothing. `open_segment_journal` sets how durable the journal is:
+
+- `Commit` (the default) syncs the journal to disk in every commit that archives changes, before the commit returns.
+  Nothing committed is lost, whatever stops the server. It costs one more disk sync per write transaction, on top of the
+  sync of the database itself (a few milliseconds on most disks; write transactions of an identity server are rare
+  compared with its reads).
+- `Interval` writes the journal in every commit but syncs it at most every `journal_sync_interval_ms` (measured on the
+  transaction clock): a crash or kill of the server still loses nothing, since the operating system holds what was
+  written, while a power loss or an operating system crash can lose the commits of that interval.
+- `Off` keeps the open segment in memory only, as before the journal existed: an unclean stop loses it.
+
+Whatever the journal misses is detected: the database records its last committed transaction, and the journal of the
+open segment records every commit, including those that archived no change. The next start compares them, logs `WAL ARCHIVE HOLE` and records
+a **gap** in the manifest from the first transaction the journal misses (the first record of the open segment with
+`Off`) up to the last transaction the database committed. A journal that can not be written stops journaling for the
+rest of the run, with an error. A committed transaction whose changes could not be recorded is logged and recorded as a
+gap the same way, while a closed segment that could not be written (for example
 on a full disk) is kept in memory and retried at least every `segment_interval_seconds`; once more than four such
 segments wait, the write is tried at once, and when it fails again the oldest are dropped and recorded as gaps. A local
 segment that is found damaged is moved aside as `<segment>.corrupt` and its range recorded as a gap. Gaps are kept in
@@ -547,6 +566,8 @@ the WAL directory until the manifest records them, so repeated crashes never los
 silently skip changes, so `recover` refuses any target whose replay would cross one, and `--latest` stops right before
 it. A base backup taken after the gap makes later points recoverable again; take one after any `WAL ARCHIVE HOLE`. With
 S3, segments that were closed but not yet uploaded are lost with the host, which only shortens the recoverable window.
+After an unclean stop, start the server once before running `recover` on the same host: until a start closed the open
+segment from its journal, `recover` treats it as a gap.
 
 The offline `kubidmd domain rename` and `kubidmd database reindex` commands archive their writes like the running server
 does; the next server start uploads them. The `kubidmd db-scan quarantine-id2entry` and `restore-quarantined` repair
@@ -671,9 +692,9 @@ encrypts every closed segment with the backup encryption scheme (AES-256-GCM, a 
 - When the key can not be obtained, nothing is archived: the closed segments stay in the WAL directory, the run is
   logged as failed, and the next run retries. A segment is never archived in plaintext while encryption is enabled.
 
-The only plaintext copies of archived changes are the open segment, held in memory, and closed segments waiting for
-their archive run (at most `segment_interval_seconds`), both in the WAL directory next to the database, which holds the
-same data. The manifest records for every segment the key identifier it was encrypted with, and keeps the SHA-256 of the
+The only plaintext copies of archived changes are the open segment, held in memory and in its journal, and closed
+segments waiting for their archive run (at most `segment_interval_seconds`), all in the WAL directory next to the
+database, which holds the same data. The manifest records for every segment the key identifier it was encrypted with, and keeps the SHA-256 of the
 plaintext segment, which recovery checks after decrypting.
 
 Argon2id is deliberately slow, and segments are small and many, so one derivation per segment would make reading a large
