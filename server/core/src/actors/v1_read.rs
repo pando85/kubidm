@@ -52,9 +52,9 @@ use uuid::Uuid;
 
 use super::QueryServerReadV1;
 use crate::backup::{
-    backup_artifact_name, finalize_local_backup_async, is_backup_artifact_name, run_blocking,
-    seal_backup_async, select_backups_to_delete, verify_backup_output_async, BackupEncryptor,
-    S3ClientWrapper,
+    backup_artifact_name, backup_identity, finalize_local_backup_async, is_backup_artifact_name,
+    run_blocking, seal_backup_async, select_backups_to_delete, verify_backup_output_async,
+    BackupEncryptor, S3ClientWrapper,
 };
 use kubidm_proto::backup::BackupEncryptionConfig;
 
@@ -270,7 +270,7 @@ impl QueryServerReadV1 {
         }
 
         let artifact = self
-            .produce_backup_artifact(compression, encryptor.as_ref())
+            .produce_backup_artifact(compression, encryptor.as_ref(), &dest_file)
             .await
             .inspect_err(|err| {
                 error!(
@@ -400,11 +400,12 @@ impl QueryServerReadV1 {
 
     /// Produce the complete backup artifact in memory: the backend serialises and
     /// compresses the database inside a read transaction, and the result is encrypted
-    /// when an `encryptor` is given.
+    /// when an `encryptor` is given, bound to the `name` it will be stored under.
     async fn produce_backup_artifact(
         &self,
         compression: BackupCompression,
         encryptor: Option<&BackupEncryptor>,
+        name: &Path,
     ) -> Result<Vec<u8>, OperationError> {
         let mut backup_data = Vec::new();
 
@@ -421,7 +422,7 @@ impl QueryServerReadV1 {
                 })?;
         }
 
-        seal_backup_async(backup_data, compression, encryptor)
+        seal_backup_async(backup_data, compression, encryptor, backup_identity(name))
             .await
             .map_err(|err| {
                 error!(%err, "Online backup failed to encrypt the backup");
@@ -446,9 +447,12 @@ impl QueryServerReadV1 {
     ) -> Result<OnlineBackupOutcome, OperationError> {
         trace!(eventid = ?msg.eventid, "Begin S3 backup event");
 
-        let backup_data = Arc::new(self.produce_backup_artifact(compression, encryptor).await?);
-
         let object_key = backup_artifact_name(timestamp, compression, encryptor.is_some());
+
+        let backup_data = Arc::new(
+            self.produce_backup_artifact(compression, encryptor, Path::new(&object_key))
+                .await?,
+        );
 
         // A backup that can not be read back is never uploaded, so the bucket only ever
         // holds artifacts that passed the same structural checks as `verify-backup`. An

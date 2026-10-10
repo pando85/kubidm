@@ -4,7 +4,11 @@
 //! [`open_backup_bytes`] or [`open_backup_file`]: the encrypted container is recognised by
 //! its magic first, decrypted with the key the configuration names, and only the plaintext
 //! is handed to the compression detection and the parser. Every writer goes through
-//! [`seal_backup`], which leaves a plain backup untouched and encrypts it otherwise.
+//! [`seal_backup_async`], which leaves a plain backup untouched and encrypts it otherwise.
+//!
+//! An encrypted backup records the timestamp of the name it is written under (see
+//! [`backup_identity`]), and is only opened under a timestamped name when that name carries
+//! the same timestamp: an older backup copied over a newer name is refused.
 
 use std::fmt;
 use std::fs::File;
@@ -12,13 +16,14 @@ use std::io::{Cursor, Read};
 use std::path::Path;
 
 use kubidm_proto::backup::{
-    is_encrypted_backup_name, BackupCompression, BackupEncryptionConfig, BackupEncryptionHeader,
-    BACKUP_ENCRYPTED_SUFFIX, BACKUP_ENCRYPTION_MAGIC,
+    is_encrypted_backup_name, BackupArtifactIdentity, BackupCompression, BackupEncryptionConfig,
+    BackupEncryptionHeader, BACKUP_ENCRYPTED_SUFFIX, BACKUP_ENCRYPTION_MAGIC,
 };
 
 use super::encryption::{
     is_encrypted_artifact, read_encryption_header, BackupEncryptionError, BackupEncryptor,
 };
+use super::retention::is_backup_artifact_name;
 use super::run_blocking;
 
 /// A backup artifact resolved to the plaintext a restore can parse.
@@ -111,39 +116,69 @@ impl fmt::Display for BackupOpenError {
 
 impl std::error::Error for BackupOpenError {}
 
-/// Turn a serialised, compressed backup into the bytes that are stored: unchanged without
-/// an encryptor, the encrypted container with one.
-pub fn seal_backup(
+/// The timestamp in an automatically generated backup name, `backup-<timestamp>.json...`,
+/// or `None` for any other name.
+pub fn backup_name_timestamp(file_name: &str) -> Option<&str> {
+    if !is_backup_artifact_name(file_name) {
+        return None;
+    }
+    let rest = file_name.strip_prefix("backup-")?;
+    rest.find(".json").map(|end| &rest[..end])
+}
+
+/// What a backup stored under `name` (a path, file name or object key) is sealed and
+/// opened as: the backup taken at the timestamp of an automatically generated name, or any
+/// backup for another name, which does not claim when it was taken. Only the last path
+/// component counts, so the copies of a backup in other directories, buckets or prefixes
+/// under the same name are the same artifact.
+pub fn backup_identity(name: &Path) -> BackupArtifactIdentity {
+    let taken_at = name
+        .file_name()
+        .and_then(|file_name| file_name.to_str())
+        .and_then(backup_name_timestamp)
+        .map(str::to_string);
+    BackupArtifactIdentity::Backup { taken_at }
+}
+
+/// Turn a serialised, compressed backup or WAL segment into the bytes that are stored:
+/// unchanged without an encryptor, the encrypted container recording `artifact` with one.
+fn seal_backup(
     plaintext: Vec<u8>,
     compression: BackupCompression,
     encryptor: Option<&BackupEncryptor>,
+    artifact: &BackupArtifactIdentity,
 ) -> Result<Vec<u8>, BackupEncryptionError> {
     match encryptor {
-        Some(encryptor) => encryptor.encrypt(&plaintext, compression),
+        Some(encryptor) => encryptor.encrypt(&plaintext, compression, artifact),
         None => Ok(plaintext),
     }
 }
 
-/// [`seal_backup`] for async callers: the Argon2id key derivation and the encryption of
-/// the whole backup run on the blocking thread pool so that they never stall the async
-/// runtime. A plain backup is returned as it is.
+/// Seal a backup (see [`backup_identity`]) or WAL segment
+/// ([`BackupArtifactIdentity::wal_segment`]) for storage: unchanged without an encryptor,
+/// encrypted with one. The Argon2id key derivation and the encryption of the whole
+/// artifact run on the blocking thread pool so that they never stall the async runtime.
 pub async fn seal_backup_async(
     plaintext: Vec<u8>,
     compression: BackupCompression,
     encryptor: Option<&BackupEncryptor>,
+    artifact: BackupArtifactIdentity,
 ) -> Result<Vec<u8>, BackupEncryptionError> {
     let Some(encryptor) = encryptor.cloned() else {
         return Ok(plaintext);
     };
-    tokio::task::spawn_blocking(move || encryptor.encrypt(&plaintext, compression))
-        .await
-        .map_err(|err| {
-            BackupEncryptionError::EncryptionFailed(format!("the encryption task failed: {err}"))
-        })?
+    tokio::task::spawn_blocking(move || {
+        seal_backup(plaintext, compression, Some(&encryptor), &artifact)
+    })
+    .await
+    .map_err(|err| {
+        BackupEncryptionError::EncryptionFailed(format!("the encryption task failed: {err}"))
+    })?
 }
 
 /// Open an artifact held in memory. `name` is the file name or object key the artifact
-/// is stored under; it only matters for the compression of a plain artifact.
+/// is stored under: it gives the compression of a plain artifact, and an encrypted one
+/// must have been sealed as [`backup_identity`] of it. An empty name claims no timestamp.
 ///
 /// With `strict` set, the artifact must match the configuration: an encrypted artifact
 /// needs an encryptor and a plain artifact must not come with one. This is what the
@@ -174,7 +209,9 @@ pub fn open_backup_bytes(
         });
     };
 
-    let (plaintext, header) = encryptor.decrypt(&data).map_err(BackupOpenError::Decrypt)?;
+    let (plaintext, header) = encryptor
+        .decrypt(&data, &backup_identity(name))
+        .map_err(BackupOpenError::Decrypt)?;
     Ok(OpenedBackup {
         reader: Box::new(Cursor::new(plaintext)),
         compression: if header.compressed {
@@ -345,6 +382,11 @@ mod tests {
         BackupEncryptor::with_key_material(config(None), passphrase.to_vec()).unwrap()
     }
 
+    /// The identity of a backup whose name claims no timestamp.
+    fn unnamed() -> BackupArtifactIdentity {
+        BackupArtifactIdentity::Backup { taken_at: None }
+    }
+
     fn gzip(bytes: &[u8]) -> Vec<u8> {
         let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
         encoder.write_all(bytes).unwrap();
@@ -361,15 +403,26 @@ mod tests {
     fn test_seal_backup_passes_plain_through_and_encrypts_otherwise() {
         let plain = b"{\"entries\": []}".to_vec();
         assert_eq!(
-            seal_backup(plain.clone(), BackupCompression::NoCompression, None).unwrap(),
+            seal_backup(
+                plain.clone(),
+                BackupCompression::NoCompression,
+                None,
+                &unnamed()
+            )
+            .unwrap(),
             plain
         );
 
         let enc = encryptor(b"pw");
-        let sealed =
-            seal_backup(plain.clone(), BackupCompression::NoCompression, Some(&enc)).unwrap();
+        let sealed = seal_backup(
+            plain.clone(),
+            BackupCompression::NoCompression,
+            Some(&enc),
+            &unnamed(),
+        )
+        .unwrap();
         assert!(is_encrypted_artifact(&sealed));
-        assert_eq!(enc.decrypt(&sealed).unwrap().0, plain);
+        assert_eq!(enc.decrypt(&sealed, &unnamed()).unwrap().0, plain);
     }
 
     #[test]
@@ -429,7 +482,7 @@ mod tests {
             (BackupCompression::NoCompression, b"{}".to_vec()),
             (BackupCompression::Gzip, gzip(b"{}")),
         ] {
-            let sealed = enc.encrypt(&plaintext, compression).unwrap();
+            let sealed = enc.encrypt(&plaintext, compression, &unnamed()).unwrap();
             // The name deliberately lies about the compression: the header wins.
             let opened =
                 open_backup_bytes(sealed, Path::new("renamed.bin"), Some(&enc), true).unwrap();
@@ -443,7 +496,7 @@ mod tests {
     fn test_open_backup_bytes_encrypted_without_key_names_the_key() {
         let enc = encryptor(b"pw");
         let sealed = enc
-            .encrypt(b"{}", BackupCompression::NoCompression)
+            .encrypt(b"{}", BackupCompression::NoCompression, &unnamed())
             .unwrap();
         match open_backup_bytes(sealed, Path::new("backup.json.enc"), None, false) {
             Err(BackupOpenError::EncryptedWithoutKey { key_identifier }) => {
@@ -454,7 +507,7 @@ mod tests {
 
         let wrong = encryptor(b"other");
         let sealed = enc
-            .encrypt(b"{}", BackupCompression::NoCompression)
+            .encrypt(b"{}", BackupCompression::NoCompression, &unnamed())
             .unwrap();
         match open_backup_bytes(sealed, Path::new("backup.json.enc"), Some(&wrong), false) {
             Err(BackupOpenError::Decrypt(BackupEncryptionError::DecryptionFailed {
@@ -512,8 +565,12 @@ mod tests {
         let encrypted = dir.path().join("backup-2024-01-01T22:00:00Z.json.gz.enc");
         std::fs::write(
             &encrypted,
-            enc.encrypt(&gzip(b"{\"enc\": true}"), BackupCompression::Gzip)
-                .unwrap(),
+            enc.encrypt(
+                &gzip(b"{\"enc\": true}"),
+                BackupCompression::Gzip,
+                &backup_identity(&encrypted),
+            )
+            .unwrap(),
         )
         .unwrap();
         let opened = open_backup_file(&encrypted, Some(&enc)).unwrap();
@@ -543,8 +600,12 @@ mod tests {
         let encrypted = dir.path().join("backup-2024-01-01T22:00:00Z.json.enc");
         std::fs::write(
             &encrypted,
-            enc.encrypt(b"{}", BackupCompression::NoCompression)
-                .unwrap(),
+            enc.encrypt(
+                b"{}",
+                BackupCompression::NoCompression,
+                &backup_identity(&encrypted),
+            )
+            .unwrap(),
         )
         .unwrap();
 
@@ -594,6 +655,103 @@ mod tests {
             open_backup_file_with_config(&encrypted, Some(&good)).await,
             Err(BackupOpenError::Decrypt(
                 BackupEncryptionError::DecryptionFailed { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn test_backup_identity_of_names() {
+        for (name, taken_at) in [
+            (
+                "backup-2026-10-01T00:00:00Z.json.gz.enc",
+                Some("2026-10-01T00:00:00Z"),
+            ),
+            (
+                "/var/backups/backup-2026-10-01T00:00:00.123Z.json",
+                Some("2026-10-01T00:00:00.123Z"),
+            ),
+            (
+                "prefix/backup-2026-10-01T00:00:00Z.json.enc",
+                Some("2026-10-01T00:00:00Z"),
+            ),
+            ("kubidm-before-upgrade.json.gz.enc", None),
+            ("backup.json.gz.enc", None),
+            ("backup-2026-10-01T00:00:00Z.json.gz.enc.invalid", None),
+            ("", None),
+        ] {
+            assert_eq!(
+                backup_identity(Path::new(name)),
+                BackupArtifactIdentity::Backup {
+                    taken_at: taken_at.map(str::to_string)
+                },
+                "{name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_older_backup_copied_under_a_newer_name_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let passphrase_path = dir.path().join("passphrase");
+        std::fs::write(&passphrase_path, "pw\n").unwrap();
+        let enc = encryptor(b"pw");
+
+        let january = dir.path().join("backup-2026-01-01T00:00:00Z.json.gz.enc");
+        let sealed = seal_backup_async(
+            gzip(b"{\"january\": true}"),
+            BackupCompression::Gzip,
+            Some(&enc),
+            backup_identity(&january),
+        )
+        .await
+        .unwrap();
+        std::fs::write(&january, &sealed).unwrap();
+        assert!(open_backup_file(&january, Some(&enc)).is_ok());
+
+        // The January backup copied over the October name decrypts fine, but is not the
+        // backup the name claims: restoring it would silently roll the directory back.
+        let october = dir.path().join("backup-2026-10-01T00:00:00Z.json.gz.enc");
+        std::fs::write(&october, &sealed).unwrap();
+        for result in [
+            open_backup_file(&october, Some(&enc)),
+            open_backup_file_with_config(&october, Some(&config(Some(&passphrase_path)))).await,
+            open_backup_bytes(sealed.clone(), &october, Some(&enc), false),
+        ] {
+            match result {
+                Err(BackupOpenError::Decrypt(BackupEncryptionError::ArtifactMismatch {
+                    expected,
+                    recorded,
+                })) => {
+                    assert_eq!(expected, backup_identity(&october));
+                    assert_eq!(recorded, backup_identity(&january));
+                }
+                other => panic!("expected ArtifactMismatch, got {other:?}"),
+            }
+        }
+
+        // A copy under a name that claims no time (a download, an operator's copy) opens
+        // and still tells when the backup was taken.
+        let copy = dir.path().join("kubidm-latest.json.gz.enc");
+        std::fs::write(&copy, &sealed).unwrap();
+        let opened = open_backup_file(&copy, Some(&enc)).unwrap();
+        assert_eq!(
+            opened.encryption.map(|header| header.artifact),
+            Some(backup_identity(&january))
+        );
+
+        // A WAL segment is never a backup.
+        let segment = seal_backup_async(
+            gzip(b"{}"),
+            BackupCompression::Gzip,
+            Some(&enc),
+            BackupArtifactIdentity::wal_segment("seg-1"),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            open_backup_bytes(segment, &copy, Some(&enc), false),
+            Err(BackupOpenError::Decrypt(
+                BackupEncryptionError::ArtifactMismatch { .. }
             ))
         ));
     }

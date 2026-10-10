@@ -94,7 +94,6 @@ Recovery restores the newest base backup at or before the target, then applies l
 - [ ] `db-scan` quarantine commands bypass the WAL archive (documented)
 - [ ] Manual `database backup` files are not PITR bases
 - [ ] The online backup still serialises inside the read transaction on the runtime, and restore writes on the runtime
-- [ ] An older valid encrypted backup copied under a newer name still restores
 
 ### Follow-up issues, not blocking
 

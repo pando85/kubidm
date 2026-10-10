@@ -274,9 +274,10 @@ When it is enabled, every backup made from this configuration is encrypted: the 
 S3, `kubidmd database backup` and `kubidmd scripting backup` (also when it writes to stdout). The backup is serialised
 and compressed as usual and the result is then sealed with AES-256-GCM under a key derived from the configured secret
 with Argon2id and a fresh random salt. The artifact is a self-describing container: a header with the salt, the key
-derivation parameters, the nonce, the key identifier and the compression, followed by the ciphertext. The header is
-authenticated together with the ciphertext, so any change to either, a truncation or a header taken from another
-artifact makes the artifact fail to open. Nothing but the secret is needed to open it.
+derivation parameters, the nonce, the key identifier, the compression and what the artifact is (a backup and the
+timestamp of its name, or a WAL segment and its id), followed by the ciphertext. The header is authenticated together
+with the ciphertext, so any change to either, a truncation or a header taken from another artifact makes the artifact
+fail to open. Nothing but the secret is needed to open it.
 
 #### Key Sources
 
@@ -323,10 +324,17 @@ decrypt it. Without a configured identifier the key is simply tried.
 Encrypted artifacts get the extra suffix `.enc` after the compression suffix: `backup-<timestamp>.json.enc` and
 `backup-<timestamp>.json.gz.enc`. Retention, `list-backups` and the post-write verification treat them as first class
 backups, and a rejected encrypted artifact is quarantined as `...json.gz.enc.invalid` like a plain one. The suffix is
-mostly informational: an encrypted container is recognised by its content, so a renamed artifact still restores. The
-reverse is refused: an artifact named `.enc`, or an S3 object whose name or metadata says it is encrypted, must be an
-encrypted container, so that whoever can write to the backup location can not swap an encrypted backup for an
-unauthenticated plain one.
+mostly informational: an encrypted container is recognised by its content. The reverse is refused: an artifact named
+`.enc`, or an S3 object whose name or metadata says it is encrypted, must be an encrypted container, so that whoever can
+write to the backup location can not swap an encrypted backup for an unauthenticated plain one.
+
+An encrypted backup also records the timestamp of the name it was written under, `backup-<timestamp>.json[.gz].enc`.
+Under a name of that form it only opens when the name carries the same timestamp, so an older backup copied over the
+name or the S3 key of a newer one is refused instead of silently restoring the older state. Under any other name, such
+as a copy to removable media or a manual `database backup` to a path of your choice, it opens and restores normally;
+such a name does not claim when the backup was taken. Copies under the same name, in another directory, bucket, prefix
+or [replication region](#encrypted-backups-and-replication), are the same artifact and open everywhere. A WAL segment is
+bound to its segment id the same way, and a segment is never accepted as a backup or the other way round.
 
 What is and is not encrypted:
 
@@ -555,7 +563,8 @@ plaintext segment, which recovery checks after decrypting.
 `restore`; the key is only obtained when an encrypted segment or base backup is actually read. It fails, and changes
 nothing, when a segment is encrypted and encryption is not enabled, when the key can not be obtained, or when it does
 not open the segment, naming the key identifier the segment needs. A segment the manifest records as encrypted must be
-an encrypted container, so a plain object can not be swapped in for it. Base backups are encrypted by the same setting,
+an encrypted container, so a plain object can not be swapped in for it, and an encrypted segment must have been sealed
+under the segment id it is stored as, so another segment can not be swapped in either. Base backups are encrypted by the same setting,
 so one secret recovers both. Key rotation works as for backups: keep every previous secret for as long as segments or
 base backups written with it are retained, which is at least `retention_days` and the age of the oldest base backup.
 

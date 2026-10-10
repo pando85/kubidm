@@ -19,6 +19,12 @@
 //! modified ciphertext. The whole artifact is one AEAD message, so truncation and
 //! reordering are detected by the tag as well.
 //!
+//! The header also records what the artifact is ([`BackupArtifactIdentity`]): a backup
+//! and the timestamp of its name, or a WAL segment and its id. Every reader states what it
+//! expects to open, so a valid artifact copied over another one (an old backup under the
+//! name of a newer one, a segment under the id of another) is refused rather than
+//! silently restoring the wrong content.
+//!
 //! Every key source yields *key material* (a passphrase, the bytes of a key file or the body
 //! of an HTTP response). The material is never used as the cipher key directly: the cipher
 //! key is derived from it with Argon2id and the per-artifact salt stored in the header, so
@@ -36,8 +42,8 @@ use crypto_glue::aes256::key_from_slice;
 use crypto_glue::aes256gcm::{Aead, Aes256Gcm, Aes256GcmNonce, KeyInit, Payload};
 use crypto_glue::traits::Zeroizing;
 use kubidm_proto::backup::{
-    BackupCompression, BackupEncryptionConfig, BackupEncryptionHeader, EncryptionKeySource,
-    KeyDerivationParams, BACKUP_ENCRYPTION_KEY_LEN, BACKUP_ENCRYPTION_MAGIC,
+    BackupArtifactIdentity, BackupCompression, BackupEncryptionConfig, BackupEncryptionHeader,
+    EncryptionKeySource, KeyDerivationParams, BACKUP_ENCRYPTION_KEY_LEN, BACKUP_ENCRYPTION_MAGIC,
     BACKUP_ENCRYPTION_NONCE_LEN, BACKUP_ENCRYPTION_SALT_LEN,
 };
 use rand::Rng;
@@ -103,6 +109,14 @@ pub enum BackupEncryptionError {
         artifact_key: String,
         configured_key: String,
     },
+    /// The artifact was sealed as something else than what it is opened as, for example an
+    /// older backup copied under the name of a newer one.
+    ArtifactMismatch {
+        /// What the artifact was opened as.
+        expected: BackupArtifactIdentity,
+        /// What the artifact records it is.
+        recorded: BackupArtifactIdentity,
+    },
     KeyDerivationFailed(String),
     InvalidKeyLength,
     InvalidNonceLength,
@@ -140,6 +154,11 @@ impl fmt::Display for BackupEncryptionError {
                 f,
                 "the artifact was encrypted with key '{artifact_key}' but the configured \
                  key_identifier is '{configured_key}'"
+            ),
+            BackupEncryptionError::ArtifactMismatch { expected, recorded } => write!(
+                f,
+                "the artifact holds {recorded} but was opened as {expected}; it was copied or \
+                 renamed over another artifact, so it is refused"
             ),
             BackupEncryptionError::KeyDerivationFailed(msg) => {
                 write!(f, "key derivation failed: {msg}")
@@ -216,9 +235,11 @@ pub fn read_encryption_header(
         return Err(BackupEncryptionError::InvalidMagic);
     }
 
-    // The identifier ends up in log lines and terminal output before the header is
-    // authenticated, so it must not be able to carry escape sequences.
-    if header.key_identifier.chars().any(char::is_control) {
+    // The identifiers end up in log lines and terminal output before the header is
+    // authenticated, so they must not be able to carry escape sequences.
+    if header.key_identifier.chars().any(char::is_control)
+        || header.artifact.has_control_characters()
+    {
         return Err(BackupEncryptionError::InvalidHeader);
     }
 
@@ -565,11 +586,13 @@ impl BackupEncryptor {
         &self.key_identifier
     }
 
-    /// Seal a serialised (and possibly compressed) backup into an encrypted container.
+    /// Seal a serialised (and possibly compressed) backup or WAL segment into an encrypted
+    /// container that records, authenticated, that it is `artifact`.
     pub fn encrypt(
         &self,
         plaintext: &[u8],
         compression: BackupCompression,
+        artifact: &BackupArtifactIdentity,
     ) -> Result<Vec<u8>, BackupEncryptionError> {
         let mut rng = rand::rng();
         let mut salt = vec![0u8; BACKUP_ENCRYPTION_SALT_LEN];
@@ -585,6 +608,7 @@ impl BackupEncryptor {
             nonce_bytes.to_vec(),
             self.config.key_derivation.clone(),
             compression == BackupCompression::Gzip,
+            artifact.clone(),
         );
 
         let header_json = serde_json::to_vec(&header)
@@ -621,12 +645,17 @@ impl BackupEncryptor {
         Ok(output)
     }
 
-    /// Open an encrypted container with this key. When a `key_identifier` is configured it
-    /// must match the one in the header; otherwise the key is simply tried and a failure
-    /// names both identifiers.
+    /// Open an encrypted container with this key, as the artifact `expected` (see
+    /// [`BackupArtifactIdentity::accepts`]). When a `key_identifier` is configured it must
+    /// match the one in the header; otherwise the key is simply tried and a failure names
+    /// both identifiers.
+    ///
+    /// Both checks of the header happen before the key derivation. A header forged to pass
+    /// them still fails the authentication that follows.
     pub fn decrypt(
         &self,
         data: &[u8],
+        expected: &BackupArtifactIdentity,
     ) -> Result<(Vec<u8>, BackupEncryptionHeader), BackupEncryptionError> {
         let (header, ciphertext_start) = read_encryption_header(data)?;
 
@@ -637,6 +666,13 @@ impl BackupEncryptor {
                     configured_key: configured.clone(),
                 });
             }
+        }
+
+        if !expected.accepts(&header.artifact) {
+            return Err(BackupEncryptionError::ArtifactMismatch {
+                expected: expected.clone(),
+                recorded: header.artifact,
+            });
         }
 
         validate_key_derivation_params(&header.key_derivation)
@@ -723,6 +759,13 @@ mod tests {
         }
     }
 
+    /// The identity most tests seal and open their artifacts as.
+    fn backup_id() -> BackupArtifactIdentity {
+        BackupArtifactIdentity::Backup {
+            taken_at: Some("2026-10-01T00:00:00Z".to_string()),
+        }
+    }
+
     fn config(key_identifier: Option<&str>) -> BackupEncryptionConfig {
         BackupEncryptionConfig {
             enabled: true,
@@ -781,7 +824,9 @@ mod tests {
         let enc = encryptor(b"correct horse battery staple", None);
         for compression in [BackupCompression::NoCompression, BackupCompression::Gzip] {
             let plaintext = b"{\"entries\": []}";
-            let sealed = enc.encrypt(plaintext, compression).expect("encrypt");
+            let sealed = enc
+                .encrypt(plaintext, compression, &backup_id())
+                .expect("encrypt");
 
             assert!(is_encrypted_artifact(&sealed));
             assert!(
@@ -789,7 +834,7 @@ mod tests {
                 "plaintext must not appear in the container"
             );
 
-            let (opened, header) = enc.decrypt(&sealed).expect("decrypt");
+            let (opened, header) = enc.decrypt(&sealed, &backup_id()).expect("decrypt");
             assert_eq!(opened, plaintext);
             assert_eq!(header.compressed, compression == BackupCompression::Gzip);
             assert_eq!(header.key_identifier, enc.key_identifier());
@@ -803,20 +848,30 @@ mod tests {
     fn test_encrypt_empty_and_large_plaintext() {
         let enc = encryptor(b"pw", None);
         let (opened, _) = enc
-            .decrypt(&enc.encrypt(b"", BackupCompression::NoCompression).unwrap())
+            .decrypt(
+                &enc.encrypt(b"", BackupCompression::NoCompression, &backup_id())
+                    .unwrap(),
+                &backup_id(),
+            )
             .unwrap();
         assert!(opened.is_empty());
 
         let large = vec![0xabu8; 2 * 1024 * 1024];
-        let sealed = enc.encrypt(&large, BackupCompression::Gzip).unwrap();
-        assert_eq!(enc.decrypt(&sealed).unwrap().0, large);
+        let sealed = enc
+            .encrypt(&large, BackupCompression::Gzip, &backup_id())
+            .unwrap();
+        assert_eq!(enc.decrypt(&sealed, &backup_id()).unwrap().0, large);
     }
 
     #[test]
     fn test_encrypt_uses_fresh_salt_and_nonce() {
         let enc = encryptor(b"pw", None);
-        let a = enc.encrypt(b"same", BackupCompression::Gzip).unwrap();
-        let b = enc.encrypt(b"same", BackupCompression::Gzip).unwrap();
+        let a = enc
+            .encrypt(b"same", BackupCompression::Gzip, &backup_id())
+            .unwrap();
+        let b = enc
+            .encrypt(b"same", BackupCompression::Gzip, &backup_id())
+            .unwrap();
         assert_ne!(a, b);
         let (ha, _) = read_encryption_header(&a).unwrap();
         let (hb, _) = read_encryption_header(&b).unwrap();
@@ -829,9 +884,11 @@ mod tests {
     fn test_decrypt_with_wrong_key_names_both_identifiers() {
         let writer = key_file_encryptor(b"right");
         let reader = key_file_encryptor(b"wrong");
-        let sealed = writer.encrypt(b"secret", BackupCompression::Gzip).unwrap();
+        let sealed = writer
+            .encrypt(b"secret", BackupCompression::Gzip, &backup_id())
+            .unwrap();
 
-        match reader.decrypt(&sealed) {
+        match reader.decrypt(&sealed, &backup_id()) {
             Err(BackupEncryptionError::DecryptionFailed {
                 artifact_key,
                 configured_key,
@@ -847,11 +904,13 @@ mod tests {
     #[test]
     fn test_decrypt_rejects_configured_key_identifier_mismatch() {
         let writer = encryptor(b"pw", Some("backup-key-2024"));
-        let sealed = writer.encrypt(b"secret", BackupCompression::Gzip).unwrap();
+        let sealed = writer
+            .encrypt(b"secret", BackupCompression::Gzip, &backup_id())
+            .unwrap();
 
         // Same material, different configured identifier: rejected before any decryption.
         let reader = encryptor(b"pw", Some("backup-key-2025"));
-        match reader.decrypt(&sealed) {
+        match reader.decrypt(&sealed, &backup_id()) {
             Err(BackupEncryptionError::KeyIdentifierMismatch {
                 artifact_key,
                 configured_key,
@@ -864,10 +923,14 @@ mod tests {
 
         // Without a configured identifier the key is tried and works.
         let reader = encryptor(b"pw", None);
-        assert_eq!(reader.decrypt(&sealed).unwrap().0, b"secret");
+        assert_eq!(reader.decrypt(&sealed, &backup_id()).unwrap().0, b"secret");
         // And the artifact keeps the identifier it was written with.
         assert_eq!(
-            reader.decrypt(&sealed).unwrap().1.key_identifier,
+            reader
+                .decrypt(&sealed, &backup_id())
+                .unwrap()
+                .1
+                .key_identifier,
             "backup-key-2024"
         );
     }
@@ -875,14 +938,16 @@ mod tests {
     #[test]
     fn test_decrypt_detects_tampering() {
         let enc = encryptor(b"pw", None);
-        let sealed = enc.encrypt(b"secret", BackupCompression::Gzip).unwrap();
+        let sealed = enc
+            .encrypt(b"secret", BackupCompression::Gzip, &backup_id())
+            .unwrap();
         let (_, ciphertext_start) = read_encryption_header(&sealed).unwrap();
 
         // Flip a ciphertext byte.
         let mut tampered = sealed.clone();
         tampered[ciphertext_start + 1] ^= 0x01;
         assert!(matches!(
-            enc.decrypt(&tampered),
+            enc.decrypt(&tampered, &backup_id()),
             Err(BackupEncryptionError::DecryptionFailed { .. })
         ));
 
@@ -891,14 +956,14 @@ mod tests {
         let last = tampered.len() - 1;
         tampered[last] ^= 0x80;
         assert!(matches!(
-            enc.decrypt(&tampered),
+            enc.decrypt(&tampered, &backup_id()),
             Err(BackupEncryptionError::DecryptionFailed { .. })
         ));
 
         // Truncate the ciphertext.
         let truncated = &sealed[..sealed.len() - 4];
         assert!(matches!(
-            enc.decrypt(truncated),
+            enc.decrypt(truncated, &backup_id()),
             Err(BackupEncryptionError::DecryptionFailed { .. })
         ));
     }
@@ -906,7 +971,9 @@ mod tests {
     #[test]
     fn test_decrypt_rejects_modified_header_salt() {
         let enc = encryptor(b"pw", None);
-        let sealed = enc.encrypt(b"secret", BackupCompression::Gzip).unwrap();
+        let sealed = enc
+            .encrypt(b"secret", BackupCompression::Gzip, &backup_id())
+            .unwrap();
         let (mut header, ciphertext_start) = read_encryption_header(&sealed).unwrap();
         header.salt = vec![0u8; BACKUP_ENCRYPTION_SALT_LEN];
 
@@ -917,7 +984,7 @@ mod tests {
         rebuilt.extend_from_slice(&sealed[ciphertext_start..]);
 
         assert!(matches!(
-            enc.decrypt(&rebuilt),
+            enc.decrypt(&rebuilt, &backup_id()),
             Err(BackupEncryptionError::DecryptionFailed { .. })
         ));
     }
@@ -927,19 +994,21 @@ mod tests {
         // Without a configured identifier, so that no field is checked before the AEAD.
         let enc = encryptor(b"pw", None);
         for compression in [BackupCompression::NoCompression, BackupCompression::Gzip] {
-            let sealed = enc.encrypt(b"secret", compression).unwrap();
+            let sealed = enc.encrypt(b"secret", compression, &backup_id()).unwrap();
             let (header, ciphertext_start) = read_encryption_header(&sealed).unwrap();
             let ciphertext = &sealed[ciphertext_start..];
 
             // Re-serialising the unmodified header reproduces the container and opens.
             assert_eq!(rebuild(&header, ciphertext), sealed);
-            assert!(enc.decrypt(&rebuild(&header, ciphertext)).is_ok());
+            assert!(enc
+                .decrypt(&rebuild(&header, ciphertext), &backup_id())
+                .is_ok());
 
             // A flipped compression flag would make a restore misread the plaintext.
             let mut flipped = header.clone();
             flipped.compressed = !flipped.compressed;
             assert!(matches!(
-                enc.decrypt(&rebuild(&flipped, ciphertext)),
+                enc.decrypt(&rebuild(&flipped, ciphertext), &backup_id()),
                 Err(BackupEncryptionError::DecryptionFailed { .. })
             ));
 
@@ -947,7 +1016,7 @@ mod tests {
             let mut renamed = header.clone();
             renamed.key_identifier = "someone-else".to_string();
             assert!(matches!(
-                enc.decrypt(&rebuild(&renamed, ciphertext)),
+                enc.decrypt(&rebuild(&renamed, ciphertext), &backup_id()),
                 Err(BackupEncryptionError::DecryptionFailed { .. })
             ));
 
@@ -959,10 +1028,86 @@ mod tests {
             respaced.extend_from_slice(ciphertext);
             assert_eq!(read_encryption_header(&respaced).unwrap().0, header);
             assert!(matches!(
-                enc.decrypt(&respaced),
+                enc.decrypt(&respaced, &backup_id()),
                 Err(BackupEncryptionError::DecryptionFailed { .. })
             ));
         }
+    }
+
+    #[test]
+    fn test_decrypt_refuses_an_artifact_opened_as_another_one() {
+        let enc = encryptor(b"pw", None);
+        let january = BackupArtifactIdentity::Backup {
+            taken_at: Some("2026-01-01T00:00:00Z".to_string()),
+        };
+        let unnamed = BackupArtifactIdentity::Backup { taken_at: None };
+        let segment = BackupArtifactIdentity::wal_segment("seg-1");
+
+        // An old backup copied over the name of a newer one: valid, but not what the name
+        // claims, so it would silently roll the restore back.
+        let old = enc
+            .encrypt(b"january", BackupCompression::Gzip, &january)
+            .unwrap();
+        match enc.decrypt(&old, &backup_id()) {
+            Err(BackupEncryptionError::ArtifactMismatch { expected, recorded }) => {
+                assert_eq!(expected, backup_id());
+                assert_eq!(recorded, january);
+            }
+            other => panic!("expected ArtifactMismatch, got {other:?}"),
+        }
+        // Opened under its own name, or under a name that claims no time, it opens.
+        assert_eq!(enc.decrypt(&old, &january).unwrap().0, b"january");
+        let (_, header) = enc.decrypt(&old, &unnamed).unwrap();
+        assert_eq!(header.artifact, january);
+
+        // A manual backup without a timestamped name can not take the place of one.
+        let manual = enc
+            .encrypt(b"manual", BackupCompression::Gzip, &unnamed)
+            .unwrap();
+        assert!(matches!(
+            enc.decrypt(&manual, &backup_id()),
+            Err(BackupEncryptionError::ArtifactMismatch { .. })
+        ));
+        assert!(enc.decrypt(&manual, &unnamed).is_ok());
+
+        // A WAL segment is neither a backup nor another segment, and the other way round.
+        let wal = enc
+            .encrypt(b"wal", BackupCompression::Gzip, &segment)
+            .unwrap();
+        assert!(enc.decrypt(&wal, &segment).is_ok());
+        for expected in [
+            unnamed.clone(),
+            backup_id(),
+            BackupArtifactIdentity::wal_segment("seg-2"),
+        ] {
+            assert!(matches!(
+                enc.decrypt(&wal, &expected),
+                Err(BackupEncryptionError::ArtifactMismatch { .. })
+            ));
+        }
+        assert!(matches!(
+            enc.decrypt(&old, &segment),
+            Err(BackupEncryptionError::ArtifactMismatch { .. })
+        ));
+
+        // The identity is authenticated: rewriting it in the header to pass the check
+        // breaks the tag.
+        let (mut header, ciphertext_start) = read_encryption_header(&old).unwrap();
+        header.artifact = backup_id();
+        assert!(matches!(
+            enc.decrypt(&rebuild(&header, &old[ciphertext_start..]), &backup_id()),
+            Err(BackupEncryptionError::DecryptionFailed { .. })
+        ));
+
+        let err = BackupEncryptionError::ArtifactMismatch {
+            expected: backup_id(),
+            recorded: january,
+        }
+        .to_string();
+        assert!(
+            err.contains("2026-01-01T00:00:00Z") && err.contains("2026-10-01T00:00:00Z"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -970,15 +1115,19 @@ mod tests {
         // Two artifacts of the same key: the ciphertext of one under the header of the
         // other must not open.
         let enc = encryptor(b"pw", None);
-        let a = enc.encrypt(b"first", BackupCompression::Gzip).unwrap();
-        let b = enc.encrypt(b"second", BackupCompression::Gzip).unwrap();
+        let a = enc
+            .encrypt(b"first", BackupCompression::Gzip, &backup_id())
+            .unwrap();
+        let b = enc
+            .encrypt(b"second", BackupCompression::Gzip, &backup_id())
+            .unwrap();
         let (header_a, start_a) = read_encryption_header(&a).unwrap();
         let (_, start_b) = read_encryption_header(&b).unwrap();
         let mut spliced = a[..start_a].to_vec();
         spliced.extend_from_slice(&b[start_b..]);
         assert_eq!(read_encryption_header(&spliced).unwrap().0, header_a);
         assert!(matches!(
-            enc.decrypt(&spliced),
+            enc.decrypt(&spliced, &backup_id()),
             Err(BackupEncryptionError::DecryptionFailed { .. })
         ));
     }
@@ -991,7 +1140,17 @@ mod tests {
             vec![0; BACKUP_ENCRYPTION_NONCE_LEN],
             KeyDerivationParams::default(),
             false,
+            backup_id(),
         );
+        assert!(matches!(
+            read_encryption_header(&rebuild(&header, b"")),
+            Err(BackupEncryptionError::InvalidHeader)
+        ));
+        let header = BackupEncryptionHeader {
+            key_identifier: "k".to_string(),
+            artifact: BackupArtifactIdentity::wal_segment("seg\u{1b}[2J"),
+            ..header
+        };
         assert!(matches!(
             read_encryption_header(&rebuild(&header, b"")),
             Err(BackupEncryptionError::InvalidHeader)
@@ -1009,7 +1168,9 @@ mod tests {
     #[test]
     fn test_decrypt_rejects_header_with_excessive_kdf_cost() {
         let enc = encryptor(b"pw", None);
-        let sealed = enc.encrypt(b"secret", BackupCompression::Gzip).unwrap();
+        let sealed = enc
+            .encrypt(b"secret", BackupCompression::Gzip, &backup_id())
+            .unwrap();
         let (header, ciphertext_start) = read_encryption_header(&sealed).unwrap();
         let ciphertext = &sealed[ciphertext_start..];
 
@@ -1049,7 +1210,7 @@ mod tests {
             let started = std::time::Instant::now();
             assert!(
                 matches!(
-                    enc.decrypt(&rebuild(&crafted, ciphertext)),
+                    enc.decrypt(&rebuild(&crafted, ciphertext), &backup_id()),
                     Err(BackupEncryptionError::KeyDerivationFailed(_))
                 ),
                 "{params}"
@@ -1099,6 +1260,7 @@ mod tests {
             nonce: vec![0; 12],
             key_derivation: KeyDerivationParams::default(),
             compressed: false,
+            artifact: backup_id(),
         };
         let json = serde_json::to_vec(&header).unwrap();
         let mut data = BACKUP_ENCRYPTION_MAGIC.to_vec();
@@ -1171,7 +1333,9 @@ mod tests {
         // a precomputable verifier of the passphrase.
         let passphrase = encryptor(b"passphrase-a", None);
         assert_eq!(passphrase.key_identifier(), PASSPHRASE_KEY_IDENTIFIER);
-        let sealed = passphrase.encrypt(b"x", BackupCompression::Gzip).unwrap();
+        let sealed = passphrase
+            .encrypt(b"x", BackupCompression::Gzip, &backup_id())
+            .unwrap();
         let (header, _) = read_encryption_header(&sealed).unwrap();
         assert_eq!(header.key_identifier, PASSPHRASE_KEY_IDENTIFIER);
         assert!(!sealed.windows(a1.len()).any(|w| w == a1.as_bytes()));
@@ -1616,9 +1780,11 @@ mod tests {
             .unwrap()
             .expect("enabled");
         assert_eq!(writer.key_identifier(), key_fingerprint(&key).unwrap());
-        let sealed = writer.encrypt(b"secret", BackupCompression::Gzip).unwrap();
+        let sealed = writer
+            .encrypt(b"secret", BackupCompression::Gzip, &backup_id())
+            .unwrap();
         let reader = key_file_encryptor(&key);
-        assert_eq!(reader.decrypt(&sealed).unwrap().0, b"secret");
+        assert_eq!(reader.decrypt(&sealed, &backup_id()).unwrap().0, b"secret");
 
         // An error status, an empty body and an oversized body are refused.
         assert!(matches!(
