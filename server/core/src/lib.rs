@@ -56,6 +56,7 @@ use crate::{
         metrics::BackupMetrics,
         online::OnlineBackupJob,
         pitr::{self, BaseLocation, PitrArchive, PitrError, PitrSettings, PitrSyncReport},
+        verify::{BackupVerifyJob, BackupVerifyRun},
     },
     config::{Configuration, OnlineBackup, ServerRole},
     interval::IntervalActor,
@@ -932,6 +933,7 @@ pub(crate) enum TaskName {
     AuditdActor,
     BackupActor,
     BackupReplicationMonitor,
+    BackupVerification,
     DelayedActionActor,
     HttpsServer,
     IntervalActor,
@@ -952,6 +954,7 @@ impl Display for TaskName {
                 TaskName::AuditdActor => "Auditd Actor",
                 TaskName::BackupActor => "Backup Actor",
                 TaskName::BackupReplicationMonitor => "Backup Replication Monitor",
+                TaskName::BackupVerification => "Backup Verification",
                 TaskName::DelayedActionActor => "Delayed Action Actor",
                 TaskName::HttpsServer => "HTTPS Server",
                 TaskName::IntervalActor => "Interval Actor",
@@ -975,6 +978,8 @@ pub struct CoreHandle {
     pitr_archive: Option<Arc<PitrArchive>>,
     /// The backup metrics every backup task records into.
     backup_metrics: Arc<BackupMetrics>,
+    /// The full verification of the newest backup, shared with its schedule.
+    backup_verify: Arc<BackupVerifyJob>,
     /// The `[online_backup]` section the server runs with.
     online_backup: Option<OnlineBackup>,
 }
@@ -1050,6 +1055,13 @@ impl CoreHandle {
         )
         .run(self.server_read_ref)
         .await
+    }
+
+    /// Run the full verification of the newest backup now, the run
+    /// `online_backup.verify_schedule` schedules, recording its result in the backup
+    /// metrics. This exists so tests can exercise the scheduled verification on demand.
+    pub async fn trigger_backup_verification(&self) -> BackupVerifyRun {
+        self.backup_verify.run().await
     }
 
     pub async fn reload(&mut self) {
@@ -1216,6 +1228,7 @@ async fn create_server_core_inner(
     };
     let online_backup = config.online_backup.clone();
     let backup_metrics = Arc::new(BackupMetrics::new(config.online_backup.as_ref()));
+    let backup_verify = Arc::new(BackupVerifyJob::new(config.clone(), backup_metrics.clone()));
 
     // Start the IDM server.
     let (_qs, idms, idms_delayed, idms_audit) = match setup_qs_idms(be, schema, &config).await {
@@ -1335,6 +1348,7 @@ async fn create_server_core_inner(
             maybe_tls_acceptor,
             pitr_archive.clone(),
             backup_metrics.clone(),
+            backup_verify.clone(),
         )
         .await
     };
@@ -1346,6 +1360,7 @@ async fn create_server_core_inner(
         server_read_ref,
         pitr_archive,
         backup_metrics,
+        backup_verify,
         online_backup,
     };
 
@@ -1376,6 +1391,7 @@ async fn launch_server_tasks(
 
     pitr_archive: Option<Arc<PitrArchive>>,
     backup_metrics: Arc<BackupMetrics>,
+    backup_verify: Arc<BackupVerifyJob>,
 ) -> Result<(), ()> {
     let status_ref = StatusActor::start();
     let tracker = status_ref.get_tracker_clone();
@@ -1541,6 +1557,28 @@ async fn launch_server_tasks(
     } else {
         let replication_configured = config.repl_config.is_some();
         tracker.mark_startup_complete(replication_configured);
+    }
+
+    // The scheduled verification of the newest backup. It only reads backups and restores
+    // them into scratch databases, so unlike the backup itself it also runs in the
+    // integration tests that configure it.
+    if let Some(verify_schedule) = config
+        .online_backup
+        .as_ref()
+        .filter(|online_backup| online_backup.enabled)
+        .and_then(|online_backup| online_backup.verify_schedule.as_deref())
+    {
+        let schedule = interval::parse_backup_schedule(verify_schedule).map_err(|reason| {
+            error!("online_backup.verify_schedule: {reason}");
+        })?;
+        handles.push((
+            TaskName::BackupVerification,
+            IntervalActor::start_backup_verification(
+                backup_verify,
+                schedule,
+                broadcast_tx.subscribe(),
+            ),
+        ));
     }
 
     // Setup a TLS Acceptor Reload trigger.

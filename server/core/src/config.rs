@@ -27,6 +27,7 @@ use std::{
 use url::Url;
 
 use crate::backup::{same_s3_location, validate_encryption_config, validate_s3_location};
+use crate::interval::parse_backup_schedule;
 use crate::repl::config::ReplicationConfiguration;
 
 #[derive(Debug, Deserialize)]
@@ -104,6 +105,13 @@ pub struct OnlineBackup {
     #[serde(default)]
     pub wal_archive: Option<WalArchiveConfig>,
 
+    /// An optional schedule, in the syntax of `schedule`, for the full verification of the
+    /// newest backup: the newest artifact of the local directory, and of the S3 prefix when
+    /// S3 is configured, is restored into a temporary database, booted and checked as
+    /// `kubidmd database verify-backup` does. Off by default. Requires `enabled = true`.
+    #[serde(default)]
+    pub verify_schedule: Option<String>,
+
     /// Serve the backup metrics in the Prometheus text format on `GET /metrics`, without
     /// authentication. Off by default.
     #[serde(default)]
@@ -121,6 +129,7 @@ impl Default for OnlineBackup {
             s3: None,
             encryption: BackupEncryptionConfig::default(),
             wal_archive: None,
+            verify_schedule: None,
             metrics_endpoint: false,
         }
     }
@@ -178,6 +187,19 @@ impl OnlineBackup {
             if let Some(replication) = &s3.replication {
                 validate_replication(s3, replication)?;
             }
+        }
+
+        if let Some(verify_schedule) = &self.verify_schedule {
+            if !self.enabled {
+                return Err(
+                    "online_backup.verify_schedule: the scheduled verification requires \
+                     online_backup.enabled = true; verify the backups of a host that does not \
+                     take them with `kubidmd database verify-backup`"
+                        .to_string(),
+                );
+            }
+            parse_backup_schedule(verify_schedule)
+                .map_err(|reason| format!("online_backup.verify_schedule: {reason}"))?;
         }
 
         Ok(())
@@ -807,6 +829,9 @@ impl fmt::Display for Configuration {
                 }
                 if let Some(wal) = bck.wal_archive.as_ref().filter(|wal| wal.enabled) {
                     write!(f, "wal_archive: {}, ", wal)?;
+                }
+                if let Some(verify_schedule) = &bck.verify_schedule {
+                    write!(f, "verify_schedule: {}, ", verify_schedule)?;
                 }
                 if bck.metrics_endpoint {
                     write!(f, "metrics_endpoint: enabled, ")?;
@@ -1500,6 +1525,55 @@ m_cost = 1024
 "
         );
         assert!(build_from_toml(&weak_kdf).is_none());
+    }
+
+    #[test]
+    fn online_backup_verify_schedule_and_metrics_endpoint_are_off_by_default() {
+        let config = build_from_toml(BASE_V2_CONFIG).expect("config");
+        let online_backup = config.online_backup.expect("online backup");
+        assert_eq!(online_backup.verify_schedule, None);
+        assert!(!online_backup.metrics_endpoint);
+    }
+
+    #[test]
+    fn online_backup_verify_schedule_is_validated() {
+        for schedule in ["@weekly", "30 3 * * Sun", "0 30 3 * * Sun *"] {
+            let config = build_from_toml(&format!(
+                "{BASE_V2_CONFIG}verify_schedule = \"{schedule}\"\nmetrics_endpoint = true\n"
+            ))
+            .unwrap_or_else(|| panic!("{schedule} must be accepted"));
+            let online_backup = config.online_backup.expect("online backup");
+            assert_eq!(online_backup.verify_schedule.as_deref(), Some(schedule));
+            assert!(online_backup.metrics_endpoint);
+        }
+
+        // Not a schedule, or one that never runs.
+        for schedule in ["sometimes", "0 0 0 1 1 * 2001"] {
+            let err = OnlineBackup {
+                verify_schedule: Some(schedule.to_string()),
+                ..OnlineBackup::default()
+            }
+            .validate()
+            .expect_err("an invalid schedule must be rejected");
+            assert!(err.starts_with("online_backup.verify_schedule"), "{err}");
+            assert!(
+                build_from_toml(&format!(
+                    "{BASE_V2_CONFIG}verify_schedule = \"{schedule}\"\n"
+                ))
+                .is_none(),
+                "{schedule} must be rejected"
+            );
+        }
+
+        // A host that does not take backups verifies them with the command instead.
+        let err = OnlineBackup {
+            enabled: false,
+            verify_schedule: Some("@daily".to_string()),
+            ..OnlineBackup::default()
+        }
+        .validate()
+        .expect_err("a disabled online backup must not be verified on a schedule");
+        assert!(err.contains("online_backup.enabled = true"), "{err}");
     }
 
     #[test]

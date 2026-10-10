@@ -15,6 +15,7 @@ use tokio::{
 use crate::backup::metrics::{BackupDestination, BackupMetrics};
 use crate::backup::online::OnlineBackupJob;
 use crate::backup::pitr::PitrArchive;
+use crate::backup::verify::BackupVerifyJob;
 use crate::backup::{region_is_healthy, RegionSyncOutcome, S3BackupError, S3ClientWrapper};
 use crate::config::OnlineBackup;
 use crate::{CoreAction, TaskName};
@@ -88,16 +89,8 @@ impl IntervalActor {
         }
 
         let crono_expr = online_backup_config.schedule.as_str().to_string();
-        let mut crono_expr_values = crono_expr.split_ascii_whitespace().collect::<Vec<&str>>();
-        let chrono_expr_uses_standard_syntax = crono_expr_values.len() == 5;
-        if chrono_expr_uses_standard_syntax {
-            // we add a 0 element at the beginning to simulate the standard crono syntax which always runs
-            // commands at seconds 00
-            crono_expr_values.insert(0, "0");
-            crono_expr_values.push("*");
-        }
-        let crono_expr_schedule = crono_expr_values.join(" ");
-        if chrono_expr_uses_standard_syntax {
+        let crono_expr_schedule = normalize_cron_expression(&crono_expr);
+        if crono_expr_schedule != crono_expr {
             info!(
                 "Provided online backup schedule is: {}, now being transformed to: {}",
                 crono_expr, crono_expr_schedule
@@ -262,6 +255,89 @@ impl IntervalActor {
             info!("Stopped {}", TaskName::BackupReplicationMonitor);
         })
     }
+
+    /// Start the scheduled full verification of the newest backup, `verify_schedule`. It
+    /// is a task of its own, so that a verification never delays or skips a scheduled
+    /// backup. A run that outlasts the gap to the next scheduled time skips the times that
+    /// are already past, so runs never overlap. On shutdown a run in progress is
+    /// abandoned: it stops at its next step and removes its temporary files.
+    pub fn start_backup_verification(
+        job: Arc<BackupVerifyJob>,
+        schedule: Schedule,
+        mut rx: broadcast::Receiver<CoreAction>,
+    ) -> JoinHandle<()> {
+        info!(
+            "Scheduled backup verification schedule parsed as: {}",
+            schedule
+        );
+        tokio::spawn(async move {
+            let mut last_run = None;
+            loop {
+                let now = Utc::now();
+                let Some(next_time) = next_backup_time(&schedule, now, last_run) else {
+                    info!(
+                        "Scheduled backup verification '{}' has no further runs",
+                        schedule
+                    );
+                    break;
+                };
+                let wait = wait_until(next_time, now);
+                debug!(
+                    "Scheduled backup verification next run on {}, wait_time = {}s",
+                    next_time,
+                    wait.as_secs()
+                );
+
+                tokio::select! {
+                    action = rx.recv() => match action {
+                        Ok(CoreAction::Shutdown) | Err(broadcast::error::RecvError::Closed) => {
+                            break
+                        }
+                        Ok(CoreAction::Reload) | Err(broadcast::error::RecvError::Lagged(_)) => {
+                            continue
+                        }
+                    },
+                    _ = sleep(wait) => {}
+                }
+
+                last_run = Some(next_time);
+                if run_until_shutdown(job.run(), &mut rx).await.is_none() {
+                    warn!("Scheduled backup verification abandoned: the server is shutting down");
+                    break;
+                }
+            }
+            info!("Stopped {}", TaskName::BackupVerification);
+        })
+    }
+}
+
+/// A cron expression of the `[online_backup]` section in the seven field syntax of the
+/// cron crate: a standard five field expression runs at second 0 of any year.
+fn normalize_cron_expression(expr: &str) -> String {
+    let mut values = expr.split_ascii_whitespace().collect::<Vec<&str>>();
+    if values.len() == 5 {
+        // we add a 0 element at the beginning to simulate the standard crono syntax which always runs
+        // commands at seconds 00
+        values.insert(0, "0");
+        values.push("*");
+    }
+    values.join(" ")
+}
+
+/// Parse a schedule of the `[online_backup]` section, in the syntax `schedule` documents.
+/// Fails when it does not parse or will never run.
+pub(crate) fn parse_backup_schedule(expr: &str) -> Result<Schedule, String> {
+    let schedule = Schedule::from_str(&normalize_cron_expression(expr)).map_err(|err| {
+        format!(
+            "'{expr}' is not a valid schedule ({err}); valid formats are \
+             `sec min hour day-of-month month day-of-week year`, \
+             `min hour day-of-month month day-of-week` and @hourly, @daily or @weekly"
+        )
+    })?;
+    if schedule.upcoming(Utc).next().is_none() {
+        return Err(format!("'{expr}' will not match any date"));
+    }
+    Ok(schedule)
 }
 
 /// Drive `run` to completion unless the server shuts down first, in which case `run` is
@@ -533,6 +609,36 @@ mod tests {
         drop(tx);
         let run = std::future::pending::<()>();
         assert_eq!(run_until_shutdown(run, &mut rx).await, None);
+    }
+
+    #[test]
+    fn backup_schedules_accept_the_standard_and_the_extended_syntax() {
+        assert_eq!(
+            normalize_cron_expression("00 22 * * *"),
+            "0 00 22 * * * *".to_string()
+        );
+        assert_eq!(normalize_cron_expression("@daily"), "@daily");
+        assert_eq!(
+            normalize_cron_expression("1 2 3 * * Mon *"),
+            "1 2 3 * * Mon *"
+        );
+        assert_eq!(
+            normalize_cron_expression(" 1  2 3 * * Mon * "),
+            "1 2 3 * * Mon *"
+        );
+
+        let standard = parse_backup_schedule("30 3 * * *").expect("standard syntax");
+        assert_eq!(
+            next_backup_time(&standard, at(1, 0, 0), None),
+            Some(at(3, 30, 0))
+        );
+        assert!(parse_backup_schedule("@hourly").is_ok());
+        assert!(parse_backup_schedule("* * * * * * *").is_ok());
+
+        let err = parse_backup_schedule("now and then").expect_err("not a schedule");
+        assert!(err.contains("valid formats"), "{err}");
+        let err = parse_backup_schedule("0 0 0 1 1 * 2001").expect_err("in the past");
+        assert!(err.contains("will not match any date"), "{err}");
     }
 
     #[test]

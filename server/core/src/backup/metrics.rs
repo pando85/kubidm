@@ -77,7 +77,8 @@ pub enum VerificationLevel {
     /// The structural check every online backup runs on its artifact before it is stored.
     Structural,
     /// The restore of the artifact into a scratch database, its boot and the consistency
-    /// checks, as `kubidmd database verify-backup` runs them.
+    /// checks, as `kubidmd database verify-backup` runs them; scheduled with
+    /// `online_backup.verify_schedule`.
     Full,
 }
 
@@ -115,6 +116,8 @@ struct DestinationMetrics {
 #[derive(Debug, Default)]
 struct MetricsState {
     destinations: BTreeMap<BackupDestination, DestinationMetrics>,
+    /// Whether the full verification is scheduled, so that its series exist from the start.
+    full_verification: bool,
     /// The WAL archive synchronisations, when the archive is enabled.
     pitr: Option<PitrMetrics>,
 }
@@ -160,6 +163,7 @@ impl BackupMetrics {
                     );
                 }
             }
+            state.full_verification = config.verify_schedule.is_some();
             if config.wal_archive.as_ref().is_some_and(|wal| wal.enabled) {
                 state.pitr = Some(PitrMetrics::default());
             }
@@ -366,6 +370,7 @@ fn render(state: &MetricsState) -> String {
         for level in [VerificationLevel::Structural, VerificationLevel::Full] {
             let scheduled = level == VerificationLevel::Full;
             let reported = !scheduled
+                || state.full_verification
                 || metrics.verified.contains_key(&level)
                 || metrics.verification_failures.contains_key(&level);
             if !reported {
@@ -479,6 +484,7 @@ mod tests {
                 enabled: true,
                 ..WalArchiveConfig::default()
             }),
+            verify_schedule: Some("@daily".to_string()),
             ..OnlineBackup::default()
         }
     }
@@ -510,7 +516,9 @@ mod tests {
         }
         for labels in [
             "destination=\"local\",level=\"structural\"",
+            "destination=\"local\",level=\"full\"",
             "destination=\"s3\",level=\"structural\"",
+            "destination=\"s3\",level=\"full\"",
         ] {
             assert_eq!(
                 sample(
@@ -545,12 +553,17 @@ mod tests {
     }
 
     #[test]
-    fn full_verification_is_only_reported_once_run() {
-        let metrics = BackupMetrics::new(Some(&full_config()));
+    fn full_verification_is_only_reported_when_scheduled_or_run() {
+        let config = OnlineBackup {
+            verify_schedule: None,
+            ..full_config()
+        };
+        let metrics = BackupMetrics::new(Some(&config));
         let text = metrics.render();
         assert!(!text.contains("level=\"full\""), "{text}");
         assert!(!text.contains("kubidm_backup_verification_failures_total"));
 
+        // A run triggered without a schedule is reported all the same.
         metrics.verification_failed(&BackupDestination::Local, VerificationLevel::Full, secs(5));
         let text = metrics.render();
         assert_eq!(
