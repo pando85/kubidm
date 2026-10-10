@@ -37,12 +37,16 @@ use crate::{config::Configuration, setup_backend, verify_booted_database};
 /// Take an offline backup of the database described by `config` into `dst_path`, or to
 /// stdout without a path. The backup uses the compression and the client-side encryption
 /// of the `[online_backup]` section, so it is interchangeable with an online backup.
-pub async fn backup_server_core(config: &Configuration, dst_path: Option<&Path>) {
+///
+/// Returns true when the backup was written and verified. Every failure, including a
+/// database that can not be opened and a destination that already exists, returns false,
+/// which the command turns into a non-zero exit code.
+pub async fn backup_server_core(config: &Configuration, dst_path: Option<&Path>) -> bool {
     let schema = match Schema::new() {
         Ok(s) => s,
         Err(e) => {
             error!("Failed to setup in memory schema: {:?}", e);
-            std::process::exit(1);
+            return false;
         }
     };
 
@@ -58,7 +62,7 @@ pub async fn backup_server_core(config: &Configuration, dst_path: Option<&Path>)
             Ok(encryptor) => encryptor,
             Err(err) => {
                 error!(%err, "Backup failed: unable to obtain the backup encryption key");
-                std::process::exit(1);
+                return false;
             }
         },
         None => None,
@@ -69,27 +73,24 @@ pub async fn backup_server_core(config: &Configuration, dst_path: Option<&Path>)
             check_backup_destination_name(dst_path, compression, encryptor.is_some())
         {
             error!("Backup failed: {reason}");
-            std::process::exit(1);
+            return false;
+        }
+        if dst_path.exists() {
+            error!(
+                "Backup failed: backup file {} already exists, will not overwrite it.",
+                dst_path.display()
+            );
+            return false;
         }
     }
 
     let be = match setup_backend(config, &schema) {
         Ok(be) => be,
         Err(e) => {
-            error!("Failed to setup BE: {:?}", e);
-            return;
+            error!("Backup failed: unable to open the database: {:?}", e);
+            return false;
         }
     };
-
-    if let Some(dst_path) = dst_path {
-        if dst_path.exists() {
-            error!(
-                "backup file {} already exists, will not overwrite it.",
-                dst_path.display()
-            );
-            return;
-        }
-    }
 
     // The backup is produced in memory first so that it can be encrypted and so that only
     // a verified backup is ever emitted to stdout. Serialising and compressing the whole
@@ -108,11 +109,11 @@ pub async fn backup_server_core(config: &Configuration, dst_path: Option<&Path>)
         Ok(Ok(backup_data)) => backup_data,
         Ok(Err(e)) => {
             error!("Backup failed: {:?}", e);
-            std::process::exit(1);
+            return false;
         }
         Err(err) => {
             error!(%err, "Backup failed: the backup task failed");
-            std::process::exit(1);
+            return false;
         }
     };
 
@@ -120,7 +121,7 @@ pub async fn backup_server_core(config: &Configuration, dst_path: Option<&Path>)
         Ok(artifact) => artifact,
         Err(err) => {
             error!(%err, "Backup failed: unable to encrypt the backup");
-            std::process::exit(1);
+            return false;
         }
     };
 
@@ -129,21 +130,25 @@ pub async fn backup_server_core(config: &Configuration, dst_path: Option<&Path>)
         // Written next to the destination, synced and read back before it gets its name,
         // so the destination only ever holds a complete, verified backup. A rejected
         // artifact is kept under an `.invalid` suffix for inspection.
-        report_backup_verification(
+        if !report_backup_verification(
             write_verified_local_backup_async(dst_path, artifact, compression, encryptor.as_ref())
                 .await,
-        );
+        ) {
+            return false;
+        }
         info!("Backup written to {}", dst_path.display());
     } else {
-        report_backup_verification(
+        if !report_backup_verification(
             verify_backup_output_async(artifact.clone(), None, compression, encryptor.as_ref())
                 .await,
-        );
+        ) {
+            return false;
+        }
 
         let mut stdout = std::io::stdout().lock();
         if let Err(err) = stdout.write_all(&artifact).and_then(|()| stdout.flush()) {
             error!(?err, "Backup failed: unable to write to stdout");
-            std::process::exit(1);
+            return false;
         }
     };
 
@@ -151,6 +156,7 @@ pub async fn backup_server_core(config: &Configuration, dst_path: Option<&Path>)
         eprintln!("Backup encrypted with key '{}'", encryptor.key_identifier());
     }
     info!("Backup success!");
+    true
 }
 
 /// Check the destination of a manual backup against what will be written to it, before
@@ -202,9 +208,9 @@ fn check_backup_destination_name(
     Ok(())
 }
 
-/// Print the outcome of the post-write verification of a manual backup. A rejected backup
-/// terminates the process with a non-zero exit code, as a failed write does.
-fn report_backup_verification(verified: Result<BackupStructuralReport, BackupVerifyError>) {
+/// Print the outcome of the post-write verification of a manual backup. Returns whether
+/// the backup passed; a rejected backup fails the command, as a failed write does.
+fn report_backup_verification(verified: Result<BackupStructuralReport, BackupVerifyError>) -> bool {
     match verified {
         Ok(report) => {
             eprintln!(
@@ -212,6 +218,7 @@ fn report_backup_verification(verified: Result<BackupStructuralReport, BackupVer
                 report.entry_count,
                 report.version.as_deref().unwrap_or("unknown")
             );
+            true
         }
         Err(err) => {
             error!("Backup failed verification: {err}");
@@ -222,43 +229,65 @@ fn report_backup_verification(verified: Result<BackupStructuralReport, BackupVer
             if let Some(path) = &err.quarantined_to {
                 eprintln!("  The rejected artifact was kept as {}", path.display());
             }
-            std::process::exit(1);
+            false
         }
     }
 }
 
-pub async fn restore_server_core(config: &Configuration, dst_path: &Path) {
-    let outcome = match restore_and_replay(config, dst_path, &[]).await {
-        Ok(outcome) => outcome,
-        Err(_) => std::process::exit(1),
-    };
+/// How a restore that restored the database ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreStatus {
+    /// The database was restored, and when WAL archiving is configured, the archive
+    /// recorded that the history after the restored backup was abandoned.
+    Complete,
+    /// The database was restored and committed, but the WAL archive could not record the
+    /// abandoned history, typically because the archive's location is unavailable, as when
+    /// restoring from a replication region while the primary bucket is down. The restore
+    /// must not be repeated or rolled back; a new online backup after the server start
+    /// makes point-in-time recovery safe again.
+    WalArchiveNotUpdated,
+}
 
-    if note_restore_in_wal_archive(config, outcome.watermark)
-        .await
-        .is_err()
-    {
-        std::process::exit(1);
+impl RestoreStatus {
+    /// The exit code of a restore command that ended this way: 0 when complete, 2 when the
+    /// database was restored but the WAL archive was not updated, so that automation can
+    /// tell it apart from a failed restore, which exits with 1.
+    pub fn exit_code(self) -> u8 {
+        match self {
+            RestoreStatus::Complete => 0,
+            RestoreStatus::WalArchiveNotUpdated => 2,
+        }
     }
+}
 
-    info!("✅ Restore Success!");
+/// Restore the backup at `dst_path` into the database described by `config`, the
+/// `database restore` command. Fails when the database was not restored.
+pub async fn restore_server_core(
+    config: &Configuration,
+    dst_path: &Path,
+) -> Result<RestoreStatus, OperationError> {
+    let outcome = restore_and_replay(config, dst_path, &[]).await?;
+    Ok(note_restore_in_wal_archive(config, outcome.watermark).await)
 }
 
 /// After a restore of the configured database, record in the WAL archive (when one is
 /// configured) that the history after the restored backup was abandoned, so that a later
 /// point-in-time recovery never replays it.
-async fn note_restore_in_wal_archive(
-    config: &Configuration,
-    watermark: Duration,
-) -> Result<(), OperationError> {
-    pitr::note_restore(config, watermark).await.map_err(|err| {
-        error!(
-            %err,
-            "The database WAS restored, but the abandoned history could not be recorded in \
-             the WAL archive. A later point-in-time recovery past this point could replay it: \
-             take a new online backup right after starting the server."
-        );
-        OperationError::InvalidState
-    })
+async fn note_restore_in_wal_archive(config: &Configuration, watermark: Duration) -> RestoreStatus {
+    match pitr::note_restore(config, watermark).await {
+        Ok(()) => RestoreStatus::Complete,
+        Err(err) => {
+            error!(
+                %err,
+                "The database WAS restored; do not restore it again. The abandoned history \
+                 could not be recorded in the WAL archive, whose location may be unavailable \
+                 (as when restoring from a replication region while the primary is down). A \
+                 later point-in-time recovery past this point could replay it: take a new \
+                 online backup right after starting the server."
+            );
+            RestoreStatus::WalArchiveNotUpdated
+        }
+    }
 }
 
 /// How deeply `verify_backup_server_core` inspects a backup artifact.
@@ -543,7 +572,7 @@ pub async fn restore_s3_database(
     config: &Configuration,
     s3_config: S3Config,
     key: &str,
-) -> Result<(), OperationError> {
+) -> Result<RestoreStatus, OperationError> {
     let fetched = fetch_s3_backup(s3_config, key).await.map_err(|err| {
         error!(%err, "Unable to download backup {key} from S3");
         OperationError::InvalidState
@@ -558,7 +587,7 @@ pub async fn restore_s3_database(
     // Remove the downloaded artifact.
     drop(fetched);
 
-    note_restore_in_wal_archive(config, outcome.watermark).await
+    Ok(note_restore_in_wal_archive(config, outcome.watermark).await)
 }
 
 /// Verify the backup stored under `key` in S3. The SHA-256 of the stored object is checked
@@ -1075,6 +1104,35 @@ mod tests {
             ],
             ..ReplicationConfig::default()
         }
+    }
+
+    #[test]
+    fn restore_status_exit_codes_tell_a_restored_database_apart() {
+        assert_eq!(RestoreStatus::Complete.exit_code(), 0);
+        // Restored, but the archive was not updated: neither success nor the failure (1)
+        // that automation would retry or roll back.
+        assert_eq!(RestoreStatus::WalArchiveNotUpdated.exit_code(), 2);
+    }
+
+    #[tokio::test]
+    async fn manual_backup_reports_every_failure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // The destination exists: nothing is written, and the command fails.
+        let existing = dir.path().join("kubidm.json.gz");
+        std::fs::write(&existing, b"an older backup").expect("write");
+        let config = Configuration::new_for_test();
+        assert!(!backup_server_core(&config, Some(&existing)).await);
+        assert_eq!(std::fs::read(&existing).expect("read"), b"an older backup");
+
+        // The database can not be opened.
+        let config = Configuration {
+            db_path: Some(dir.path().join("missing").join("kubidm.db")),
+            ..Configuration::new_for_test()
+        };
+        let dest = dir.path().join("new.json.gz");
+        assert!(!backup_server_core(&config, Some(&dest)).await);
+        assert!(!dest.exists());
     }
 
     #[test]

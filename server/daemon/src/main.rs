@@ -27,6 +27,7 @@ use std::fs::{metadata, File};
 // This works on both unix and windows.
 use clap::{Args, Parser, Subcommand};
 use futures::{SinkExt, StreamExt};
+use kubidm_proto::internal::OperationError;
 use kubidmd_core::{
     admin::{
         AdminTaskRequest, AdminTaskResponse, ClientCodec, ProtoDomainInfo,
@@ -41,7 +42,7 @@ use kubidmd_core::{
     domain_rename_core, list_backups_server_core, reindex_server_core,
     replicate_status_server_core, restore_s3_database, restore_server_core, s3_config_for_cli,
     vacuum_server_core, verify_backup_server_core, verify_s3_backup_server_core,
-    verify_server_core, BackupVerifyLevel, CoreAction,
+    verify_server_core, BackupVerifyLevel, CoreAction, RestoreStatus,
 };
 use serde::Serialize;
 use sketching::{pipeline::TracingPipelineGuard, tracing_forest::util::*};
@@ -405,6 +406,24 @@ fn check_file_ownership(opt: &KubidmdParser) -> Result<(), ExitCode> {
     Ok(())
 }
 
+/// The exit code of `database restore` and `restore-s3`: 1 when the database was not
+/// restored, otherwise [`RestoreStatus::exit_code`].
+fn restore_exit_code(restored: Result<RestoreStatus, OperationError>) -> ExitCode {
+    match restored.ok() {
+        Some(RestoreStatus::Complete) => {
+            info!("✅ Restore Success!");
+            ExitCode::SUCCESS
+        }
+        Some(status) => {
+            warn!(
+                "Restore finished: the database was restored, but the WAL archive was not updated"
+            );
+            ExitCode::from(status.exit_code())
+        }
+        None => ExitCode::FAILURE,
+    }
+}
+
 async fn scripting_command(cmd: ScriptingCommand, config: Configuration) -> ExitCode {
     match cmd {
         ScriptingCommand::RecoverAccount { name } => {
@@ -418,7 +437,9 @@ async fn scripting_command(cmd: ScriptingCommand, config: Configuration) -> Exit
         }
 
         ScriptingCommand::Backup { path } => {
-            backup_server_core(&config, path.as_deref()).await;
+            if !backup_server_core(&config, path.as_deref()).await {
+                return ExitCode::FAILURE;
+            }
         }
 
         ScriptingCommand::Reload => {
@@ -984,13 +1005,15 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
         } => {
             info!("Running in backup mode ...");
 
-            backup_server_core(&config, Some(&bopt.path)).await;
+            if !backup_server_core(&config, Some(&bopt.path)).await {
+                return ExitCode::FAILURE;
+            }
         }
         KubidmdOpt::Database {
             commands: DbCommands::Restore(ropt),
         } => {
             info!("Running in restore mode ...");
-            restore_server_core(&config, &ropt.path).await;
+            return restore_exit_code(restore_server_core(&config, &ropt.path).await);
         }
         KubidmdOpt::Database {
             commands: DbCommands::Verify,
@@ -1022,13 +1045,7 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
             ) else {
                 return ExitCode::FAILURE;
             };
-            if restore_s3_database(&config, s3_config, &ropt.key)
-                .await
-                .is_err()
-            {
-                return ExitCode::FAILURE;
-            }
-            info!("✅ Restore Success!");
+            return restore_exit_code(restore_s3_database(&config, s3_config, &ropt.key).await);
         }
         KubidmdOpt::Database {
             commands: DbCommands::VerifyS3(vopt),

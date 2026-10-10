@@ -45,7 +45,7 @@ pub use crate::backup::{
     cli::{
         backup_server_core, list_backups_server_core, replicate_status_server_core,
         restore_s3_database, restore_server_core, s3_config_for_cli, verify_backup_server_core,
-        verify_s3_backup_server_core, BackupVerifyLevel,
+        verify_s3_backup_server_core, BackupVerifyLevel, RestoreStatus,
     },
     restore::restore_database,
 };

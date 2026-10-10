@@ -39,7 +39,9 @@ checks as `kubidmd database verify-backup --level structural`: the artifact is r
 entries and for the server version that wrote it. It is opened the way a restore opens it, so its name counts: a plain
 backup must carry the compression suffix of the compression it was written with (`.json.gz` for gzip, `.json` without
 compression), and only an encrypted backup may end in `.enc`. `kubidmd database backup` refuses a destination whose name
-contradicts the configured compression or encryption before it writes anything.
+contradicts the configured compression or encryption before it writes anything. It exits non-zero on every failure,
+including a destination that already exists and a database that can not be opened, so a scheduled job never mistakes a
+backup that was not written for a success.
 
 A local artifact is first written to a hidden `.<name>.partial` file next to its destination, synced to disk and
 verified there, and only then renamed to its final name, so a backup name never holds a partially written backup, even
@@ -547,8 +549,10 @@ Abandoned history is never replayed again: after recovering to 10:30, the server
 writes new history, and a later recovery to any point after it replays the recovered state plus the new history, never
 the transactions that were discarded. `kubidmd database restore` and `restore-s3` record abandoned history the same way
 when WAL archiving is configured. They record it in the primary archive only: when that archive can not be reached (for
-example while restoring with `restore-s3 --region` during an outage of the primary), they restore the database but exit
-non-zero with an error saying the history could not be recorded. Prefer `recover --region` in that situation.
+example while restoring with `restore-s3 --region` during an outage of the primary), they restore the database and exit
+with code 2 and an error saying the history could not be recorded: the restore succeeded and must not be repeated or
+rolled back, but a later point-in-time recovery past it could replay the abandoned history until a new online backup is
+taken. A restore that failed exits with code 1. Prefer `recover --region` in that situation.
 
 #### The Encrypted WAL Archive
 
