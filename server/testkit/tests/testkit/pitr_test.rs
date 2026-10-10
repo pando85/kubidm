@@ -34,7 +34,7 @@ use kubidmd_core::{
 use kubidmd_lib::be::SharedWalArchiver;
 use kubidmd_lib::repl::wal::{
     format_ts_rfc3339, list_segments, read_local_events, read_pending_events, WalArchiver,
-    WAL_HANDED_OVER_GAPS_DIR,
+    WAL_HANDED_OVER_GAPS_DIR, WAL_OPEN_SEGMENT_MARKER,
 };
 use kubidmd_testkit::{login_put_admin_idm_admins, setup_async_test, AsyncTestEnvironment};
 use uuid::Uuid;
@@ -400,6 +400,26 @@ fn test_pitr_recover_after_an_unclean_stop_includes_the_journal_without_a_start(
                 .await
                 .expect("Dry run of the recovery failed");
         assert_eq!(journals(), 1, "a dry run changes nothing");
+        // A recovery that is refused (no base backup that early) changes nothing either:
+        // the server may still be running, and keeps appending to its journal.
+        let marker = std::fs::read(wal_dir.join(WAL_OPEN_SEGMENT_MARKER)).ok();
+        let refused = pitr_recover_server_core(
+            &latest_config,
+            &RecoveryTargetSpec::Time("1970-01-01T00:00:00Z".to_string()),
+            false,
+            None,
+        )
+        .await;
+        assert!(
+            matches!(&refused, Err(PitrError::NotRecoverable(_))),
+            "{refused:?}"
+        );
+        assert_eq!(journals(), 1, "a refused recovery changes nothing");
+        assert_eq!(
+            std::fs::read(wal_dir.join(WAL_OPEN_SEGMENT_MARKER)).ok(),
+            marker
+        );
+        assert!(!latest_db.exists());
         let recovered =
             pitr_recover_server_core(&latest_config, &RecoveryTargetSpec::Latest, false, None)
                 .await

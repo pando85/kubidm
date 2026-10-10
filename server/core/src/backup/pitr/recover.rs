@@ -209,27 +209,17 @@ struct OpenedArchive {
     journaled: BTreeMap<String, Vec<u8>>,
 }
 
-/// What [`open_archive`] does with the journals and the open segment marker a stopped
-/// server left in its WAL directory.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LeftHistory {
-    /// Read what they hold, changing nothing: the server may still be running.
-    Read,
-    /// Close the segments they hold, as the next start of the server would, so that the
-    /// commands that follow find them in the directory.
-    Close,
-}
-
 /// Open the archive described by `config`, or its copy in the replication region `region`,
 /// and load its manifest.
 ///
 /// What the local WAL directory holds and the archive does not is added: segments not
-/// archived yet, the segments the journals of a server that stopped uncleanly hold (see
-/// [`LeftHistory`]), and the gaps no manifest records yet.
+/// archived yet, the segments the journals of a server that stopped uncleanly hold, and
+/// the gaps no manifest records yet. Nothing in the WAL directory is changed: the server
+/// may still be running, and a recovery that is then refused must leave it as it was. A
+/// recovery closes the journals only once it restores, see [`prepare_restore`].
 async fn open_archive(
     config: &Configuration,
     region: Option<&str>,
-    left: LeftHistory,
 ) -> Result<OpenedArchive, PitrError> {
     let configured = PitrSettings::from_config(config)?.ok_or_else(|| {
         PitrError::Config(
@@ -287,23 +277,8 @@ async fn open_archive(
     let (local_events, journaled, local_segments) = {
         let local_dir = settings.local_dir.clone();
         blocking(move || {
-            let (events, journaled) = match left {
-                LeftHistory::Close => {
-                    if let Some(gap) = close_left_segments_offline(&local_dir)? {
-                        warn!(
-                            from = %format_ts_rfc3339(gap.from_ts),
-                            "The server stopped uncleanly, and its WAL directory does not show \
-                             whether the database committed transactions after this point; \
-                             recovery stops before it"
-                        );
-                    }
-                    (read_local_events(&local_dir), Vec::new())
-                }
-                LeftHistory::Read => {
-                    let left = read_left_segments(&local_dir)?;
-                    (left.events, left.segments)
-                }
-            };
+            let left = read_left_segments(&local_dir)?;
+            let (events, journaled) = (left.events, left.segments);
             Ok((events, journaled, list_segments(&local_dir)?))
         })
         .await?
@@ -441,7 +416,7 @@ pub async fn pitr_list_server_core(config: &Configuration, region: Option<&str>)
         local_only,
         journaled,
         ..
-    } = match open_archive(config, region, LeftHistory::Read).await {
+    } = match open_archive(config, region).await {
         Ok(opened) => opened,
         Err(err) => {
             error!(%err, "Unable to read the PITR archive");
@@ -738,13 +713,9 @@ pub async fn pitr_recover_server_core(
     dry_run: bool,
     region: Option<&str>,
 ) -> Result<RecoveryOutcome, PitrError> {
-    // A dry run changes nothing, and may run next to the server.
-    let left = if dry_run {
-        LeftHistory::Read
-    } else {
-        LeftHistory::Close
-    };
-    let opened = open_archive(config, region, left).await?;
+    // Planning changes nothing: a dry run may run next to the server, and a recovery that
+    // is refused leaves the WAL directory as it was.
+    let opened = open_archive(config, region).await?;
     let plan = plan_recovery(&opened.manifest, target)?;
 
     if plan.base.server_version != env!("KUBIDM_PKG_SERIES") {
