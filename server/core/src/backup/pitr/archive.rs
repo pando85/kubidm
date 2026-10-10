@@ -276,6 +276,24 @@ impl PitrArchive {
         now: Duration,
         force_flush: bool,
     ) -> Result<PitrSyncReport, PitrError> {
+        self.sync_with(now, force_flush, true).await
+    }
+
+    /// The synchronisation at shutdown: [`Self::sync`] with `force_flush`, without the
+    /// comparison of the sidecars of the region copies even when it is due. That reads two
+    /// sidecars per segment and region, which for a large archive outlasts the grace period
+    /// of a stop, and what follows the synchronisation (the pending events, the clean
+    /// shutdown) would be lost to the kill. The next start's first run does it.
+    pub async fn sync_at_shutdown(&self, now: Duration) -> Result<PitrSyncReport, PitrError> {
+        self.sync_with(now, true, false).await
+    }
+
+    async fn sync_with(
+        &self,
+        now: Duration,
+        force_flush: bool,
+        check_regions: bool,
+    ) -> Result<PitrSyncReport, PitrError> {
         let guard = self.manifest_lock.lock().await;
         let mut report = PitrSyncReport::default();
 
@@ -338,7 +356,9 @@ impl PitrArchive {
         let manifest = result?;
         drop(guard);
         // The sidecars of the region copies are compared without the manifest lock.
-        if let Ok(store) = self.store().await {
+        if !check_regions {
+            debug!("The comparison of the region copies is left to the next start");
+        } else if let Ok(store) = self.store().await {
             self.check_region_copies(store, &manifest, now, &mut report)
                 .await;
         }

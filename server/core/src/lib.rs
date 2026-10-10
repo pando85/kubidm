@@ -1071,7 +1071,7 @@ impl CoreHandle {
         // Every task that can write has stopped: close the open WAL segment and archive
         // it, so that a clean shutdown loses no committed transaction.
         if let Some(archive) = &self.pitr_archive {
-            let result = archive.sync(duration_from_epoch_now(), true).await;
+            let result = archive.sync_at_shutdown(duration_from_epoch_now()).await;
             self.backup_metrics
                 .record_pitr_sync(&result, duration_from_epoch_now());
             match result {

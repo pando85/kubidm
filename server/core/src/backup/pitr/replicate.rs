@@ -1501,4 +1501,52 @@ mod tests {
         assert_eq!(health.unavailable_on_primary[0].0, ids[1]);
         assert!(!health.is_healthy());
     }
+    /// The synchronisation at shutdown never compares the sidecars of the region copies,
+    /// which could outlast the grace period of a stop; the periodic runs do when it is due.
+    #[tokio::test]
+    async fn test_the_shutdown_synchronisation_skips_the_region_comparison() {
+        let objects: Objects = Arc::new(Mutex::new(BTreeMap::new()));
+        let fake = fake_s3::FakeS3::start(fake_s3::store(Arc::clone(&objects))).await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let server = Uuid::new_v4();
+        let mut primary_s3 = fake.config("primary");
+        primary_s3.replication = Some(ReplicationConfig {
+            enabled: true,
+            regions: vec![region_of(&fake, "replica")],
+            sync_interval_seconds: 300,
+        });
+        let wal = WalArchiveConfig {
+            enabled: true,
+            local_path: Some(dir.path().join("wal")),
+            ..WalArchiveConfig::default()
+        };
+        let settings = PitrSettings {
+            wal: wal.clone(),
+            local_dir: dir.path().join("wal"),
+            location: PitrLocation::S3(primary_s3),
+            bases: BaseLocation::Local(dir.path().join("backups")),
+            encryption: BackupEncryptionConfig::default(),
+        };
+        let archiver: SharedWalArchiver = Arc::new(std::sync::Mutex::new(
+            WalArchiver::open(wal, server, dir.path().join("wal"), None).expect("archiver"),
+        ));
+        let archive = PitrArchive::new(settings, archiver);
+        let last_check = || {
+            *archive
+                .last_deep_check
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        };
+
+        archive
+            .sync_at_shutdown(Duration::from_secs(1000))
+            .await
+            .expect("sync at shutdown");
+        assert_eq!(last_check(), None);
+        archive
+            .sync(Duration::from_secs(1000), true)
+            .await
+            .expect("sync");
+        assert_eq!(last_check(), Some(Duration::from_secs(1000)));
+    }
 }
