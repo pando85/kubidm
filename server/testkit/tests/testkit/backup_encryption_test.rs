@@ -19,8 +19,8 @@ use kubidm_proto::backup::{
 };
 use kubidmd_core::backup::{
     is_backup_artifact_name, is_encrypted_artifact, open_backup_file_with_config,
-    read_encryption_header, BackupEncryptionError, BackupOpenError, S3ClientWrapper,
-    MIN_KDF_M_COST, PASSPHRASE_ENV,
+    read_encryption_header, BackupEncryptionError, BackupEncryptor, BackupOpenError,
+    S3ClientWrapper, MIN_KDF_M_COST, PASSPHRASE_ENV,
 };
 use kubidmd_core::config::{Configuration, OnlineBackup};
 use kubidmd_core::{
@@ -532,5 +532,52 @@ fn test_encrypted_s3_backup_verify_and_restore() {
             "restore-s3 must fail with a wrong passphrase"
         );
         assert!(!wrong_db.exists());
+
+        // Someone with write access to the bucket swaps the encrypted backup for a plain
+        // one under an encrypted name, with a consistent sidecar that says "not
+        // encrypted". The plain backup is a perfectly valid backup, so only the name
+        // check stands between it and the restore.
+        let opener = BackupEncryptor::from_config(&encryption)
+            .await
+            .expect("Failed to resolve the key")
+            .expect("Encryption is enabled");
+        let (plaintext, _) = opener.decrypt(&raw).expect("Failed to decrypt the backup");
+        let swapped_key = "backup-2099-01-01T00:00:00Z.json.gz.enc";
+        client
+            .upload_backup(
+                plaintext,
+                swapped_key,
+                "2099-01-01T00:00:00Z",
+                BackupCompression::Gzip,
+                None,
+            )
+            .await
+            .expect("Failed to upload the swapped backup");
+        assert!(
+            !client
+                .get_backup_metadata(swapped_key)
+                .await
+                .expect("Failed to read the swapped metadata")
+                .encrypted
+        );
+        let swapped_db = workdir.path().join("swapped.db");
+        let swapped_config = config_with_encryption(&swapped_db, encryption.clone());
+        assert!(
+            !verify_s3_backup_server_core(
+                &swapped_config,
+                s3_config.clone(),
+                swapped_key,
+                BackupVerifyLevel::Structural,
+            )
+            .await,
+            "verify-s3 must refuse a plain artifact under an encrypted name"
+        );
+        assert!(
+            restore_s3_database(&swapped_config, s3_config.clone(), swapped_key)
+                .await
+                .is_err(),
+            "restore-s3 must refuse a plain artifact under an encrypted name"
+        );
+        assert!(!swapped_db.exists());
     });
 }

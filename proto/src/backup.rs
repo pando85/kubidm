@@ -773,7 +773,8 @@ pub struct BackupEncryptionConfig {
     #[serde(default)]
     pub key_derivation: KeyDerivationParams,
     /// Name written into every artifact and into the S3 metadata sidecar to tell which key
-    /// an artifact needs. Defaults to a fingerprint of the key material.
+    /// an artifact needs. Defaults to a fingerprint of the key material for a key file or
+    /// key endpoint, and to `passphrase` for a passphrase, which is never fingerprinted.
     #[serde(default)]
     pub key_identifier: Option<String>,
     /// With `key_source = "Passphrase"`: read the passphrase from this file instead of the

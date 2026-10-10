@@ -780,7 +780,9 @@ async fn fetch_s3_backup(s3_config: S3Config, key: &str) -> Result<FetchedS3Back
     let (data, metadata) = client.download_backup(key).await?;
 
     let scratch_dir = tempfile::tempdir()?;
-    let encryption_suffix = if metadata.encrypted {
+    // The requested key counts as well as the sidecar: the sidecar is not authenticated, so
+    // an object requested as `.enc` must be an encrypted container whatever it says.
+    let encryption_suffix = if metadata.encrypted || is_encrypted_backup_name(key) {
         BACKUP_ENCRYPTED_SUFFIX
     } else {
         ""

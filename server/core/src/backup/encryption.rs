@@ -13,18 +13,28 @@
 //! needs, so a cold restore on a fresh host only requires the server configuration and the
 //! passphrase, key file or key endpoint it names.
 //!
+//! Everything before the ciphertext (magic, header length and header) is the associated
+//! data of the AEAD, so a header that was modified in any way, such as a flipped
+//! compression flag or a substituted key identifier, fails authentication exactly like a
+//! modified ciphertext. The whole artifact is one AEAD message, so truncation and
+//! reordering are detected by the tag as well.
+//!
 //! Every key source yields *key material* (a passphrase, the bytes of a key file or the body
 //! of an HTTP response). The material is never used as the cipher key directly: the cipher
 //! key is derived from it with Argon2id and the per-artifact salt stored in the header, so
-//! two backups made with the same material never share a key or a nonce.
+//! two backups made with the same material never share a key or a nonce. Key material and
+//! derived keys are held in [`Zeroizing`] buffers and wiped when dropped.
 
 use std::fmt;
 use std::fs;
+use std::net::IpAddr;
 use std::path::Path;
+use std::time::Duration;
 
 use argon2::{Algorithm, Argon2, Params, Version};
 use crypto_glue::aes256::key_from_slice;
-use crypto_glue::aes256gcm::{Aead, Aes256Gcm, Aes256GcmNonce, KeyInit};
+use crypto_glue::aes256gcm::{Aead, Aes256Gcm, Aes256GcmNonce, KeyInit, Payload};
+use crypto_glue::traits::Zeroizing;
 use kubidm_proto::backup::{
     BackupCompression, BackupEncryptionConfig, BackupEncryptionHeader, EncryptionKeySource,
     KeyDerivationParams, BACKUP_ENCRYPTION_KEY_LEN, BACKUP_ENCRYPTION_MAGIC,
@@ -47,12 +57,22 @@ pub const MAX_KDF_T_COST: u32 = 64;
 /// Highest accepted Argon2id parallelism.
 pub const MAX_KDF_P_COST: u32 = 64;
 
-/// Fixed salt of the key fingerprint that identifies key material when no `key_identifier`
-/// is configured. The fingerprint goes through the same KDF as the cipher key so that it
-/// does not offer a cheaper way to test passphrase guesses than the ciphertext itself.
+/// Fixed salt of the key fingerprint that identifies the material of a key file or key
+/// endpoint when no `key_identifier` is configured. A fixed salt would let an attacker
+/// precompute a dictionary of passphrase fingerprints once and look up every backup, so
+/// passphrases are never fingerprinted, see [`PASSPHRASE_KEY_IDENTIFIER`].
 const KEY_FINGERPRINT_SALT: &[u8; BACKUP_ENCRYPTION_SALT_LEN] = b"kubidm-bk-keyid1";
 /// Number of hex characters of a key fingerprint.
 const KEY_FINGERPRINT_LEN: usize = 16;
+/// Key identifier recorded for a passphrase when no `key_identifier` is configured.
+pub const PASSPHRASE_KEY_IDENTIFIER: &str = "passphrase";
+
+/// Time limit for obtaining the key from an HTTP key endpoint.
+const KEY_ENDPOINT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Largest key endpoint response accepted, in bytes.
+const MAX_KEY_ENDPOINT_BODY: usize = 64 * 1024;
+/// Largest encryption header accepted, in bytes. A real header is a few hundred bytes.
+const MAX_HEADER_LEN: usize = 64 * 1024;
 
 #[derive(Debug)]
 pub enum BackupEncryptionError {
@@ -169,6 +189,9 @@ pub fn read_encryption_header(
             .try_into()
             .map_err(|_| BackupEncryptionError::InvalidHeader)?,
     );
+    if header_len as usize > MAX_HEADER_LEN {
+        return Err(BackupEncryptionError::InvalidHeader);
+    }
     let header_end = header_start
         .checked_add(header_len as usize)
         .ok_or(BackupEncryptionError::InvalidHeader)?;
@@ -181,6 +204,12 @@ pub fn read_encryption_header(
 
     if !header.validate_magic() {
         return Err(BackupEncryptionError::InvalidMagic);
+    }
+
+    // The identifier ends up in log lines and terminal output before the header is
+    // authenticated, so it must not be able to carry escape sequences.
+    if header.key_identifier.chars().any(char::is_control) {
+        return Err(BackupEncryptionError::InvalidHeader);
     }
 
     Ok((header, header_end))
@@ -243,36 +272,84 @@ pub fn validate_encryption_config(config: &BackupEncryptionConfig) -> Result<(),
 
     match &config.key_source {
         EncryptionKeySource::Passphrase => {
+            if let Some(path) = &config.passphrase_file {
+                warn_on_insecure_permissions(path, "passphrase_file");
+            }
             resolve_passphrase(config.passphrase_file.as_deref()).map(|_| ())
         }
-        EncryptionKeySource::File { path } => read_key_file(Path::new(path)).map(|_| ()),
-        EncryptionKeySource::HttpEndpoint { url } => {
-            let parsed = Url::parse(url)
-                .map_err(|err| format!("key_source endpoint '{url}' is not a valid URL: {err}"))?;
-            if !matches!(parsed.scheme(), "http" | "https") {
-                return Err(format!(
-                    "key_source endpoint '{url}' must use the http or https scheme"
-                ));
-            }
-            Ok(())
+        EncryptionKeySource::File { path } => {
+            warn_on_insecure_permissions(Path::new(path), "key file");
+            read_key_file(Path::new(path)).map(|_| ())
         }
+        EncryptionKeySource::HttpEndpoint { url } => validate_key_endpoint(url),
+    }
+}
+
+/// The key endpoint must be an `https` URL. Plain `http` would send the key material in
+/// the clear, so it is only accepted for a loopback address such as a local secrets agent.
+fn validate_key_endpoint(url: &str) -> Result<(), String> {
+    let parsed = Url::parse(url)
+        .map_err(|err| format!("key_source endpoint '{url}' is not a valid URL: {err}"))?;
+    match parsed.scheme() {
+        "https" => Ok(()),
+        "http" => {
+            let loopback = match parsed.host() {
+                Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+                Some(url::Host::Ipv4(ip)) => IpAddr::V4(ip).is_loopback(),
+                Some(url::Host::Ipv6(ip)) => IpAddr::V6(ip).is_loopback(),
+                None => false,
+            };
+            if loopback {
+                Ok(())
+            } else {
+                Err(format!(
+                    "key_source endpoint '{url}' must use https; plain http is only accepted \
+                     for a loopback address"
+                ))
+            }
+        }
+        _ => Err(format!(
+            "key_source endpoint '{url}' must use the https scheme"
+        )),
+    }
+}
+
+/// Warn, like for the TLS key, when a file holding backup key material can be read by
+/// everyone on the host. A missing file is reported by the read that follows.
+fn warn_on_insecure_permissions(path: &Path, what: &str) {
+    #[cfg(not(target_os = "windows"))]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let Ok(meta) = fs::metadata(path) {
+            if meta.mode() & 0o007 != 0 {
+                warn!(
+                    "WARNING: the backup encryption {what} {} has 'everyone' permission bits in \
+                     the mode. Anyone on this host can read the key of every backup ...",
+                    path.display()
+                );
+            }
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = (path, what);
     }
 }
 
 /// The passphrase: the content of `passphrase_file` with trailing whitespace removed when
 /// a file is configured, otherwise the [`PASSPHRASE_ENV`] environment variable.
-fn resolve_passphrase(passphrase_file: Option<&Path>) -> Result<Vec<u8>, String> {
+fn resolve_passphrase(passphrase_file: Option<&Path>) -> Result<Zeroizing<Vec<u8>>, String> {
     let passphrase = match passphrase_file {
         Some(path) => {
-            let raw = fs::read(path).map_err(|err| {
+            let mut passphrase = Zeroizing::new(fs::read(path).map_err(|err| {
                 format!("unable to read passphrase_file {}: {err}", path.display())
-            })?;
-            let trimmed_len = raw
+            })?);
+            let trimmed_len = passphrase
                 .iter()
                 .rposition(|byte| !byte.is_ascii_whitespace())
                 .map(|pos| pos + 1)
                 .unwrap_or(0);
-            let mut passphrase = raw;
+            // Truncating keeps the allocation, so the trailing bytes are wiped on drop too.
             passphrase.truncate(trimmed_len);
             if passphrase.is_empty() {
                 return Err(format!("passphrase_file {} is empty", path.display()));
@@ -280,7 +357,7 @@ fn resolve_passphrase(passphrase_file: Option<&Path>) -> Result<Vec<u8>, String>
             passphrase
         }
         None => match std::env::var_os(PASSPHRASE_ENV) {
-            Some(value) if !value.is_empty() => value.into_encoded_bytes(),
+            Some(value) if !value.is_empty() => Zeroizing::new(value.into_encoded_bytes()),
             _ => {
                 return Err(format!(
                     "key_source is \"Passphrase\" but neither passphrase_file is configured nor \
@@ -293,9 +370,11 @@ fn resolve_passphrase(passphrase_file: Option<&Path>) -> Result<Vec<u8>, String>
 }
 
 /// The bytes of a key file, used exactly as stored.
-fn read_key_file(path: &Path) -> Result<Vec<u8>, String> {
-    let key = fs::read(path)
-        .map_err(|err| format!("unable to read key file {}: {err}", path.display()))?;
+fn read_key_file(path: &Path) -> Result<Zeroizing<Vec<u8>>, String> {
+    let key = Zeroizing::new(
+        fs::read(path)
+            .map_err(|err| format!("unable to read key file {}: {err}", path.display()))?,
+    );
     if key.is_empty() {
         return Err(format!("key file {} is empty", path.display()));
     }
@@ -307,7 +386,7 @@ fn read_key_file(path: &Path) -> Result<Vec<u8>, String> {
 /// endpoint.
 pub async fn resolve_key_material(
     config: &BackupEncryptionConfig,
-) -> Result<Vec<u8>, BackupEncryptionError> {
+) -> Result<Zeroizing<Vec<u8>>, BackupEncryptionError> {
     match &config.key_source {
         EncryptionKeySource::Passphrase => resolve_passphrase(config.passphrase_file.as_deref())
             .map_err(BackupEncryptionError::KeySourceError),
@@ -315,22 +394,36 @@ pub async fn resolve_key_material(
             read_key_file(Path::new(path)).map_err(BackupEncryptionError::KeySourceError)
         }
         EncryptionKeySource::HttpEndpoint { url } => {
-            let response = Client::new()
+            validate_key_endpoint(url).map_err(BackupEncryptionError::KeySourceError)?;
+            let client = Client::builder()
+                .timeout(KEY_ENDPOINT_TIMEOUT)
+                .build()
+                .map_err(|e| BackupEncryptionError::HttpError(e.to_string()))?;
+            let mut response = client
                 .get(url)
                 .send()
                 .await
                 .and_then(|response| response.error_for_status())
                 .map_err(|e| BackupEncryptionError::HttpError(e.to_string()))?;
-            let key = response
-                .bytes()
+            let mut key = Zeroizing::new(Vec::new());
+            while let Some(chunk) = response
+                .chunk()
                 .await
-                .map_err(|e| BackupEncryptionError::HttpError(e.to_string()))?;
+                .map_err(|e| BackupEncryptionError::HttpError(e.to_string()))?
+            {
+                if key.len() + chunk.len() > MAX_KEY_ENDPOINT_BODY {
+                    return Err(BackupEncryptionError::KeySourceError(format!(
+                        "key endpoint {url} returned more than {MAX_KEY_ENDPOINT_BODY} bytes"
+                    )));
+                }
+                key.extend_from_slice(&chunk);
+            }
             if key.is_empty() {
                 return Err(BackupEncryptionError::KeySourceError(format!(
                     "key endpoint {url} returned an empty body"
                 )));
             }
-            Ok(key.to_vec())
+            Ok(key)
         }
     }
 }
@@ -338,7 +431,7 @@ pub async fn resolve_key_material(
 /// Key material resolved from a configuration, ready to encrypt and decrypt artifacts.
 pub struct BackupEncryptor {
     config: BackupEncryptionConfig,
-    key_material: Vec<u8>,
+    key_material: Zeroizing<Vec<u8>>,
     key_identifier: String,
 }
 
@@ -365,11 +458,13 @@ impl BackupEncryptor {
     }
 
     /// Build an encryptor from already obtained key material. The identifier of the key is
-    /// the configured `key_identifier`, or a fingerprint of the material.
+    /// the configured `key_identifier`. Without one it is [`PASSPHRASE_KEY_IDENTIFIER`] for
+    /// a passphrase and a fingerprint of the material for a key file or key endpoint.
     pub fn with_key_material(
         config: BackupEncryptionConfig,
-        key_material: Vec<u8>,
+        key_material: impl Into<Zeroizing<Vec<u8>>>,
     ) -> Result<Self, BackupEncryptionError> {
+        let key_material = key_material.into();
         if key_material.is_empty() {
             return Err(BackupEncryptionError::KeySourceError(
                 "key material is empty".to_string(),
@@ -377,9 +472,10 @@ impl BackupEncryptor {
         }
         validate_key_derivation_params(&config.key_derivation)
             .map_err(BackupEncryptionError::KeyDerivationFailed)?;
-        let key_identifier = match &config.key_identifier {
-            Some(id) => id.clone(),
-            None => key_fingerprint(&key_material)?,
+        let key_identifier = match (&config.key_identifier, &config.key_source) {
+            (Some(id), _) => id.clone(),
+            (None, EncryptionKeySource::Passphrase) => PASSPHRASE_KEY_IDENTIFIER.to_string(),
+            (None, _) => key_fingerprint(&key_material)?,
         };
         Ok(Self {
             config,
@@ -415,26 +511,36 @@ impl BackupEncryptor {
             compression == BackupCompression::Gzip,
         );
 
+        let header_json = serde_json::to_vec(&header)
+            .map_err(|e| BackupEncryptionError::SerializeError(e.to_string()))?;
+        let header_len = u32::try_from(header_json.len())
+            .ok()
+            .filter(|len| *len as usize <= MAX_HEADER_LEN)
+            .ok_or_else(|| BackupEncryptionError::SerializeError("header too large".to_string()))?;
+
+        // The prefix (magic, length, header) is written first and is the associated data.
+        let mut output = Vec::with_capacity(
+            BACKUP_ENCRYPTION_MAGIC.len() + 4 + header_json.len() + plaintext.len() + 16,
+        );
+        output.extend_from_slice(BACKUP_ENCRYPTION_MAGIC);
+        output.extend_from_slice(&header_len.to_le_bytes());
+        output.extend_from_slice(&header_json);
+
         let key = key_from_slice(&key).ok_or(BackupEncryptionError::InvalidKeyLength)?;
         let cipher = Aes256Gcm::new(&*key);
         let nonce = <&Aes256GcmNonce>::try_from(nonce_bytes.as_slice())
             .map_err(|_| BackupEncryptionError::InvalidNonceLength)?;
 
         let ciphertext = cipher
-            .encrypt(nonce, plaintext)
+            .encrypt(
+                nonce,
+                Payload {
+                    msg: plaintext,
+                    aad: &output,
+                },
+            )
             .map_err(|e| BackupEncryptionError::EncryptionFailed(e.to_string()))?;
 
-        let header_json = serde_json::to_vec(&header)
-            .map_err(|e| BackupEncryptionError::SerializeError(e.to_string()))?;
-        let header_len = u32::try_from(header_json.len())
-            .map_err(|_| BackupEncryptionError::SerializeError("header too large".to_string()))?;
-
-        let mut output = Vec::with_capacity(
-            BACKUP_ENCRYPTION_MAGIC.len() + 4 + header_json.len() + ciphertext.len(),
-        );
-        output.extend_from_slice(BACKUP_ENCRYPTION_MAGIC);
-        output.extend_from_slice(&header_len.to_le_bytes());
-        output.extend_from_slice(&header_json);
         output.extend_from_slice(&ciphertext);
         Ok(output)
     }
@@ -467,8 +573,8 @@ impl BackupEncryptor {
         }
 
         let key = derive_key(&self.key_material, &header.salt, &header.key_derivation)?;
-        let ciphertext = data
-            .get(ciphertext_start..)
+        let (associated_data, ciphertext) = data
+            .split_at_checked(ciphertext_start)
             .ok_or(BackupEncryptionError::InvalidHeader)?;
 
         let key = key_from_slice(&key).ok_or(BackupEncryptionError::InvalidKeyLength)?;
@@ -476,7 +582,11 @@ impl BackupEncryptor {
         let nonce = <&Aes256GcmNonce>::try_from(header.nonce.as_slice())
             .map_err(|_| BackupEncryptionError::InvalidNonceLength)?;
 
-        let plaintext = cipher.decrypt(nonce, ciphertext).map_err(|_| {
+        let payload = Payload {
+            msg: ciphertext,
+            aad: associated_data,
+        };
+        let plaintext = cipher.decrypt(nonce, payload).map_err(|_| {
             BackupEncryptionError::DecryptionFailed {
                 artifact_key: header.key_identifier.clone(),
                 configured_key: self.key_identifier.clone(),
@@ -492,7 +602,7 @@ fn derive_key(
     key_material: &[u8],
     salt: &[u8],
     params: &KeyDerivationParams,
-) -> Result<Vec<u8>, BackupEncryptionError> {
+) -> Result<Zeroizing<Vec<u8>>, BackupEncryptionError> {
     if salt.len() != BACKUP_ENCRYPTION_SALT_LEN {
         return Err(BackupEncryptionError::InvalidSaltLength);
     }
@@ -501,7 +611,7 @@ fn derive_key(
         .map_err(|e| BackupEncryptionError::KeyDerivationFailed(e.to_string()))?;
     let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, argon_params);
 
-    let mut key = vec![0u8; BACKUP_ENCRYPTION_KEY_LEN];
+    let mut key = Zeroizing::new(vec![0u8; BACKUP_ENCRYPTION_KEY_LEN]);
     argon
         .hash_password_into(key_material, salt, &mut key)
         .map_err(|e| BackupEncryptionError::KeyDerivationFailed(e.to_string()))?;
@@ -509,14 +619,16 @@ fn derive_key(
 }
 
 /// A stable, public identifier of key material: Argon2id of the material with a fixed salt
-/// and the default parameters, truncated to [`KEY_FINGERPRINT_LEN`] hex characters.
+/// and the default parameters, truncated to [`KEY_FINGERPRINT_LEN`] hex characters. Only
+/// for high entropy material (key files, key endpoints): with a fixed salt it would be a
+/// precomputable verifier of a passphrase.
 fn key_fingerprint(key_material: &[u8]) -> Result<String, BackupEncryptionError> {
     let derived = derive_key(
         key_material,
         KEY_FINGERPRINT_SALT,
         &KeyDerivationParams::default(),
     )?;
-    let mut fingerprint = hex::encode(derived);
+    let mut fingerprint = hex::encode(&*derived);
     fingerprint.truncate(KEY_FINGERPRINT_LEN);
     Ok(fingerprint)
 }
@@ -548,6 +660,31 @@ mod tests {
     fn encryptor(passphrase: &[u8], key_identifier: Option<&str>) -> BackupEncryptor {
         BackupEncryptor::with_key_material(config(key_identifier), passphrase.to_vec())
             .expect("encryptor")
+    }
+
+    /// An encryptor whose material comes from a key file, so that it is identified by a
+    /// fingerprint when no identifier is configured.
+    fn key_file_encryptor(material: &[u8]) -> BackupEncryptor {
+        BackupEncryptor::with_key_material(
+            BackupEncryptionConfig {
+                key_source: EncryptionKeySource::File {
+                    path: "/unused/backup.key".to_string(),
+                },
+                ..config(None)
+            },
+            material.to_vec(),
+        )
+        .expect("encryptor")
+    }
+
+    /// Rebuild a container from a (modified) header and the original ciphertext.
+    fn rebuild(header: &BackupEncryptionHeader, ciphertext: &[u8]) -> Vec<u8> {
+        let header_json = serde_json::to_vec(header).unwrap();
+        let mut rebuilt = BACKUP_ENCRYPTION_MAGIC.to_vec();
+        rebuilt.extend_from_slice(&(header_json.len() as u32).to_le_bytes());
+        rebuilt.extend_from_slice(&header_json);
+        rebuilt.extend_from_slice(ciphertext);
+        rebuilt
     }
 
     #[test]
@@ -614,8 +751,8 @@ mod tests {
 
     #[test]
     fn test_decrypt_with_wrong_key_names_both_identifiers() {
-        let writer = encryptor(b"right", None);
-        let reader = encryptor(b"wrong", None);
+        let writer = key_file_encryptor(b"right");
+        let reader = key_file_encryptor(b"wrong");
         let sealed = writer.encrypt(b"secret", BackupCompression::Gzip).unwrap();
 
         match reader.decrypt(&sealed) {
@@ -706,6 +843,90 @@ mod tests {
         assert!(matches!(
             enc.decrypt(&rebuilt),
             Err(BackupEncryptionError::DecryptionFailed { .. })
+        ));
+    }
+
+    #[test]
+    fn test_header_is_authenticated() {
+        // Without a configured identifier, so that no field is checked before the AEAD.
+        let enc = encryptor(b"pw", None);
+        for compression in [BackupCompression::NoCompression, BackupCompression::Gzip] {
+            let sealed = enc.encrypt(b"secret", compression).unwrap();
+            let (header, ciphertext_start) = read_encryption_header(&sealed).unwrap();
+            let ciphertext = &sealed[ciphertext_start..];
+
+            // Re-serialising the unmodified header reproduces the container and opens.
+            assert_eq!(rebuild(&header, ciphertext), sealed);
+            assert!(enc.decrypt(&rebuild(&header, ciphertext)).is_ok());
+
+            // A flipped compression flag would make a restore misread the plaintext.
+            let mut flipped = header.clone();
+            flipped.compressed = !flipped.compressed;
+            assert!(matches!(
+                enc.decrypt(&rebuild(&flipped, ciphertext)),
+                Err(BackupEncryptionError::DecryptionFailed { .. })
+            ));
+
+            // A substituted key identifier would misattribute the artifact.
+            let mut renamed = header.clone();
+            renamed.key_identifier = "someone-else".to_string();
+            assert!(matches!(
+                enc.decrypt(&rebuild(&renamed, ciphertext)),
+                Err(BackupEncryptionError::DecryptionFailed { .. })
+            ));
+
+            // Equivalent JSON with different bytes (extra whitespace) is a different header.
+            let json = serde_json::to_vec_pretty(&header).unwrap();
+            let mut respaced = BACKUP_ENCRYPTION_MAGIC.to_vec();
+            respaced.extend_from_slice(&(json.len() as u32).to_le_bytes());
+            respaced.extend_from_slice(&json);
+            respaced.extend_from_slice(ciphertext);
+            assert_eq!(read_encryption_header(&respaced).unwrap().0, header);
+            assert!(matches!(
+                enc.decrypt(&respaced),
+                Err(BackupEncryptionError::DecryptionFailed { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn test_decrypt_detects_swapped_ciphertexts() {
+        // Two artifacts of the same key: the ciphertext of one under the header of the
+        // other must not open.
+        let enc = encryptor(b"pw", None);
+        let a = enc.encrypt(b"first", BackupCompression::Gzip).unwrap();
+        let b = enc.encrypt(b"second", BackupCompression::Gzip).unwrap();
+        let (header_a, start_a) = read_encryption_header(&a).unwrap();
+        let (_, start_b) = read_encryption_header(&b).unwrap();
+        let mut spliced = a[..start_a].to_vec();
+        spliced.extend_from_slice(&b[start_b..]);
+        assert_eq!(read_encryption_header(&spliced).unwrap().0, header_a);
+        assert!(matches!(
+            enc.decrypt(&spliced),
+            Err(BackupEncryptionError::DecryptionFailed { .. })
+        ));
+    }
+
+    #[test]
+    fn test_read_encryption_header_rejects_control_characters_and_oversize() {
+        let header = BackupEncryptionHeader::new(
+            "evil\u{1b}[2J".to_string(),
+            vec![0; BACKUP_ENCRYPTION_SALT_LEN],
+            vec![0; BACKUP_ENCRYPTION_NONCE_LEN],
+            KeyDerivationParams::default(),
+            false,
+        );
+        assert!(matches!(
+            read_encryption_header(&rebuild(&header, b"")),
+            Err(BackupEncryptionError::InvalidHeader)
+        ));
+
+        let mut data = BACKUP_ENCRYPTION_MAGIC.to_vec();
+        data.extend_from_slice(&((MAX_HEADER_LEN + 1) as u32).to_le_bytes());
+        data.resize(data.len() + MAX_HEADER_LEN + 1, b' ');
+        assert!(matches!(
+            read_encryption_header(&data),
+            Err(BackupEncryptionError::InvalidHeader)
         ));
     }
 
@@ -809,10 +1030,14 @@ mod tests {
         assert_eq!(a1.len(), KEY_FINGERPRINT_LEN);
         assert!(a1.chars().all(|c| c.is_ascii_hexdigit()));
 
-        // The fingerprint does not depend on the configured KDF parameters, so changing
-        // them does not change which key an artifact is attributed to.
+        // The fingerprint of key file material does not depend on the configured KDF
+        // parameters, so changing them does not change which key an artifact is
+        // attributed to.
         let default_params = BackupEncryptor::with_key_material(
             BackupEncryptionConfig {
+                key_source: EncryptionKeySource::File {
+                    path: "/unused/backup.key".to_string(),
+                },
                 key_derivation: KeyDerivationParams::default(),
                 ..config(None)
             },
@@ -820,7 +1045,28 @@ mod tests {
         )
         .unwrap();
         assert_eq!(default_params.key_identifier(), a1);
-        assert_eq!(encryptor(b"passphrase-a", None).key_identifier(), a1);
+        assert_eq!(key_file_encryptor(b"passphrase-a").key_identifier(), a1);
+        let endpoint = BackupEncryptor::with_key_material(
+            BackupEncryptionConfig {
+                key_source: EncryptionKeySource::HttpEndpoint {
+                    url: "https://vault.example.com/key".to_string(),
+                },
+                ..config(None)
+            },
+            b"passphrase-a".to_vec(),
+        )
+        .unwrap();
+        assert_eq!(endpoint.key_identifier(), a1);
+
+        // A passphrase is never fingerprinted: with a fixed salt the fingerprint would be
+        // a precomputable verifier of the passphrase.
+        let passphrase = encryptor(b"passphrase-a", None);
+        assert_eq!(passphrase.key_identifier(), PASSPHRASE_KEY_IDENTIFIER);
+        let sealed = passphrase.encrypt(b"x", BackupCompression::Gzip).unwrap();
+        let (header, _) = read_encryption_header(&sealed).unwrap();
+        assert_eq!(header.key_identifier, PASSPHRASE_KEY_IDENTIFIER);
+        assert!(!sealed.windows(a1.len()).any(|w| w == a1.as_bytes()));
+
         assert_eq!(
             encryptor(b"passphrase-a", Some("named")).key_identifier(),
             "named"
@@ -902,7 +1148,7 @@ mod tests {
         let path = dir.path().join("passphrase");
         std::fs::write(&path, "  my secret passphrase \n\n").unwrap();
         assert_eq!(
-            resolve_passphrase(Some(&path)).unwrap(),
+            *resolve_passphrase(Some(&path)).unwrap(),
             b"  my secret passphrase".to_vec()
         );
 
@@ -922,7 +1168,7 @@ mod tests {
         file.write_all(&[0u8, 10, 13, 32, 255, 10]).unwrap();
         drop(file);
         assert_eq!(
-            read_key_file(&path).unwrap(),
+            *read_key_file(&path).unwrap(),
             vec![0u8, 10, 13, 32, 255, 10]
         );
 
@@ -946,7 +1192,7 @@ mod tests {
             ..config(None)
         };
         assert_eq!(
-            resolve_key_material(&passphrase_config).await.unwrap(),
+            *resolve_key_material(&passphrase_config).await.unwrap(),
             b"hunter2".to_vec()
         );
 
@@ -957,16 +1203,22 @@ mod tests {
             ..config(None)
         };
         assert_eq!(
-            resolve_key_material(&file_config).await.unwrap(),
+            *resolve_key_material(&file_config).await.unwrap(),
             vec![7u8; 32]
         );
 
-        // from_config resolves the key and derives the fingerprint of the material.
+        // from_config resolves the key; a passphrase gets the generic identifier and a key
+        // file the fingerprint of its material.
         let enc = BackupEncryptor::from_config(&passphrase_config)
             .await
             .unwrap()
             .expect("enabled configuration yields an encryptor");
-        assert_eq!(enc.key_identifier(), key_fingerprint(b"hunter2").unwrap());
+        assert_eq!(enc.key_identifier(), PASSPHRASE_KEY_IDENTIFIER);
+        let enc = BackupEncryptor::from_config(&file_config)
+            .await
+            .unwrap()
+            .expect("enabled configuration yields an encryptor");
+        assert_eq!(enc.key_identifier(), key_fingerprint(&[7u8; 32]).unwrap());
 
         // A disabled configuration yields no encryptor and reads no secret.
         let disabled = BackupEncryptionConfig {
@@ -1077,7 +1329,32 @@ mod tests {
             ..config(None)
         })
         .unwrap_err();
-        assert!(err.contains("http or https"), "{err}");
+        assert!(err.contains("https"), "{err}");
+        // Plain http would send the key in the clear: only accepted on loopback.
+        let err = validate_encryption_config(&BackupEncryptionConfig {
+            key_source: EncryptionKeySource::HttpEndpoint {
+                url: "http://vault.example.com/key".to_string(),
+            },
+            ..config(None)
+        })
+        .unwrap_err();
+        assert!(err.contains("loopback"), "{err}");
+        for url in [
+            "http://127.0.0.1:8200/key",
+            "http://[::1]:8200/key",
+            "http://localhost/key",
+        ] {
+            assert!(
+                validate_encryption_config(&BackupEncryptionConfig {
+                    key_source: EncryptionKeySource::HttpEndpoint {
+                        url: url.to_string(),
+                    },
+                    ..config(None)
+                })
+                .is_ok(),
+                "{url}"
+            );
+        }
 
         // KDF bounds and key identifier.
         let err = validate_encryption_config(&BackupEncryptionConfig {
@@ -1101,6 +1378,105 @@ mod tests {
             ..config(Some("prod-2026"))
         })
         .is_ok());
+    }
+
+    /// Serve `responses` one connection each on a loopback port, as a key endpoint would.
+    async fn serve_key_endpoint(responses: Vec<Vec<u8>>) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for response in responses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                // Read the request head before answering.
+                let mut request = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = stream.read(&mut buf).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buf[..n]);
+                }
+                assert!(request.starts_with(b"GET /backup-key "));
+                stream.write_all(&response).await.unwrap();
+                stream.shutdown().await.unwrap();
+            }
+        });
+        addr
+    }
+
+    fn http_response(status: &str, body: &[u8]) -> Vec<u8> {
+        let mut response = format!(
+            "HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(body);
+        response
+    }
+
+    #[tokio::test]
+    async fn test_http_key_endpoint_against_a_live_server() {
+        let key = [0x5au8; 32];
+        let addr = serve_key_endpoint(vec![
+            http_response("200 OK", &key),
+            http_response("200 OK", &key),
+            http_response("404 Not Found", b"no such key"),
+            http_response("200 OK", b""),
+            http_response("200 OK", &vec![1u8; MAX_KEY_ENDPOINT_BODY + 1]),
+        ])
+        .await;
+        let endpoint = BackupEncryptionConfig {
+            key_source: EncryptionKeySource::HttpEndpoint {
+                url: format!("http://{addr}/backup-key"),
+            },
+            ..config(None)
+        };
+        assert!(validate_encryption_config(&endpoint).is_ok());
+
+        // The body is the key material, and an artifact sealed with it opens with a
+        // second fetch of the same key.
+        assert_eq!(
+            *resolve_key_material(&endpoint).await.unwrap(),
+            key.to_vec()
+        );
+        let writer = BackupEncryptor::from_config(&endpoint)
+            .await
+            .unwrap()
+            .expect("enabled");
+        assert_eq!(writer.key_identifier(), key_fingerprint(&key).unwrap());
+        let sealed = writer.encrypt(b"secret", BackupCompression::Gzip).unwrap();
+        let reader = key_file_encryptor(&key);
+        assert_eq!(reader.decrypt(&sealed).unwrap().0, b"secret");
+
+        // An error status, an empty body and an oversized body are refused.
+        assert!(matches!(
+            resolve_key_material(&endpoint).await,
+            Err(BackupEncryptionError::HttpError(_))
+        ));
+        let err = resolve_key_material(&endpoint).await.unwrap_err();
+        assert!(err.to_string().contains("empty body"), "{err}");
+        let err = resolve_key_material(&endpoint).await.unwrap_err();
+        assert!(err.to_string().contains("more than"), "{err}");
+
+        // Nothing listens any more: the error is reported, not a hang.
+        assert!(matches!(
+            resolve_key_material(&endpoint).await,
+            Err(BackupEncryptionError::HttpError(_))
+        ));
+
+        // A plain http endpoint off loopback is refused before any request is made.
+        let remote = BackupEncryptionConfig {
+            key_source: EncryptionKeySource::HttpEndpoint {
+                url: "http://192.0.2.1/backup-key".to_string(),
+            },
+            ..config(None)
+        };
+        assert!(matches!(
+            resolve_key_material(&remote).await,
+            Err(BackupEncryptionError::KeySourceError(_))
+        ));
     }
 
     #[test]

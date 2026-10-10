@@ -12,7 +12,8 @@ use std::io::{Cursor, Read};
 use std::path::Path;
 
 use kubidm_proto::backup::{
-    BackupCompression, BackupEncryptionConfig, BackupEncryptionHeader, BACKUP_ENCRYPTION_MAGIC,
+    is_encrypted_backup_name, BackupCompression, BackupEncryptionConfig, BackupEncryptionHeader,
+    BACKUP_ENCRYPTED_SUFFIX, BACKUP_ENCRYPTION_MAGIC,
 };
 
 use super::encryption::{
@@ -67,6 +68,10 @@ pub enum BackupOpenError {
     /// The artifact is not encrypted although the configuration encrypts backups. Only the
     /// post-write verification treats this as an error.
     NotEncrypted,
+    /// The artifact is named as an encrypted backup (`.enc`) but is not an encrypted
+    /// container. Whoever can write to the backup store could otherwise swap an encrypted
+    /// backup for an unauthenticated plain one.
+    PlainUnderEncryptedName { name: String },
     /// The container is malformed or the key does not open it.
     Decrypt(BackupEncryptionError),
 }
@@ -92,6 +97,11 @@ impl fmt::Display for BackupOpenError {
             BackupOpenError::NotEncrypted => write!(
                 f,
                 "the backup is not encrypted although backup encryption is enabled"
+            ),
+            BackupOpenError::PlainUnderEncryptedName { name } => write!(
+                f,
+                "{name} is named as an encrypted backup ({BACKUP_ENCRYPTED_SUFFIX}) but is not \
+                 an encrypted container; it may have been replaced, so it is refused"
             ),
             BackupOpenError::Decrypt(err) => write!(f, "{err}"),
         }
@@ -130,6 +140,7 @@ pub fn open_backup_bytes(
         if strict && encryptor.is_some() {
             return Err(BackupOpenError::NotEncrypted);
         }
+        check_plain_name(name)?;
         return Ok(OpenedBackup {
             reader: Box::new(Cursor::new(data)),
             compression: BackupCompression::identify_file(name),
@@ -154,6 +165,19 @@ pub fn open_backup_bytes(
         },
         encryption: Some(header),
     })
+}
+
+/// A plain artifact must not carry the encrypted suffix, see
+/// [`BackupOpenError::PlainUnderEncryptedName`].
+fn check_plain_name(name: &Path) -> Result<(), BackupOpenError> {
+    match name.file_name().and_then(|name| name.to_str()) {
+        Some(file_name) if is_encrypted_backup_name(file_name) => {
+            Err(BackupOpenError::PlainUnderEncryptedName {
+                name: name.display().to_string(),
+            })
+        }
+        _ => Ok(()),
+    }
 }
 
 /// The first bytes of `file`, as many as the encrypted container magic has (fewer when the
@@ -182,6 +206,7 @@ pub fn open_backup_file(
     let prefix = peek_prefix(&mut file).map_err(io_err)?;
 
     if !is_encrypted_artifact(&prefix) {
+        check_plain_name(path)?;
         return Ok(OpenedBackup {
             reader: Box::new(Cursor::new(prefix).chain(file)),
             compression: BackupCompression::identify_file(path),
@@ -211,7 +236,18 @@ pub async fn open_backup_file_with_config(
     drop(file);
 
     if !is_encrypted_artifact(&prefix) {
-        return open_backup_file(path, None);
+        let opened = open_backup_file(path, None)?;
+        if encryption.is_some_and(|config| config.enabled) {
+            // Kept working so that backups from before encryption was enabled restore, but
+            // a plain artifact is not authenticated: say so.
+            warn!(
+                "{} is not encrypted although backup encryption is enabled; its integrity is \
+                 not protected by the encryption key. Only restore it if you know where it \
+                 comes from",
+                path.display()
+            );
+        }
+        return Ok(opened);
     }
 
     let encryptor = match encryption {
@@ -311,6 +347,21 @@ mod tests {
         assert_eq!(opened.compression, BackupCompression::Gzip);
         assert!(opened.key_identifier().is_none());
 
+        // A plain artifact named as an encrypted one is refused, strict or not.
+        for encryptor in [None, Some(encryptor(b"pw"))] {
+            match open_backup_bytes(
+                b"{}".to_vec(),
+                Path::new("backup-2024-01-01T22:00:00Z.json.enc"),
+                encryptor.as_ref(),
+                false,
+            ) {
+                Err(BackupOpenError::PlainUnderEncryptedName { name }) => {
+                    assert!(name.ends_with(".json.enc"), "{name}")
+                }
+                other => panic!("expected PlainUnderEncryptedName, got {other:?}"),
+            }
+        }
+
         // Strict mode refuses a plain artifact when encryption is configured.
         assert!(matches!(
             open_backup_bytes(
@@ -379,8 +430,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn test_open_backup_file_streams_plain_and_decrypts_encrypted() {
+    #[tokio::test]
+    async fn test_open_backup_file_streams_plain_and_decrypts_encrypted() {
         let dir = tempfile::tempdir().unwrap();
         let enc = encryptor(b"pw");
 
@@ -390,6 +441,19 @@ mod tests {
         assert_eq!(opened.compression, BackupCompression::Gzip);
         assert!(opened.encryption.is_none());
         assert_eq!(read_all(opened.reader), gzip(b"{\"plain\": true}"));
+
+        // A plain artifact swapped in under an encrypted name is refused.
+        let swapped = dir.path().join("backup-2024-01-01T22:00:00Z.json.gz.enc");
+        std::fs::write(&swapped, gzip(b"{\"plain\": true}")).unwrap();
+        assert!(matches!(
+            open_backup_file(&swapped, Some(&enc)),
+            Err(BackupOpenError::PlainUnderEncryptedName { .. })
+        ));
+        assert!(matches!(
+            open_backup_file_with_config(&swapped, None).await,
+            Err(BackupOpenError::PlainUnderEncryptedName { .. })
+        ));
+        std::fs::remove_file(&swapped).unwrap();
 
         // Files shorter than the magic are plain too.
         let tiny = dir.path().join("tiny.json");
