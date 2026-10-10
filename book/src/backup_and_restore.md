@@ -614,11 +614,12 @@ when its bucket does not exist), they restore the database, hand the abandoned h
 directory, and exit with code 2 and a warning: the restore succeeded and must not be repeated or rolled back. The server
 records the abandoned history, and the change of server uuid when the restored backup carries another one, at its first
 archive synchronisation that reaches the archive, before it archives anything else. Should even the WAL directory not be
-writable, the error says so: a later point-in-time recovery past the restore could then replay the abandoned history
-until a new online backup is taken. `recover` behaves the same way, and also records the abandoned history in the region
-it recovered from. A restore or recovery that failed exits with code 1, including one whose reindex or verification
-failed after the commit: its error then says that the database WAS restored, and whether to run
-`kubidmd database reindex` before the server starts or to recover to another point.
+writable, the error says so and the command exits with code 3: a later point-in-time recovery past the restore could
+then replay the abandoned history until a new online backup is taken, so take one right after starting the server.
+`recover` behaves the same way, and also records the abandoned history in the region it recovered from. A restore or
+recovery that failed exits with code 1, including one whose reindex or verification failed after the commit: its error
+then says that the database WAS restored, and whether to run `kubidmd database reindex` before the server starts or to
+recover to another point.
 
 #### The Encrypted WAL Archive
 

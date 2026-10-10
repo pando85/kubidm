@@ -268,20 +268,25 @@ pub enum RestoreStatus {
     /// abandoned history, typically because the archive's location is unavailable, as when
     /// restoring from a replication region while the primary bucket is down. The restore
     /// must not be repeated or rolled back. The restore is handed to the server, which
-    /// records it at its first synchronisation that reaches the archive; should even that
-    /// fail, a new online backup after the server start makes point-in-time recovery safe
-    /// again.
+    /// records it at its first synchronisation that reaches the archive: nothing else is
+    /// needed.
     WalArchiveNotUpdated,
+    /// As [`Self::WalArchiveNotUpdated`], but the restore could not be handed to the
+    /// server either. Until a new online backup is taken after the server start, a
+    /// point-in-time recovery past the restore could replay the abandoned history.
+    AbandonedHistoryNotRecorded,
 }
 
 impl RestoreStatus {
-    /// The exit code of a restore command that ended this way: 0 when complete, 2 when the
-    /// database was restored but the WAL archive was not updated, so that automation can
-    /// tell it apart from a failed restore, which exits with 1.
+    /// The exit code of a restore command that ended this way, so that automation can tell
+    /// it apart from a failed restore, which exits with 1: 0 when complete, 2 when the
+    /// database was restored and the server records the abandoned history, and 3 when it
+    /// was restored but a new online backup must follow the server start.
     pub fn exit_code(self) -> u8 {
         match self {
             RestoreStatus::Complete => 0,
             RestoreStatus::WalArchiveNotUpdated => 2,
+            RestoreStatus::AbandonedHistoryNotRecorded => 3,
         }
     }
 }
@@ -319,7 +324,7 @@ async fn note_restore_in_wal_archive(
     outcome: &RestoreOutcome,
 ) -> RestoreStatus {
     match pitr::note_restore(config, outcome.watermark, outcome.server_uuid).await {
-        Ok(AbandonedHistory::Recorded) => RestoreStatus::Complete,
+        Ok(AbandonedHistory::Recorded | AbandonedHistory::NotConfigured) => RestoreStatus::Complete,
         Ok(AbandonedHistory::Deferred(err)) => {
             warn!(
                 %err,
@@ -338,7 +343,7 @@ async fn note_restore_in_wal_archive(
                  point-in-time recovery past this point could replay it: take a new online \
                  backup right after starting the server."
             );
-            RestoreStatus::WalArchiveNotUpdated
+            RestoreStatus::AbandonedHistoryNotRecorded
         }
     }
 }
@@ -1166,6 +1171,8 @@ mod tests {
         // Restored, but the archive was not updated: neither success nor the failure (1)
         // that automation would retry or roll back.
         assert_eq!(RestoreStatus::WalArchiveNotUpdated.exit_code(), 2);
+        // Nor when a new online backup must follow the server start.
+        assert_eq!(RestoreStatus::AbandonedHistoryNotRecorded.exit_code(), 3);
     }
 
     #[tokio::test]

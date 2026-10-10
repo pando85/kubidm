@@ -406,6 +406,16 @@ fn check_file_ownership(opt: &KubidmdParser) -> Result<(), ExitCode> {
     Ok(())
 }
 
+/// What the operator must do after a restore or recovery that ended with `status`.
+fn not_recorded_hint(status: RestoreStatus) -> &'static str {
+    match status {
+        RestoreStatus::AbandonedHistoryNotRecorded => {
+            "; take a new online backup right after starting the server"
+        }
+        RestoreStatus::Complete | RestoreStatus::WalArchiveNotUpdated => "",
+    }
+}
+
 /// The exit code of `database restore` and `restore-s3`: 1 when the restore failed, which
 /// includes a database that was restored but could not be reindexed (its error says so),
 /// otherwise [`RestoreStatus::exit_code`].
@@ -417,7 +427,9 @@ fn restore_exit_code(restored: Result<RestoreStatus, OperationError>) -> ExitCod
         }
         Some(status) => {
             warn!(
-                "Restore finished: the database was restored, but the WAL archive was not updated"
+                "Restore finished: the database was restored, but the WAL archive was not \
+                 updated{}",
+                not_recorded_hint(status)
             );
             ExitCode::from(status.exit_code())
         }
@@ -1275,12 +1287,13 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
                 .await
             {
                 Ok(_) if ropt.dry_run => {}
-                Ok(outcome) if !outcome.archive_updated => {
+                Ok(outcome) if outcome.archive != RestoreStatus::Complete => {
                     warn!(
                         "Recovery finished: the database was recovered, but the WAL archive was \
-                         not updated"
+                         not updated{}",
+                        not_recorded_hint(outcome.archive)
                     );
-                    return ExitCode::from(2);
+                    return ExitCode::from(outcome.archive.exit_code());
                 }
                 Ok(_) => info!("✅ Recovery Success!"),
                 Err(err) => {

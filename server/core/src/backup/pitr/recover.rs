@@ -22,6 +22,7 @@ use uuid::Uuid;
 use super::archive::{manifest_gap, manifest_uuid_change};
 use super::store::{PitrStore, SegmentKeys};
 use super::{blocking, PitrError, PitrLocation, PitrSettings};
+use crate::backup::cli::RestoreStatus;
 use crate::config::Configuration;
 
 /// What the operator asked `recover` to reach.
@@ -183,8 +184,9 @@ pub struct RecoveryOutcome {
     pub apply: Option<WalApplyReport>,
     /// Whether the WAL archive records the history the recovery abandoned. When it does
     /// not, the database was still recovered, and the server records it once it reaches
-    /// the archive, when the recovery could hand it over.
-    pub archive_updated: bool,
+    /// the archive, when the recovery could hand it over. Complete for a dry run, which
+    /// abandons nothing.
+    pub archive: RestoreStatus,
 }
 
 /// The archive as recovery sees it: the manifest, plus the closed segments of the same
@@ -694,7 +696,7 @@ pub async fn pitr_recover_server_core(
             recovered_ts,
             dry_run: true,
             apply: None,
-            archive_updated: false,
+            archive: RestoreStatus::Complete,
         });
     }
 
@@ -743,8 +745,8 @@ pub async fn pitr_recover_server_core(
         reason: "recover",
         now: duration_from_epoch_now(),
     };
-    let archive_updated = match record_abandoned_history(&opened, &restored).await {
-        Ok(AbandonedHistory::Recorded) => true,
+    let archive = match record_abandoned_history(&opened, &restored).await {
+        Ok(AbandonedHistory::Recorded | AbandonedHistory::NotConfigured) => RestoreStatus::Complete,
         Ok(AbandonedHistory::Deferred(err)) => {
             warn!(
                 %err,
@@ -752,7 +754,7 @@ pub async fn pitr_recover_server_core(
                  updated; do not recover it again. The server records the abandoned history in \
                  the archive at its first synchronisation that reaches it."
             );
-            false
+            RestoreStatus::WalArchiveNotUpdated
         }
         Err(err) => {
             error!(
@@ -762,7 +764,7 @@ pub async fn pitr_recover_server_core(
                  again. A later recovery past this point could replay it: take a new online \
                  backup right after starting the server, and recover only to points after it."
             );
-            false
+            RestoreStatus::AbandonedHistoryNotRecorded
         }
     };
 
@@ -781,7 +783,7 @@ pub async fn pitr_recover_server_core(
         recovered_ts,
         dry_run: false,
         apply,
-        archive_updated,
+        archive,
     })
 }
 
@@ -871,6 +873,8 @@ pub(super) struct RestoredDatabase<'a> {
 pub enum AbandonedHistory {
     /// In the archive.
     Recorded,
+    /// Nowhere: WAL archiving is not configured.
+    NotConfigured,
     /// The archive could not be updated, for the reason given. The restore was handed to
     /// the server through its WAL directory instead: its first synchronisation that
     /// reaches the archive records it, before archiving anything else.
@@ -1011,7 +1015,7 @@ pub async fn note_restore(
     server_uuid: Uuid,
 ) -> Result<AbandonedHistory, PitrError> {
     let Some(settings) = PitrSettings::from_config(config)? else {
-        return Ok(AbandonedHistory::Recorded);
+        return Ok(AbandonedHistory::NotConfigured);
     };
     let restored = RestoredDatabase {
         after_ts: watermark,
