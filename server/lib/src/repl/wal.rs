@@ -134,6 +134,8 @@ pub enum WalError {
     SerializationError(String),
     InvalidSegment(String),
     ConfigError(String),
+    /// A recovery target that is not a valid time or CID.
+    InvalidTarget(String),
 }
 
 impl std::fmt::Display for WalError {
@@ -143,6 +145,7 @@ impl std::fmt::Display for WalError {
             WalError::SerializationError(msg) => write!(f, "WAL serialization error: {}", msg),
             WalError::InvalidSegment(msg) => write!(f, "Invalid WAL segment: {}", msg),
             WalError::ConfigError(msg) => write!(f, "WAL config error: {}", msg),
+            WalError::InvalidTarget(msg) => write!(f, "{msg}"),
         }
     }
 }
@@ -1325,10 +1328,10 @@ pub fn select_records<'a>(
 /// Parse an RFC3339 recovery target into a duration since the epoch.
 pub fn parse_recovery_target_time(timestamp: &str) -> Result<Duration, WalError> {
     let dt = OffsetDateTime::parse(timestamp, &Rfc3339)
-        .map_err(|e| WalError::InvalidSegment(format!("Invalid timestamp format: {}", e)))?;
+        .map_err(|e| WalError::InvalidTarget(format!("Invalid timestamp format: {}", e)))?;
     let nanos = dt.unix_timestamp_nanos();
     if nanos < 0 {
-        return Err(WalError::InvalidSegment(format!(
+        return Err(WalError::InvalidTarget(format!(
             "Timestamp {timestamp} is before the epoch"
         )));
     }
@@ -1338,7 +1341,7 @@ pub fn parse_recovery_target_time(timestamp: &str) -> Result<Duration, WalError>
 /// Parse a CID as printed by the server (`<nanos>-<server uuid>`).
 pub fn parse_recovery_target_cid(cid_str: &str) -> Result<Cid, WalError> {
     let Some((ts_str, uuid_str)) = cid_str.split_once('-') else {
-        return Err(WalError::InvalidSegment(format!(
+        return Err(WalError::InvalidTarget(format!(
             "Invalid CID format: {}",
             cid_str
         )));
@@ -1346,10 +1349,10 @@ pub fn parse_recovery_target_cid(cid_str: &str) -> Result<Cid, WalError> {
 
     let ts_nanos: u64 = ts_str
         .parse()
-        .map_err(|_| WalError::InvalidSegment("Invalid timestamp in CID".to_string()))?;
+        .map_err(|_| WalError::InvalidTarget("Invalid timestamp in CID".to_string()))?;
 
     let s_uuid = Uuid::parse_str(uuid_str)
-        .map_err(|_| WalError::InvalidSegment("Invalid UUID in CID".to_string()))?;
+        .map_err(|_| WalError::InvalidTarget("Invalid UUID in CID".to_string()))?;
 
     Ok(Cid {
         ts: Duration::from_nanos(ts_nanos),

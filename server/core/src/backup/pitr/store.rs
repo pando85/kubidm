@@ -89,6 +89,7 @@ impl BaseLocation {
 }
 
 /// Reads and writes the archive at a [`PitrLocation`].
+#[derive(Clone)]
 pub(super) enum PitrStore {
     Local { dir: PathBuf },
     S3 { client: Box<S3ClientWrapper> },

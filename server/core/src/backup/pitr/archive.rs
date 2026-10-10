@@ -1,6 +1,7 @@
 //! The running server's archive task: closing, archiving and pruning segments, and
 //! indexing base backups.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -156,6 +157,10 @@ pub struct PitrArchive {
     /// Serialises the read-modify-write cycles on the manifest between the periodic
     /// synchronisation and base backup registration.
     manifest_lock: tokio::sync::Mutex<()>,
+    /// The archive location, opened (its S3 client built) once.
+    store: tokio::sync::OnceCell<PitrStore>,
+    /// The stores of the replication regions, by region name, built once.
+    pub(super) region_stores: tokio::sync::Mutex<BTreeMap<String, PitrStore>>,
 }
 
 impl PitrArchive {
@@ -164,7 +169,16 @@ impl PitrArchive {
             settings,
             archiver,
             manifest_lock: tokio::sync::Mutex::new(()),
+            store: tokio::sync::OnceCell::new(),
+            region_stores: tokio::sync::Mutex::new(BTreeMap::new()),
         }
+    }
+
+    /// The archive location; its S3 client is built at the first use and then reused.
+    async fn store(&self) -> Result<&PitrStore, PitrError> {
+        self.store
+            .get_or_try_init(|| PitrStore::open(&self.settings.location))
+            .await
     }
 
     pub fn settings(&self) -> &PitrSettings {
@@ -298,9 +312,9 @@ impl PitrArchive {
             let local_dir = self.settings.local_dir.clone();
             blocking(move || Ok(scan_segments(&local_dir)?)).await?
         };
-        let store = PitrStore::open(&self.settings.location).await?;
+        let store = self.store().await?;
         let (mut manifest, mut changed) = load_or_new_manifest(
-            &store,
+            store,
             &self.settings.location,
             server_uuid,
             &events.server_uuid_changes,
@@ -319,9 +333,9 @@ impl PitrArchive {
             local_segments.sort_by_key(|segment| segment.start_ts);
         }
 
-        let pending = self.pending_segments(&store, &manifest, local_segments);
+        let pending = self.pending_segments(store, &manifest, local_segments);
         let archived = self
-            .archive_pending(&store, &mut manifest, pending, now)
+            .archive_pending(store, &mut manifest, pending, now)
             .await;
         changed |= archived.quarantined;
 
@@ -330,14 +344,14 @@ impl PitrArchive {
             *events_recorded = true;
             changed = false;
             report.archived += archived.segments.len();
-            self.cleanup_local(&store, &archived.segments).await?;
+            self.cleanup_local(store, &archived.segments).await?;
         }
         if let Some(err) = archived.error {
             return Err(err);
         }
 
         changed |= self
-            .apply_retention(&store, &mut manifest, now, report)
+            .apply_retention(store, &mut manifest, now, report)
             .await?;
         changed |= prune_markers(&mut manifest);
 
@@ -346,7 +360,7 @@ impl PitrArchive {
         }
         *events_recorded = true;
 
-        self.replicate(&store, &mut manifest, now, report).await;
+        self.replicate(store, &mut manifest, now, report).await;
 
         Ok(())
     }
@@ -627,7 +641,7 @@ impl PitrArchive {
         })?;
 
         let _guard = self.manifest_lock.lock().await;
-        let store = PitrStore::open(&self.settings.location).await?;
+        let store = self.store().await?;
         // The identity changes the archiver noticed are applied first: a backup taken
         // right after a replication refresh carries the new server uuid already.
         let (server_uuid, changes) = self
@@ -646,7 +660,7 @@ impl PitrArchive {
             }
         }
         let (mut manifest, _) =
-            load_or_new_manifest(&store, &self.settings.location, server_uuid, &changes).await?;
+            load_or_new_manifest(store, &self.settings.location, server_uuid, &changes).await?;
         manifest.add_base_backup(PitrBaseBackup {
             key: key.to_string(),
             timestamp: timestamp.to_string(),
@@ -671,7 +685,7 @@ impl PitrArchive {
             watermark = %format_ts_rfc3339(watermark_ts),
             "Base backup indexed for point-in-time recovery"
         );
-        self.replicate(&store, &mut manifest, now, &mut PitrSyncReport::default())
+        self.replicate(store, &mut manifest, now, &mut PitrSyncReport::default())
             .await;
         Ok(())
     }

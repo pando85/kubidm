@@ -288,7 +288,7 @@ impl BackendConfig {
     }
 
     /// Enable WAL archiving with `wal_archive`. Segments are written to its `local_path`,
-    /// or to `wal` next to the database file when that is unset.
+    /// which must be set.
     pub fn with_wal_archive(mut self, wal_archive: Option<WalArchiveConfig>) -> Self {
         self.wal_archive = wal_archive;
         self
@@ -305,26 +305,17 @@ impl BackendConfig {
         }
     }
 
-    /// The directory WAL segments are written to when archiving is enabled.
+    /// The directory WAL segments are written to when archiving is enabled. The caller
+    /// resolves it (the server core derives the default from the database path), so that
+    /// there is one place that does.
     fn wal_segments_path(&self) -> Result<Option<PathBuf>, OperationError> {
         let Some(wal_archive) = self.wal_archive.as_ref().filter(|w| w.enabled) else {
             return Ok(None);
         };
-        if let Some(local_path) = &wal_archive.local_path {
-            return Ok(Some(local_path.clone()));
-        }
-        if self.path.as_os_str().is_empty() {
-            error!(
-                "WAL archiving is enabled on an in-memory database without wal_archive.local_path"
-            );
-            return Err(OperationError::InvalidState);
-        }
-        match self.path.parent() {
-            Some(parent) => Ok(Some(parent.join("wal"))),
+        match &wal_archive.local_path {
+            Some(local_path) => Ok(Some(local_path.clone())),
             None => {
-                error!(
-                    "WAL archiving is enabled but the database path has no parent directory and wal_archive.local_path is unset"
-                );
+                error!("WAL archiving is enabled without a WAL directory (wal_archive.local_path)");
                 Err(OperationError::InvalidState)
             }
         }

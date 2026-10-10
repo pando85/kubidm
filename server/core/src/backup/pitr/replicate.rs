@@ -12,6 +12,20 @@ use super::{select_segments_to_delete, BaseLocation, PitrArchive, PitrError, Pit
 use crate::backup::S3ClientWrapper;
 
 impl PitrArchive {
+    /// The store of the replication region `region`, built once and reused by every
+    /// synchronisation.
+    async fn region_store(&self, region: &ReplicationRegionConfig) -> Result<PitrStore, PitrError> {
+        let mut stores = self.region_stores.lock().await;
+        if let Some(store) = stores.get(&region.region) {
+            return Ok(store.clone());
+        }
+        let store = PitrStore::S3 {
+            client: Box::new(S3ClientWrapper::for_region(region).await?),
+        };
+        stores.insert(region.region.clone(), store.clone());
+        Ok(store)
+    }
+
     /// Mirror the archive to every region of [`PitrSettings::replication`].
     ///
     /// The segments a region misses are copied from the primary (checked against the
@@ -54,7 +68,13 @@ impl PitrArchive {
                 now,
                 retention: self.settings.wal.retention(),
             };
-            match replicate_to_region(client, store, manifest, &target).await {
+            let result = match self.region_store(region).await {
+                Ok(region_store) => {
+                    replicate_to_region(client, store, &region_store, manifest, &target).await
+                }
+                Err(err) => Err(err),
+            };
+            match result {
                 Ok(copied) => report.replicated += copied,
                 Err(err) => {
                     report.region_errors += 1;
@@ -85,14 +105,12 @@ struct RegionTarget<'a> {
 async fn replicate_to_region(
     primary: &S3ClientWrapper,
     store: &PitrStore,
+    region_store: &PitrStore,
     manifest: &mut PitrManifest,
     target: &RegionTarget<'_>,
 ) -> Result<usize, PitrError> {
     let region_name = &target.config.region;
-    let region_store = PitrStore::S3 {
-        client: Box::new(S3ClientWrapper::for_region(target.config).await?),
-    };
-    let PitrStore::S3 { client: region } = &region_store else {
+    let PitrStore::S3 { client: region } = region_store else {
         return Err(PitrError::Config("region store is not S3".to_string()));
     };
 
