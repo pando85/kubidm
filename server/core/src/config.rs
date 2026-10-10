@@ -142,6 +142,14 @@ impl OnlineBackup {
             wal_archive
                 .validate()
                 .map_err(|reason| format!("online_backup.wal_archive: {reason}"))?;
+            // A separate S3 location of the archive may replicate it to regions of its own.
+            if let Some(wal_s3) = &wal_archive.s3 {
+                if let Some(replication) = &wal_s3.replication {
+                    validate_replication(wal_s3, replication).map_err(|reason| {
+                        reason.replacen("online_backup.s3", "online_backup.wal_archive.s3", 1)
+                    })?;
+                }
+            }
         }
 
         if let Some(s3) = &self.s3 {
@@ -1801,6 +1809,26 @@ path_prefix = \"dr\"
         let err = online_backup.validate().expect_err("must be rejected");
         assert!(err.starts_with("online_backup.wal_archive:"));
         assert!(err.contains("online_backup.enabled"));
+        online_backup.enabled = true;
+
+        // A separate S3 location of the archive has its replication checked like the
+        // backups' one, and the error names that location.
+        let mut wal_s3 = S3Config::with_bucket("kubidm-wal".to_string());
+        wal_s3.replication = Some(ReplicationConfig {
+            enabled: true,
+            regions: Vec::new(),
+            ..ReplicationConfig::default()
+        });
+        online_backup.wal_archive = Some(WalArchiveConfig {
+            enabled: true,
+            s3: Some(wal_s3),
+            ..WalArchiveConfig::default()
+        });
+        let err = online_backup.validate().expect_err("must be rejected");
+        assert!(
+            err.starts_with("online_backup.wal_archive.s3.replication:"),
+            "{err}"
+        );
     }
 
     #[test]

@@ -114,6 +114,21 @@ struct PitrRecoverOpt {
     /// use, and change nothing.
     #[clap(long)]
     dry_run: bool,
+
+    /// Recover from the copy of the WAL archive (and of the S3 base backups) held by the
+    /// replication region of this name, as configured under
+    /// [[online_backup.s3.replication.regions]] (or the regions of
+    /// [online_backup.wal_archive.s3.replication]), instead of the primary bucket.
+    #[clap(long, value_name = "NAME")]
+    region: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct PitrListOpt {
+    /// List the copy of the WAL archive held by the replication region of this name
+    /// instead of the primary bucket.
+    #[clap(long, value_name = "NAME")]
+    region: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -193,7 +208,7 @@ enum DbCommands {
     Recover(PitrRecoverOpt),
     #[clap(name = "pitr-list")]
     /// List the base backups, WAL segments and the recoverable window of the WAL archive
-    PitrList,
+    PitrList(PitrListOpt),
     #[clap(name = "replicate-status")]
     /// Report the state of cross-region backup replication.
     ///

@@ -15,6 +15,19 @@
 //! Recovery restores the newest base backup whose watermark is at or before the target,
 //! then replays every archived record with a CID above the watermark and at or below the
 //! target, in CID order, in the same database transaction as the restore.
+//!
+//! Segments hold the full state of every changed entry, credentials included, so they get
+//! the protection of the backups:
+//!
+//! - with `[online_backup.encryption]` enabled, a closed segment is sealed with the backup
+//!   encryption scheme before it is archived (uploaded to S3, or kept as `<segment>.enc` in
+//!   the local WAL directory) and the plaintext copy is removed; recovery decrypts it;
+//! - when the S3 location of the archive replicates its backups to regions, the archive
+//!   (segments, then the manifest) is mirrored to every region after each synchronisation,
+//!   and `recover --region` / `pitr-list --region` read a region's copy.
+//!
+//! The manifest is never encrypted: it holds CID ranges, checksums, object keys and key
+//! identifiers, no directory content.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -24,8 +37,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kubidm_proto::backup::{
-    PitrBaseBackup, PitrManifest, PitrTimelineBreak, PitrWalGap, S3Config, WalArchiveConfig,
-    WalSegment, PITR_MANIFEST_KEY,
+    is_encrypted_backup_name, BackupEncryptionConfig, PitrBaseBackup, PitrManifest,
+    PitrTimelineBreak, PitrWalGap, ReplicationConfig, ReplicationRegionConfig, S3Config,
+    WalArchiveConfig, WalSegment, PITR_MANIFEST_KEY, WAL_SEGMENT_KEY_PREFIX,
 };
 use kubidm_proto::internal::OperationError;
 use kubidmd_lib::be::{BackupStructuralReport, SharedWalArchiver, WalApplyReport};
@@ -39,7 +53,10 @@ use tokio::sync::broadcast;
 use tokio::time::{interval, MissedTickBehavior};
 use uuid::Uuid;
 
-use crate::backup::{is_backup_artifact_name, S3BackupError, S3ClientWrapper};
+use crate::backup::{
+    is_backup_artifact_name, is_encrypted_artifact, read_encryption_header, seal_backup_async,
+    BackupEncryptor, S3BackupError, S3ClientWrapper,
+};
 use crate::config::Configuration;
 use crate::CoreAction;
 
@@ -53,6 +70,8 @@ pub enum PitrError {
     Target(String),
     NotRecoverable(String),
     Operation(OperationError),
+    /// The backup encryption key could not be obtained, or does not open a segment.
+    Encryption(String),
 }
 
 impl fmt::Display for PitrError {
@@ -66,6 +85,7 @@ impl fmt::Display for PitrError {
             PitrError::Target(msg) => write!(f, "invalid recovery target: {msg}"),
             PitrError::NotRecoverable(msg) => write!(f, "not recoverable: {msg}"),
             PitrError::Operation(err) => write!(f, "PITR database error: {err:?}"),
+            PitrError::Encryption(msg) => write!(f, "PITR encryption error: {msg}"),
         }
     }
 }
@@ -94,6 +114,18 @@ impl From<OperationError> for PitrError {
     fn from(err: OperationError) -> Self {
         PitrError::Operation(err)
     }
+}
+
+/// Run file I/O, segment parsing and cryptography on the blocking thread pool, so that the
+/// archive task and the recovery commands never stall the async runtime.
+async fn blocking<T, F>(work: F) -> Result<T, PitrError>
+where
+    F: FnOnce() -> Result<T, PitrError> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|err| PitrError::Io(std::io::Error::other(err)))?
 }
 
 /// Where closed segments and the manifest are kept.
@@ -161,6 +193,9 @@ pub struct PitrSettings {
     /// Where the base backups are. S3 when `[online_backup.s3]` is configured, since an
     /// off-host copy is what disaster recovery needs; the local directory otherwise.
     pub bases: BaseLocation,
+    /// The backup encryption settings. When enabled, archived segments are encrypted with
+    /// them exactly like backups.
+    pub encryption: BackupEncryptionConfig,
 }
 
 impl PitrSettings {
@@ -212,7 +247,59 @@ impl PitrSettings {
             local_dir,
             location,
             bases,
+            encryption: online_backup.encryption.clone(),
         }))
+    }
+
+    /// The replication section the archive is mirrored with: the enabled replication of
+    /// the S3 location the archive is uploaded to. A local archive is never replicated.
+    pub fn replication(&self) -> Option<&ReplicationConfig> {
+        match &self.location {
+            PitrLocation::S3(config) => config
+                .replication
+                .as_ref()
+                .filter(|replication| replication.enabled),
+            PitrLocation::Local(_) => None,
+        }
+    }
+
+    /// These settings with the archive, and the base backups when they are in S3, read from
+    /// the copies held by the replication region `name`. The region is looked up whether or
+    /// not replication is enabled, so that a replica stays a recovery source after
+    /// replication was switched off, as for `restore-s3 --region`.
+    pub fn for_region(&self, name: &str) -> Result<Self, PitrError> {
+        let PitrLocation::S3(wal_s3) = &self.location else {
+            return Err(PitrError::Config(format!(
+                "the WAL archive is kept in the local directory {}; only an archive in S3 is \
+                 replicated to regions",
+                self.local_dir.display()
+            )));
+        };
+        let wal_region = find_region(wal_s3, name).ok_or_else(|| {
+            PitrError::Config(format!(
+                "no replication region named '{name}' is configured for the S3 location of \
+                 the WAL archive ({})",
+                self.location
+            ))
+        })?;
+        let bases = match &self.bases {
+            BaseLocation::S3(base_s3) => BaseLocation::S3(
+                find_region(base_s3, name)
+                    .ok_or_else(|| {
+                        PitrError::Config(format!(
+                            "no replication region named '{name}' is configured in \
+                             [online_backup.s3], where the base backups are"
+                        ))
+                    })?
+                    .to_s3_config(),
+            ),
+            BaseLocation::Local(dir) => BaseLocation::Local(dir.clone()),
+        };
+        Ok(Self {
+            location: PitrLocation::S3(wal_region.to_s3_config()),
+            bases,
+            ..self.clone()
+        })
     }
 
     /// The WAL configuration the backend archives with: the configured one with the
@@ -223,6 +310,14 @@ impl PitrSettings {
             ..self.wal.clone()
         }
     }
+}
+
+/// The replication region `name` of `config`, whether or not replication is enabled.
+fn find_region<'a>(config: &'a S3Config, name: &str) -> Option<&'a ReplicationRegionConfig> {
+    config
+        .replication
+        .as_ref()
+        .and_then(|replication| replication.regions.iter().find(|r| r.region == name))
 }
 
 /// A base backup fetched for recovery. The S3 variant is removed when dropped.
@@ -245,19 +340,23 @@ impl BaseLocation {
     async fn list_keys(&self) -> Result<Vec<String>, PitrError> {
         let mut keys = match self {
             BaseLocation::Local(dir) => {
-                if !dir.exists() {
-                    return Ok(Vec::new());
-                }
-                let mut keys = Vec::new();
-                for entry in fs::read_dir(dir)? {
-                    let entry = entry?;
-                    if let Some(name) = entry.file_name().to_str() {
-                        if is_backup_artifact_name(name) {
-                            keys.push(name.to_string());
+                let dir = dir.clone();
+                blocking(move || {
+                    let mut keys = Vec::new();
+                    if !dir.exists() {
+                        return Ok(keys);
+                    }
+                    for entry in fs::read_dir(&dir)? {
+                        let entry = entry?;
+                        if let Some(name) = entry.file_name().to_str() {
+                            if is_backup_artifact_name(name) {
+                                keys.push(name.to_string());
+                            }
                         }
                     }
-                }
-                keys
+                    Ok(keys)
+                })
+                .await?
             }
             BaseLocation::S3(config) => S3ClientWrapper::new(config.clone())
                 .await?
@@ -315,10 +414,17 @@ impl PitrStore {
         let data = match self {
             PitrStore::Local { dir } => {
                 let path = dir.join(PITR_MANIFEST_KEY);
-                if !path.exists() {
-                    return Ok(None);
+                let read = blocking(move || {
+                    if !path.exists() {
+                        return Ok(None);
+                    }
+                    Ok(Some(fs::read(&path)?))
+                })
+                .await?;
+                match read {
+                    Some(data) => data,
+                    None => return Ok(None),
                 }
-                fs::read(&path)?
             }
             PitrStore::S3 { client } => {
                 match client.download_backup_if_exists(PITR_MANIFEST_KEY).await? {
@@ -340,11 +446,16 @@ impl PitrStore {
             .map_err(|err| PitrError::Manifest(format!("unable to serialise: {err}")))?;
         match self {
             PitrStore::Local { dir } => {
-                fs::create_dir_all(dir)?;
-                let path = dir.join(PITR_MANIFEST_KEY);
-                let tmp = dir.join(format!("{PITR_MANIFEST_KEY}.tmp"));
-                fs::write(&tmp, &data)?;
-                fs::rename(&tmp, &path)?;
+                let dir = dir.clone();
+                blocking(move || {
+                    fs::create_dir_all(&dir)?;
+                    let path = dir.join(PITR_MANIFEST_KEY);
+                    let tmp = dir.join(format!("{PITR_MANIFEST_KEY}.tmp"));
+                    fs::write(&tmp, &data)?;
+                    fs::rename(&tmp, &path)?;
+                    Ok(())
+                })
+                .await?;
             }
             PitrStore::S3 { client } => {
                 client
@@ -361,24 +472,69 @@ impl PitrStore {
         Ok(())
     }
 
-    /// Make the closed segment in `local_dir` available at the location. A no-op for the
-    /// local location, where the segment already is where it belongs.
-    async fn put_segment(&self, local_dir: &Path, segment: &WalSegment) -> Result<(), PitrError> {
-        let PitrStore::S3 { client } = self else {
-            return Ok(());
-        };
-        let data = fs::read(local_dir.join(&segment.segment_id))?;
+    /// Archive the closed segment in `local_dir` and return it as the manifest records it.
+    ///
+    /// With an `encryptor` the segment is sealed with the backup encryption scheme first
+    /// and stored as `<segment>.enc`: uploaded to S3, or written next to the plaintext in
+    /// the local directory, whose plaintext copy the caller removes once the manifest
+    /// records the encrypted one. Without one, the segment is uploaded as it is to S3, and
+    /// the local location has nothing to do: the segment already is where it belongs.
+    async fn put_segment(
+        &self,
+        local_dir: &Path,
+        segment: &WalSegment,
+        encryptor: Option<&BackupEncryptor>,
+    ) -> Result<WalSegment, PitrError> {
+        if !self.is_s3() && encryptor.is_none() {
+            return Ok(segment.clone());
+        }
+        let path = local_dir.join(&segment.segment_id);
+        let data = blocking(move || Ok(fs::read(path)?)).await?;
         verify_segment_checksum(segment, &data)?;
-        client
-            .upload_backup(
-                &data,
-                &segment.object_key(),
-                &segment.created_at,
-                segment.compression,
-                None,
-            )
-            .await?;
-        Ok(())
+
+        let mut archived = WalSegment {
+            encryption_key: None,
+            ..segment.clone()
+        };
+        let stored = match encryptor {
+            Some(encryptor) => {
+                archived.encryption_key = Some(encryptor.key_identifier().to_string());
+                seal_backup_async(data, segment.compression, Some(encryptor))
+                    .await
+                    .map_err(|err| {
+                        PitrError::Encryption(format!(
+                            "unable to encrypt segment {}: {err}",
+                            segment.segment_id
+                        ))
+                    })?
+            }
+            None => data,
+        };
+
+        match self {
+            PitrStore::Local { dir } => {
+                let path = dir.join(archived.stored_name());
+                let tmp = dir.join(format!("{}.tmp", archived.stored_name()));
+                blocking(move || {
+                    fs::write(&tmp, &stored)?;
+                    fs::rename(&tmp, &path)?;
+                    Ok(())
+                })
+                .await?;
+            }
+            PitrStore::S3 { client } => {
+                client
+                    .upload_backup(
+                        &stored,
+                        &archived.object_key(),
+                        &segment.created_at,
+                        segment.compression,
+                        archived.encryption_key.as_deref(),
+                    )
+                    .await?;
+            }
+        }
+        Ok(archived)
     }
 
     async fn delete_segment(
@@ -387,29 +543,137 @@ impl PitrStore {
         segment: &WalSegment,
     ) -> Result<(), PitrError> {
         match self {
-            PitrStore::Local { .. } => remove_segment(local_dir, &segment.segment_id)?,
+            PitrStore::Local { dir } => {
+                let local_dir = local_dir.to_path_buf();
+                let segment_id = segment.segment_id.clone();
+                let stored = (segment.stored_name() != segment.segment_id)
+                    .then(|| dir.join(segment.stored_name()));
+                blocking(move || {
+                    remove_segment(&local_dir, &segment_id)?;
+                    if let Some(stored) = stored.filter(|path| path.exists()) {
+                        fs::remove_file(stored)?;
+                    }
+                    Ok(())
+                })
+                .await?
+            }
             PitrStore::S3 { client } => client.delete_backup(&segment.object_key()).await?,
         }
         Ok(())
     }
 
     /// Read a segment from the archive, or from `local_dir` when `local` says it has not
-    /// been archived yet.
+    /// been archived yet, decrypt it when it is encrypted, and check it against the
+    /// checksum the manifest recorded.
     async fn fetch_segment(
         &self,
         local_dir: &Path,
         segment: &WalSegment,
         local: bool,
+        keys: &mut SegmentKeys<'_>,
     ) -> Result<Vec<u8>, PitrError> {
         let data = match self {
             PitrStore::S3 { client } if !local => {
                 client.download_backup(&segment.object_key()).await?.0
             }
-            _ => fs::read(local_dir.join(&segment.segment_id))?,
+            PitrStore::Local { dir } if !local => {
+                let path = dir.join(segment.stored_name());
+                blocking(move || Ok(fs::read(path)?)).await?
+            }
+            _ => {
+                let path = local_dir.join(&segment.segment_id);
+                blocking(move || Ok(fs::read(path)?)).await?
+            }
         };
-        verify_segment_checksum(segment, &data)?;
-        Ok(data)
+        let plaintext = open_segment(segment, data, keys).await?;
+        verify_segment_checksum(segment, &plaintext)?;
+        Ok(plaintext)
     }
+}
+
+/// The backup encryption key recovery decrypts segments with, obtained from the configured
+/// key source the first time an encrypted segment needs it, so that recovering a plain
+/// archive never touches the key source.
+struct SegmentKeys<'a> {
+    config: &'a BackupEncryptionConfig,
+    encryptor: Option<BackupEncryptor>,
+}
+
+impl<'a> SegmentKeys<'a> {
+    fn new(config: &'a BackupEncryptionConfig) -> Self {
+        Self {
+            config,
+            encryptor: None,
+        }
+    }
+
+    async fn get(
+        &mut self,
+        segment: &WalSegment,
+        key_identifier: &str,
+    ) -> Result<BackupEncryptor, PitrError> {
+        if let Some(encryptor) = &self.encryptor {
+            return Ok(encryptor.clone());
+        }
+        if !self.config.enabled {
+            return Err(PitrError::Encryption(format!(
+                "segment {} is encrypted with key '{key_identifier}' but backup encryption is \
+                 not enabled in the configuration; enable [online_backup.encryption] with the \
+                 key that wrote it",
+                segment.segment_id
+            )));
+        }
+        let encryptor = BackupEncryptor::from_config(self.config)
+            .await
+            .map_err(|err| {
+                PitrError::Encryption(format!(
+                    "segment {} is encrypted with key '{key_identifier}' and the configured key \
+                     could not be obtained: {err}",
+                    segment.segment_id
+                ))
+            })?
+            .ok_or_else(|| PitrError::Encryption("backup encryption is not enabled".to_string()))?;
+        self.encryptor = Some(encryptor.clone());
+        Ok(encryptor)
+    }
+}
+
+/// The plaintext of the archived copy `data` of `segment`. An encrypted container is
+/// decrypted, whatever the manifest says. A segment the manifest records as encrypted must
+/// be an encrypted container, so that whoever can write to the archive can not swap an
+/// encrypted segment for an unauthenticated plain one, as for backups.
+async fn open_segment(
+    segment: &WalSegment,
+    data: Vec<u8>,
+    keys: &mut SegmentKeys<'_>,
+) -> Result<Vec<u8>, PitrError> {
+    if !is_encrypted_artifact(&data) {
+        if let Some(key) = &segment.encryption_key {
+            return Err(PitrError::NotRecoverable(format!(
+                "segment {} is recorded as encrypted with key '{key}' but its archived copy is \
+                 not an encrypted container; it may have been replaced, so it is refused",
+                segment.segment_id
+            )));
+        }
+        return Ok(data);
+    }
+    let (header, _) = read_encryption_header(&data).map_err(|err| {
+        PitrError::Encryption(format!(
+            "segment {} has an unreadable encryption header: {err}",
+            segment.segment_id
+        ))
+    })?;
+    let encryptor = keys.get(segment, &header.key_identifier).await?;
+    let segment_id = segment.segment_id.clone();
+    blocking(move || {
+        encryptor
+            .decrypt(&data)
+            .map(|(plaintext, _)| plaintext)
+            .map_err(|err| {
+                PitrError::Encryption(format!("unable to decrypt segment {segment_id}: {err}"))
+            })
+    })
+    .await
 }
 
 fn verify_segment_checksum(segment: &WalSegment, data: &[u8]) -> Result<(), PitrError> {
@@ -460,6 +724,10 @@ pub struct PitrSyncReport {
     pub archived: usize,
     /// Segments removed by retention.
     pub deleted: usize,
+    /// Segments copied to replication regions.
+    pub replicated: usize,
+    /// Replication regions the archive could not be mirrored to in this run.
+    pub region_errors: usize,
 }
 
 /// The running server's archive: the backend's archiver plus the location segments go to.
@@ -556,7 +824,10 @@ impl PitrArchive {
         report: &mut PitrSyncReport,
     ) -> Result<(), PitrError> {
         let local_dir = &self.settings.local_dir;
-        let local_segments = list_segments(local_dir)?;
+        let local_segments = {
+            let local_dir = local_dir.clone();
+            blocking(move || Ok(list_segments(&local_dir)?)).await?
+        };
         let store = PitrStore::open(&self.settings.location).await?;
         let server_uuid = self.server_uuid();
         let (mut manifest, existed) =
@@ -576,35 +847,77 @@ impl PitrArchive {
             changed = true;
         }
 
+        // A segment leaves the local directory once archived when it is uploaded to S3 or
+        // encrypted: the plaintext copy must not outlive its archived copy.
+        let encrypt = self.settings.encryption.enabled;
+        let moves_segments = store.is_s3() || encrypt;
+
         // Segments the manifest does not know yet. For the local location this is only an
-        // index update; for S3 it is the upload, and every local segment is uploaded since
-        // a segment stays local only until its upload and the manifest update succeeded. A
-        // failure leaves the segment in the local directory for the next run.
+        // index update, unless the segment is encrypted into `<segment>.enc`; for S3 it is
+        // the upload. Every segment that moves is archived again while its local copy is
+        // there, since a segment stays local only until its archiving and the manifest
+        // update succeeded. A failure leaves the segment in the local directory for the
+        // next run.
+        let pending: Vec<WalSegment> = local_segments
+            .into_iter()
+            .filter(|segment| {
+                if segment.server_uuid != server_uuid {
+                    warn!(
+                        segment = %segment.segment_id,
+                        "WAL segment of another server in {}, not archived",
+                        local_dir.display()
+                    );
+                    return false;
+                }
+                moves_segments
+                    || !manifest
+                        .segments
+                        .iter()
+                        .any(|known| known.segment_id == segment.segment_id)
+            })
+            .collect();
+
         let mut archived: Vec<WalSegment> = Vec::new();
         let mut upload_error = None;
-        for segment in local_segments {
-            if segment.server_uuid != server_uuid {
-                warn!(
-                    segment = %segment.segment_id,
-                    "WAL segment of another server in {}, not archived",
-                    local_dir.display()
-                );
-                continue;
+        // The key is obtained once per run, and only when there is something to encrypt.
+        // Without it nothing is archived: a segment is never archived in plaintext while
+        // encryption is enabled.
+        let encryptor = if encrypt && !pending.is_empty() {
+            match BackupEncryptor::from_config(&self.settings.encryption).await {
+                Ok(encryptor) => encryptor,
+                Err(err) => {
+                    let err = PitrError::Encryption(format!(
+                        "unable to obtain the backup encryption key; {} WAL segments stay in {} \
+                         until it is available: {err}",
+                        pending.len(),
+                        local_dir.display()
+                    ));
+                    error!(%err, "Unable to archive WAL segments");
+                    upload_error = Some(err);
+                    None
+                }
             }
-            let known = manifest
-                .segments
-                .iter()
-                .any(|known| known.segment_id == segment.segment_id);
-            if known && !store.is_s3() {
-                continue;
+        } else {
+            None
+        };
+
+        if upload_error.is_none() {
+            for segment in pending {
+                match store
+                    .put_segment(local_dir, &segment, encryptor.as_ref())
+                    .await
+                {
+                    Ok(stored) => {
+                        manifest.add_segment(stored);
+                        archived.push(segment);
+                    }
+                    Err(err) => {
+                        error!(%err, segment = %segment.segment_id, "Unable to archive WAL segment");
+                        upload_error = Some(err);
+                        break;
+                    }
+                }
             }
-            if let Err(err) = store.put_segment(local_dir, &segment).await {
-                error!(%err, segment = %segment.segment_id, "Unable to archive WAL segment");
-                upload_error = Some(err);
-                break;
-            }
-            manifest.add_segment(segment.clone());
-            archived.push(segment);
         }
 
         if !archived.is_empty() || changed {
@@ -612,10 +925,16 @@ impl PitrArchive {
             *gaps_recorded = true;
             changed = false;
             report.archived = archived.len();
-            if store.is_s3() {
-                for segment in &archived {
-                    remove_segment(local_dir, &segment.segment_id)?;
-                }
+            if moves_segments && !archived.is_empty() {
+                let local_dir = local_dir.clone();
+                let ids: Vec<String> = archived.iter().map(|s| s.segment_id.clone()).collect();
+                blocking(move || {
+                    for id in ids {
+                        remove_segment(&local_dir, &id)?;
+                    }
+                    Ok(())
+                })
+                .await?;
             }
             if !archived.is_empty() {
                 info!(
@@ -670,7 +989,67 @@ impl PitrArchive {
         }
         *gaps_recorded = true;
 
+        self.replicate(&store, &mut manifest, now, report).await;
+
         Ok(())
+    }
+
+    /// Mirror the archive to every region of [`PitrSettings::replication`].
+    ///
+    /// The segments a region misses are copied from the primary (checked against the
+    /// primary's checksum; stored bytes and sidecar unchanged, so encrypted segments stay
+    /// encrypted and the region never needs the key). The region's manifest is then the
+    /// primary's merged with what only the region still records, so that a region keeps
+    /// the history a primary that lost its archive no longer has, and the region applies
+    /// the retention rules of the primary to its own copy: base backups it no longer holds
+    /// drop out, and segments older than `retention_days` that its oldest base backup does
+    /// not need are deleted after the manifest stops naming them.
+    ///
+    /// Abandoned history and gaps a region records that the primary does not (a recovery
+    /// from that region while the primary was unreachable) are merged into the primary
+    /// manifest first. A region that fails is logged and retried by the next
+    /// synchronisation; it never fails the archiving itself.
+    async fn replicate(
+        &self,
+        store: &PitrStore,
+        manifest: &mut PitrManifest,
+        now: Duration,
+        report: &mut PitrSyncReport,
+    ) {
+        let (Some(replication), PitrStore::S3 { client }) = (self.settings.replication(), store)
+        else {
+            return;
+        };
+        for region in &replication.regions {
+            // Where the region keeps its copies of the base backups, for its retention. When
+            // the base backups are in another S3 location without this region, the region's
+            // index keeps every base it learnt about, which only delays its retention.
+            let region_bases = self
+                .settings
+                .for_region(&region.region)
+                .map(|settings| settings.bases)
+                .inspect_err(|err| debug!(%err, region = %region.region, "No base backups to prune the region index with"))
+                .ok();
+            let target = RegionTarget {
+                config: region,
+                bases: region_bases.as_ref(),
+                now,
+                retention: self.settings.wal.retention(),
+            };
+            match replicate_to_region(client, store, manifest, &target).await {
+                Ok(copied) => report.replicated += copied,
+                Err(err) => {
+                    report.region_errors += 1;
+                    error!(
+                        %err,
+                        region = %region.region,
+                        bucket = %region.bucket,
+                        "Unable to replicate the WAL archive to the region; the next \
+                         synchronisation retries"
+                    );
+                }
+            }
+        }
     }
 
     /// Record a base backup that was just written to `location`. A backup written
@@ -722,6 +1101,13 @@ impl PitrArchive {
             watermark = %format_ts_rfc3339(watermark_ts),
             "Base backup indexed for point-in-time recovery"
         );
+        self.replicate(
+            &store,
+            &mut manifest,
+            duration_from_epoch_now(),
+            &mut PitrSyncReport::default(),
+        )
+        .await;
         Ok(())
     }
 
@@ -746,6 +1132,131 @@ impl PitrArchive {
             );
         }
     }
+}
+
+/// A replication region the archive is mirrored to.
+struct RegionTarget<'a> {
+    config: &'a ReplicationRegionConfig,
+    /// Where the region holds its copies of the base backups, when known.
+    bases: Option<&'a BaseLocation>,
+    now: Duration,
+    retention: Duration,
+}
+
+/// Mirror the archive of `primary` (whose manifest is `manifest`) to `target`, see
+/// [`PitrArchive::replicate`]. Returns the number of segments copied.
+async fn replicate_to_region(
+    primary: &S3ClientWrapper,
+    store: &PitrStore,
+    manifest: &mut PitrManifest,
+    target: &RegionTarget<'_>,
+) -> Result<usize, PitrError> {
+    let region_name = &target.config.region;
+    let region_store = PitrStore::S3 {
+        client: Box::new(S3ClientWrapper::for_region(target.config).await?),
+    };
+    let PitrStore::S3 { client: region } = &region_store else {
+        return Err(PitrError::Config("region store is not S3".to_string()));
+    };
+
+    let region_manifest = region_store.load_manifest().await?;
+    if let Some(region_manifest) = &region_manifest {
+        if region_manifest.server_uuid != manifest.server_uuid {
+            return Err(PitrError::Manifest(format!(
+                "{PITR_MANIFEST_KEY} in region {region_name} ({}) belongs to server {}, this \
+                 server is {}; refusing to mix archives",
+                region.location(),
+                region_manifest.server_uuid,
+                manifest.server_uuid
+            )));
+        }
+        // Only markers that still concern the primary's history are kept, as its own
+        // synchronisation would prune the others right away.
+        let markers_before = (manifest.timeline_breaks.clone(), manifest.gaps.clone());
+        manifest.merge_markers(region_manifest);
+        manifest.prune_timeline_breaks();
+        manifest.prune_gaps();
+        if (&manifest.timeline_breaks, &manifest.gaps) != (&markers_before.0, &markers_before.1) {
+            info!(
+                region = %region_name,
+                "Abandoned history or gaps recorded in the region merged into the WAL archive"
+            );
+            store.save_manifest(manifest).await?;
+        }
+    }
+
+    // Segments first, so that the region's manifest never names a segment it lacks.
+    let present: BTreeSet<String> = region
+        .list_backups()
+        .await?
+        .into_iter()
+        .filter(|key| key.starts_with(WAL_SEGMENT_KEY_PREFIX))
+        .collect();
+    let mut copied = 0;
+    for segment in &manifest.segments {
+        let key = segment.object_key();
+        if !present.contains(&key) {
+            primary.copy_backup_to(region, &key).await?;
+            copied += 1;
+        }
+    }
+
+    // The region's view: the primary's manifest plus what only the region still records,
+    // with the primary's retention rules applied to the region's own copies.
+    let mut mirrored = manifest.clone();
+    if let Some(region_manifest) = &region_manifest {
+        mirrored.merge_from(region_manifest);
+    }
+    if let Some(bases) = target.bases {
+        mirrored.retain_base_backups(&bases.list_keys().await?);
+    }
+    // A segment the primary still lists stays, or the next run would copy it again.
+    let expired: Vec<WalSegment> =
+        select_segments_to_delete(&mirrored, target.now, target.retention)
+            .into_iter()
+            .filter(|id| !manifest.segments.iter().any(|s| &s.segment_id == id))
+            .filter_map(|id| {
+                mirrored
+                    .segments
+                    .iter()
+                    .find(|s| s.segment_id == id)
+                    .cloned()
+            })
+            .collect();
+    for segment in &expired {
+        mirrored.remove_segment(&segment.segment_id);
+    }
+    mirrored.prune_timeline_breaks();
+    mirrored.prune_gaps();
+
+    let up_to_date = region_manifest.is_some_and(|mut region_manifest| {
+        region_manifest.updated_at.clone_from(&mirrored.updated_at);
+        region_manifest == mirrored
+    });
+    if !up_to_date {
+        region_store.save_manifest(&mut mirrored).await?;
+    }
+
+    for segment in &expired {
+        match region.delete_backup(&segment.object_key()).await {
+            Ok(()) => info!(
+                region = %region_name,
+                segment = %segment.segment_id,
+                "Expired WAL segment deleted from the region"
+            ),
+            Err(err) => warn!(
+                %err,
+                region = %region_name,
+                segment = %segment.segment_id,
+                "Unable to delete an expired WAL segment from the region"
+            ),
+        }
+    }
+
+    if copied > 0 {
+        info!(region = %region_name, copied, "WAL segments replicated");
+    }
+    Ok(copied)
 }
 
 /// The segments retention removes: older than `retention` relative to `now`, and never
@@ -949,21 +1460,33 @@ pub struct RecoveryOutcome {
 /// server still in the local WAL directory that were never archived (the server stopped
 /// before its next synchronisation, or their upload failed).
 struct OpenedArchive {
+    /// The settings the archive is read with: those of the configuration, or those of the
+    /// replication region it is read from.
     settings: PitrSettings,
+    /// The settings of the primary archive, when the archive is read from a region.
+    primary: Option<PitrSettings>,
     store: PitrStore,
     manifest: PitrManifest,
     /// Ids of the segments that are only in the local WAL directory.
     local_only: BTreeSet<String>,
 }
 
-/// Open the archive described by `config` and load its manifest.
-async fn open_archive(config: &Configuration) -> Result<OpenedArchive, PitrError> {
-    let settings = PitrSettings::from_config(config)?.ok_or_else(|| {
+/// Open the archive described by `config`, or its copy in the replication region `region`,
+/// and load its manifest.
+async fn open_archive(
+    config: &Configuration,
+    region: Option<&str>,
+) -> Result<OpenedArchive, PitrError> {
+    let configured = PitrSettings::from_config(config)?.ok_or_else(|| {
         PitrError::Config(
             "online_backup.wal_archive is not enabled; it tells the command where the archive is"
                 .to_string(),
         )
     })?;
+    let (settings, primary) = match region {
+        Some(name) => (configured.for_region(name)?, Some(configured)),
+        None => (configured, None),
+    };
     let store = PitrStore::open(&settings.location).await?;
     let mut manifest = store.load_manifest().await?.ok_or_else(|| {
         PitrError::NotRecoverable(format!(
@@ -972,8 +1495,27 @@ async fn open_archive(config: &Configuration) -> Result<OpenedArchive, PitrError
         ))
     })?;
 
+    // A region prunes its base backups on its own; recovery from it can only start from
+    // the base backups it actually holds.
+    if primary.is_some() {
+        let held = settings.bases.list_keys().await?;
+        let indexed = manifest.base_backups.len();
+        manifest.retain_base_backups(&held);
+        if manifest.base_backups.len() != indexed {
+            warn!(
+                missing = indexed - manifest.base_backups.len(),
+                bases = %settings.bases,
+                "Base backups indexed by the archive are missing in the region and are not used"
+            );
+        }
+    }
+
     let mut local_only = BTreeSet::new();
-    for segment in list_segments(&settings.local_dir)? {
+    let local_segments = {
+        let local_dir = settings.local_dir.clone();
+        blocking(move || Ok(list_segments(&local_dir)?)).await?
+    };
+    for segment in local_segments {
         if segment.server_uuid != manifest.server_uuid
             || manifest
                 .segments
@@ -988,6 +1530,7 @@ async fn open_archive(config: &Configuration) -> Result<OpenedArchive, PitrError
 
     Ok(OpenedArchive {
         settings,
+        primary,
         store,
         manifest,
         local_only,
@@ -996,13 +1539,13 @@ async fn open_archive(config: &Configuration) -> Result<OpenedArchive, PitrError
 
 /// `kubidmd database pitr-list`: print the base backups, segments and the recoverable
 /// window. Returns false when nothing is recoverable or the archive could not be read.
-pub async fn pitr_list_server_core(config: &Configuration) -> bool {
+pub async fn pitr_list_server_core(config: &Configuration, region: Option<&str>) -> bool {
     let OpenedArchive {
         settings,
         manifest,
         local_only,
         ..
-    } = match open_archive(config).await {
+    } = match open_archive(config, region).await {
         Ok(opened) => opened,
         Err(err) => {
             error!(%err, "Unable to read the PITR archive");
@@ -1011,7 +1554,10 @@ pub async fn pitr_list_server_core(config: &Configuration) -> bool {
         }
     };
 
-    println!("PITR archive at {}:", settings.location);
+    match region {
+        Some(region) => println!("PITR archive at {} (region {region}):", settings.location),
+        None => println!("PITR archive at {}:", settings.location),
+    }
     println!("  Server:       {}", manifest.server_uuid);
     println!("  Base backups: {}", settings.bases);
     if !manifest.updated_at.is_empty() {
@@ -1036,11 +1582,16 @@ pub async fn pitr_list_server_core(config: &Configuration) -> bool {
         );
         for base in &manifest.base_backups {
             println!(
-                "  {:<key_width$}  {:<35}  {:<35}  {}",
+                "  {:<key_width$}  {:<35}  {:<35}  {}{}",
                 base.key,
                 base.timestamp,
                 format_ts_rfc3339(base.watermark_ts),
-                base.server_version
+                base.server_version,
+                if is_encrypted_backup_name(&base.key) {
+                    "  (encrypted)"
+                } else {
+                    ""
+                }
             );
         }
     }
@@ -1062,18 +1613,20 @@ pub async fn pitr_list_server_core(config: &Configuration) -> bool {
             "SEGMENT", "FROM", "TO", "RECORDS", "SIZE_BYTES"
         );
         for segment in &manifest.segments {
+            let note = if local_only.contains(&segment.segment_id) {
+                "  (local, not archived yet)".to_string()
+            } else if let Some(key) = &segment.encryption_key {
+                format!("  (encrypted, key '{key}')")
+            } else {
+                String::new()
+            };
             println!(
-                "  {:<key_width$}  {:<35}  {:<35}  {:>8}  {:>12}{}",
+                "  {:<key_width$}  {:<35}  {:<35}  {:>8}  {:>12}{note}",
                 segment.segment_id,
                 format_ts_rfc3339(segment.start_ts),
                 format_ts_rfc3339(segment.end_ts),
                 segment.entry_count,
                 segment.size_bytes,
-                if local_only.contains(&segment.segment_id) {
-                    "  (local, not archived yet)"
-                } else {
-                    ""
-                }
             );
         }
     }
@@ -1128,6 +1681,7 @@ async fn load_records(
     plan: &RecoveryPlan,
 ) -> Result<Vec<WalEntryRecord>, PitrError> {
     let mut records: Vec<WalEntryRecord> = Vec::new();
+    let mut keys = SegmentKeys::new(&opened.settings.encryption);
     for segment in &plan.segments {
         if segment.server_version != env!("KUBIDM_PKG_SERIES") {
             return Err(PitrError::NotRecoverable(format!(
@@ -1143,9 +1697,11 @@ async fn load_records(
                 &opened.settings.local_dir,
                 segment,
                 opened.local_only.contains(&segment.segment_id),
+                &mut keys,
             )
             .await?;
-        let file = parse_segment(&data, segment.compression)?;
+        let compression = segment.compression;
+        let file = blocking(move || Ok(parse_segment(&data, compression)?)).await?;
         if file.server_uuid != opened.manifest.server_uuid {
             return Err(PitrError::NotRecoverable(format!(
                 "segment {} belongs to server {}, the archive belongs to {}",
@@ -1191,6 +1747,8 @@ fn print_plan(opened: &OpenedArchive, plan: &RecoveryPlan, records: usize, recov
                 segment.entry_count,
                 if opened.local_only.contains(&segment.segment_id) {
                     ", local"
+                } else if segment.encryption_key.is_some() {
+                    ", encrypted"
                 } else {
                     ""
                 }
@@ -1213,8 +1771,9 @@ pub async fn pitr_recover_server_core(
     config: &Configuration,
     target: &RecoveryTargetSpec,
     dry_run: bool,
+    region: Option<&str>,
 ) -> Result<RecoveryOutcome, PitrError> {
-    let opened = open_archive(config).await?;
+    let opened = open_archive(config, region).await?;
     let plan = plan_recovery(&opened.manifest, target)?;
 
     if plan.base.server_version != env!("KUBIDM_PKG_SERIES") {
@@ -1310,6 +1869,22 @@ pub async fn pitr_recover_server_core(
             );
         })?;
 
+    // Recovered from a region: the primary archive, which the recovered server archives
+    // into, must learn about the abandoned history too. It is often unreachable when a
+    // region is used, so this is best effort; the server merges what the region recorded
+    // into the primary archive at its first synchronisation that reaches both.
+    if let Some(primary) = &opened.primary {
+        if let Err(err) = record_timeline_break(primary, recovered_ts, "recover").await {
+            warn!(
+                %err,
+                "The abandoned history was recorded in the region, but not in the primary WAL \
+                 archive at {}. The server merges it into the primary archive once it reaches \
+                 both; until then take a new online backup right after starting the server.",
+                primary.location
+            );
+        }
+    }
+
     eprintln!(
         "Recovered {db_path} to {} ({} records replayed on {})",
         format_ts_rfc3339(recovered_ts),
@@ -1340,7 +1915,10 @@ async fn record_timeline_break(
         return Ok(());
     };
     let now = duration_from_epoch_now();
-    let local_segments = list_segments(&settings.local_dir)?;
+    let local_segments = {
+        let local_dir = settings.local_dir.clone();
+        blocking(move || Ok(list_segments(&local_dir)?)).await?
+    };
     let until_ts = manifest
         .segments
         .iter()
@@ -1395,6 +1973,7 @@ mod tests {
             compression: BackupCompression::Gzip,
             server_version: env!("KUBIDM_PKG_SERIES").to_string(),
             created_at: String::new(),
+            encryption_key: None,
         }
     }
 
@@ -1738,6 +2317,7 @@ mod tests {
             local_dir: wal_dir.clone(),
             location: PitrLocation::Local(wal_dir.clone()),
             bases: bases.clone(),
+            encryption: BackupEncryptionConfig::default(),
         };
         let archive = PitrArchive::new(settings.clone(), archiver.clone());
 
@@ -1897,6 +2477,7 @@ mod tests {
                 local_dir: wal_dir.clone(),
                 location: PitrLocation::Local(wal_dir.clone()),
                 bases: bases.clone(),
+                encryption: BackupEncryptionConfig::default(),
             },
             archiver.clone(),
         );
@@ -1973,6 +2554,213 @@ mod tests {
         )
         .unwrap();
         assert_eq!(plan.base.key, key2);
+    }
+
+    fn fast_encryption(passphrase_file: &Path) -> BackupEncryptionConfig {
+        BackupEncryptionConfig {
+            enabled: true,
+            key_source: kubidm_proto::backup::EncryptionKeySource::Passphrase,
+            key_derivation: kubidm_proto::backup::KeyDerivationParams {
+                m_cost: crate::backup::MIN_KDF_M_COST,
+                t_cost: 1,
+                p_cost: 1,
+            },
+            key_identifier: Some("unit-wal-key".to_string()),
+            passphrase_file: Some(passphrase_file.to_path_buf()),
+        }
+    }
+
+    fn append_create(archiver: &SharedWalArchiver, server: Uuid, secs: u64, data: &[u8]) {
+        archiver
+            .lock()
+            .unwrap()
+            .append_transaction(
+                &Cid {
+                    ts: Duration::from_secs(secs),
+                    s_uuid: server,
+                },
+                false,
+                vec![(
+                    secs,
+                    WalPendingOp::Create {
+                        entry_uuid: Uuid::new_v4(),
+                        entry_data: data.to_vec(),
+                    },
+                )],
+            )
+            .unwrap();
+    }
+
+    fn opened(settings: &PitrSettings, manifest: PitrManifest) -> OpenedArchive {
+        let PitrLocation::Local(dir) = &settings.location else {
+            panic!("local settings expected");
+        };
+        OpenedArchive {
+            settings: settings.clone(),
+            primary: None,
+            store: PitrStore::Local { dir: dir.clone() },
+            manifest,
+            local_only: BTreeSet::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_local_archive_encrypts_segments_and_recovery_decrypts_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("wal");
+        let backup_dir = dir.path().join("backups");
+        fs::create_dir_all(&backup_dir).unwrap();
+        let passphrase = dir.path().join("passphrase");
+        fs::write(&passphrase, "unit test wal passphrase\n").unwrap();
+        let wrong_passphrase = dir.path().join("wrong-passphrase");
+        fs::write(&wrong_passphrase, "another passphrase\n").unwrap();
+
+        let server = Uuid::new_v4();
+        let wal_cfg = WalArchiveConfig {
+            enabled: true,
+            s3: None,
+            retention_days: 1,
+            segment_size_bytes: 1024 * 1024,
+            segment_interval_seconds: 60,
+            local_path: Some(wal_dir.clone()),
+        };
+        let archiver: SharedWalArchiver = Arc::new(Mutex::new(
+            WalArchiver::new(wal_cfg.clone(), server, wal_dir.clone()).unwrap(),
+        ));
+        let bases = BaseLocation::Local(backup_dir.clone());
+        let plain_settings = PitrSettings {
+            wal: wal_cfg,
+            local_dir: wal_dir.clone(),
+            location: PitrLocation::Local(wal_dir.clone()),
+            bases: bases.clone(),
+            encryption: BackupEncryptionConfig::default(),
+        };
+        let encrypted_settings = PitrSettings {
+            encryption: fast_encryption(&passphrase),
+            ..plain_settings.clone()
+        };
+        let store = PitrStore::open(&plain_settings.location).await.unwrap();
+
+        // Before encryption is enabled: a base and a plain segment, kept as it is.
+        let plain_archive = PitrArchive::new(plain_settings.clone(), archiver.clone());
+        let key = "backup-2024-01-01T00:00:00Z.json.gz.enc";
+        fs::write(backup_dir.join(key), b"base").unwrap();
+        plain_archive
+            .register_base_backup(&bases, key, "2024-01-01T00:00:00Z", &report(1000, server))
+            .await
+            .unwrap();
+        append_create(&archiver, server, 1100, b"credential before encryption");
+        plain_archive
+            .sync(Duration::from_secs(1100), true)
+            .await
+            .unwrap();
+        let manifest = store.load_manifest().await.unwrap().unwrap();
+        assert_eq!(manifest.segments.len(), 1);
+        assert!(manifest.segments[0].encryption_key.is_none());
+        assert_eq!(list_segments(&wal_dir).unwrap().len(), 1);
+
+        // The key source is unavailable: nothing is archived in plaintext, the new segment
+        // stays where the backend wrote it, and the run fails.
+        let unavailable = PitrArchive::new(
+            PitrSettings {
+                encryption: fast_encryption(&dir.path().join("missing-passphrase")),
+                ..plain_settings.clone()
+            },
+            archiver.clone(),
+        );
+        append_create(&archiver, server, 1200, b"credential after encryption");
+        assert!(matches!(
+            unavailable.sync(Duration::from_secs(1200), true).await,
+            Err(PitrError::Encryption(_))
+        ));
+        assert_eq!(list_segments(&wal_dir).unwrap().len(), 2);
+        assert_eq!(
+            store.load_manifest().await.unwrap().unwrap().segments.len(),
+            1
+        );
+
+        // With the key: both segments, the one archived before encryption was enabled
+        // included, are sealed into `<segment>.enc` and their plaintext copies removed.
+        let archive = PitrArchive::new(encrypted_settings.clone(), archiver.clone());
+        let report_sync = archive
+            .sync(Duration::from_secs(1300), false)
+            .await
+            .unwrap();
+        assert_eq!(report_sync.archived, 2);
+        let manifest = store.load_manifest().await.unwrap().unwrap();
+        assert_eq!(manifest.segments.len(), 2);
+        for segment in &manifest.segments {
+            assert_eq!(segment.encryption_key.as_deref(), Some("unit-wal-key"));
+            let stored = wal_dir.join(segment.stored_name());
+            assert!(stored.to_string_lossy().ends_with(".json.gz.enc"));
+            assert!(is_encrypted_artifact(&fs::read(&stored).unwrap()));
+            assert!(!wal_dir.join(&segment.segment_id).exists());
+        }
+        assert!(list_segments(&wal_dir).unwrap().is_empty());
+        // A further run has nothing to do.
+        let report_sync = archive
+            .sync(Duration::from_secs(1400), false)
+            .await
+            .unwrap();
+        assert_eq!(report_sync.archived, 0);
+
+        // Recovery decrypts the segments and checks them against the plaintext checksums.
+        let plan = plan_recovery(&manifest, &RecoveryTargetSpec::Latest).unwrap();
+        assert_eq!(plan.segments.len(), 2);
+        let records = load_records(&opened(&encrypted_settings, manifest.clone()), &plan)
+            .await
+            .unwrap();
+        let payloads: Vec<&[u8]> = records
+            .iter()
+            .map(|record| match &record.operation {
+                WalOperationRecord::Create { entry_data } => entry_data.as_slice(),
+                other => panic!("unexpected record {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            payloads,
+            vec![
+                b"credential before encryption".as_slice(),
+                b"credential after encryption".as_slice()
+            ]
+        );
+
+        // Without encryption enabled, or with another key, recovery refuses with a message
+        // naming the key the segment needs.
+        match load_records(&opened(&plain_settings, manifest.clone()), &plan).await {
+            Err(PitrError::Encryption(msg)) => {
+                assert!(
+                    msg.contains("unit-wal-key") && msg.contains("not enabled"),
+                    "{msg}"
+                )
+            }
+            other => panic!("expected an encryption error, got {other:?}"),
+        }
+        let wrong_key = PitrSettings {
+            encryption: fast_encryption(&wrong_passphrase),
+            ..plain_settings.clone()
+        };
+        assert!(matches!(
+            load_records(&opened(&wrong_key, manifest.clone()), &plan).await,
+            Err(PitrError::Encryption(_))
+        ));
+
+        // A plain file in place of an encrypted segment is refused.
+        let swapped = wal_dir.join(manifest.segments[0].stored_name());
+        let original = fs::read(&swapped).unwrap();
+        fs::write(&swapped, b"not encrypted").unwrap();
+        assert!(matches!(
+            load_records(&opened(&encrypted_settings, manifest.clone()), &plan).await,
+            Err(PitrError::NotRecoverable(msg)) if msg.contains("not an encrypted container")
+        ));
+        fs::write(&swapped, original).unwrap();
+
+        // Retention deletes the encrypted copy.
+        store
+            .delete_segment(&wal_dir, &manifest.segments[0])
+            .await
+            .unwrap();
+        assert!(!swapped.exists());
     }
 
     #[test]

@@ -895,8 +895,9 @@ impl S3ClientWrapper {
     }
 
     /// Copy the primary backup `backup_key` and its sidecar to `region`, after checking
-    /// the downloaded bytes against the primary's checksum.
-    async fn copy_backup_to(
+    /// the downloaded bytes against the primary's checksum. The WAL archive replicates its
+    /// segments with it as well.
+    pub(crate) async fn copy_backup_to(
         &self,
         region: &S3ClientWrapper,
         backup_key: &str,

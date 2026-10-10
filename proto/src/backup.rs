@@ -1151,12 +1151,28 @@ pub struct WalSegment {
     pub server_version: String,
     /// RFC3339 rendering of `end_ts`, for display.
     pub created_at: String,
+    /// The identifier of the client-side backup encryption key the archived copy of the
+    /// segment is sealed with, or None when the archived copy is the segment exactly as the
+    /// backend wrote it. `checksum_sha256` and `size_bytes` always describe the plaintext
+    /// segment, which is what a recovery checks after decrypting it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encryption_key: Option<String>,
 }
 
 impl WalSegment {
-    /// The S3 key of this segment relative to the configured `path_prefix`.
+    /// The name the archived copy of this segment is stored under: the segment id, with
+    /// the [`BACKUP_ENCRYPTED_SUFFIX`] when it is encrypted, as for backups.
+    pub fn stored_name(&self) -> String {
+        match self.encryption_key {
+            Some(_) => format!("{}{BACKUP_ENCRYPTED_SUFFIX}", self.segment_id),
+            None => self.segment_id.clone(),
+        }
+    }
+
+    /// The S3 key of the archived copy of this segment relative to the configured
+    /// `path_prefix`.
     pub fn object_key(&self) -> String {
-        format!("{WAL_SEGMENT_KEY_PREFIX}{}", self.segment_id)
+        format!("{WAL_SEGMENT_KEY_PREFIX}{}", self.stored_name())
     }
 }
 
@@ -1348,6 +1364,56 @@ impl PitrManifest {
         self.segments.retain(|s| s.segment_id != segment_id);
     }
 
+    /// Add the abandoned history and the gaps `other` records and this manifest does not.
+    /// Both only ever exclude history from a recovery, so their union is always safe.
+    /// Returns whether anything was added.
+    pub fn merge_markers(&mut self, other: &PitrManifest) -> bool {
+        let mut changed = false;
+        for timeline_break in &other.timeline_breaks {
+            if !self.timeline_breaks.contains(timeline_break) {
+                self.add_timeline_break(timeline_break.clone());
+                changed = true;
+            }
+        }
+        for gap in &other.gaps {
+            let before = self.gaps.len();
+            self.add_gap(gap.clone());
+            changed |= self.gaps.len() != before;
+        }
+        changed
+    }
+
+    /// Add everything `other` records that this manifest does not: abandoned history and
+    /// gaps (see [`Self::merge_markers`]), segments, and base backups that do not lie in
+    /// abandoned history. What this manifest already records is kept as it is. A
+    /// replication region keeps its copy of the archive this way, so that it still holds
+    /// what the primary lost.
+    pub fn merge_from(&mut self, other: &PitrManifest) -> bool {
+        let mut changed = self.merge_markers(other);
+        for segment in &other.segments {
+            if !self
+                .segments
+                .iter()
+                .any(|known| known.segment_id == segment.segment_id)
+            {
+                self.add_segment(segment.clone());
+                changed = true;
+            }
+        }
+        for base in &other.base_backups {
+            let known = self.base_backups.iter().any(|known| known.key == base.key);
+            let abandoned = self
+                .timeline_breaks
+                .iter()
+                .any(|timeline_break| timeline_break.contains(base.watermark_ts));
+            if !known && !abandoned {
+                self.add_base_backup(base.clone());
+                changed = true;
+            }
+        }
+        changed
+    }
+
     /// Drop the timeline breaks that no retained base backup or segment precedes: once all
     /// archived history is newer than a break, it can not affect any recovery.
     pub fn prune_timeline_breaks(&mut self) {
@@ -1513,6 +1579,7 @@ mod wal_tests {
             compression: BackupCompression::Gzip,
             server_version: "test".to_string(),
             created_at: String::new(),
+            encryption_key: None,
         }
     }
 
@@ -1860,6 +1927,102 @@ mod wal_tests {
         let back: PitrManifest = serde_json::from_str(&json).unwrap();
         assert_eq!(manifest, back);
         assert_eq!(back.version, PITR_MANIFEST_VERSION);
+    }
+
+    #[test]
+    fn test_segment_stored_name_and_encryption_field() {
+        let mut plain = segment("wal-a.json.gz", 1, 2);
+        assert_eq!(plain.stored_name(), "wal-a.json.gz");
+        assert_eq!(plain.object_key(), "wal/wal-a.json.gz");
+        // A plain segment serialises without the field, and a manifest written before the
+        // field existed still parses.
+        let json = serde_json::to_string(&plain).unwrap();
+        assert!(!json.contains("encryption_key"));
+        let back: WalSegment = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, plain);
+
+        plain.encryption_key = Some("prod-2026".to_string());
+        assert_eq!(plain.stored_name(), "wal-a.json.gz.enc");
+        assert_eq!(plain.object_key(), "wal/wal-a.json.gz.enc");
+        let back: WalSegment =
+            serde_json::from_str(&serde_json::to_string(&plain).unwrap()).unwrap();
+        assert_eq!(back.encryption_key.as_deref(), Some("prod-2026"));
+    }
+
+    #[test]
+    fn test_manifest_merge_markers() {
+        let server = Uuid::new_v4();
+        let mut primary = PitrManifest::new(server);
+        primary.add_base_backup(base("b1", 100));
+        primary.add_base_backup(base("b2", 300));
+
+        let mut region = primary.clone();
+        let timeline_break = PitrTimelineBreak {
+            after_ts: Duration::from_secs(200),
+            until_ts: Duration::from_secs(400),
+            at: "t".to_string(),
+            reason: "recover".to_string(),
+        };
+        region.add_timeline_break(timeline_break.clone());
+        region.add_gap(PitrWalGap {
+            from_ts: Duration::from_secs(500),
+            until_ts: Duration::from_secs(600),
+            reason: "unclean shutdown".to_string(),
+        });
+
+        assert!(primary.merge_markers(&region));
+        assert_eq!(primary.timeline_breaks, vec![timeline_break]);
+        assert_eq!(primary.gaps.len(), 1);
+        // The base backup inside the abandoned history drops out, as on the region.
+        assert_eq!(primary.base_backups.len(), 1);
+        // Merging again adds nothing.
+        assert!(!primary.merge_markers(&region));
+        assert!(!region.merge_markers(&primary));
+    }
+
+    #[test]
+    fn test_manifest_merge_from_keeps_what_only_the_other_holds() {
+        let server = Uuid::new_v4();
+        let mut region = PitrManifest::new(server);
+        region.add_base_backup(base("b1", 100));
+        region.add_segment(segment("s1", 110, 200));
+        region.add_segment(segment("s2", 210, 300));
+
+        // The primary lost its archive and started over, after a recovery to 150 recorded
+        // in the region only.
+        let mut primary = PitrManifest::new(server);
+        let mut s3 = segment("s3", 400, 500);
+        s3.encryption_key = Some("k".to_string());
+        primary.add_segment(s3.clone());
+        primary.add_base_backup(base("b3", 390));
+        region.add_timeline_break(PitrTimelineBreak {
+            after_ts: Duration::from_secs(150),
+            until_ts: Duration::from_secs(380),
+            at: "t".to_string(),
+            reason: "recover".to_string(),
+        });
+        // A base the region indexed inside that history.
+        region.add_base_backup(base("b2", 250));
+
+        let mut mirrored = primary.clone();
+        assert!(mirrored.merge_from(&region));
+        let ids: Vec<&str> = mirrored
+            .segments
+            .iter()
+            .map(|s| s.segment_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["s1", "s2", "s3"]);
+        // The base inside the abandoned history is not brought back.
+        let keys: Vec<&str> = mirrored
+            .base_backups
+            .iter()
+            .map(|b| b.key.as_str())
+            .collect();
+        assert_eq!(keys, vec!["b1", "b3"]);
+        assert_eq!(mirrored.timeline_breaks.len(), 1);
+        // The primary's record of a segment wins.
+        assert_eq!(mirrored.segments[2], s3);
+        assert!(!mirrored.merge_from(&region));
     }
 
     #[test]

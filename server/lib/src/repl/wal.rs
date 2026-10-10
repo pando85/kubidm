@@ -674,6 +674,8 @@ pub fn write_segment_file(dir: &Path, file: &WalSegmentFile) -> Result<WalSegmen
         compression: BackupCompression::Gzip,
         server_version: file.server_version.clone(),
         created_at: format_ts_rfc3339(file.end_ts),
+        // The backend always writes the plaintext segment; the archive encrypts it.
+        encryption_key: None,
     };
 
     let segment_path = dir.join(&file.segment_id);

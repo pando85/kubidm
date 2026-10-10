@@ -620,7 +620,7 @@ async fn start_daemon(opt: KubidmdParser, config: Configuration) -> ExitCode {
         | KubidmdOpt::Database {
             commands:
                 DbCommands::ListBackups { .. }
-                | DbCommands::PitrList
+                | DbCommands::PitrList(_)
                 | DbCommands::ReplicateStatus { .. },
         } => None,
         _ => {
@@ -1247,8 +1247,15 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
                 (None, Some(cid), _) => RecoveryTargetSpec::Cid(cid.clone()),
                 (None, None, _) => RecoveryTargetSpec::Latest,
             };
-            info!("Running point-in-time recovery to {target} ...");
-            match pitr_recover_server_core(&config, &target, ropt.dry_run).await {
+            match &ropt.region {
+                Some(region) => {
+                    info!("Running point-in-time recovery to {target} from region {region} ...")
+                }
+                None => info!("Running point-in-time recovery to {target} ..."),
+            }
+            match pitr_recover_server_core(&config, &target, ropt.dry_run, ropt.region.as_deref())
+                .await
+            {
                 Ok(_) if ropt.dry_run => {}
                 Ok(_) => info!("✅ Recovery Success!"),
                 Err(err) => {
@@ -1258,10 +1265,10 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
             }
         }
         KubidmdOpt::Database {
-            commands: DbCommands::PitrList,
+            commands: DbCommands::PitrList(lopt),
         } => {
             info!("Running in PITR listing mode ...");
-            if !pitr_list_server_core(&config).await {
+            if !pitr_list_server_core(&config, lopt.region.as_deref()).await {
                 return ExitCode::FAILURE;
             }
         }
