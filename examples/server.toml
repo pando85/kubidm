@@ -191,6 +191,25 @@ compression = "gzip"
 # algorithm = "aws:kms"  # or "AES256"
 # kms_key_id = "arn:aws:kms:us-east-1:123456789:key/..."
 #
-#   Cross-region replication ([online_backup.s3.replication]), point-in-time recovery
-#   ([online_backup.wal_archive]) and client-side encryption ([online_backup.encryption])
-#   are not available yet. Enabling any of these keys is rejected at startup.
+#   Point-in-time recovery (optional)
+#   Archive every committed write so that `kubidmd database recover` can rebuild the
+#   database as of any moment since the oldest base backup. Requires the online backup
+#   above, whose backups are the bases (the S3 ones when [online_backup.s3] is set).
+#   Segments are uploaded to [online_backup.s3] (or [online_backup.wal_archive.s3]) or,
+#   without S3, kept in local_path. See the Backup and Restore chapter of the book.
+#
+# [online_backup.wal_archive]
+# enabled = true
+#   Close the open segment at least this often; also the upload period (default 300)
+# segment_interval_seconds = 300
+#   Close a segment once its records reach this size (default 16 MiB)
+# segment_size_bytes = 16777216
+#   Keep archived segments at least this many days. Segments the oldest remaining
+#   base backup needs are always kept (default 7)
+# retention_days = 7
+#   Where segments are written before upload (default: "wal" next to db_path)
+# local_path = "/var/lib/private/kubidm/wal"
+#
+#   Cross-region replication ([online_backup.s3.replication]) and client-side encryption
+#   ([online_backup.encryption]) are not available yet. Enabling either is rejected at
+#   startup.
