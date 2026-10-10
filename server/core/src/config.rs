@@ -223,16 +223,16 @@ impl OnlineBackup {
                 .map_err(|reason| format!("online_backup.verify_schedule: {reason}"))?;
         }
 
-        if let Some(token_file) = &self.metrics_token_file {
-            if !self.metrics_endpoint {
-                return Err(
-                    "online_backup.metrics_token_file: it protects the metrics endpoint, which \
-                     requires online_backup.metrics_endpoint = true"
-                        .to_string(),
-                );
-            }
-            read_metrics_token(token_file)
-                .map_err(|reason| format!("online_backup.metrics_token_file: {reason}"))?;
+        // The token file itself is only read by the server that serves the endpoint, when
+        // it starts (and that start fails when it can not be read): the offline commands
+        // share this configuration and never need the token, so a token mounted for the
+        // server alone must not stop them.
+        if self.metrics_token_file.is_some() && !self.metrics_endpoint {
+            return Err(
+                "online_backup.metrics_token_file: it protects the metrics endpoint, which \
+                 requires online_backup.metrics_endpoint = true"
+                    .to_string(),
+            );
         }
 
         Ok(())
@@ -1652,16 +1652,36 @@ m_cost = 1024
             .expect_err("a token without the endpoint must be rejected");
         assert!(err.contains("metrics_endpoint = true"), "{err}");
 
-        // Never serve the metrics without the token the operator asked for.
-        let err = with_token(true, &dir.path().join("missing"))
+        // The file is read by the server only: an offline command (a restore or recovery
+        // from a rescue container) validates the configuration without it.
+        assert!(with_token(true, &dir.path().join("missing"))
             .validate()
+            .is_ok());
+
+        // The server never serves the metrics without the token the operator asked for.
+        let err = read_metrics_token(&dir.path().join("missing"))
             .expect_err("a missing token file must be rejected");
-        assert!(err.starts_with("online_backup.metrics_token_file"), "{err}");
+        assert!(err.contains("unable to read"), "{err}");
         std::fs::write(&token_file, " \n").expect("write");
-        let err = with_token(true, &token_file)
-            .validate()
-            .expect_err("an empty token must be rejected");
+        let err = read_metrics_token(&token_file).expect_err("an empty token must be rejected");
         assert!(err.contains("holds no token"), "{err}");
+    }
+
+    /// Every subcommand builds the configuration: one whose metrics token file is not
+    /// readable here (not mounted in a rescue container, or readable by the server's user
+    /// only) still builds, so that `database restore` or `recover` never need it.
+    #[test]
+    fn offline_commands_build_a_configuration_whose_token_file_is_unreadable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = build_from_toml(&format!(
+            "{BASE_V2_CONFIG}metrics_endpoint = true\nmetrics_token_file = \"{}\"\n",
+            dir.path().join("not-mounted").display()
+        ))
+        .expect("the configuration of an offline command must build");
+        assert!(config
+            .online_backup
+            .and_then(|online_backup| online_backup.metrics_token_file)
+            .is_some());
     }
 
     #[test]

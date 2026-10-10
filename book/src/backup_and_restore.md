@@ -950,7 +950,9 @@ be recovered from. Without it, `/metrics` answers 404 like any other unknown pat
 Restrict who can read it, in one or both of these ways:
 
 - Set `metrics_token_file` to a file holding a token: a request must then send `Authorization: Bearer <token>`, and is
-  answered 401 otherwise. The file is read when the server starts, which fails when it is missing or empty.
+  answered 401 otherwise. The server reads the file when it starts, and the start fails when it is missing or empty.
+  The offline commands (`database backup`, `restore`, `recover`, `db-scan` and the others) never read it, so it can be
+  mounted for the server alone.
 - Block `/metrics` on the reverse proxy or load balancer that exposes the server, and scrape the server directly.
 
 ```toml
