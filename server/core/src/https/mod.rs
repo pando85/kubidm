@@ -1,7 +1,6 @@
 use self::{extractors::ClientConnInfo, javascript::*};
 use crate::{
     actors::{QueryServerReadV1, QueryServerWriteV1},
-    backup::metrics::BackupMetrics,
     config::{AddressSet, Configuration, HttpVersions, ServerRole, TcpAddressInfo},
     tcp::process_client_addr,
     CoreAction,
@@ -54,7 +53,7 @@ pub(crate) mod authorization;
 pub(crate) mod cache_buster;
 pub(crate) mod errors;
 mod extractors;
-mod generic;
+pub(crate) mod generic;
 mod javascript;
 mod manifest;
 pub(crate) mod middleware;
@@ -88,8 +87,6 @@ pub struct ServerState {
     pub(crate) secure_cookies: bool,
     /// So that we can work out which ID to use for spans
     pub(crate) logging_pipeline: LoggerType,
-    /// The backup metrics, when `online_backup.metrics_endpoint` serves them.
-    pub(crate) backup_metrics: Option<Arc<BackupMetrics>>,
 }
 
 impl ServerState {
@@ -195,7 +192,7 @@ pub async fn create_https_server(
     server_message_tx: broadcast::Sender<CoreAction>,
     maybe_tls_acceptor: Option<TlsAcceptor>,
     tls_acceptor_reload_tx: &broadcast::Sender<TlsAcceptor>,
-    backup_metrics: Option<Arc<BackupMetrics>>,
+    metrics_endpoint: Option<generic::MetricsEndpoint>,
 ) -> Result<Vec<task::JoinHandle<()>>, ()> {
     let js_checksums = match config.role {
         ServerRole::WriteReplicaNoUI => String::new(),
@@ -304,7 +301,6 @@ pub async fn create_https_server(
         domain: config.domain.clone(),
         secure_cookies: config.integration_test_config.is_none(),
         logging_pipeline,
-        backup_metrics,
     };
 
     let static_routes = match config.role {
@@ -387,10 +383,13 @@ pub async fn create_https_server(
         .route("/readyz", get(generic::readyz));
 
     // Only served when enabled: without it, /metrics is not found like any other path.
-    let app = if state.backup_metrics.is_some() {
-        app.route("/metrics", get(generic::metrics))
-    } else {
-        app
+    let app = match metrics_endpoint {
+        Some(endpoint) => app.merge(
+            Router::new()
+                .route("/metrics", get(generic::metrics))
+                .with_state(endpoint),
+        ),
+        None => app,
     };
 
     let app = app

@@ -47,6 +47,7 @@ impl Modify for SecurityAddon {
 
     paths(
         super::generic::status,
+        super::generic::metrics,
         super::generic::maintenance_status,
         super::generic::robots_txt,
 

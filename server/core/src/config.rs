@@ -112,6 +112,14 @@ pub struct OnlineBackup {
     #[serde(default)]
     pub verify_schedule: Option<String>,
 
+    /// Where the scheduled verification creates its scratch directories (the copied or
+    /// downloaded artifact and the restored, unencrypted scratch database), each named
+    /// `kubidm-verify-*`. Defaults to the directory of the database. The server removes the
+    /// `kubidm-verify-*` directories it finds there when it starts, so it must not be
+    /// shared with another server.
+    #[serde(default)]
+    pub verify_temp_path: Option<PathBuf>,
+
     /// Serve the backup metrics in the Prometheus text format on `GET /metrics`, without
     /// authentication. Off by default.
     #[serde(default)]
@@ -130,6 +138,7 @@ impl Default for OnlineBackup {
             encryption: BackupEncryptionConfig::default(),
             wal_archive: None,
             verify_schedule: None,
+            verify_temp_path: None,
             metrics_endpoint: false,
         }
     }
@@ -837,6 +846,9 @@ impl fmt::Display for Configuration {
                 }
                 if let Some(verify_schedule) = &bck.verify_schedule {
                     write!(f, "verify_schedule: {}, ", verify_schedule)?;
+                }
+                if let Some(verify_temp_path) = &bck.verify_temp_path {
+                    write!(f, "verify_temp_path: {}, ", verify_temp_path.display())?;
                 }
                 if bck.metrics_endpoint {
                     write!(f, "metrics_endpoint: enabled, ")?;

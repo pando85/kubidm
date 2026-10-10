@@ -17,7 +17,7 @@ use kubidmd_lib::be::BackupStructuralReport;
 use kubidmd_lib::prelude::duration_from_epoch_now;
 use tracing::instrument;
 
-use super::metrics::{BackupDestination, BackupMetrics, VerificationLevel};
+use super::metrics::{BackupDestination, BackupMetrics};
 use super::pitr::{BaseLocation, PitrArchive};
 use super::retention::prune_s3_backups;
 use super::{
@@ -30,8 +30,9 @@ use crate::config::OnlineBackup;
 
 /// What one online backup run does: where it stores the backup, how many backups every
 /// location keeps, how the artifact is compressed and encrypted, the WAL archive that
-/// indexes every stored backup as a point-in-time recovery base, and the metrics that
-/// record the outcome in every location.
+/// indexes every stored backup as a point-in-time recovery base, the metrics that record
+/// the outcome in every location, and the lock that keeps the scheduled verification from
+/// running at the same time.
 #[derive(Clone)]
 pub(crate) struct OnlineBackupJob {
     pub targets: Vec<BaseLocation>,
@@ -40,6 +41,7 @@ pub(crate) struct OnlineBackupJob {
     pub encryption: BackupEncryptionConfig,
     pub pitr_archive: Option<Arc<PitrArchive>>,
     pub metrics: Arc<BackupMetrics>,
+    pub backup_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl OnlineBackupJob {
@@ -49,6 +51,7 @@ impl OnlineBackupJob {
         config: &OnlineBackup,
         pitr_archive: Option<Arc<PitrArchive>>,
         metrics: Arc<BackupMetrics>,
+        backup_lock: Arc<tokio::sync::Mutex<()>>,
     ) -> Self {
         let mut targets = Vec::with_capacity(2);
         if let Some(path) = &config.path {
@@ -64,15 +67,26 @@ impl OnlineBackupJob {
             encryption: config.encryption.clone(),
             pitr_archive,
             metrics,
+            backup_lock,
         }
     }
 
     /// Run one online backup. Every target is attempted, and every backup stored is
     /// indexed by the WAL archive. Fails when the artifact can not be produced or when any
     /// target failed, after every target has been attempted. The outcome in every target
-    /// is recorded in the metrics: an artifact that can not be produced fails them all.
+    /// and replication region is recorded in the metrics: an artifact that can not be
+    /// produced fails them all, and an S3 upload that fails fails its regions too. Waits
+    /// for a scheduled verification in progress to end first.
     #[instrument(level = "info", name = "online_backup", skip_all)]
     pub async fn run(&self, server: &'static QueryServerReadV1) -> Result<(), OperationError> {
+        let _no_verification = match self.backup_lock.try_lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                info!("Online backup waits for the backup verification in progress");
+                self.backup_lock.lock().await
+            }
+        };
+
         let (key, timestamp, artifact, encryptor) = match self.produce(server).await {
             Ok(produced) => produced,
             Err(err) => {
@@ -80,6 +94,9 @@ impl OnlineBackupJob {
                 for target in &self.targets {
                     self.metrics
                         .backup_failed(&BackupDestination::from(target), now);
+                    for region in regions_of(target) {
+                        self.metrics.backup_failed(&region, now);
+                    }
                 }
                 return Err(err);
             }
@@ -100,14 +117,8 @@ impl OnlineBackupJob {
             let destination = BackupDestination::from(target);
             match stored {
                 Ok(report) => {
-                    // A target only stores an artifact that passed the structural checks.
-                    let now = duration_from_epoch_now();
-                    self.metrics.backup_succeeded(&destination, now);
-                    self.metrics.verification_succeeded(
-                        &destination,
-                        VerificationLevel::Structural,
-                        now,
-                    );
+                    self.metrics
+                        .backup_succeeded(&destination, duration_from_epoch_now());
                     if let Some(archive) = &self.pitr_archive {
                         archive
                             .register_base_backup_logged(target, &key, &timestamp, &report)
@@ -115,8 +126,13 @@ impl OnlineBackupJob {
                     }
                 }
                 Err(err) => {
-                    self.metrics
-                        .backup_failed(&destination, duration_from_epoch_now());
+                    // The regions are only copied to once the upload succeeded: they did
+                    // not receive this backup either.
+                    let now = duration_from_epoch_now();
+                    self.metrics.backup_failed(&destination, now);
+                    for region in regions_of(target) {
+                        self.metrics.backup_failed(&region, now);
+                    }
                     error!(?err, "Online backup to {} failed", target);
                     failure.get_or_insert(err);
                 }
@@ -339,5 +355,69 @@ impl OnlineBackupJob {
         }
 
         Ok(report)
+    }
+}
+
+/// The replication regions the backups stored in `target` are copied to: the enabled
+/// regions of an S3 target.
+fn regions_of(target: &BaseLocation) -> Vec<BackupDestination> {
+    match target {
+        BaseLocation::Local(_) => Vec::new(),
+        BaseLocation::S3(s3_config) => s3_config
+            .replication
+            .iter()
+            .filter(|replication| replication.enabled)
+            .flat_map(|replication| replication.regions.iter())
+            .map(|region| BackupDestination::S3Region(region.name().to_string()))
+            .collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use kubidm_proto::backup::{ReplicationConfig, ReplicationRegionConfig};
+
+    use super::*;
+
+    fn region(name: &str) -> ReplicationRegionConfig {
+        ReplicationRegionConfig {
+            name: Some(name.to_string()),
+            region: "eu-west-1".to_string(),
+            endpoint: None,
+            bucket: format!("bucket-{name}"),
+            path_prefix: None,
+            credentials: None,
+            server_side_encryption: None,
+            storage_class: "STANDARD".to_string(),
+            kms_key_id: None,
+        }
+    }
+
+    #[test]
+    fn a_failed_s3_target_fails_its_enabled_regions() {
+        let mut s3 = S3Config::with_bucket("primary".to_string());
+        assert!(regions_of(&BaseLocation::S3(s3.clone())).is_empty());
+        assert!(regions_of(&BaseLocation::Local(PathBuf::from("/backups"))).is_empty());
+
+        s3.replication = Some(ReplicationConfig {
+            enabled: true,
+            regions: vec![region("eu"), region("us")],
+            ..ReplicationConfig::default()
+        });
+        assert_eq!(
+            regions_of(&BaseLocation::S3(s3.clone())),
+            vec![
+                BackupDestination::S3Region("eu".to_string()),
+                BackupDestination::S3Region("us".to_string()),
+            ]
+        );
+
+        // Replication switched off copies to no region.
+        if let Some(replication) = s3.replication.as_mut() {
+            replication.enabled = false;
+        }
+        assert!(regions_of(&BaseLocation::S3(s3)).is_empty());
     }
 }

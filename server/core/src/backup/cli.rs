@@ -402,14 +402,15 @@ pub async fn verify_backup_server_core(
         return report.is_valid();
     }
 
-    let consistency_errors = match verify_backup_restores(config, backup_path, &|| false).await {
-        Ok(errors) => errors,
-        Err(reason) => {
-            eprintln!("Backup restore verification: FAIL");
-            eprintln!("  - {reason}");
-            return false;
-        }
-    };
+    let consistency_errors =
+        match verify_backup_restores(config, backup_path, None, &|| false).await {
+            Ok(errors) => errors,
+            Err(reason) => {
+                eprintln!("Backup restore verification: FAIL");
+                eprintln!("  - {reason}");
+                return false;
+            }
+        };
 
     eprintln!(
         "Backup restore verification: {}",
@@ -538,9 +539,19 @@ pub(crate) async fn fetch_s3_backup(
     key: &str,
 ) -> Result<FetchedS3Backup, S3BackupError> {
     let client = S3ClientWrapper::new(s3_config).await?;
+    let scratch_dir = tempfile::tempdir()?;
+    fetch_s3_backup_into(&client, key, scratch_dir).await
+}
+
+/// [`fetch_s3_backup`] with an S3 client the caller already has, into `scratch_dir`, which
+/// is removed with the returned value.
+pub(crate) async fn fetch_s3_backup_into(
+    client: &S3ClientWrapper,
+    key: &str,
+    scratch_dir: tempfile::TempDir,
+) -> Result<FetchedS3Backup, S3BackupError> {
     let (data, metadata) = client.download_backup(key).await?;
 
-    let scratch_dir = tempfile::tempdir()?;
     // The requested key counts as well as the sidecar: the sidecar is not authenticated, so
     // an object requested as `.enc` must be an encrypted container whatever it says.
     let encryption_suffix = if metadata.encrypted || is_encrypted_backup_name(key) {

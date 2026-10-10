@@ -12,7 +12,7 @@ use tokio::{
     time::{interval, interval_at, sleep, Duration, Instant, MissedTickBehavior},
 };
 
-use crate::backup::metrics::{BackupDestination, BackupMetrics};
+use crate::backup::metrics::{seed_from_backups, BackupDestination, BackupMetrics};
 use crate::backup::online::OnlineBackupJob;
 use crate::backup::pitr::PitrArchive;
 use crate::backup::verify::BackupVerifyJob;
@@ -77,6 +77,7 @@ impl IntervalActor {
         online_backup_config: &OnlineBackup,
         pitr_archive: Option<Arc<PitrArchive>>,
         metrics: Arc<BackupMetrics>,
+        backup_lock: Arc<tokio::sync::Mutex<()>>,
         rx: broadcast::Receiver<CoreAction>,
     ) -> Result<Vec<(TaskName, JoinHandle<()>)>, ()> {
         let outpath = online_backup_config.path.to_owned();
@@ -119,7 +120,12 @@ impl IntervalActor {
             }
         }
 
-        let job = OnlineBackupJob::from_config(online_backup_config, pitr_archive, metrics.clone());
+        let job = OnlineBackupJob::from_config(
+            online_backup_config,
+            pitr_archive,
+            metrics.clone(),
+            backup_lock,
+        );
         let s3_config = online_backup_config.s3.clone();
 
         let mut handles = Vec::with_capacity(2);
@@ -200,11 +206,43 @@ impl IntervalActor {
         })
     }
 
+    /// Start the task that keeps the backup metrics across restarts: it first takes the
+    /// last success of every destination of `online_backup` from the newest backup found
+    /// in it (abandoned on shutdown), then writes the state file whenever a timestamp
+    /// changes, and once more when the server shuts down.
+    pub fn start_backup_metrics(
+        metrics: Arc<BackupMetrics>,
+        online_backup: OnlineBackup,
+        mut rx: broadcast::Receiver<CoreAction>,
+    ) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            let seeded = seed_from_backups(&metrics, &online_backup);
+            if run_until_shutdown(seeded, &mut rx).await.is_some() {
+                loop {
+                    tokio::select! {
+                        action = rx.recv() => match action {
+                            Ok(CoreAction::Shutdown) | Err(broadcast::error::RecvError::Closed) => {
+                                break
+                            }
+                            Ok(CoreAction::Reload) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                        },
+                        _ = metrics.changed() => metrics.save_state_file().await,
+                    }
+                }
+            }
+            metrics.save_state_file().await;
+            info!("Stopped {}", TaskName::BackupMetrics);
+        })
+    }
+
     /// Start the scheduled full verification of the newest backup, `verify_schedule`. It
-    /// is a task of its own, so that a verification never delays or skips a scheduled
-    /// backup. A run that outlasts the gap to the next scheduled time skips the times that
-    /// are already past, so runs never overlap. On shutdown a run in progress is
-    /// abandoned: it stops at its next step and removes its temporary files.
+    /// is a task of its own, and never runs at the same time as an online backup: the one
+    /// that starts second waits for the other. A run that outlasts the gap to the next
+    /// scheduled time skips the times that are already past, so runs never overlap. On
+    /// shutdown a run in progress is abandoned: the blocking work it handed off stops
+    /// before its next step (restore, reindex, boot, consistency checks) and removes its
+    /// scratch directories; a process killed before then leaves them for the next start
+    /// to remove.
     pub fn start_backup_verification(
         job: Arc<BackupVerifyJob>,
         schedule: Schedule,

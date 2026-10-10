@@ -1,6 +1,8 @@
+use std::sync::Arc;
+
 use axum::extract::State;
 use axum::http::{header::CONTENT_TYPE, StatusCode};
-use axum::response::{IntoResponse, Redirect};
+use axum::response::{IntoResponse, Redirect, Response};
 use axum::{Extension, Json};
 use kubidmd_lib::maintenance::{maintenance_public_status, MaintenancePublicStatus};
 use kubidmd_lib::prelude::APPLICATION_JSON;
@@ -8,7 +10,7 @@ use kubidmd_lib::status::{LivenessStatus, ReadinessStatus, ServingReadiness, Sta
 use url::Url;
 
 use super::{middleware::KOpId, views::constants::Urls, ServerState};
-use crate::backup::metrics::PROMETHEUS_TEXT_CONTENT_TYPE;
+use crate::backup::metrics::{BackupMetrics, PROMETHEUS_TEXT_CONTENT_TYPE};
 
 #[utoipa::path(
     get,
@@ -100,6 +102,18 @@ pub async fn readyz(State(state): State<ServerState>) -> impl IntoResponse {
     (status_code, Json(status))
 }
 
+/// The `/metrics` endpoint: the backup metrics it serves.
+#[derive(Clone)]
+pub struct MetricsEndpoint {
+    metrics: Arc<BackupMetrics>,
+}
+
+impl MetricsEndpoint {
+    pub fn new(metrics: Arc<BackupMetrics>) -> Self {
+        Self { metrics }
+    }
+}
+
 #[utoipa::path(
     get,
     path = "/metrics",
@@ -111,19 +125,16 @@ pub async fn readyz(State(state): State<ServerState>) -> impl IntoResponse {
     operation_id = "metrics"
 )]
 /// The backup metrics in the Prometheus text exposition format: per backup destination the
-/// time of the last successful and failed backup and of the last verification, and the
-/// time of the last WAL archive synchronisation. Only served when
+/// time of the last successful and failed backup and of the last full verification, and
+/// the time of the last WAL archive synchronisation. Only served when
 /// `online_backup.metrics_endpoint` is enabled.
-pub async fn metrics(State(state): State<ServerState>) -> impl IntoResponse {
-    match &state.backup_metrics {
-        Some(metrics) => (
-            StatusCode::OK,
-            [(CONTENT_TYPE, PROMETHEUS_TEXT_CONTENT_TYPE)],
-            metrics.render(),
-        )
-            .into_response(),
-        None => StatusCode::NOT_FOUND.into_response(),
-    }
+pub async fn metrics(State(endpoint): State<MetricsEndpoint>) -> Response {
+    (
+        StatusCode::OK,
+        [(CONTENT_TYPE, PROMETHEUS_TEXT_CONTENT_TYPE)],
+        endpoint.metrics.render(),
+    )
+        .into_response()
 }
 
 #[utoipa::path(

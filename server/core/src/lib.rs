@@ -53,7 +53,7 @@ use crate::{
     actors::{QueryServerReadV1, QueryServerWriteV1},
     admin::AdminActor,
     backup::{
-        metrics::BackupMetrics,
+        metrics::{metrics_state_file, BackupMetrics},
         online::OnlineBackupJob,
         pitr::{self, BaseLocation, PitrArchive, PitrError, PitrSettings, PitrSyncReport},
         verify::{BackupVerifyJob, BackupVerifyRun},
@@ -934,6 +934,7 @@ pub(crate) enum TaskName {
     BackupActor,
     BackupReplicationMonitor,
     BackupVerification,
+    BackupMetrics,
     DelayedActionActor,
     HttpsServer,
     IntervalActor,
@@ -955,6 +956,7 @@ impl Display for TaskName {
                 TaskName::BackupActor => "Backup Actor",
                 TaskName::BackupReplicationMonitor => "Backup Replication Monitor",
                 TaskName::BackupVerification => "Backup Verification",
+                TaskName::BackupMetrics => "Backup Metrics",
                 TaskName::DelayedActionActor => "Delayed Action Actor",
                 TaskName::HttpsServer => "HTTPS Server",
                 TaskName::IntervalActor => "Interval Actor",
@@ -982,6 +984,8 @@ pub struct CoreHandle {
     backup_verify: Arc<BackupVerifyJob>,
     /// The `[online_backup]` section the server runs with.
     online_backup: Option<OnlineBackup>,
+    /// Held by an online backup or a scheduled verification while it runs.
+    backup_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl CoreHandle {
@@ -1020,6 +1024,9 @@ impl CoreHandle {
             }
             archive.persist_pending_events();
         }
+        // The metrics task wrote the state file when it stopped; this keeps the outcome of
+        // the final synchronisation.
+        self.backup_metrics.save_state_file().await;
 
         self.clean_shutdown = true;
     }
@@ -1052,6 +1059,7 @@ impl CoreHandle {
             online_backup,
             self.pitr_archive.clone(),
             self.backup_metrics.clone(),
+            self.backup_lock.clone(),
         )
         .run(self.server_read_ref)
         .await
@@ -1072,7 +1080,8 @@ impl CoreHandle {
 
     /// Run an online backup now, through the same code path the scheduled online backup
     /// uses. `versions` is the number of backups to keep in `outpath`. This exists so
-    /// tests can exercise the production backup path on demand.
+    /// tests can exercise the production backup path on demand; since `outpath` is not a
+    /// location of the configuration, the backup metrics do not record it.
     pub async fn trigger_online_backup(
         &self,
         outpath: &Path,
@@ -1122,7 +1131,8 @@ impl CoreHandle {
             compression,
             encryption: encryption.clone(),
             pitr_archive: self.pitr_archive.clone(),
-            metrics: self.backup_metrics.clone(),
+            metrics: Arc::new(BackupMetrics::new(None)),
+            backup_lock: self.backup_lock.clone(),
         }
         .run(self.server_read_ref)
         .await
@@ -1227,8 +1237,16 @@ async fn create_server_core_inner(
         _ => None,
     };
     let online_backup = config.online_backup.clone();
-    let backup_metrics = Arc::new(BackupMetrics::new(config.online_backup.as_ref()));
-    let backup_verify = Arc::new(BackupVerifyJob::new(config.clone(), backup_metrics.clone()));
+    let backup_metrics = Arc::new(
+        BackupMetrics::new(config.online_backup.as_ref())
+            .with_state_file(metrics_state_file(&config)),
+    );
+    let backup_lock = Arc::new(tokio::sync::Mutex::new(()));
+    let backup_verify = Arc::new(BackupVerifyJob::new(
+        config.clone(),
+        backup_metrics.clone(),
+        backup_lock.clone(),
+    ));
 
     // Start the IDM server.
     let (_qs, idms, idms_delayed, idms_audit) = match setup_qs_idms(be, schema, &config).await {
@@ -1349,6 +1367,7 @@ async fn create_server_core_inner(
             pitr_archive.clone(),
             backup_metrics.clone(),
             backup_verify.clone(),
+            backup_lock.clone(),
         )
         .await
     };
@@ -1362,6 +1381,7 @@ async fn create_server_core_inner(
         backup_metrics,
         backup_verify,
         online_backup,
+        backup_lock,
     };
 
     if startup_success.is_ok() {
@@ -1392,6 +1412,7 @@ async fn launch_server_tasks(
     pitr_archive: Option<Arc<PitrArchive>>,
     backup_metrics: Arc<BackupMetrics>,
     backup_verify: Arc<BackupVerifyJob>,
+    backup_lock: Arc<tokio::sync::Mutex<()>>,
 ) -> Result<(), ()> {
     let status_ref = StatusActor::start();
     let tracker = status_ref.get_tracker_clone();
@@ -1454,6 +1475,39 @@ async fn launch_server_tasks(
 
     handles.push((TaskName::AuditdActor, auditd_handle));
 
+    // The backup metrics start from what the previous run of the server recorded, before
+    // the first scrape; the backups found are read in the background. The scratch
+    // directories a killed verification left behind are removed before one can run.
+    if let Some(online_backup) = config
+        .online_backup
+        .as_ref()
+        .filter(|online_backup| online_backup.enabled)
+    {
+        backup_metrics.load_state_file().await;
+        handles.push((
+            TaskName::BackupMetrics,
+            IntervalActor::start_backup_metrics(
+                backup_metrics.clone(),
+                online_backup.clone(),
+                broadcast_tx.subscribe(),
+            ),
+        ));
+        if let Some(parent) = backup_verify.scratch_parent().map(Path::to_path_buf) {
+            let swept = parent.clone();
+            if let Err(err) =
+                backup::run_blocking(move || backup::verify::remove_stale_scratch_dirs(&swept))
+                    .await
+            {
+                warn!(
+                    %err,
+                    "Unable to look for the scratch directories of an interrupted backup \
+                     verification in {}",
+                    parent.display()
+                );
+            }
+        }
+    }
+
     // WAL archiving runs in every mode, integration tests included: it only ships what
     // the backend already recorded.
     if let Some(archive) = &pitr_archive {
@@ -1502,6 +1556,7 @@ async fn launch_server_tasks(
                         online_backup_config,
                         pitr_archive.clone(),
                         backup_metrics.clone(),
+                        backup_lock,
                         broadcast_tx.subscribe(),
                     )?;
                     handles.extend(backup_handles);
@@ -1652,6 +1707,13 @@ async fn launch_server_tasks(
         }
     };
 
+    // The metrics endpoint, when enabled.
+    let metrics_endpoint = config
+        .online_backup
+        .as_ref()
+        .filter(|online_backup| online_backup.metrics_endpoint)
+        .map(|_| https::generic::MetricsEndpoint::new(backup_metrics));
+
     // Finally launch the https tasks.
     let http_handles: Vec<task::JoinHandle<()>> = https::create_https_server(
         config.clone(),
@@ -1661,11 +1723,7 @@ async fn launch_server_tasks(
         broadcast_tx.clone(),
         maybe_tls_acceptor,
         &tls_acceptor_reload_tx,
-        config
-            .online_backup
-            .as_ref()
-            .is_some_and(|online_backup| online_backup.metrics_endpoint)
-            .then_some(backup_metrics),
+        metrics_endpoint,
     )
     .await
     .inspect_err(|err| {
