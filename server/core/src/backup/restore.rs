@@ -77,11 +77,7 @@ impl CommittedRestore {
         reindex_inner(self.be, self.schema, config)
             .await
             .inspect_err(|err| {
-                error!(
-                    ?err,
-                    "The database WAS restored, but reindexing it failed; run \
-                     `kubidmd database reindex` before starting the server"
-                );
+                error!(?err, "The database WAS restored, but reindexing it failed");
             })?;
         Ok(self.outcome)
     }

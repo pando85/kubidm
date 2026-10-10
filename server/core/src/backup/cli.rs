@@ -25,9 +25,12 @@ use time::format_description::well_known::Rfc3339;
 
 use super::{
     backup_identity, backup_name_timestamp, compare_backup_names, is_backup_artifact_name,
-    lag_metrics_from_health, open_backup_file_with_config, pitr, region_is_healthy,
+    lag_metrics_from_health, open_backup_file_with_config,
+    pitr::{self, AbandonedHistory},
+    region_is_healthy,
     restore::{
-        backup_encryption_config, restore_and_replay_commit, restore_database, RestoreOutcome,
+        backup_encryption_config, restore_and_replay_commit, restore_database, CommittedRestore,
+        RestoreOutcome,
     },
     run_blocking, s3_location, seal_backup_async, verify_backup_output_async,
     write_verified_local_backup_async, BackupEncryptor, BackupVerifyError, S3BackupError,
@@ -247,8 +250,10 @@ pub enum RestoreStatus {
     /// The database was restored and committed, but the WAL archive could not record the
     /// abandoned history, typically because the archive's location is unavailable, as when
     /// restoring from a replication region while the primary bucket is down. The restore
-    /// must not be repeated or rolled back; a new online backup after the server start
-    /// makes point-in-time recovery safe again.
+    /// must not be repeated or rolled back. The restore is handed to the server, which
+    /// records it at its first synchronisation that reaches the archive; should even that
+    /// fail, a new online backup after the server start makes point-in-time recovery safe
+    /// again.
     WalArchiveNotUpdated,
 }
 
@@ -272,10 +277,20 @@ pub async fn restore_server_core(
     dst_path: &Path,
 ) -> Result<RestoreStatus, OperationError> {
     let committed = restore_and_replay_commit(config, dst_path, Vec::new()).await?;
-    // The database holds the backup from here on, so the history after it is abandoned
-    // whatever happens next.
+    finish_restore(config, committed).await
+}
+
+/// The steps of a restore after its commit. The database holds the backup from here on,
+/// so the history after it is abandoned whatever happens next: that is recorded first,
+/// then the database is reindexed.
+async fn finish_restore(
+    config: &Configuration,
+    committed: CommittedRestore,
+) -> Result<RestoreStatus, OperationError> {
     let status = note_restore_in_wal_archive(config, &committed.outcome).await;
-    committed.reindex(config).await?;
+    committed.reindex(config).await.inspect_err(|_| {
+        error!("Run `kubidmd database reindex` before starting the server");
+    })?;
     Ok(status)
 }
 
@@ -287,15 +302,24 @@ async fn note_restore_in_wal_archive(
     outcome: &RestoreOutcome,
 ) -> RestoreStatus {
     match pitr::note_restore(config, outcome.watermark, outcome.server_uuid).await {
-        Ok(()) => RestoreStatus::Complete,
+        Ok(AbandonedHistory::Recorded) => RestoreStatus::Complete,
+        Ok(AbandonedHistory::Deferred(err)) => {
+            warn!(
+                %err,
+                "The database WAS restored; do not restore it again. The WAL archive could not \
+                 be updated, as when restoring from a replication region while the primary is \
+                 down: the server records the abandoned history in the archive at its first \
+                 synchronisation that reaches it."
+            );
+            RestoreStatus::WalArchiveNotUpdated
+        }
         Err(err) => {
             error!(
                 %err,
                 "The database WAS restored; do not restore it again. The abandoned history \
-                 could not be recorded in the WAL archive, whose location may be unavailable \
-                 (as when restoring from a replication region while the primary is down). A \
-                 later point-in-time recovery past this point could replay it: take a new \
-                 online backup right after starting the server."
+                 could not be recorded in the WAL archive nor handed to the server. A later \
+                 point-in-time recovery past this point could replay it: take a new online \
+                 backup right after starting the server."
             );
             RestoreStatus::WalArchiveNotUpdated
         }
@@ -605,12 +629,7 @@ pub async fn restore_s3_database(
     let committed = restore_and_replay_commit(config, &fetched.path, Vec::new()).await?;
     // Remove the downloaded artifact.
     drop(fetched);
-
-    // The database holds the backup from here on, so the history after it is abandoned
-    // whatever happens next.
-    let status = note_restore_in_wal_archive(config, &committed.outcome).await;
-    committed.reindex(config).await?;
-    Ok(status)
+    finish_restore(config, committed).await
 }
 
 /// Verify the backup stored under `key` in S3. The SHA-256 of the stored object is checked

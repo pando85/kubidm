@@ -212,11 +212,16 @@ pub struct WalPendingEvents {
     /// Changes of the server identity, in the order they happened.
     #[serde(default)]
     pub server_uuid_changes: Vec<WalServerUuidChange>,
+    /// Restores and recoveries the archive could not record when they happened, oldest
+    /// first. Each one precedes the gaps and changes of identity above, which the server
+    /// started on the restored database noticed.
+    #[serde(default)]
+    pub restores: Vec<WalRestore>,
 }
 
 impl WalPendingEvents {
     pub fn is_empty(&self) -> bool {
-        self.gaps.is_empty() && self.server_uuid_changes.is_empty()
+        self.gaps.is_empty() && self.server_uuid_changes.is_empty() && self.restores.is_empty()
     }
 
     /// Remove the events of `recorded`, each once.
@@ -235,7 +240,35 @@ impl WalPendingEvents {
                 self.server_uuid_changes.remove(index);
             }
         }
+        for restore in &recorded.restores {
+            if let Some(index) = self.restores.iter().position(|known| known == restore) {
+                self.restores.remove(index);
+            }
+        }
     }
+}
+
+/// An offline restore or recovery put a database in place while the archive could not
+/// record it: the history after `after_ts` is abandoned, and the archive continues under
+/// `server_uuid`. The next synchronisation that reaches the archive records it, before
+/// anything the new server archives.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WalRestore {
+    /// The CID timestamp the database was restored or recovered to.
+    pub after_ts: Duration,
+    /// The least end of the abandoned history: the time of the restore, or the end of a
+    /// segment the stopped server left in the WAL directory, whichever is later.
+    pub until_ts: Duration,
+    /// The server uuid the restored database carries.
+    pub server_uuid: Uuid,
+    /// When the restore happened.
+    pub at: Duration,
+    /// The command, for display.
+    pub reason: String,
+    /// What the stopped server left in the WAL directory and the archive did not record
+    /// yet. It belongs to the abandoned history.
+    #[serde(default)]
+    pub abandoned: WalPendingEvents,
 }
 
 /// The database took a new server uuid: from `at_ts` on, its transactions belong to
@@ -1026,7 +1059,7 @@ fn unreadable_pending_events() -> WalPendingEvents {
             until_ts: None,
             reason: WalGapReason::ArchiveFailure,
         }],
-        server_uuid_changes: Vec::new(),
+        ..WalPendingEvents::default()
     }
 }
 
@@ -1061,18 +1094,22 @@ pub fn clear_local_events(dir: &Path) -> Result<(), WalError> {
     }
 }
 
-/// Hand `change` to the next archiver started on `dir`, for an offline command that put a
-/// database with another server uuid in place.
-pub fn add_pending_server_uuid_change(
-    dir: &Path,
-    change: WalServerUuidChange,
-) -> Result<(), WalError> {
+/// Hand `restore` to the next archiver started on `dir`, for an offline restore or recovery
+/// the archive could not record. `restore.abandoned` must hold the events
+/// [`read_local_events`] returned: they are replaced by it, so that they are recorded as
+/// part of the abandoned history.
+pub fn defer_restore(dir: &Path, restore: WalRestore) -> Result<(), WalError> {
     fs::create_dir_all(dir)?;
-    let mut events = read_pending_events(dir);
-    if !events.server_uuid_changes.contains(&change) {
-        events.server_uuid_changes.push(change);
+    let events = WalPendingEvents {
+        restores: vec![restore],
+        ..WalPendingEvents::default()
+    };
+    write_pending_events(dir, &events)?;
+    match fs::remove_file(dir.join(WAL_OPEN_SEGMENT_MARKER)) {
+        Ok(()) => sync_dir(dir),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.into()),
     }
-    write_pending_events(dir, &events)
 }
 
 /// The gap the open segment marker left in `dir` by a run that stopped without closing

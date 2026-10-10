@@ -1274,6 +1274,13 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
                 .await
             {
                 Ok(_) if ropt.dry_run => {}
+                Ok(outcome) if !outcome.archive_updated => {
+                    warn!(
+                        "Recovery finished: the database was recovered, but the WAL archive was \
+                         not updated"
+                    );
+                    return ExitCode::from(2);
+                }
                 Ok(_) => info!("✅ Recovery Success!"),
                 Err(err) => {
                     error!(%err, "Point-in-time recovery failed");
