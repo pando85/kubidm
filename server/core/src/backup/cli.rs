@@ -26,7 +26,7 @@ use time::format_description::well_known::Rfc3339;
 use super::{
     backup_identity, backup_name_timestamp, compare_backup_names, is_backup_artifact_name,
     lag_metrics_from_health, open_backup_file_with_config,
-    pitr::{self, AbandonedHistory},
+    pitr::{self, AbandonedHistory, ManualBase},
     region_is_healthy,
     restore::{
         backup_encryption_config, restore_and_replay_commit, restore_database,
@@ -154,18 +154,22 @@ pub async fn backup_server_core(
         // Written next to the destination, synced and read back before it gets its name,
         // so the destination only ever holds a complete, verified backup. A rejected
         // artifact is kept under an `.invalid` suffix for inspection.
-        if !report_backup_verification(
+        let Some(report) = report_backup_verification(
             write_verified_local_backup_async(dst_path, artifact, compression, encryptor.as_ref())
                 .await,
-        ) {
+        ) else {
             return false;
-        }
+        };
         info!("Backup written to {}", dst_path.display());
+        // The backup has succeeded; whether it is a point-in-time recovery base is reported.
+        report_manual_base(pitr::note_manual_backup(config, dst_path, &report).await);
     } else {
-        if !report_backup_verification(
+        if report_backup_verification(
             verify_backup_output_async(artifact.clone(), name, compression, encryptor.as_ref())
                 .await,
-        ) {
+        )
+        .is_none()
+        {
             return false;
         }
 
@@ -232,9 +236,31 @@ fn check_backup_destination_name(
     Ok(())
 }
 
-/// Print the outcome of the post-write verification of a manual backup. Returns whether
-/// the backup passed; a rejected backup fails the command, as a failed write does.
-fn report_backup_verification(verified: Result<BackupStructuralReport, BackupVerifyError>) -> bool {
+/// Print whether a manual backup became a point-in-time recovery base. The backup itself
+/// succeeded either way.
+fn report_manual_base(noted: Result<ManualBase, pitr::PitrError>) {
+    match noted {
+        Ok(ManualBase::NotConfigured) => {}
+        Ok(ManualBase::HandedOver { watermark }) => eprintln!(
+            "Point-in-time recovery base: yes, watermark {watermark}; the server indexes it at \
+             its next archive run, and recover can use it right away"
+        ),
+        Ok(ManualBase::NotABase(reason)) => {
+            eprintln!("Point-in-time recovery base: no, {reason}")
+        }
+        Err(err) => {
+            error!(%err, "Unable to hand the backup to the WAL archive as a base");
+            eprintln!("Point-in-time recovery base: no, it could not be handed over: {err}");
+        }
+    }
+}
+
+/// Print the outcome of the post-write verification of a manual backup. Returns the
+/// report when the backup passed; a rejected backup fails the command, as a failed write
+/// does.
+fn report_backup_verification(
+    verified: Result<BackupStructuralReport, BackupVerifyError>,
+) -> Option<BackupStructuralReport> {
     match verified {
         Ok(report) => {
             eprintln!(
@@ -242,7 +268,7 @@ fn report_backup_verification(verified: Result<BackupStructuralReport, BackupVer
                 report.entry_count,
                 report.version.as_deref().unwrap_or("unknown")
             );
-            true
+            Some(report)
         }
         Err(err) => {
             error!("Backup failed verification: {err}");
@@ -253,7 +279,7 @@ fn report_backup_verification(verified: Result<BackupStructuralReport, BackupVer
             if let Some(path) = &err.quarantined_to {
                 eprintln!("  The rejected artifact was kept as {}", path.display());
             }
-            false
+            None
         }
     }
 }

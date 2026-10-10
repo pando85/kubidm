@@ -23,12 +23,12 @@ use kubidm_proto::backup::{
 };
 use kubidmd_core::backup::pitr::{
     pitr_list_server_core, pitr_recover_server_core, PitrArchive, PitrError, PitrSettings,
-    RecoveryTargetSpec,
+    RecoveryTargetSpec, HANDED_OVER_BASES_DIR,
 };
 use kubidmd_core::backup::{is_encrypted_artifact, MIN_KDF_M_COST};
 use kubidmd_core::config::{Configuration, OnlineBackup};
 use kubidmd_core::{
-    dbscan_quarantine_id2entry_core, dbscan_restore_quarantined_core, restore_s3_database,
+    backup_server_core, dbscan_quarantine_id2entry_core, dbscan_restore_quarantined_core, restore_s3_database,
     restore_server_core, RestoreStatus,
 };
 use kubidmd_lib::be::SharedWalArchiver;
@@ -433,6 +433,85 @@ fn test_pitr_dbscan_repairs_are_gaps_recovery_does_not_cross() {
         let mut recovered = setup_async_test(after_config).await;
         login_put_admin_idm_admins(&recovered.rsclient).await;
         assert!(person_exists(&recovered.rsclient, PITR_USER_BEFORE).await);
+        assert!(person_exists(&recovered.rsclient, PITR_USER_AFTER).await);
+        recovered.core_handle.shutdown().await;
+    });
+}
+
+/// A manual `kubidmd database backup` written into the base backup directory under a backup
+/// name is a recovery base like an online backup: recovery can use it right away, and the
+/// server indexes it at its next archive run.
+#[test]
+fn test_pitr_manual_backup_in_the_base_directory_is_a_base() {
+    run(async {
+        let workdir = tempfile::tempdir().expect("Failed to create workdir");
+        let backup_dir = workdir.path().join("backups");
+        let wal_dir = workdir.path().join("wal");
+        std::fs::create_dir(&backup_dir).expect("Failed to create backup directory");
+        let config = pitr_config(
+            &workdir.path().join("source.db"),
+            &backup_dir,
+            &wal_dir,
+            None,
+        );
+
+        // No online backup is ever taken.
+        let mut env = setup_async_test(config.clone()).await;
+        populate(&env).await;
+        env.core_handle.shutdown().await;
+        assert!(!pitr_list_server_core(&config, None).await);
+
+        // A manual backup elsewhere is not a base; one in the base directory is.
+        let key = format!("backup-{}.json.gz", now_rfc3339());
+        let elsewhere = workdir.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).expect("Failed to create a directory");
+        assert!(backup_server_core(&config, Some(&elsewhere.join(&key)), None).await);
+        assert!(!pitr_list_server_core(&config, None).await);
+        assert!(backup_server_core(&config, Some(&backup_dir.join(&key)), None).await);
+        assert!(
+            pitr_list_server_core(&config, None).await,
+            "Recovery can start from the manual backup before the server indexed it"
+        );
+
+        // The server indexes it, and archives what follows.
+        let mut env = setup_async_test(config.clone()).await;
+        login_put_admin_idm_admins(&env.rsclient).await;
+        env.rsclient
+            .idm_person_account_create(PITR_USER_AFTER, "After")
+            .await
+            .expect("Failed to create the person after the manual backup");
+        env.core_handle.shutdown().await;
+        let manifest = read_manifest(&wal_dir.join(PITR_MANIFEST_KEY));
+        assert_eq!(
+            manifest
+                .base_backups
+                .iter()
+                .map(|base| base.key.as_str())
+                .collect::<Vec<_>>(),
+            vec![key.as_str()]
+        );
+        assert!(
+            std::fs::read_dir(wal_dir.join(HANDED_OVER_BASES_DIR))
+                .expect("Failed to read the hand-over directory")
+                .next()
+                .is_none(),
+            "The hand-over file goes once the manifest records the base"
+        );
+
+        let recovered_db = workdir.path().join("recovered.db");
+        let recovered_config = pitr_config(&recovered_db, &backup_dir, &wal_dir, None);
+        let outcome = pitr_recover_server_core(
+            &recovered_config,
+            &RecoveryTargetSpec::Latest,
+            false,
+            None,
+        )
+        .await
+        .expect("Recovery from the manual backup failed");
+        assert_eq!(outcome.plan.base.key, key);
+        let mut recovered = setup_async_test(recovered_config).await;
+        login_put_admin_idm_admins(&recovered.rsclient).await;
+        assert_directory_state_restored(&recovered.rsclient).await;
         assert!(person_exists(&recovered.rsclient, PITR_USER_AFTER).await);
         recovered.core_handle.shutdown().await;
     });

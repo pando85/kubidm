@@ -19,6 +19,9 @@ use tokio::sync::broadcast;
 use tokio::time::{interval, MissedTickBehavior};
 use uuid::Uuid;
 
+use super::offline::{
+    adopt_handed_over_bases, forget_handed_over_bases, read_handed_over_bases,
+};
 use super::recover::{apply_restore, RestoreRecord};
 use super::store::{read_local_segment, PitrStore};
 use super::{blocking, BaseLocation, PitrError, PitrLocation, PitrSettings};
@@ -367,6 +370,8 @@ impl PitrArchive {
             load_or_new_manifest(store, &self.settings.location, server_uuid, events).await?;
 
         changed |= record_gaps(&mut manifest, &events.gaps, now);
+        let settled_bases = self.adopt_manual_bases(&mut manifest).await?;
+        changed |= !settled_bases.is_empty();
         let mut local_segments = scan.segments;
         if !scan.unreadable.is_empty() {
             let repaired = self.repair_local(scan.unreadable, now).await?;
@@ -391,6 +396,13 @@ impl PitrArchive {
             report.archived += archived.segments.len();
             self.cleanup_local(store, &archived.segments).await?;
         }
+        if !settled_bases.is_empty() {
+            blocking(move || {
+                forget_handed_over_bases(&settled_bases);
+                Ok(())
+            })
+            .await?;
+        }
         if let Some(err) = archived.error {
             return Err(err);
         }
@@ -408,6 +420,35 @@ impl PitrArchive {
         self.replicate(store, &mut manifest, now, report).await;
 
         Ok(())
+    }
+
+    /// Index the manual backups handed over as bases since the last run, see
+    /// [`super::offline`]. Returns the hand-over files the manifest settles once saved.
+    async fn adopt_manual_bases(
+        &self,
+        manifest: &mut PitrManifest,
+    ) -> Result<Vec<std::path::PathBuf>, PitrError> {
+        let handed_over = {
+            let local_dir = self.settings.local_dir.clone();
+            blocking(move || Ok(read_handed_over_bases(&local_dir))).await?
+        };
+        if handed_over.is_empty() {
+            return Ok(Vec::new());
+        }
+        // A base that can not be checked now is indexed anyway: retention drops it from the
+        // index once its location is listed and it is not there.
+        let held = self
+            .settings
+            .bases
+            .list_keys()
+            .await
+            .inspect_err(|err| warn!(%err, "Unable to list the base backups"))
+            .ok();
+        Ok(adopt_handed_over_bases(
+            manifest,
+            handed_over,
+            held.as_deref(),
+        ))
     }
 
     /// Whether archiving moves a segment out of the local directory: when it is uploaded

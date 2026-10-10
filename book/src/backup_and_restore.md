@@ -508,10 +508,11 @@ WAL archiving requires `online_backup.enabled = true`, since recovery always sta
   its own metadata, without a `.metadata.json` object, so a save that fails or is interrupted leaves the previous
   version whole. A base backup whose object or metadata object is gone drops out of the index.
 - **Base backups.** Every successful scheduled online backup is indexed as a base: the S3 backup when
-  `[online_backup.s3]` is configured, otherwise the local one. Manual `kubidmd database backup` artifacts are not
-  indexed. Recovery becomes possible with the first online backup taken after WAL archiving was enabled. When only
-  `[online_backup.wal_archive.s3]` is set, segments go to S3 but base backups stay in the local directory, so recovery
-  needs that directory too.
+  `[online_backup.s3]` is configured, otherwise the local one. When the bases are local, a manual
+  `kubidmd database backup` written into `online_backup.path` under a backup name is a base as well, see
+  [Manual Backups as Recovery Bases](#manual-backups-as-recovery-bases). Recovery becomes possible with the first base
+  taken after WAL archiving was enabled. When only `[online_backup.wal_archive.s3]` is set, segments go to S3 but base
+  backups stay in the local directory, so recovery needs that directory too.
 
 The archive task runs every `segment_interval_seconds`: it closes a segment older than that, archives (encrypts,
 uploads) closed segments, updates the manifest, applies retention and
@@ -547,6 +548,26 @@ command, with a reason naming the command. It goes into the manifest, or, when t
 be reached, into the WAL directory, from where the server records it at its next start and `recover` honours it
 meanwhile; when neither works the command refuses to change the database. Recovery then stops right before the repair,
 and an online backup taken after it makes later points recoverable again: take one after using these commands.
+
+#### Manual Backups as Recovery Bases
+
+A manual backup captures the database exactly like an online backup: one read transaction, whose last committed
+transaction is the watermark the backup records. When WAL archiving is enabled, the base backups are local
+(`online_backup.path` without `[online_backup.s3]`), and the backup is written into `online_backup.path` under the name
+an online backup would have, `backup-<RFC3339 UTC time>.json`, then `.gz` when compressed and `.enc` when encrypted, it
+is a base like any other:
+
+```bash
+kubidmd database backup -c /data/server.toml \
+    "/var/lib/kubidm/backups/backup-$(date -u +%Y-%m-%dT%H:%M:%SZ).json.gz"
+```
+
+The command prints whether the backup became a base, and why not. Since it may run next to a running server, which owns
+the manifest, it does not write the manifest itself: it hands the base over through the WAL directory (a file in
+`.handed-over-bases/`), the server indexes it at its next archive run, and `recover` and `pitr-list` use it from there
+meanwhile. A backup of another server's database is never indexed. Backup retention counts such a backup with the online
+backups of the directory, so it is pruned with them. With S3 base backups a manual backup is never a base: the archive
+pairs its segments with the online backups in S3, and a local file would not be there for a recovery on another host.
 
 #### Server Identity Changes
 
@@ -707,7 +728,7 @@ topology, treat a recovered node like a restored one: the other nodes must be re
 | Artifact                                  | Where                                               | Encrypted with `[online_backup.encryption]` | Replicated to regions                        | Recovered with                     |
 | ----------------------------------------- | --------------------------------------------------- | ------------------------------------------- | -------------------------------------------- | ---------------------------------- |
 | Online backup                             | `online_backup.path` and/or `[online_backup.s3]`    | yes (`.enc`)                                | S3 copy, by `[online_backup.s3.replication]` | `restore`, `restore-s3 [--region]` |
-| Manual backup (`kubidmd database backup`) | the path given                                      | yes                                         | no                                           | `restore`                          |
+| Manual backup (`kubidmd database backup`) | the path given                                      | yes                                         | no                                           | `restore`; `recover` as a base     |
 | WAL segment                               | `wal/` of the archive's S3 location, or the WAL dir | yes (`.enc`)                                | when the archive's S3 location replicates    | `recover [--region]`               |
 | `pitr-manifest.json`                      | next to the segments                                | no (holds no directory content)             | with the segments                            | read by `pitr-list` and `recover`  |
 | `.metadata.json` sidecars                 | next to every S3 object but the manifest            | no (checksum, size, key identifier)         | with their object                            | checked by every download          |
@@ -801,6 +822,9 @@ docker start <container name>
 ```
 
 You can then restart your instance. DO NOT modify the backup file as it may introduce data errors into your instance.
+
+With WAL archiving enabled, a manual backup written into the local base backup directory under a backup name is also a
+point-in-time recovery base, see [Manual Backups as Recovery Bases](#manual-backups-as-recovery-bases).
 
 The manual backup uses the `compression` and the `[online_backup.encryption]` settings of the configuration. Name the
 file after the compression: `.json.gz` with the default gzip, `.json` with `compression = "NoCompression"`. Restore

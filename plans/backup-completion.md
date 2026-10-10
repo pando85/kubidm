@@ -100,7 +100,10 @@ Recovery restores the newest base backup at or before the target, then applies l
 - [x] `db-scan` quarantine commands bypassed the WAL archive: `quarantine-id2entry` and `restore-quarantined` record a
       gap from just after the last committed transaction up to now before they change anything (in the manifest, or
       handed to the server through the WAL directory, else they refuse), so recovery never replays across them
-- [ ] Manual `database backup` files are not PITR bases
+- [x] Manual `database backup` files were not PITR bases: one written into the local base directory under a backup
+      name is handed over through the WAL directory (`.handed-over-bases/`) with the watermark of its content; the server
+      indexes it at its next archive run and recovery uses it meanwhile. With S3 bases a manual backup stays outside the
+      index (documented)
 - [x] The offline `restore` and `recover` ran their write transaction and reindex on the CLI's runtime: the restore,
       replay, reindex and boot verification now run on a dedicated database thread (`on_database_thread`), checked by
       a test that the single thread of a current thread runtime keeps ticking through a restore and a recovery

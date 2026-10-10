@@ -20,6 +20,7 @@ use kubidmd_lib::repl::wal::{
 use uuid::Uuid;
 
 use super::archive::{manifest_gap, manifest_uuid_change};
+use super::offline::{adopt_handed_over_bases, read_handed_over_bases};
 use super::store::{PitrStore, SegmentKeys};
 use super::{blocking, PitrError, PitrLocation, PitrSettings};
 use crate::backup::cli::RestoreStatus;
@@ -227,6 +228,13 @@ async fn open_archive(
             settings.location
         ))
     })?;
+
+    // Manual backups handed over as bases that the server did not index yet.
+    let handed_over = {
+        let local_dir = settings.local_dir.clone();
+        blocking(move || Ok(read_handed_over_bases(&local_dir))).await?
+    };
+    adopt_handed_over_bases(&mut manifest, handed_over, None);
 
     // Recovery can only start from the base backups the location actually holds: a region
     // prunes its copies on its own, and a base may have been deleted, or lost its sidecar,
