@@ -1360,6 +1360,16 @@ impl PitrManifest {
             .retain(|base| existing.iter().any(|key| key == &base.key));
     }
 
+    /// The segment `segment_id`, when the manifest records it.
+    pub fn segment(&self, segment_id: &str) -> Option<&WalSegment> {
+        self.segments.iter().find(|s| s.segment_id == segment_id)
+    }
+
+    /// Whether the manifest records the segment `segment_id`.
+    pub fn has_segment(&self, segment_id: &str) -> bool {
+        self.segment(segment_id).is_some()
+    }
+
     pub fn remove_segment(&mut self, segment_id: &str) {
         self.segments.retain(|s| s.segment_id != segment_id);
     }
@@ -1391,11 +1401,7 @@ impl PitrManifest {
     pub fn merge_from(&mut self, other: &PitrManifest) -> bool {
         let mut changed = self.merge_markers(other);
         for segment in &other.segments {
-            if !self
-                .segments
-                .iter()
-                .any(|known| known.segment_id == segment.segment_id)
-            {
+            if !self.has_segment(&segment.segment_id) {
                 self.add_segment(segment.clone());
                 changed = true;
             }
