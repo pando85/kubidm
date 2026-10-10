@@ -292,9 +292,9 @@ async fn open_archive(
                     if let Some(gap) = close_left_segments_offline(&local_dir)? {
                         warn!(
                             from = %format_ts_rfc3339(gap.from_ts),
-                            "The server stopped uncleanly and its journal does not show that \
-                             it holds every transaction the database committed after this \
-                             point; recovery stops before it"
+                            "The server stopped uncleanly, and its WAL directory does not show \
+                             whether the database committed transactions after this point; \
+                             recovery stops before it"
                         );
                     }
                     (read_local_events(&local_dir), Vec::new())
