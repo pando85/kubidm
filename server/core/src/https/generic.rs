@@ -133,7 +133,7 @@ impl MetricsEndpoint {
         let Some(presented) = headers
             .get(AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.strip_prefix("Bearer "))
+            .and_then(bearer_token)
         else {
             return false;
         };
@@ -144,6 +144,13 @@ impl MetricsEndpoint {
             .fold(0u8, |difference, (a, b)| difference | (a ^ b))
             == 0
     }
+}
+
+/// The token of the `Authorization` header value `value` when it uses the `Bearer` scheme,
+/// whose name is case-insensitive (RFC 7235): some scrapers and proxies send `bearer`.
+fn bearer_token(value: &str) -> Option<&str> {
+    let (scheme, token) = value.split_once(' ')?;
+    scheme.eq_ignore_ascii_case("bearer").then_some(token)
 }
 
 #[utoipa::path(
@@ -262,6 +269,26 @@ mod tests {
             Some("s3cret-token"),
         ] {
             assert!(!protected.authorized(&headers(refused)), "{refused:?}");
+        }
+    }
+
+    /// The scheme name is case-insensitive (RFC 7235): a scraper or proxy that sends
+    /// `bearer` with the right token is let in.
+    #[test]
+    fn the_bearer_scheme_is_matched_without_regard_to_case() {
+        let protected = MetricsEndpoint::new(
+            Arc::new(BackupMetrics::new(None)),
+            Some("s3cret-token".to_string()),
+        );
+        for accepted in [
+            "bearer s3cret-token",
+            "BEARER s3cret-token",
+            "BeArEr s3cret-token",
+        ] {
+            assert!(protected.authorized(&headers(Some(accepted))), "{accepted}");
+        }
+        for refused in ["Bearers3cret-token", "Bear s3cret-token", "bearer wrong"] {
+            assert!(!protected.authorized(&headers(Some(refused))), "{refused}");
         }
     }
 }
