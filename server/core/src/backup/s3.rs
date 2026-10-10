@@ -1,6 +1,7 @@
 use std::io::{Read, Write};
+use std::time::Duration;
 
-use aws_config::{BehaviorVersion, Region, SdkConfig};
+use aws_config::{timeout::TimeoutConfig, BehaviorVersion, Region, SdkConfig};
 use aws_credential_types::Credentials;
 use aws_sdk_s3::error::DisplayErrorContext;
 use aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput;
@@ -20,6 +21,17 @@ use kubidm_proto::backup::{
 use sha2::{Digest, Sha256};
 
 use super::retention::is_backup_artifact_name;
+
+/// Limit on establishing a connection to the service. An unreachable endpoint fails
+/// after this instead of the operating system's TCP timeout.
+const S3_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Limit on one attempt of one request, which for an upload includes sending its body: up
+/// to [`MULTIPART_THRESHOLD`] for a single upload, [`MULTIPART_CHUNK_SIZE`] for a part. A
+/// stalled connection fails after this rather than hanging the backup run, the replication
+/// monitor or the WAL archive.
+const S3_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// Limit on one request including the SDK's own retries.
+const S3_OPERATION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 const MULTIPART_THRESHOLD: u64 = 100 * 1024 * 1024;
 const MULTIPART_CHUNK_SIZE: usize = 10 * 1024 * 1024;
@@ -103,7 +115,13 @@ impl S3ClientWrapper {
     }
 
     async fn build_sdk_config(config: &S3Config) -> Result<SdkConfig, S3BackupError> {
-        let mut config_builder = aws_config::defaults(BehaviorVersion::latest());
+        let mut config_builder = aws_config::defaults(BehaviorVersion::latest()).timeout_config(
+            TimeoutConfig::builder()
+                .connect_timeout(S3_CONNECT_TIMEOUT)
+                .operation_attempt_timeout(S3_ATTEMPT_TIMEOUT)
+                .operation_timeout(S3_OPERATION_TIMEOUT)
+                .build(),
+        );
 
         if let Some(endpoint) = &config.endpoint {
             config_builder = config_builder.endpoint_url(endpoint);
@@ -1233,6 +1251,31 @@ fn parse_storage_class(s: &str) -> StorageClass {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_sdk_config_bounds_every_request() {
+        let mut config = S3Config::with_bucket("bucket".to_string());
+        config.region = Some("us-east-1".to_string());
+        config.endpoint = Some("http://127.0.0.1:1".to_string());
+        config.credentials = Some(S3Credentials {
+            access_key_id: "key".to_string(),
+            secret_access_key: "secret".to_string(),
+            session_token: None,
+        });
+
+        let sdk_config = S3ClientWrapper::build_sdk_config(&config)
+            .await
+            .expect("sdk config");
+        let timeouts = sdk_config
+            .timeout_config()
+            .expect("timeouts are configured");
+        assert_eq!(timeouts.connect_timeout(), Some(S3_CONNECT_TIMEOUT));
+        assert_eq!(
+            timeouts.operation_attempt_timeout(),
+            Some(S3_ATTEMPT_TIMEOUT)
+        );
+        assert_eq!(timeouts.operation_timeout(), Some(S3_OPERATION_TIMEOUT));
+    }
     use kubidm_proto::backup::{S3Credentials, S3ServerSideEncryption};
     use std::io::Cursor;
 
