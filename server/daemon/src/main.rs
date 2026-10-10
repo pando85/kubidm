@@ -821,12 +821,17 @@ fn main() -> ExitCode {
     // server has stopped its tasks by now, but a scheduled backup verification abandoned
     // by the shutdown only stops at its next step, which can be minutes away on a large
     // database: never hold the exit for it. Its scratch directories are removed at the
-    // next start.
-    rt.shutdown_timeout(BLOCKING_TASKS_SHUTDOWN_TIMEOUT);
+    // next start. Every other command waits for its blocking work, so that a write it
+    // left running is never cut short.
+    if is_server {
+        rt.shutdown_timeout(BLOCKING_TASKS_SHUTDOWN_TIMEOUT);
+    } else {
+        drop(rt);
+    }
     exit_code
 }
 
-/// How long the exit waits for blocking tasks still running once the command is done.
+/// How long the exit of the server waits for blocking tasks still running once it stopped.
 const BLOCKING_TASKS_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Build and execute the main server. The ServerConfig are the configuration options
