@@ -3,17 +3,20 @@
 //! Writing a backup only proves that the backend produced bytes without an error. Before
 //! a backup is announced as a success, kept by retention or uploaded, it is parsed again
 //! with the same structural checks as `kubidmd database verify-backup --level structural`.
-//! A local artifact that fails is kept for forensics under an `.invalid` suffix, which the
-//! backup name matcher in [`super::retention`] never recognises as a backup, so a broken
-//! backup can neither count towards nor prune the retained good ones.
+//! The artifact is checked exactly as stored: an encrypted backup is decrypted with the
+//! key it was written with, which also proves that the key can open it. A local artifact
+//! that fails is kept for forensics under an `.invalid` suffix, which the backup name
+//! matcher in [`super::retention`] never recognises as a backup, so a broken backup can
+//! neither count towards nor prune the retained good ones.
 
 use std::fmt;
-use std::fs::File;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use kubidm_proto::backup::BackupCompression;
 use kubidmd_lib::be::{verify_backup_structure, BackupStructuralReport};
+
+use super::artifact::open_backup_bytes;
+use super::encryption::BackupEncryptor;
 
 /// Suffix appended to the file name of a freshly written local backup that failed
 /// verification.
@@ -68,35 +71,57 @@ fn available_invalid_backup_path(path: &Path) -> Option<PathBuf> {
         .find(|candidate| !candidate.exists())
 }
 
-/// Structurally verify a backup that has been produced into `input`. This is the check
-/// applied to in-memory backups before they leave the server, such as an S3 upload.
-pub fn verify_backup_output<IN: Read>(
-    input: IN,
+/// Structurally verify a backup artifact exactly as it is stored or about to be stored:
+/// `data` is the complete artifact, `compression` the compression it was produced with and
+/// `encryptor` the key it was sealed with, if any. This is the check applied to in-memory
+/// backups before they leave the server, such as an S3 upload.
+///
+/// The artifact must match the configuration it was produced under: with an `encryptor`
+/// it has to be an encrypted container that this key opens and whose header records
+/// `compression`; without one it has to be a plain backup.
+pub fn verify_backup_output(
+    data: &[u8],
     compression: BackupCompression,
+    encryptor: Option<&BackupEncryptor>,
 ) -> Result<BackupStructuralReport, BackupVerifyError> {
-    match verify_backup_structure(input, compression) {
+    let reject = |reason: String| BackupVerifyError {
+        reasons: vec![reason],
+        quarantined_to: None,
+    };
+
+    let opened = open_backup_bytes(data.to_vec(), Path::new(""), encryptor, true)
+        .map_err(|err| reject(format!("artifact could not be opened: {err}")))?;
+
+    if opened.encryption.is_some() && opened.compression != compression {
+        return Err(reject(format!(
+            "encrypted artifact records {} but the backup was written with {compression}",
+            opened.compression
+        )));
+    }
+
+    // A plain artifact has no header to tell its compression from, so the parser is told
+    // the compression the backup was written with and a mismatch fails to parse.
+    match verify_backup_structure(opened.reader, compression) {
         Ok(report) if report.is_valid() => Ok(report),
         Ok(report) => Err(BackupVerifyError {
             reasons: report.errors,
             quarantined_to: None,
         }),
-        Err(err) => Err(BackupVerifyError {
-            reasons: vec![format!(
-                "artifact could not be parsed as a kubidm backup: {err:?}"
-            )],
-            quarantined_to: None,
-        }),
+        Err(err) => Err(reject(format!(
+            "artifact could not be parsed as a kubidm backup: {err:?}"
+        ))),
     }
 }
 
 /// Reopen the backup that was just written to `path` and structurally verify it with the
-/// `compression` it was written with. On failure the file is renamed to
-/// [`invalid_backup_path`] so that it is kept but never treated as a backup again.
+/// `compression` and the `encryptor` it was written with. On failure the file is renamed
+/// to [`invalid_backup_path`] so that it is kept but never treated as a backup again.
 pub fn finalize_local_backup(
     path: &Path,
     compression: BackupCompression,
+    encryptor: Option<&BackupEncryptor>,
 ) -> Result<BackupStructuralReport, BackupVerifyError> {
-    let verified = File::open(path)
+    let verified = std::fs::read(path)
         .map_err(|err| BackupVerifyError {
             reasons: vec![format!(
                 "unable to reopen {} for verification: {err}",
@@ -104,7 +129,7 @@ pub fn finalize_local_backup(
             )],
             quarantined_to: None,
         })
-        .and_then(|file| verify_backup_output(file, compression));
+        .and_then(|data| verify_backup_output(&data, compression, encryptor));
 
     verified.map_err(|mut err| {
         let Some(invalid) = available_invalid_backup_path(path) else {
@@ -132,8 +157,30 @@ mod tests {
 
     use flate2::write::GzEncoder;
     use flate2::Compression;
+    use kubidm_proto::backup::{
+        BackupEncryptionConfig, EncryptionKeySource, KeyDerivationParams, BACKUP_ENCRYPTED_SUFFIX,
+    };
 
     use super::*;
+    use crate::backup::encryption::MIN_KDF_M_COST;
+
+    fn encryptor(passphrase: &[u8]) -> BackupEncryptor {
+        BackupEncryptor::with_key_material(
+            BackupEncryptionConfig {
+                enabled: true,
+                key_source: EncryptionKeySource::Passphrase,
+                key_derivation: KeyDerivationParams {
+                    m_cost: MIN_KDF_M_COST,
+                    t_cost: 1,
+                    p_cost: 1,
+                },
+                key_identifier: None,
+                passphrase_file: None,
+            },
+            passphrase.to_vec(),
+        )
+        .expect("encryptor")
+    }
 
     /// The smallest artifact `verify_backup_structure` accepts: a V5 backup written by this
     /// server series that carries one (empty) live entry.
@@ -177,6 +224,15 @@ mod tests {
         assert!(!crate::backup::is_backup_artifact_name(
             "backup-2024-01-01T22:00:00Z.json.gz.invalid"
         ));
+
+        let encrypted = Path::new("/var/backups/backup-2024-01-01T22:00:00Z.json.gz.enc");
+        assert_eq!(
+            invalid_backup_path(encrypted),
+            PathBuf::from("/var/backups/backup-2024-01-01T22:00:00Z.json.gz.enc.invalid")
+        );
+        assert!(!crate::backup::is_backup_artifact_name(
+            "backup-2024-01-01T22:00:00Z.json.gz.enc.invalid"
+        ));
     }
 
     #[test]
@@ -185,7 +241,7 @@ mod tests {
 
         let plain = dir.path().join("backup-plain.json");
         std::fs::write(&plain, minimal_valid_backup()).expect("write");
-        let report = finalize_local_backup(&plain, BackupCompression::NoCompression)
+        let report = finalize_local_backup(&plain, BackupCompression::NoCompression, None)
             .expect("a valid backup must pass");
         assert_eq!(report.entry_count, 1);
         assert_eq!(report.version.as_deref(), Some(env!("KUBIDM_PKG_SERIES")));
@@ -194,7 +250,7 @@ mod tests {
 
         let gz = dir.path().join("backup-gzip.json.gz");
         std::fs::write(&gz, gzip(&minimal_valid_backup())).expect("write");
-        let report = finalize_local_backup(&gz, BackupCompression::Gzip)
+        let report = finalize_local_backup(&gz, BackupCompression::Gzip, None)
             .expect("a valid gzip backup must pass");
         assert_eq!(report.entry_count, 1);
         assert!(gz.exists());
@@ -206,7 +262,7 @@ mod tests {
         let path = dir.path().join("backup-garbage.json");
         std::fs::write(&path, b"this is not a backup").expect("write");
 
-        let err = finalize_local_backup(&path, BackupCompression::NoCompression)
+        let err = finalize_local_backup(&path, BackupCompression::NoCompression, None)
             .expect_err("garbage must be rejected");
         let invalid = invalid_backup_path(&path);
         assert_eq!(err.quarantined_to.as_deref(), Some(invalid.as_path()));
@@ -229,7 +285,7 @@ mod tests {
         // Plain JSON written where gzip was expected.
         std::fs::write(&path, minimal_valid_backup()).expect("write");
 
-        let err = finalize_local_backup(&path, BackupCompression::Gzip)
+        let err = finalize_local_backup(&path, BackupCompression::Gzip, None)
             .expect_err("a compression mismatch must be rejected");
         assert!(err.quarantined_to.is_some());
         assert!(!path.exists());
@@ -243,7 +299,7 @@ mod tests {
         // A V1 backup: parses, but has no version and no entries.
         std::fs::write(&path, b"[]").expect("write");
 
-        let err = finalize_local_backup(&path, BackupCompression::NoCompression)
+        let err = finalize_local_backup(&path, BackupCompression::NoCompression, None)
             .expect_err("an unrestorable backup must be rejected");
         assert!(err
             .reasons
@@ -257,7 +313,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("backup-missing.json");
 
-        let err = finalize_local_backup(&path, BackupCompression::NoCompression)
+        let err = finalize_local_backup(&path, BackupCompression::NoCompression, None)
             .expect_err("a missing file must be rejected");
         assert!(err.quarantined_to.is_none());
         assert!(
@@ -273,14 +329,14 @@ mod tests {
         let invalid = invalid_backup_path(&path);
 
         std::fs::write(&path, b"first attempt").expect("write");
-        let first = finalize_local_backup(&path, BackupCompression::NoCompression)
+        let first = finalize_local_backup(&path, BackupCompression::NoCompression, None)
             .expect_err("garbage must be rejected");
         assert_eq!(first.quarantined_to.as_deref(), Some(invalid.as_path()));
 
         // An operator retries the same destination and it fails again: the earlier
         // forensic copy must not be overwritten.
         std::fs::write(&path, b"second attempt").expect("write");
-        let second = finalize_local_backup(&path, BackupCompression::NoCompression)
+        let second = finalize_local_backup(&path, BackupCompression::NoCompression, None)
             .expect_err("garbage must be rejected");
         let numbered = dir.path().join("backup-retry.json.invalid.1");
         assert_eq!(second.quarantined_to.as_deref(), Some(numbered.as_path()));
@@ -293,15 +349,114 @@ mod tests {
     #[test]
     fn test_verify_backup_output_in_memory() {
         let report = verify_backup_output(
-            &minimal_valid_backup()[..],
+            &minimal_valid_backup(),
             BackupCompression::NoCompression,
+            None,
         )
         .expect("a valid in-memory backup must pass");
         assert_eq!(report.entry_count, 1);
 
-        let err = verify_backup_output(&b"garbage"[..], BackupCompression::NoCompression)
+        let err = verify_backup_output(b"garbage", BackupCompression::NoCompression, None)
             .expect_err("garbage must be rejected");
         assert!(err.quarantined_to.is_none());
         assert!(err.to_string().contains("could not be parsed"));
+    }
+
+    #[test]
+    fn test_verify_backup_output_encrypted_round_trip() {
+        let enc = encryptor(b"pw");
+        for (compression, plaintext) in [
+            (BackupCompression::NoCompression, minimal_valid_backup()),
+            (BackupCompression::Gzip, gzip(&minimal_valid_backup())),
+        ] {
+            let sealed = enc.encrypt(&plaintext, compression).expect("encrypt");
+            let report = verify_backup_output(&sealed, compression, Some(&enc))
+                .expect("an encrypted backup verified with its key must pass");
+            assert_eq!(report.entry_count, 1);
+            assert_eq!(report.version.as_deref(), Some(env!("KUBIDM_PKG_SERIES")));
+        }
+    }
+
+    #[test]
+    fn test_verify_backup_output_rejects_configuration_mismatches() {
+        let enc = encryptor(b"pw");
+        let sealed = enc
+            .encrypt(&gzip(&minimal_valid_backup()), BackupCompression::Gzip)
+            .expect("encrypt");
+
+        // Encrypted artifact, no key.
+        let err = verify_backup_output(&sealed, BackupCompression::Gzip, None)
+            .expect_err("an encrypted artifact without a key must be rejected");
+        assert!(
+            err.to_string().contains(enc.key_identifier()),
+            "the key identifier must be named: {err}"
+        );
+
+        // Encrypted artifact, wrong key.
+        let err = verify_backup_output(&sealed, BackupCompression::Gzip, Some(&encryptor(b"no")))
+            .expect_err("a wrong key must be rejected");
+        assert!(err.to_string().contains("decryption failed"), "{err}");
+
+        // Encrypted artifact whose header disagrees with the compression it should have.
+        let err = verify_backup_output(&sealed, BackupCompression::NoCompression, Some(&enc))
+            .expect_err("a compression mismatch must be rejected");
+        assert!(err.to_string().contains("records Gzip"), "{err}");
+
+        // Plain artifact although encryption is configured.
+        let err = verify_backup_output(
+            &minimal_valid_backup(),
+            BackupCompression::NoCompression,
+            Some(&enc),
+        )
+        .expect_err("a plain artifact must be rejected when encryption is on");
+        assert!(err.to_string().contains("not encrypted"), "{err}");
+
+        // Encrypted garbage: decrypts, but is not a backup.
+        let sealed_garbage = enc
+            .encrypt(b"not a backup", BackupCompression::NoCompression)
+            .expect("encrypt");
+        let err = verify_backup_output(
+            &sealed_garbage,
+            BackupCompression::NoCompression,
+            Some(&enc),
+        )
+        .expect_err("encrypted garbage must be rejected");
+        assert!(err.to_string().contains("could not be parsed"), "{err}");
+    }
+
+    #[test]
+    fn test_finalize_encrypted_backup_keeps_valid_and_quarantines_unopenable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let enc = encryptor(b"pw");
+
+        let good = dir
+            .path()
+            .join(format!("backup-good.json.gz{BACKUP_ENCRYPTED_SUFFIX}"));
+        std::fs::write(
+            &good,
+            enc.encrypt(&gzip(&minimal_valid_backup()), BackupCompression::Gzip)
+                .expect("encrypt"),
+        )
+        .expect("write");
+        let report = finalize_local_backup(&good, BackupCompression::Gzip, Some(&enc))
+            .expect("a valid encrypted backup must pass");
+        assert_eq!(report.entry_count, 1);
+        assert!(good.exists(), "a valid backup is left in place");
+
+        // The same artifact checked with another key is quarantined with the encrypted
+        // name plus the invalid suffix.
+        let other = dir
+            .path()
+            .join(format!("backup-other.json.gz{BACKUP_ENCRYPTED_SUFFIX}"));
+        std::fs::copy(&good, &other).expect("copy");
+        let err = finalize_local_backup(&other, BackupCompression::Gzip, Some(&encryptor(b"no")))
+            .expect_err("a wrong key must be rejected");
+        let quarantined = invalid_backup_path(&other);
+        assert_eq!(err.quarantined_to.as_deref(), Some(quarantined.as_path()));
+        assert!(!other.exists());
+        assert!(quarantined.exists());
+        assert!(quarantined
+            .to_string_lossy()
+            .ends_with(".json.gz.enc.invalid"));
     }
 }

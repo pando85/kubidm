@@ -45,8 +45,9 @@ use crate::{
     actors::{QueryServerReadV1, QueryServerWriteV1},
     admin::AdminActor,
     backup::{
-        finalize_local_backup, is_backup_artifact_name, lag_metrics_from_health, region_is_healthy,
-        s3_location, verify_backup_output, BackupVerifyError, S3BackupError, S3ClientWrapper,
+        finalize_local_backup, is_backup_artifact_name, lag_metrics_from_health,
+        open_backup_file_with_config, region_is_healthy, s3_location, seal_backup,
+        verify_backup_output, BackupEncryptor, BackupVerifyError, S3BackupError, S3ClientWrapper,
     },
     config::{Configuration, ServerRole},
     interval::IntervalActor,
@@ -59,8 +60,9 @@ use crypto_glue::{
 };
 use kubidm_proto::{
     backup::{
-        BackupCompression, ReplicationConfig, ReplicationHealthCheck, ReplicationRegionConfig,
-        ReplicationStatus, S3BackupMetadata, S3Config,
+        is_encrypted_backup_name, BackupCompression, BackupEncryptionConfig, ReplicationConfig,
+        ReplicationHealthCheck, ReplicationRegionConfig, ReplicationStatus, S3BackupMetadata,
+        S3Config, BACKUP_ENCRYPTED_SUFFIX,
     },
     internal::{ConsistencyError, OperationError},
     scim_v1::client::ScimAssertGeneric,
@@ -373,7 +375,20 @@ pub fn dbscan_restore_quarantined_core(config: &Configuration, id: u64) {
     };
 }
 
-pub fn backup_server_core(config: &Configuration, dst_path: Option<&Path>) {
+/// The encryption settings of the server configuration, if any. Backups made from this
+/// configuration are encrypted when they are enabled, and encrypted artifacts are opened
+/// with the key they name.
+fn backup_encryption_config(config: &Configuration) -> Option<&BackupEncryptionConfig> {
+    config
+        .online_backup
+        .as_ref()
+        .map(|backup| &backup.encryption)
+}
+
+/// Take an offline backup of the database described by `config` into `dst_path`, or to
+/// stdout without a path. The backup uses the compression and the client-side encryption
+/// of the `[online_backup]` section, so it is interchangeable with an online backup.
+pub async fn backup_server_core(config: &Configuration, dst_path: Option<&Path>) {
     let schema = match Schema::new() {
         Ok(s) => s,
         Err(e) => {
@@ -381,6 +396,38 @@ pub fn backup_server_core(config: &Configuration, dst_path: Option<&Path>) {
             std::process::exit(1);
         }
     };
+
+    let compression = match config.online_backup.as_ref() {
+        Some(backup_config) => backup_config.compression,
+        None => BackupCompression::default(),
+    };
+
+    // The key is obtained before the database is opened so that a missing key fails
+    // without touching anything.
+    let encryptor = match backup_encryption_config(config) {
+        Some(encryption) => match BackupEncryptor::from_config(encryption).await {
+            Ok(encryptor) => encryptor,
+            Err(err) => {
+                error!(%err, "Backup failed: unable to obtain the backup encryption key");
+                std::process::exit(1);
+            }
+        },
+        None => None,
+    };
+
+    if let (Some(dst_path), Some(_)) = (dst_path, &encryptor) {
+        if !dst_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(is_encrypted_backup_name)
+        {
+            warn!(
+                "Backup encryption is enabled: {} will hold an encrypted artifact although \
+                 its name does not end in {BACKUP_ENCRYPTED_SUFFIX}",
+                dst_path.display()
+            );
+        }
+    }
 
     let be = match setup_backend(config, &schema) {
         Ok(be) => be,
@@ -398,11 +445,6 @@ pub fn backup_server_core(config: &Configuration, dst_path: Option<&Path>) {
         }
     };
 
-    let compression = match config.online_backup.as_ref() {
-        Some(backup_config) => backup_config.compression,
-        None => BackupCompression::default(),
-    };
-
     if let Some(dst_path) = dst_path {
         if dst_path.exists() {
             error!(
@@ -411,46 +453,63 @@ pub fn backup_server_core(config: &Configuration, dst_path: Option<&Path>) {
             );
             return;
         }
+    }
 
-        let output = match std::fs::File::create(dst_path) {
-            Ok(output) => output,
-            Err(err) => {
-                error!(?err, "File::create error creating {}", dst_path.display());
-                return;
-            }
-        };
+    // The backup is produced in memory first so that it can be encrypted and so that only
+    // a verified backup is ever emitted to stdout.
+    let mut backup_data = Vec::new();
+    if let Err(e) = be_ro_txn.backup(&mut backup_data, compression) {
+        error!("Backup failed: {:?}", e);
+        std::process::exit(1);
+    }
+    // Let the txn abort, even on success.
+    drop(be_ro_txn);
 
-        match be_ro_txn.backup(output, compression) {
-            Ok(_) => info!("Backup written to {}", dst_path.display()),
-            Err(e) => {
-                error!("Backup failed: {:?}", e);
-                std::process::exit(1);
-            }
-        };
+    let artifact = match seal_backup(backup_data, compression, encryptor.as_ref()) {
+        Ok(artifact) => artifact,
+        Err(err) => {
+            error!(%err, "Backup failed: unable to encrypt the backup");
+            std::process::exit(1);
+        }
+    };
+
+    if let Some(dst_path) = dst_path {
+        if let Err(err) = std::fs::write(dst_path, &artifact) {
+            error!(
+                ?err,
+                "Backup failed: unable to write {}",
+                dst_path.display()
+            );
+            std::process::exit(1);
+        }
+        drop(artifact);
+        info!("Backup written to {}", dst_path.display());
 
         // Read the artifact back before announcing it. A rejected artifact is kept under
         // an `.invalid` suffix for inspection.
-        report_backup_verification(finalize_local_backup(dst_path, compression));
+        report_backup_verification(finalize_local_backup(
+            dst_path,
+            compression,
+            encryptor.as_ref(),
+        ));
     } else {
-        // No path set, default to stdout. The backup is produced in memory first so that
-        // only a verified backup is ever emitted.
-        let mut backup_data = Vec::new();
-
-        if let Err(e) = be_ro_txn.backup(&mut backup_data, compression) {
-            error!("Backup failed: {:?}", e);
-            std::process::exit(1);
-        }
-
-        report_backup_verification(verify_backup_output(&backup_data[..], compression));
+        report_backup_verification(verify_backup_output(
+            &artifact,
+            compression,
+            encryptor.as_ref(),
+        ));
 
         let mut stdout = std::io::stdout().lock();
-        if let Err(err) = stdout.write_all(&backup_data).and_then(|()| stdout.flush()) {
+        if let Err(err) = stdout.write_all(&artifact).and_then(|()| stdout.flush()) {
             error!(?err, "Backup failed: unable to write to stdout");
             std::process::exit(1);
         }
     };
+
+    if let Some(encryptor) = &encryptor {
+        eprintln!("Backup encrypted with key '{}'", encryptor.key_identifier());
+    }
     info!("Backup success!");
-    // Let the txn abort, even on success.
 }
 
 /// Print the outcome of the post-write verification of a manual backup. A rejected backup
@@ -493,6 +552,21 @@ pub async fn restore_database(
     config: &Configuration,
     src_path: &Path,
 ) -> Result<(), OperationError> {
+    // The artifact is opened before the database is touched, so that a backup that can
+    // not be read (missing, or encrypted with a key this configuration does not have)
+    // leaves the target database as it was. An encrypted artifact is decrypted with the
+    // key the configuration names; the compression then comes from its header, from the
+    // file name otherwise.
+    let opened = open_backup_file_with_config(src_path, backup_encryption_config(config))
+        .await
+        .map_err(|err| {
+            error!(%err, "Unable to open backup {}", src_path.display());
+            OperationError::FsError
+        })?;
+    if let Some(key_identifier) = opened.key_identifier() {
+        info!("Backup is encrypted with key '{key_identifier}'");
+    }
+
     // If it's an in memory database, we don't need to touch anything
     if let Some(db_path) = config.db_path.as_ref() {
         touch_file_or_quit(db_path);
@@ -514,15 +588,8 @@ pub async fn restore_database(
         );
     })?;
 
-    let compression = BackupCompression::identify_file(src_path);
-
-    let input = std::fs::File::open(src_path).map_err(|err| {
-        error!(?err, "File::open error reading {}", src_path.display());
-        OperationError::FsError
-    })?;
-
     be_wr_txn
-        .restore(input, compression)
+        .restore(opened.reader, opened.compression)
         .and_then(|_| be_wr_txn.commit())
         .inspect_err(|err| {
             error!(?err, "Failed to restore database");
@@ -552,19 +619,19 @@ pub async fn verify_backup_server_core(
     backup_path: &Path,
     level: BackupVerifyLevel,
 ) -> bool {
-    let compression = BackupCompression::identify_file(backup_path);
+    let opened =
+        match open_backup_file_with_config(backup_path, backup_encryption_config(config)).await {
+            Ok(opened) => opened,
+            Err(err) => {
+                error!(%err, "Unable to open backup {}", backup_path.display());
+                eprintln!("Backup structural verification: FAIL");
+                eprintln!("  - unable to open {}: {err}", backup_path.display());
+                return false;
+            }
+        };
+    let encryption_key = opened.key_identifier().map(str::to_string);
 
-    let input = match std::fs::File::open(backup_path) {
-        Ok(file) => file,
-        Err(err) => {
-            error!(?err, "Unable to open backup {}", backup_path.display());
-            eprintln!("Backup structural verification: FAIL");
-            eprintln!("  - unable to open {}: {err}", backup_path.display());
-            return false;
-        }
-    };
-
-    let report = match verify_backup_structure(input, compression) {
+    let report = match verify_backup_structure(opened.reader, opened.compression) {
         Ok(report) => report,
         Err(err) => {
             eprintln!("Backup structural verification: FAIL");
@@ -576,6 +643,13 @@ pub async fn verify_backup_server_core(
     eprintln!(
         "Backup structural verification: {}",
         pass_fail(report.is_valid())
+    );
+    eprintln!(
+        "  Encrypted: {}",
+        match &encryption_key {
+            Some(key) => format!("yes, key '{key}'"),
+            None => "no".to_string(),
+        }
     );
     eprintln!("  Entries: {}", report.entry_count);
     eprintln!(
@@ -745,23 +819,26 @@ struct FetchedS3Backup {
 
 /// Download the backup `key` from S3, verifying its SHA-256 against the metadata sidecar,
 /// into a temporary file. The file is named so that `BackupCompression::identify_file`
-/// recognises the compression recorded in the metadata, which lets the local restore and
-/// verification paths treat it exactly like a local artifact.
+/// recognises the compression recorded in the metadata and so that an encrypted artifact
+/// carries the `.enc` suffix, which lets the local restore and verification paths treat it
+/// exactly like a local artifact (the encrypted container is recognised by its content,
+/// the name only keeps it consistent).
 async fn fetch_s3_backup(s3_config: S3Config, key: &str) -> Result<FetchedS3Backup, S3BackupError> {
     let client = S3ClientWrapper::new(s3_config).await?;
     let (data, metadata) = client.download_backup(key).await?;
 
-    if metadata.encrypted {
-        return Err(S3BackupError::DownloadError(format!(
-            "backup {key} is marked encrypted; decryption on restore is not supported in \
-             this release"
-        )));
-    }
-
     let scratch_dir = tempfile::tempdir()?;
-    let path = scratch_dir
-        .path()
-        .join(format!("backup.json{}", metadata.compression.suffix()));
+    // The requested key counts as well as the sidecar: the sidecar is not authenticated, so
+    // an object requested as `.enc` must be an encrypted container whatever it says.
+    let encryption_suffix = if metadata.encrypted || is_encrypted_backup_name(key) {
+        BACKUP_ENCRYPTED_SUFFIX
+    } else {
+        ""
+    };
+    let path = scratch_dir.path().join(format!(
+        "backup.json{}{encryption_suffix}",
+        metadata.compression.suffix()
+    ));
     std::fs::write(&path, &data)?;
 
     info!(
@@ -769,6 +846,8 @@ async fn fetch_s3_backup(s3_config: S3Config, key: &str) -> Result<FetchedS3Back
         size_bytes = metadata.size_bytes,
         checksum_sha256 = %metadata.checksum_sha256,
         timestamp = %metadata.timestamp,
+        encrypted = metadata.encrypted,
+        encryption_key = ?metadata.key_identifier,
         "Downloaded S3 backup to {}",
         path.display()
     );
@@ -831,6 +910,16 @@ pub async fn verify_s3_backup_server_core(
     eprintln!("  Size: {} bytes", fetched.metadata.size_bytes);
     eprintln!("  SHA-256: {}", fetched.metadata.checksum_sha256);
     eprintln!("  Uploaded: {}", fetched.metadata.timestamp);
+    if fetched.metadata.encrypted {
+        eprintln!(
+            "  Encrypted: yes, key '{}'",
+            fetched
+                .metadata
+                .key_identifier
+                .as_deref()
+                .unwrap_or("unknown")
+        );
+    }
 
     verify_backup_server_core(config, &fetched.path, level).await
 }
@@ -884,7 +973,7 @@ fn list_local_backups(config: &Configuration) -> bool {
         }
     };
 
-    let mut rows: Vec<(String, u64, String)> = Vec::new();
+    let mut rows: Vec<(String, u64, String, &str)> = Vec::new();
     for entry in entries {
         let entry = match entry {
             Ok(entry) => entry,
@@ -917,7 +1006,12 @@ fn list_local_backups(config: &Configuration) -> bool {
                 return false;
             }
         };
-        rows.push((name.to_string(), size, modified));
+        let encrypted = if is_encrypted_backup_name(name) {
+            "yes"
+        } else {
+            "no"
+        };
+        rows.push((name.to_string(), size, modified, encrypted));
     }
 
     if rows.is_empty() {
@@ -928,12 +1022,15 @@ fn list_local_backups(config: &Configuration) -> bool {
     rows.sort();
     let name_width = rows
         .iter()
-        .map(|(name, _, _)| name.len())
+        .map(|(name, _, _, _)| name.len())
         .max()
         .unwrap_or(0);
-    println!("  {:<name_width$}  {:>12}  MODIFIED", "NAME", "SIZE_BYTES");
-    for (name, size, modified) in rows {
-        println!("  {name:<name_width$}  {size:>12}  {modified}");
+    println!(
+        "  {:<name_width$}  {:>12}  {:<20}  ENCRYPTED",
+        "NAME", "SIZE_BYTES", "MODIFIED"
+    );
+    for (name, size, modified, encrypted) in rows {
+        println!("  {name:<name_width$}  {size:>12}  {modified:<20}  {encrypted}");
     }
 
     true
@@ -1016,15 +1113,20 @@ async fn list_s3_backups(config: &Configuration, region: Option<&str>) -> bool {
         .unwrap_or(0)
         .max("UPLOADED".len());
     println!(
-        "  {:<key_width$}  {:>12}  {:<time_width$}  SHA256",
-        "KEY", "SIZE_BYTES", "UPLOADED"
+        "  {:<key_width$}  {:>12}  {:<time_width$}  {:<12}  ENCRYPTED",
+        "KEY", "SIZE_BYTES", "UPLOADED", "SHA256"
     );
     for (key, metadata) in rows {
         match metadata {
             Ok(metadata) => {
                 let short_checksum: String = metadata.checksum_sha256.chars().take(12).collect();
+                let encrypted = match (metadata.encrypted, &metadata.key_identifier) {
+                    (true, Some(key_identifier)) => format!("yes, key '{key_identifier}'"),
+                    (true, None) => "yes".to_string(),
+                    (false, _) => "no".to_string(),
+                };
                 println!(
-                    "  {key:<key_width$}  {:>12}  {:<time_width$}  {short_checksum}",
+                    "  {key:<key_width$}  {:>12}  {:<time_width$}  {short_checksum:<12}  {encrypted}",
                     metadata.size_bytes, metadata.timestamp
                 );
             }
@@ -1810,6 +1912,7 @@ impl CoreHandle {
         outpath: &Path,
         versions: usize,
         compression: BackupCompression,
+        encryption: &BackupEncryptionConfig,
     ) -> Result<(), OperationError> {
         self.server_read_ref
             .handle_online_backup(
@@ -1817,6 +1920,7 @@ impl CoreHandle {
                 outpath,
                 versions,
                 compression,
+                encryption,
                 None,
             )
             .await
@@ -1830,6 +1934,7 @@ impl CoreHandle {
         s3_config: S3Config,
         versions: usize,
         compression: BackupCompression,
+        encryption: &BackupEncryptionConfig,
     ) -> Result<(), OperationError> {
         let client = S3ClientWrapper::new(s3_config).await.map_err(|err| {
             error!(%err, "Unable to create the S3 client");
@@ -1842,6 +1947,7 @@ impl CoreHandle {
                 Path::new("s3://backup"),
                 versions,
                 compression,
+                encryption,
                 Some(client),
             )
             .await

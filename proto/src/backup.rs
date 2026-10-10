@@ -1,5 +1,10 @@
 //! Relates to backup functionality in the Server
-use std::{fmt::Display, path::Path, str::FromStr, time::Duration};
+use std::{
+    fmt::Display,
+    path::{Path, PathBuf},
+    str::FromStr,
+    time::Duration,
+};
 
 use serde::{Deserialize, Serialize};
 use serde_with::DeserializeFromStr;
@@ -10,6 +15,9 @@ pub const BACKUP_ENCRYPTION_MAGIC: &[u8] = b"KANIDM_ENC_BACKUP_V1";
 pub const BACKUP_ENCRYPTION_KEY_LEN: usize = 32;
 pub const BACKUP_ENCRYPTION_NONCE_LEN: usize = 12;
 pub const BACKUP_ENCRYPTION_SALT_LEN: usize = 16;
+/// File name suffix of a client-side encrypted backup artifact, appended after the
+/// compression suffix: `backup-<ts>.json.enc`, `backup-<ts>.json.gz.enc`.
+pub const BACKUP_ENCRYPTED_SUFFIX: &str = ".enc";
 
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq, DeserializeFromStr, Serialize)]
 pub enum BackupCompression {
@@ -26,14 +34,28 @@ impl BackupCompression {
         }
     }
 
+    /// The compression a backup file name announces. An encrypted artifact carries the
+    /// compression suffix of its plaintext before [`BACKUP_ENCRYPTED_SUFFIX`], so
+    /// `backup.json.gz.enc` identifies as gzip.
     pub fn identify_file(filepath: &Path) -> Self {
         let filename = filepath.file_name().and_then(|s| s.to_str()).unwrap_or("");
-        if filename.ends_with(".gz") {
+        Self::identify_name(filename)
+    }
+
+    /// [`Self::identify_file`] for a bare file name or object key.
+    pub fn identify_name(name: &str) -> Self {
+        let name = name.strip_suffix(BACKUP_ENCRYPTED_SUFFIX).unwrap_or(name);
+        if name.ends_with(".gz") {
             BackupCompression::Gzip
         } else {
             BackupCompression::NoCompression
         }
     }
+}
+
+/// Whether a backup file name or object key announces a client-side encrypted artifact.
+pub fn is_encrypted_backup_name(name: &str) -> bool {
+    name.ends_with(BACKUP_ENCRYPTED_SUFFIX)
 }
 
 impl Display for BackupCompression {
@@ -92,6 +114,40 @@ fn test_backup_compression_identify() {
         BackupCompression::identify_file(no_comp_path),
         BackupCompression::NoCompression
     );
+
+    // The encrypted suffix wraps the compression suffix.
+    assert_eq!(
+        BackupCompression::identify_file(Path::new(
+            "/backups/backup-2024-01-01T22:00:00Z.json.gz.enc"
+        )),
+        BackupCompression::Gzip
+    );
+    assert_eq!(
+        BackupCompression::identify_file(Path::new(
+            "/backups/backup-2024-01-01T22:00:00Z.json.enc"
+        )),
+        BackupCompression::NoCompression
+    );
+    assert_eq!(
+        BackupCompression::identify_name("backup.json.gz.enc"),
+        BackupCompression::Gzip
+    );
+    assert_eq!(
+        BackupCompression::identify_name("backup.json.enc"),
+        BackupCompression::NoCompression
+    );
+    assert!(is_encrypted_backup_name(
+        "backup-2024-01-01T22:00:00Z.json.gz.enc"
+    ));
+    assert!(is_encrypted_backup_name(
+        "backup-2024-01-01T22:00:00Z.json.enc"
+    ));
+    assert!(!is_encrypted_backup_name(
+        "backup-2024-01-01T22:00:00Z.json.gz"
+    ));
+    assert!(!is_encrypted_backup_name(
+        "backup-2024-01-01T22:00:00Z.json.gz.enc.metadata.json"
+    ));
 
     for (input, expected) in [
         (vec!["gzip", "Gzip", "GzIp"], BackupCompression::Gzip),
@@ -163,6 +219,7 @@ fn test_backup_encryption_config_default() {
     assert!(!config.enabled);
     assert_eq!(config.key_source, EncryptionKeySource::Passphrase);
     assert!(config.key_identifier.is_none());
+    assert!(config.passphrase_file.is_none());
 }
 
 #[test]
@@ -174,6 +231,7 @@ fn test_backup_encryption_config_serialization() {
         },
         key_derivation: KeyDerivationParams::default(),
         key_identifier: Some("key-123".to_string()),
+        passphrase_file: None,
     };
 
     let json = serde_json::to_string(&config).unwrap();
@@ -182,6 +240,7 @@ fn test_backup_encryption_config_serialization() {
     assert_eq!(config.enabled, deserialized.enabled);
     assert_eq!(config.key_source, deserialized.key_source);
     assert_eq!(config.key_identifier, deserialized.key_identifier);
+    assert_eq!(config, deserialized);
 }
 
 #[test]
@@ -191,6 +250,7 @@ fn test_backup_encryption_config_display() {
         key_source: EncryptionKeySource::Passphrase,
         key_derivation: KeyDerivationParams::default(),
         key_identifier: None,
+        passphrase_file: None,
     };
     assert!(config.to_string().contains("enabled: true"));
     assert!(config.to_string().contains("key_source: passphrase"));
@@ -842,8 +902,15 @@ pub struct BackupEncryptionConfig {
     pub key_source: EncryptionKeySource,
     #[serde(default)]
     pub key_derivation: KeyDerivationParams,
+    /// Name written into every artifact and into the S3 metadata sidecar to tell which key
+    /// an artifact needs. Defaults to a fingerprint of the key material for a key file or
+    /// key endpoint, and to `passphrase` for a passphrase, which is never fingerprinted.
     #[serde(default)]
     pub key_identifier: Option<String>,
+    /// With `key_source = "Passphrase"`: read the passphrase from this file instead of the
+    /// `KUBIDM_BACKUP_PASSPHRASE` environment variable. Trailing whitespace is ignored.
+    #[serde(default)]
+    pub passphrase_file: Option<PathBuf>,
 }
 
 impl Default for BackupEncryptionConfig {
@@ -853,6 +920,7 @@ impl Default for BackupEncryptionConfig {
             key_source: EncryptionKeySource::Passphrase,
             key_derivation: KeyDerivationParams::default(),
             key_identifier: None,
+            passphrase_file: None,
         }
     }
 }
@@ -861,8 +929,8 @@ impl Display for BackupEncryptionConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "BackupEncryptionConfig {{ enabled: {}, key_source: {}, key_derivation: {} }}",
-            self.enabled, self.key_source, self.key_derivation
+            "BackupEncryptionConfig {{ enabled: {}, key_source: {}, passphrase_file: {:?}, key_identifier: {:?}, key_derivation: {} }}",
+            self.enabled, self.key_source, self.passphrase_file, self.key_identifier, self.key_derivation
         )
     }
 }

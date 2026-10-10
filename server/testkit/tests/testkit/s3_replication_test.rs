@@ -25,7 +25,7 @@ use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client as SdkClient;
 use kubidm_proto::backup::{
-    BackupCompression, ReplicationConfig, ReplicationRegionConfig, ReplicationStatus, S3Config,
+    BackupCompression, BackupEncryptionConfig, ReplicationConfig, ReplicationRegionConfig, ReplicationStatus, S3Config,
     S3Credentials,
 };
 use kubidmd_core::backup::S3ClientWrapper;
@@ -278,6 +278,7 @@ fn test_s3_backup_replication_retention_status_and_recovery() {
                     setup.primary.clone(),
                     RETAINED_VERSIONS,
                     BackupCompression::Gzip,
+                    &BackupEncryptionConfig::default(),
                 )
                 .await
                 .expect("S3 backup with replication failed");
@@ -343,6 +344,7 @@ fn test_s3_backup_replication_retention_status_and_recovery() {
                 setup.primary_with_broken_region.clone(),
                 RETAINED_VERSIONS,
                 BackupCompression::Gzip,
+                &BackupEncryptionConfig::default(),
             )
             .await
             .expect("A failing region must not fail the primary backup");

@@ -417,7 +417,7 @@ async fn scripting_command(cmd: ScriptingCommand, config: Configuration) -> Exit
         }
 
         ScriptingCommand::Backup { path } => {
-            backup_server_core(&config, path.as_deref());
+            backup_server_core(&config, path.as_deref()).await;
         }
 
         ScriptingCommand::Reload => {
@@ -983,7 +983,7 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
         } => {
             info!("Running in backup mode ...");
 
-            backup_server_core(&config, Some(&bopt.path));
+            backup_server_core(&config, Some(&bopt.path)).await;
         }
         KubidmdOpt::Database {
             commands: DbCommands::Restore(ropt),

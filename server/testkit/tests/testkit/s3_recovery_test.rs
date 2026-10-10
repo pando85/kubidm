@@ -24,7 +24,7 @@ use std::time::Duration;
 use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client as SdkClient;
-use kubidm_proto::backup::{BackupCompression, S3Config, S3Credentials};
+use kubidm_proto::backup::{BackupCompression, BackupEncryptionConfig, S3Config, S3Credentials};
 use kubidmd_core::backup::{S3BackupError, S3ClientWrapper};
 use kubidmd_core::{restore_s3_database, verify_s3_backup_server_core, BackupVerifyLevel};
 use kubidmd_testkit::login_put_admin_idm_admins;
@@ -45,8 +45,9 @@ const REGION: &str = "us-east-1";
 const RETAINED_VERSIONS: usize = 2;
 
 /// The S3 configuration for this test run, or None (after printing why) when no endpoint is
-/// configured.
-fn test_s3_config() -> Option<S3Config> {
+/// configured. `prefix` keeps the runs of different tests apart; every call adds a fresh
+/// UUID below it.
+pub(super) fn test_s3_config_with_prefix(prefix: &str) -> Option<S3Config> {
     let Ok(endpoint) = std::env::var(ENDPOINT_ENV) else {
         eprintln!("skipping: {ENDPOINT_ENV} not set");
         return None;
@@ -61,7 +62,7 @@ fn test_s3_config() -> Option<S3Config> {
         bucket,
         region: Some(REGION.to_string()),
         endpoint: Some(endpoint),
-        path_prefix: Some(format!("s3-recovery-test/{}", Uuid::new_v4())),
+        path_prefix: Some(format!("{prefix}/{}", Uuid::new_v4())),
         credentials: Some(S3Credentials {
             access_key_id,
             secret_access_key,
@@ -73,9 +74,13 @@ fn test_s3_config() -> Option<S3Config> {
     })
 }
 
+fn test_s3_config() -> Option<S3Config> {
+    test_s3_config_with_prefix("s3-recovery-test")
+}
+
 /// A raw SDK client for the same endpoint and credentials, used to prepare the bucket, to
 /// inspect the objects behind the back of `S3ClientWrapper` and to corrupt them.
-async fn sdk_client(s3_config: &S3Config) -> SdkClient {
+pub(super) async fn sdk_client(s3_config: &S3Config) -> SdkClient {
     let credentials = s3_config
         .credentials
         .as_ref()
@@ -104,12 +109,13 @@ async fn sdk_client(s3_config: &S3Config) -> SdkClient {
     )
 }
 
-async fn ensure_bucket(sdk: &SdkClient, bucket: &str) {
+/// Create the shared test bucket when it does not exist. Several S3 tests run concurrently
+/// in this binary and may race to create it, so a failed creation is only an error when the
+/// bucket still does not exist afterwards.
+pub(super) async fn ensure_bucket(sdk: &SdkClient, bucket: &str) {
     if sdk.head_bucket().bucket(bucket).send().await.is_ok() {
         return;
     }
-    // The S3 tests run concurrently and share this bucket: losing the creation race against
-    // another test is fine as long as the bucket exists afterwards.
     if let Err(err) = sdk.create_bucket().bucket(bucket).send().await {
         assert!(
             sdk.head_bucket().bucket(bucket).send().await.is_ok(),
@@ -119,7 +125,7 @@ async fn ensure_bucket(sdk: &SdkClient, bucket: &str) {
 }
 
 /// Every object key below `prefix`, with the prefix stripped, sorted.
-async fn raw_object_keys(sdk: &SdkClient, s3_config: &S3Config) -> Vec<String> {
+pub(super) async fn raw_object_keys(sdk: &SdkClient, s3_config: &S3Config) -> Vec<String> {
     let prefix = s3_config
         .path_prefix
         .clone()
@@ -180,6 +186,7 @@ fn test_s3_backup_retention_verify_and_restore() {
                     s3_config.clone(),
                     RETAINED_VERSIONS,
                     BackupCompression::Gzip,
+                    &BackupEncryptionConfig::default(),
                 )
                 .await
                 .expect("S3 backup failed");

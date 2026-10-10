@@ -184,18 +184,32 @@ impl S3ClientWrapper {
         Self::new(region_config.to_s3_config()).await
     }
 
-    /// Upload `data` as the backup `key` (relative to the configured prefix) together
-    /// with its `<key>.metadata.json` sidecar, and return the metadata written to it.
+    /// Upload `data`, a complete backup artifact, as the backup `key` (relative to the
+    /// configured prefix) together with its `<key>.metadata.json` sidecar, and return the
+    /// metadata written to it. `compression` is the compression of the backup and
+    /// `encryption_key_identifier` the identifier of the key the artifact was encrypted
+    /// with, if it is encrypted; both are recorded in the sidecar, which replication
+    /// copies verbatim to every region.
     pub async fn upload_backup(
         &self,
         data: &[u8],
         key: &str,
         timestamp: &str,
         compression: BackupCompression,
+        encryption_key_identifier: Option<&str>,
     ) -> Result<S3BackupMetadata, S3BackupError> {
         let size = data.len() as u64;
         let checksum = hex_encode(Sha256::digest(data));
-        let metadata = S3BackupMetadata::new(checksum, timestamp.to_string(), compression, size);
+        let metadata = match encryption_key_identifier {
+            Some(key_identifier) => S3BackupMetadata::new_encrypted(
+                checksum,
+                timestamp.to_string(),
+                compression,
+                size,
+                key_identifier.to_string(),
+            ),
+            None => S3BackupMetadata::new(checksum, timestamp.to_string(), compression, size),
+        };
 
         self.upload_with_metadata(data, key, &metadata).await?;
 

@@ -8,7 +8,7 @@
 use std::future::Future;
 use std::path::{Path, PathBuf};
 
-use kubidm_proto::backup::BackupCompression;
+use kubidm_proto::backup::{BackupCompression, BackupEncryptionConfig};
 use kubidmd_core::config::Configuration;
 use kubidmd_core::{restore_database, verify_database};
 use kubidmd_testkit::{login_put_admin_idm_admins, setup_async_test, AsyncTestEnvironment};
@@ -85,7 +85,12 @@ fn test_database_verify_passes_on_cold_database() {
 /// Take an online backup through the production online backup path and return it.
 async fn backup_via_production_path(env: &AsyncTestEnvironment, backup_dir: &Path) -> PathBuf {
     env.core_handle
-        .trigger_online_backup(backup_dir, 1, BackupCompression::NoCompression)
+        .trigger_online_backup(
+            backup_dir,
+            1,
+            BackupCompression::NoCompression,
+            &BackupEncryptionConfig::default(),
+        )
         .await
         .expect("Online backup failed");
 

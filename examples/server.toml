@@ -202,6 +202,9 @@ compression = "gzip"
 #   `kubidmd database replicate-status` prints the same check on demand, and
 #   `restore-s3`, `verify-s3` and `list-backups` take `--region <name>` to work on a
 #   region's copies instead of the primary bucket.
+#   Client-side encrypted backups (see [online_backup.encryption] below) are copied as
+#   they are: a region holds the same `.enc` objects and sidecars as the primary, and
+#   restoring or verifying from a region needs the same encryption key.
 #   Requires at least one region, unique region names, a bucket per region, a
 #   location (endpoint, bucket, path_prefix) per region distinct from the primary and
 #   from every other region, and a positive sync_interval_seconds when enabled.
@@ -239,6 +242,36 @@ compression = "gzip"
 # region = "ap-southeast-1"
 # bucket = "kubidm-backups-ap"
 #
-#   Point-in-time recovery ([online_backup.wal_archive]) and client-side encryption
-#   ([online_backup.encryption]) are not available yet. Enabling either key is rejected
-#   at startup.
+#   Client-side backup encryption (optional)
+#   When enabled, every backup made from this configuration (online, S3 and
+#   `kubidmd database backup`) is encrypted with AES-256-GCM under a key derived from the
+#   key source below, and gets the extra file suffix ".enc". `restore`, `verify-backup`,
+#   `restore-s3` and `verify-s3` decrypt with the same settings. Keep the key outside of
+#   the server: a backup can only be restored by whoever holds it. This is independent
+#   of S3 server_side_encryption / kms_key_id, which the bucket applies at rest; replicated
+#   copies stay encrypted with this key in every region.
+#
+# [online_backup.encryption]
+# enabled = true
+#   Where the secret comes from. "Passphrase" reads the KUBIDM_BACKUP_PASSPHRASE
+#   environment variable, or the file named by passphrase_file when set.
+# key_source = "Passphrase"
+# passphrase_file = "/etc/kubidm/backup-passphrase"
+#   Alternatively a key file, used byte for byte (for example 32 random bytes) ...
+# key_source = { File = { path = "/etc/kubidm/backup.key" } }
+#   ... or an HTTPS endpoint whose response body is the key material (plain http is only
+#   accepted for a loopback address).
+# key_source = { HttpEndpoint = { url = "https://vault.example.com/v1/kubidm-backup-key" } }
+#   Name recorded in every artifact and in the S3 metadata sidecar so that a restore can
+#   tell which key an artifact needs. Defaults to a fingerprint of a key file or key
+#   endpoint, and to "passphrase" for a passphrase.
+# key_identifier = "prod-2026"
+#   Argon2id parameters of the key derivation (memory in KiB, iterations, parallelism).
+#   The defaults are 19 MiB, 2 and 1; m_cost must be between 8192 and 4194304.
+# [online_backup.encryption.key_derivation]
+# m_cost = 19456
+# t_cost = 2
+# p_cost = 1
+#
+#   Point-in-time recovery ([online_backup.wal_archive]) is not available yet. Enabling
+#   it is rejected at startup.

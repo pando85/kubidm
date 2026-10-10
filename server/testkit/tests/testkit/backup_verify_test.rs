@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
-use kubidm_proto::backup::BackupCompression;
+use kubidm_proto::backup::{BackupCompression, BackupEncryptionConfig};
 use kubidmd_core::backup::{is_backup_artifact_name, INVALID_BACKUP_SUFFIX};
 use kubidmd_core::config::Configuration;
 use kubidmd_core::{
@@ -28,7 +28,12 @@ use super::backup_common::{
 /// Take an online backup through the production online backup path and return it.
 async fn backup_via_production_path(env: &AsyncTestEnvironment, backup_dir: &Path) -> PathBuf {
     env.core_handle
-        .trigger_online_backup(backup_dir, 1, BackupCompression::NoCompression)
+        .trigger_online_backup(
+            backup_dir,
+            1,
+            BackupCompression::NoCompression,
+            &BackupEncryptionConfig::default(),
+        )
         .await
         .expect("Online backup failed");
 
@@ -122,7 +127,12 @@ fn test_online_backup_keeps_verified_artifact_name_and_structure() {
             std::fs::create_dir(&backup_dir).expect("Failed to create backup directory");
 
             env.core_handle
-                .trigger_online_backup(&backup_dir, 1, compression)
+                .trigger_online_backup(
+                    &backup_dir,
+                    1,
+                    compression,
+                    &BackupEncryptionConfig::default(),
+                )
                 .await
                 .expect("Online backup failed");
 

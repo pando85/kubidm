@@ -25,7 +25,7 @@ use std::{
 };
 use url::Url;
 
-use crate::backup::same_s3_location;
+use crate::backup::{same_s3_location, validate_encryption_config};
 use crate::repl::config::ReplicationConfiguration;
 
 #[derive(Debug, Deserialize)]
@@ -91,8 +91,10 @@ pub struct OnlineBackup {
     #[serde(default)]
     pub s3: Option<S3Config>,
 
-    /// Encryption configuration for client-side backup encryption.
-    /// When enabled, backups are encrypted with AES-256-GCM before storage.
+    /// Client-side backup encryption. When enabled, every backup made from this
+    /// configuration (online, S3 and `kubidmd database backup`) is encrypted with
+    /// AES-256-GCM under a key derived from the configured key source, and encrypted
+    /// artifacts are decrypted on restore and verification with the same key.
     #[serde(default)]
     pub encryption: BackupEncryptionConfig,
 
@@ -117,17 +119,14 @@ impl Default for OnlineBackup {
 }
 
 impl OnlineBackup {
-    /// Reject settings that are parsed but have no effect in this release, so that an
-    /// operator can not believe a feature is active when it is not, and check that the
-    /// features which are available are configured coherently.
+    /// Check the settings that can be checked without a database: the backup encryption
+    /// key must be obtainable now, so that the first scheduled backup does not discover a
+    /// missing key, the replication section must be coherent, and settings that are parsed
+    /// but have no effect in this release are rejected. Accepting those silently would let
+    /// an operator believe a feature is active when it is not.
     pub fn validate(&self) -> Result<(), String> {
-        if self.encryption.enabled {
-            return Err(
-                "online_backup.encryption: client-side backup encryption is not available in this release; \
-                 remove or disable this setting"
-                    .to_string(),
-            );
-        }
+        validate_encryption_config(&self.encryption)
+            .map_err(|reason| format!("online_backup.encryption: {reason}"))?;
 
         if self
             .wal_archive
@@ -1256,7 +1255,7 @@ impl ConfigurationBuilder {
 mod tests {
     use super::*;
     use cidr::{IpCidr, Ipv4Cidr, Ipv6Cidr};
-    use kubidm_proto::backup::ReplicationRegionConfig;
+    use kubidm_proto::backup::{EncryptionKeySource, ReplicationRegionConfig};
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     const BASE_V2_CONFIG: &str = r#"
@@ -1287,15 +1286,14 @@ schedule = "@daily"
     }
 
     #[test]
-    fn online_backup_encryption_enabled_is_rejected() {
-        let enabled = format!(
-            "{BASE_V2_CONFIG}
-[online_backup.encryption]
-enabled = true
-"
-        );
-        assert!(build_from_toml(&enabled).is_none());
+    fn online_backup_encryption_needs_a_resolvable_key_source() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let passphrase_file = dir.path().join("passphrase");
+        std::fs::write(&passphrase_file, "correct horse battery staple\n").expect("write");
+        let key_file = dir.path().join("backup.key");
+        std::fs::write(&key_file, [42u8; 32]).expect("write");
 
+        // Disabled encryption is accepted with any other setting.
         let disabled = format!(
             "{BASE_V2_CONFIG}
 [online_backup.encryption]
@@ -1303,6 +1301,98 @@ enabled = false
 "
         );
         assert!(build_from_toml(&disabled).is_some());
+
+        // Enabled with a passphrase file that exists.
+        let passphrase = format!(
+            "{BASE_V2_CONFIG}
+[online_backup.encryption]
+enabled = true
+key_source = \"Passphrase\"
+passphrase_file = {passphrase_file:?}
+key_identifier = \"prod-2026\"
+"
+        );
+        let config = build_from_toml(&passphrase).expect("accepted");
+        let encryption = config.online_backup.expect("online backup").encryption;
+        assert!(encryption.enabled);
+        assert_eq!(encryption.key_source, EncryptionKeySource::Passphrase);
+        assert_eq!(
+            encryption.passphrase_file.as_deref(),
+            Some(passphrase_file.as_path())
+        );
+        assert_eq!(encryption.key_identifier.as_deref(), Some("prod-2026"));
+
+        // Enabled with a passphrase file that does not exist.
+        let missing = format!(
+            "{BASE_V2_CONFIG}
+[online_backup.encryption]
+enabled = true
+passphrase_file = {:?}
+",
+            dir.path().join("missing")
+        );
+        assert!(build_from_toml(&missing).is_none());
+
+        // Enabled with a key file that exists, and with one that does not.
+        let key = format!(
+            "{BASE_V2_CONFIG}
+[online_backup.encryption]
+enabled = true
+[online_backup.encryption.key_source.File]
+path = {key_file:?}
+"
+        );
+        let config = build_from_toml(&key).expect("accepted");
+        assert_eq!(
+            config
+                .online_backup
+                .expect("online backup")
+                .encryption
+                .key_source,
+            EncryptionKeySource::File {
+                path: key_file.to_string_lossy().into_owned()
+            }
+        );
+        let missing_key = format!(
+            "{BASE_V2_CONFIG}
+[online_backup.encryption]
+enabled = true
+[online_backup.encryption.key_source.File]
+path = {:?}
+",
+            dir.path().join("missing.key")
+        );
+        assert!(build_from_toml(&missing_key).is_none());
+
+        // An HTTP key source only needs a well formed http(s) URL at this point.
+        let endpoint = format!(
+            "{BASE_V2_CONFIG}
+[online_backup.encryption]
+enabled = true
+key_source = {{ HttpEndpoint = {{ url = \"https://vault.example.com/v1/backup-key\" }} }}
+"
+        );
+        assert!(build_from_toml(&endpoint).is_some());
+        let bad_endpoint = format!(
+            "{BASE_V2_CONFIG}
+[online_backup.encryption]
+enabled = true
+key_source = {{ HttpEndpoint = {{ url = \"vault.example.com\" }} }}
+"
+        );
+        assert!(build_from_toml(&bad_endpoint).is_none());
+
+        // Key derivation parameters outside the accepted bounds.
+        let weak_kdf = format!(
+            "{BASE_V2_CONFIG}
+[online_backup.encryption]
+enabled = true
+passphrase_file = {passphrase_file:?}
+[online_backup.encryption.key_derivation]
+m_cost = 1024
+"
+        );
+        assert!(build_from_toml(&weak_kdf).is_none());
     }
 
     #[test]
@@ -1579,10 +1669,14 @@ path_prefix = \"dr\"
         let mut online_backup = OnlineBackup::default();
         assert!(online_backup.validate().is_ok());
 
+        // Enabled encryption whose passphrase file is missing: the key is the reason.
         online_backup.encryption.enabled = true;
+        online_backup.encryption.passphrase_file = Some(PathBuf::from("/nonexistent/passphrase"));
         let err = online_backup.validate().expect_err("must be rejected");
-        assert!(err.starts_with("online_backup.encryption:"));
+        assert!(err.starts_with("online_backup.encryption:"), "{err}");
+        assert!(err.contains("passphrase_file"), "{err}");
         online_backup.encryption.enabled = false;
+        online_backup.encryption.passphrase_file = None;
 
         online_backup.wal_archive = Some(WalArchiveConfig {
             enabled: true,
