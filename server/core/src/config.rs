@@ -120,10 +120,16 @@ pub struct OnlineBackup {
     #[serde(default)]
     pub verify_temp_path: Option<PathBuf>,
 
-    /// Serve the backup metrics in the Prometheus text format on `GET /metrics`, without
-    /// authentication. Off by default.
+    /// Serve the backup metrics in the Prometheus text format on `GET /metrics`. Off by
+    /// default.
     #[serde(default)]
     pub metrics_endpoint: bool,
+
+    /// A file holding the token a scraper must send as `Authorization: Bearer <token>` to
+    /// read `/metrics`. Without it the endpoint needs no authentication. Requires
+    /// `metrics_endpoint = true`.
+    #[serde(default)]
+    pub metrics_token_file: Option<PathBuf>,
 }
 
 impl Default for OnlineBackup {
@@ -140,6 +146,7 @@ impl Default for OnlineBackup {
             verify_schedule: None,
             verify_temp_path: None,
             metrics_endpoint: false,
+            metrics_token_file: None,
         }
     }
 }
@@ -216,8 +223,32 @@ impl OnlineBackup {
                 .map_err(|reason| format!("online_backup.verify_schedule: {reason}"))?;
         }
 
+        if let Some(token_file) = &self.metrics_token_file {
+            if !self.metrics_endpoint {
+                return Err(
+                    "online_backup.metrics_token_file: it protects the metrics endpoint, which \
+                     requires online_backup.metrics_endpoint = true"
+                        .to_string(),
+                );
+            }
+            read_metrics_token(token_file)
+                .map_err(|reason| format!("online_backup.metrics_token_file: {reason}"))?;
+        }
+
         Ok(())
     }
+}
+
+/// The token of `online_backup.metrics_token_file`: the content of the file without its
+/// surrounding whitespace. Fails when it can not be read or holds no token.
+pub fn read_metrics_token(path: &Path) -> Result<String, String> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|err| format!("unable to read {}: {err}", path.display()))?;
+    let token = content.trim();
+    if token.is_empty() {
+        return Err(format!("{} holds no token", path.display()));
+    }
+    Ok(token.to_string())
 }
 
 /// Check an enabled `[online_backup.s3.replication]` section of `s3`: it needs at least one
@@ -851,7 +882,15 @@ impl fmt::Display for Configuration {
                     write!(f, "verify_temp_path: {}, ", verify_temp_path.display())?;
                 }
                 if bck.metrics_endpoint {
-                    write!(f, "metrics_endpoint: enabled, ")?;
+                    write!(
+                        f,
+                        "metrics_endpoint: enabled ({}), ",
+                        if bck.metrics_token_file.is_some() {
+                            "bearer token"
+                        } else {
+                            "no authentication"
+                        }
+                    )?;
                 }
                 write!(f, "")
             }
@@ -1591,6 +1630,38 @@ m_cost = 1024
         .validate()
         .expect_err("a disabled online backup must not be verified on a schedule");
         assert!(err.contains("online_backup.enabled = true"), "{err}");
+    }
+
+    #[test]
+    fn online_backup_metrics_token_file_is_validated() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let token_file = dir.path().join("token");
+        std::fs::write(&token_file, "  s3cret\n").expect("write");
+        assert_eq!(read_metrics_token(&token_file).as_deref(), Ok("s3cret"));
+
+        let with_token = |metrics_endpoint: bool, path: &Path| OnlineBackup {
+            metrics_endpoint,
+            metrics_token_file: Some(path.to_path_buf()),
+            ..OnlineBackup::default()
+        };
+        assert!(with_token(true, &token_file).validate().is_ok());
+
+        // A token for an endpoint that is not served is a mistake.
+        let err = with_token(false, &token_file)
+            .validate()
+            .expect_err("a token without the endpoint must be rejected");
+        assert!(err.contains("metrics_endpoint = true"), "{err}");
+
+        // Never serve the metrics without the token the operator asked for.
+        let err = with_token(true, &dir.path().join("missing"))
+            .validate()
+            .expect_err("a missing token file must be rejected");
+        assert!(err.starts_with("online_backup.metrics_token_file"), "{err}");
+        std::fs::write(&token_file, " \n").expect("write");
+        let err = with_token(true, &token_file)
+            .validate()
+            .expect_err("an empty token must be rejected");
+        assert!(err.contains("holds no token"), "{err}");
     }
 
     #[test]

@@ -1707,12 +1707,28 @@ async fn launch_server_tasks(
         }
     };
 
-    // The metrics endpoint, when enabled.
-    let metrics_endpoint = config
+    // The metrics endpoint, and the token it requires when one is configured. A token
+    // that can not be read fails the start rather than serving the metrics without it.
+    let metrics_endpoint = match config
         .online_backup
         .as_ref()
         .filter(|online_backup| online_backup.metrics_endpoint)
-        .map(|_| https::generic::MetricsEndpoint::new(backup_metrics));
+    {
+        Some(online_backup) => {
+            let token = match online_backup.metrics_token_file.clone() {
+                Some(token_file) => Some(
+                    backup::run_blocking(move || {
+                        config::read_metrics_token(&token_file).map_err(std::io::Error::other)
+                    })
+                    .await
+                    .map_err(|err| error!(%err, "online_backup.metrics_token_file"))?,
+                ),
+                None => None,
+            };
+            Some(https::generic::MetricsEndpoint::new(backup_metrics, token))
+        }
+        None => None,
+    };
 
     // Finally launch the https tasks.
     let http_handles: Vec<task::JoinHandle<()>> = https::create_https_server(
