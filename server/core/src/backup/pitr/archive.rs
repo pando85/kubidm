@@ -275,7 +275,7 @@ impl PitrArchive {
         now: Duration,
         force_flush: bool,
     ) -> Result<PitrSyncReport, PitrError> {
-        let _guard = self.manifest_lock.lock().await;
+        let guard = self.manifest_lock.lock().await;
         let mut report = PitrSyncReport::default();
 
         let (sealed, events, server_uuid) = self
@@ -334,7 +334,13 @@ impl PitrArchive {
             }
         }
 
-        result?;
+        let manifest = result?;
+        drop(guard);
+        // The sidecars of the region copies are compared without the manifest lock.
+        if let Ok(store) = self.store().await {
+            self.check_region_copies(store, &manifest, now, &mut report)
+                .await;
+        }
         match flush_error {
             Some(err) => Err(err),
             None => Ok(report),
@@ -356,7 +362,7 @@ impl PitrArchive {
     /// One synchronisation, in steps that each say whether they changed the manifest:
     /// record the gaps, archive the pending segments (saving the manifest before any local
     /// copy goes), apply retention, prune the markers no history needs any more, save, and
-    /// mirror the result to the replication regions.
+    /// mirror the result to the replication regions. Returns the manifest as saved.
     async fn sync_locked(
         &self,
         now: Duration,
@@ -364,7 +370,7 @@ impl PitrArchive {
         server_uuid: Uuid,
         events_recorded: &mut bool,
         report: &mut PitrSyncReport,
-    ) -> Result<(), PitrError> {
+    ) -> Result<PitrManifest, PitrError> {
         let scan = {
             let local_dir = self.settings.local_dir.clone();
             blocking(move || Ok(scan_segments(&local_dir)?)).await?
@@ -423,7 +429,7 @@ impl PitrArchive {
 
         self.replicate(store, &mut manifest, now, report).await;
 
-        Ok(())
+        Ok(manifest)
     }
 
     /// Index the manual backups handed over as bases since the last run, see

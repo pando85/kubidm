@@ -1315,10 +1315,10 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
             }
         }
         KubidmdOpt::Database {
-            commands: DbCommands::ReplicateStatus { detailed },
+            commands: DbCommands::ReplicateStatus { detailed, deep },
         } => {
             info!("Running in backup replication status mode ...");
-            if !replicate_status_server_core(&config, *detailed).await {
+            if !replicate_status_server_core(&config, *detailed, *deep).await {
                 return ExitCode::FAILURE;
             }
         }

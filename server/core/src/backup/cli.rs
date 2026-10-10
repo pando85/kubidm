@@ -940,13 +940,19 @@ async fn list_s3_backups(config: &Configuration, region: Option<&str>) -> bool {
 /// the primary's backups it holds intact, its newest backup and how far it lags behind the
 /// primary; and, when the WAL archive of point-in-time recovery is replicated, whether
 /// every region holds a current copy of its manifest and an intact copy of every segment.
-/// `detailed` adds the lag metrics of every region and the segments it misses. The database
-/// is never opened, so the command can run next to a running server.
+/// `detailed` adds the lag metrics of every region and the segments it misses. The WAL
+/// archive is compared by its listings, unless `deep` asks to compare the sidecar of every
+/// segment as well. The database is never opened, so the command can run next to a running
+/// server.
 ///
 /// Returns false when neither backups nor the WAL archive are replicated, when a primary
 /// location can not be read, or when any region is unhealthy, so the exit code of
 /// `replicate-status` is usable from monitoring.
-pub async fn replicate_status_server_core(config: &Configuration, detailed: bool) -> bool {
+pub async fn replicate_status_server_core(
+    config: &Configuration,
+    detailed: bool,
+    deep: bool,
+) -> bool {
     let backups = backup_replication_status(config, detailed).await;
     let pitr_settings = match pitr::PitrSettings::from_config(config) {
         Ok(settings) => settings,
@@ -958,7 +964,7 @@ pub async fn replicate_status_server_core(config: &Configuration, detailed: bool
     if pitr_settings.is_some() {
         println!();
     }
-    let wal = pitr::wal_replication_status(pitr_settings.as_ref(), detailed).await;
+    let wal = pitr::wal_replication_status(pitr_settings.as_ref(), detailed, deep).await;
     match (backups, wal) {
         (None, None) => false,
         (backups, wal) => backups.unwrap_or(true) && wal.unwrap_or(true),

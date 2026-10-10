@@ -78,11 +78,17 @@ fn pitr_config(
     config
 }
 
-fn now_rfc3339() -> String {
-    let now = SystemTime::now()
+fn epoch_now() -> Duration {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("The clock is before the epoch");
-    format_ts_rfc3339(now)
+        .expect("The clock is before the epoch")
+}
+
+/// Long enough for every segment archived by a test to be past the replication tolerance.
+const ONE_DAY: Duration = Duration::from_secs(24 * 60 * 60);
+
+fn now_rfc3339() -> String {
+    format_ts_rfc3339(epoch_now())
 }
 
 async fn person_exists(rsclient: &KubidmClient, name: &str) -> bool {
@@ -1244,13 +1250,13 @@ fn test_pitr_s3_replicate_status_reports_and_the_archive_repairs_region_copies()
         env.core_handle.shutdown().await;
 
         // Everything is replicated: backups and archive.
-        let health = check_wal_replication(&settings)
+        let health = check_wal_replication(&settings, true, epoch_now())
             .await
             .expect("Unable to check the WAL archive replication")
             .expect("The archive is replicated");
         assert!(health.is_healthy(), "{health:#?}");
         assert!(health.segments >= 2, "{health:#?}");
-        assert!(replicate_status_server_core(&config, true).await);
+        assert!(replicate_status_server_core(&config, true, true).await);
 
         // The region loses one segment, holds a truncated copy of another, and its
         // manifest is overwritten with something unreadable.
@@ -1274,7 +1280,7 @@ fn test_pitr_s3_replicate_status_reports_and_the_archive_repairs_region_copies()
                 .await
                 .expect("Failed to damage a region object");
         }
-        let health = check_wal_replication(&settings)
+        let health = check_wal_replication(&settings, true, epoch_now() + ONE_DAY)
             .await
             .expect("Unable to check the WAL archive replication")
             .expect("The archive is replicated");
@@ -1294,7 +1300,7 @@ fn test_pitr_s3_replicate_status_reports_and_the_archive_repairs_region_copies()
             1,
             "{region_health:#?}"
         );
-        assert!(!replicate_status_server_core(&config, true).await);
+        assert!(!replicate_status_server_core(&config, true, true).await);
         let unreadable = pitr_recover_server_core(
             &pitr_config(
                 &workdir.path().join("unused.db"),
@@ -1313,12 +1319,12 @@ fn test_pitr_s3_replicate_status_reports_and_the_archive_repairs_region_copies()
         let mut env = setup_async_test(config.clone()).await;
         archive_now(&env).await;
         env.core_handle.shutdown().await;
-        let health = check_wal_replication(&settings)
+        let health = check_wal_replication(&settings, true, epoch_now())
             .await
             .expect("Unable to check the WAL archive replication")
             .expect("The archive is replicated");
         assert!(health.is_healthy(), "{health:#?}");
-        assert!(replicate_status_server_core(&config, false).await);
+        assert!(replicate_status_server_core(&config, false, false).await);
 
         // And the region recovers the latest state again.
         let recovered_config = pitr_config(
