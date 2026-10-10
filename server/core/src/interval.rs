@@ -309,9 +309,9 @@ fn replication_monitor_period(replication: &ReplicationConfig) -> Duration {
     Duration::from_secs(replication.sync_interval_seconds.max(1))
 }
 
-/// One run of the replication monitor: copy what every region misses, then report the
-/// health, a warning per unhealthy region and an info line per healthy one. Never fails;
-/// a primary that can not be listed is a warning too.
+/// One run of the replication monitor: copy what every region misses and report the
+/// resulting health, a warning per unhealthy region and an info line per healthy one.
+/// Never fails; a primary that can not be listed is a warning too.
 async fn sync_and_report_replication(s3_config: &S3Config, replication: &ReplicationConfig) {
     let client = match S3ClientWrapper::new(s3_config.clone()).await {
         Ok(client) => client,
@@ -324,33 +324,14 @@ async fn sync_and_report_replication(s3_config: &S3Config, replication: &Replica
         }
     };
 
-    match client.sync_replication(replication).await {
-        Ok(results) => {
-            for (region, result) in results {
-                match result {
-                    Ok(outcome) => {
-                        if !outcome.copied.is_empty() {
-                            info!(
-                                "Backup replication sync copied {} backup(s) to region {}: {}",
-                                outcome.copied.len(),
-                                region,
-                                outcome.copied.join(", ")
-                            );
-                        }
-                        for (key, err) in &outcome.failed {
-                            warn!(
-                                "Backup replication sync failed to copy {} to region {}: {}",
-                                key, region, err
-                            );
-                        }
-                    }
-                    Err(err) => warn!(
-                        "Backup replication sync skipped region {}: unable to list it: {}",
-                        region, err
-                    ),
-                }
-            }
-        }
+    // One comparison per region serves both the copies and the health report, and every
+    // region client is built once per run.
+    let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let report = match client
+        .sync_and_check_replication(replication, Some(&now))
+        .await
+    {
+        Ok(report) => report,
         Err(err) => {
             warn!(
                 "Backup replication sync skipped: unable to list the primary backups in {}: {}",
@@ -359,25 +340,34 @@ async fn sync_and_report_replication(s3_config: &S3Config, replication: &Replica
             );
             return;
         }
-    }
-
-    let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    let health = match client
-        .check_replication_health(replication, Some(&now))
-        .await
-    {
-        Ok(health) => health,
-        Err(err) => {
-            warn!(
-                "Backup replication health check skipped: unable to list the primary backups \
-                 in {}: {}",
-                client.location(),
-                err
-            );
-            return;
-        }
     };
 
+    for (region, result) in &report.synced {
+        match result {
+            Ok(outcome) => {
+                if !outcome.copied.is_empty() {
+                    info!(
+                        "Backup replication sync copied {} backup(s) to region {}: {}",
+                        outcome.copied.len(),
+                        region,
+                        outcome.copied.join(", ")
+                    );
+                }
+                for (key, err) in &outcome.failed {
+                    warn!(
+                        "Backup replication sync failed to copy {} to region {}: {}",
+                        key, region, err
+                    );
+                }
+            }
+            Err(err) => warn!(
+                "Backup replication sync skipped region {}: unable to list it: {}",
+                region, err
+            ),
+        }
+    }
+
+    let health = report.health;
     for region in &health.regions {
         if region_is_healthy(region) {
             info!(
