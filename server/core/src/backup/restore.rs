@@ -12,7 +12,7 @@ use kubidmd_lib::{
 };
 
 use super::open_backup_file_with_config;
-use crate::{config::Configuration, reindex_inner, setup_backend, utils::touch_file_or_quit};
+use crate::{config::Configuration, reindex_inner, setup_backend, utils::touch_file};
 
 /// The encryption settings of the server configuration, if any. Backups made from this
 /// configuration are encrypted when they are enabled, and encrypted artifacts are opened
@@ -95,9 +95,11 @@ pub(crate) async fn restore_and_replay_commit(
         info!("Backup is encrypted with key '{key_identifier}'");
     }
 
-    // If it's an in memory database, we don't need to touch anything
+    // If it's an in memory database, we don't need to touch anything. A database file
+    // that can not be written fails the restore; it never ends the process, since the
+    // scheduled verification restores inside a running server.
     if let Some(db_path) = config.db_path.as_ref() {
-        touch_file_or_quit(db_path);
+        touch_file(db_path).map_err(|_| OperationError::FsError)?;
     }
 
     // First, we provide the in-memory schema so that core attrs are indexed correctly.

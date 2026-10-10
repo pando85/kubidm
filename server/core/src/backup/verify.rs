@@ -105,17 +105,8 @@ pub(crate) async fn verify_backup_restores(
         format!("unable to create a scratch directory: {err}")
     })?;
 
-    // The restore touches the database file and ends the process when it can not. The
-    // file is created here, so that a verification inside a running server can only
-    // fail, never stop the server.
-    let db_path = scratch_dir.path().join("verify.db");
-    let create_path = db_path.clone();
-    run_blocking(move || std::fs::File::create(create_path).map(drop))
-        .await
-        .map_err(|err| format!("unable to create the scratch database: {err}"))?;
-
     let mut scratch_config = config.clone();
-    scratch_config.db_path = Some(db_path);
+    scratch_config.db_path = Some(scratch_dir.path().join("verify.db"));
 
     info!(
         "Restoring backup into scratch database in {}",
