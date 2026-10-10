@@ -18,8 +18,8 @@ use tracing::instrument;
 
 use super::pitr::{BaseLocation, PitrArchive};
 use super::{
-    backup_artifact_name, finalize_local_backup_async, is_backup_artifact_name, run_blocking,
-    seal_backup_async, select_backups_to_delete, verify_backup_output_async, BackupEncryptor,
+    backup_artifact_name, is_backup_artifact_name, seal_backup_async, select_backups_to_delete,
+    verify_backup_output_async, write_verified_local_backup_async, BackupEncryptor,
     S3ClientWrapper,
 };
 use crate::actors::QueryServerReadV1;
@@ -154,39 +154,27 @@ impl OnlineBackupJob {
     ) -> Result<BackupStructuralReport, OperationError> {
         let dest_file = dir.join(key);
 
-        if dest_file.exists() {
+        // Written to a temporary file, synced and read back before it gets its backup
+        // name, so a backup name only ever holds a complete, verified backup. A rejected
+        // artifact is kept under an `.invalid` suffix, which the retention matcher
+        // ignores, and retention below is skipped so that a failed backup can not cause
+        // an older good backup to be removed.
+        let report = write_verified_local_backup_async(
+            &dest_file,
+            Arc::clone(artifact),
+            self.compression,
+            encryptor,
+        )
+        .await
+        .map_err(|err| {
             error!(
-                "Online backup file {} already exists, will not overwrite it.",
+                reasons = ?err.reasons,
+                quarantined_to = ?err.quarantined_to,
+                "Online backup {} failed",
                 dest_file.display()
             );
-            return Err(OperationError::InvalidState);
-        }
-
-        let write_to = dest_file.clone();
-        let data = Arc::clone(artifact);
-        run_blocking(move || std::fs::write(write_to, data.as_slice()))
-            .await
-            .map_err(|err| {
-                error!(?err, "Unable to write {}", dest_file.display());
-                OperationError::FsError
-            })?;
-        debug!("Online backup written to {}", dest_file.display());
-
-        // Never announce, retain or prune on the strength of a backup that can not be
-        // read back. A rejected artifact is kept under an `.invalid` suffix, which the
-        // retention matcher ignores, and retention below is skipped so that a failed
-        // backup can not cause an older good backup to be removed.
-        let report = finalize_local_backup_async(&dest_file, self.compression, encryptor)
-            .await
-            .map_err(|err| {
-                error!(
-                    reasons = ?err.reasons,
-                    quarantined_to = ?err.quarantined_to,
-                    "Online backup {} failed verification",
-                    dest_file.display()
-                );
-                OperationError::InvalidState
-            })?;
+            OperationError::InvalidState
+        })?;
         info!(
             entries = report.entry_count,
             version = ?report.version,
@@ -219,16 +207,21 @@ impl OnlineBackupJob {
         // A backup that can not be read back is never uploaded, so the bucket only ever
         // holds artifacts that passed the same structural checks as `verify-backup`. An
         // encrypted artifact is decrypted for this, which proves the key opens it.
-        let report = verify_backup_output_async(Arc::clone(artifact), self.compression, encryptor)
-            .await
-            .map_err(|err| {
-                error!(
-                    reasons = ?err.reasons,
-                    "S3 backup {} failed verification and was not uploaded",
-                    key
-                );
-                OperationError::InvalidState
-            })?;
+        let report = verify_backup_output_async(
+            Arc::clone(artifact),
+            Some(Path::new(key)),
+            self.compression,
+            encryptor,
+        )
+        .await
+        .map_err(|err| {
+            error!(
+                reasons = ?err.reasons,
+                "S3 backup {} failed verification and was not uploaded",
+                key
+            );
+            OperationError::InvalidState
+        })?;
         info!(
             entries = report.entry_count,
             version = ?report.version,

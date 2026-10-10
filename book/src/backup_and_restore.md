@@ -36,9 +36,17 @@ investigation and potentially manual intervention to resolve the underlying data
 
 In addition, every online and manual backup is structurally verified immediately after it is written, with the same
 checks as `kubidmd database verify-backup --level structural`: the artifact is read back, parsed, and checked for
-entries and for the server version that wrote it. A local artifact that fails this check is renamed with an `.invalid`
-suffix so that it is kept for inspection but is neither counted nor deleted by retention, and the backup is reported as
-an error without pruning any older backup. An S3 artifact that fails this check is never uploaded.
+entries and for the server version that wrote it. It is opened the way a restore opens it, so its name counts: a plain
+backup must carry the compression suffix of the compression it was written with (`.json.gz` for gzip, `.json` without
+compression), and only an encrypted backup may end in `.enc`. `kubidmd database backup` refuses a destination whose name
+contradicts the configured compression or encryption before it writes anything.
+
+A local artifact is first written to a hidden `.<name>.partial` file next to its destination, synced to disk and
+verified there, and only then renamed to its final name, so a backup name never holds a partially written backup, even
+after a full disk or a crash, and an existing file is never overwritten. An artifact that fails the verification is
+renamed with an `.invalid` suffix so that it is kept for inspection but is neither counted nor deleted by retention, and
+the backup is reported as an error without pruning any older backup. A `.partial` file left behind by a crash is never
+counted either and can be removed. An S3 artifact that fails this check is never uploaded.
 
 ## Method 1 - Automatic Backup
 

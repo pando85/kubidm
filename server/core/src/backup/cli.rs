@@ -25,11 +25,12 @@ use kubidmd_lib::{
 use time::format_description::well_known::Rfc3339;
 
 use super::{
-    finalize_local_backup_async, is_backup_artifact_name, lag_metrics_from_health,
-    open_backup_file_with_config, pitr, region_is_healthy,
+    is_backup_artifact_name, lag_metrics_from_health, open_backup_file_with_config, pitr,
+    region_is_healthy,
     restore::{backup_encryption_config, restore_and_replay, restore_database},
-    run_blocking, s3_location, seal_backup_async, verify_backup_output_async, BackupEncryptor,
-    BackupVerifyError, S3BackupError, S3ClientWrapper,
+    run_blocking, s3_location, seal_backup_async, verify_backup_output_async,
+    write_verified_local_backup_async, BackupEncryptor, BackupVerifyError, S3BackupError,
+    S3ClientWrapper,
 };
 use crate::{config::Configuration, setup_backend, verify_booted_database};
 
@@ -63,17 +64,12 @@ pub async fn backup_server_core(config: &Configuration, dst_path: Option<&Path>)
         None => None,
     };
 
-    if let (Some(dst_path), Some(_)) = (dst_path, &encryptor) {
-        if !dst_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(is_encrypted_backup_name)
+    if let Some(dst_path) = dst_path {
+        if let Err(reason) =
+            check_backup_destination_name(dst_path, compression, encryptor.is_some())
         {
-            warn!(
-                "Backup encryption is enabled: {} will hold an encrypted artifact although \
-                 its name does not end in {BACKUP_ENCRYPTED_SUFFIX}",
-                dst_path.display()
-            );
+            error!("Backup failed: {reason}");
+            std::process::exit(1);
         }
     }
 
@@ -128,28 +124,25 @@ pub async fn backup_server_core(config: &Configuration, dst_path: Option<&Path>)
         }
     };
 
+    let artifact = Arc::new(artifact);
     if let Some(dst_path) = dst_path {
-        let write_to = dst_path.to_path_buf();
-        if let Err(err) = run_blocking(move || std::fs::write(write_to, artifact)).await {
-            error!(
-                ?err,
-                "Backup failed: unable to write {}",
-                dst_path.display()
-            );
-            std::process::exit(1);
-        }
-        info!("Backup written to {}", dst_path.display());
-
-        // Read the artifact back before announcing it. A rejected artifact is kept under
-        // an `.invalid` suffix for inspection.
+        // Written next to the destination, synced and read back before it gets its name,
+        // so the destination only ever holds a complete, verified backup. A rejected
+        // artifact is kept under an `.invalid` suffix for inspection.
         report_backup_verification(
-            finalize_local_backup_async(dst_path, compression, encryptor.as_ref()).await,
-        );
-    } else {
-        let artifact = Arc::new(artifact);
-        report_backup_verification(
-            verify_backup_output_async(Arc::clone(&artifact), compression, encryptor.as_ref())
+            write_verified_local_backup_async(dst_path, artifact, compression, encryptor.as_ref())
                 .await,
+        );
+        info!("Backup written to {}", dst_path.display());
+    } else {
+        report_backup_verification(
+            verify_backup_output_async(
+                Arc::clone(&artifact),
+                None,
+                compression,
+                encryptor.as_ref(),
+            )
+            .await,
         );
 
         let mut stdout = std::io::stdout().lock();
@@ -163,6 +156,55 @@ pub async fn backup_server_core(config: &Configuration, dst_path: Option<&Path>)
         eprintln!("Backup encrypted with key '{}'", encryptor.key_identifier());
     }
     info!("Backup success!");
+}
+
+/// Check the destination of a manual backup against what will be written to it, before
+/// anything is: restore and `verify-backup` take a plain backup's compression from its
+/// name and refuse a plain backup named as an encrypted one, so such a name would hold a
+/// backup that can not be restored. An encrypted backup records its compression itself
+/// and is recognised by its content, so a name without the encrypted suffix only warns.
+fn check_backup_destination_name(
+    dst_path: &Path,
+    compression: BackupCompression,
+    encrypted: bool,
+) -> Result<(), String> {
+    let name = dst_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let named_encrypted = is_encrypted_backup_name(name);
+
+    if encrypted {
+        if !named_encrypted {
+            warn!(
+                "Backup encryption is enabled: {} will hold an encrypted artifact although \
+                 its name does not end in {BACKUP_ENCRYPTED_SUFFIX}",
+                dst_path.display()
+            );
+        }
+        return Ok(());
+    }
+
+    if named_encrypted {
+        return Err(format!(
+            "{} ends in {BACKUP_ENCRYPTED_SUFFIX} but backup encryption is not enabled; \
+             restore refuses a plain backup under an encrypted name",
+            dst_path.display()
+        ));
+    }
+
+    let named_compression = BackupCompression::identify_name(name);
+    if named_compression != compression {
+        return Err(format!(
+            "{} is named as a {named_compression} backup but the configured compression is \
+             {compression}; restore takes the compression of a plain backup from its name, \
+             so name it with the suffix '.json{}'",
+            dst_path.display(),
+            compression.suffix()
+        ));
+    }
+
+    Ok(())
 }
 
 /// Print the outcome of the post-write verification of a manual backup. A rejected backup
@@ -1031,6 +1073,34 @@ mod tests {
             ],
             ..ReplicationConfig::default()
         }
+    }
+
+    #[test]
+    fn manual_backup_refuses_a_destination_restore_could_not_read() {
+        let gzip = BackupCompression::Gzip;
+        let plain = BackupCompression::NoCompression;
+
+        // Names that announce what is written are accepted.
+        assert!(check_backup_destination_name(Path::new("/b/kubidm.json.gz"), gzip, false).is_ok());
+        assert!(check_backup_destination_name(Path::new("/b/kubidm.json"), plain, false).is_ok());
+        assert!(
+            check_backup_destination_name(Path::new("/b/kubidm.json.gz.enc"), gzip, true).is_ok()
+        );
+        // An encrypted backup records its compression, and is recognised by its content.
+        assert!(check_backup_destination_name(Path::new("/b/kubidm.json"), gzip, true).is_ok());
+
+        // Gzip under a plain name would be parsed as plain JSON on restore.
+        let err = check_backup_destination_name(Path::new("/b/kubidm.json"), gzip, false)
+            .expect_err("a gzip backup under a plain name must be refused");
+        assert!(err.contains(".json.gz"), "{err}");
+        // And the other way round.
+        assert!(
+            check_backup_destination_name(Path::new("/b/kubidm.json.gz"), plain, false).is_err()
+        );
+        // A plain backup under an encrypted name is refused by restore.
+        let err = check_backup_destination_name(Path::new("/b/kubidm.json.gz.enc"), gzip, false)
+            .expect_err("a plain backup under an encrypted name must be refused");
+        assert!(err.contains("not enabled"), "{err}");
     }
 
     #[test]
