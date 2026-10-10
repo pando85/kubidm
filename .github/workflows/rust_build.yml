@@ -56,10 +56,12 @@ jobs:
         env:
           MINIO_ROOT_USER: kubidm-test
           MINIO_ROOT_PASSWORD: kubidm-test-secret
+          # The multi-arch index of the tag, pinned by digest.
+          SILO_IMAGE: pgsty/silo:RELEASE.2026-09-16T00-00-00Z@sha256:635197cb9f36d01bee221d34d1c7d7960f6a95c48b0b6c01d99cd13bdae51a46
         run: |
           docker run -d --name silo -p 9000:9000 \
             -e MINIO_ROOT_USER -e MINIO_ROOT_PASSWORD \
-            pgsty/silo:RELEASE.2026-09-16T00-00-00Z server /data
+            "$SILO_IMAGE" server /data
           for _ in $(seq 1 60); do
             if curl -sf http://127.0.0.1:9000/minio/health/live > /dev/null; then
               echo "silo is ready"
