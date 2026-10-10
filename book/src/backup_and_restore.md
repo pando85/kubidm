@@ -153,6 +153,8 @@ sync_interval_seconds = 300
 [[online_backup.s3.replication.regions]]
 region = "eu-west-1"
 bucket = "kubidm-backups-eu"
+# Optional: The name of the replica for replicate-status and --region (default: region)
+# name = "eu-dr"
 # Optional: Custom endpoint for MinIO or other S3-compatible services
 # endpoint = "https://s3.eu-west-1.example.com"
 # Optional: Path prefix inside the region's bucket, independent from the primary's
@@ -177,16 +179,18 @@ region = "ap-southeast-1"
 bucket = "kubidm-backups-ap"
 ```
 
-`region` names the entry: it is shown by `replicate-status`, selected by `--region` on the recovery commands, and used
-as the signing region of the requests to that bucket. Each region has its own `bucket`, and optionally its own
-`endpoint`, `path_prefix`, `credentials`, `storage_class` and server-side encryption, so a replica can live at a
-different provider than the primary. When `enabled = true`, the configuration must list at least one region, region
-names must be unique, every region needs a bucket, no region may point at the primary location or at the location of
-another region (same bucket and `path_prefix`, and the same endpoint, where every AWS S3 endpoint counts as the default
-one), every region's storage class and server-side encryption must be valid as for the primary (the `kms_key_id`
-shorthand can not be combined with `AES256`), and `sync_interval_seconds` must be greater than zero; the server and
-`kubidmd configtest` reject anything else. With `enabled = false` the section is ignored, but its regions can still be
-targeted with `--region`, so a replica remains a recovery source after replication has been switched off.
+`region` is the signing region of the requests to that bucket and, unless `name` is set, also names the entry: the name
+is shown by `replicate-status` and selected by `--region` on the recovery commands. Set `name` when two replicas share a
+signing region, such as two buckets or accounts in one AWS region, or two S3-compatible stores that both sign with the
+same region. Each region has its own `bucket`, and optionally its own `endpoint`, `path_prefix`, `credentials`,
+`storage_class` and server-side encryption, so a replica can live at a different provider than the primary. When
+`enabled = true`, the configuration must list at least one region, region names (`name`, or `region` without one) must
+be unique, every region needs a bucket, no region may point at the primary location or at the location of another region
+(same bucket and `path_prefix`, and the same endpoint, where every AWS S3 endpoint counts as the default one), every
+region's storage class and server-side encryption must be valid as for the primary (the `kms_key_id` shorthand can not
+be combined with `AES256`), and `sync_interval_seconds` must be greater than zero; the server and `kubidmd configtest`
+reject anything else. With `enabled = false` the section is ignored, but its regions can still be targeted with
+`--region`, so a replica remains a recovery source after replication has been switched off.
 
 #### What Is Replicated, and When
 

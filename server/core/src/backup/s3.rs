@@ -842,7 +842,7 @@ impl S3ClientWrapper {
         info!(
             "Replicated backup {} to region {} ({})",
             backup_key,
-            region_config.region,
+            region_config.name(),
             region.location()
         );
         Ok(())
@@ -926,7 +926,9 @@ impl S3ClientWrapper {
 
             info!(
                 "Replication sync copies {} to region {}: the region copy {}",
-                backup_key, region_config.region, reason
+                backup_key,
+                region_config.name(),
+                reason
             );
             match self.copy_backup_to(&region, backup_key).await {
                 Ok(()) => outcome.copied.push(backup_key.clone()),
@@ -949,7 +951,7 @@ impl S3ClientWrapper {
         let mut results = Vec::with_capacity(replication_config.regions.len());
         for region_config in &replication_config.regions {
             let result = self.sync_region(region_config, &source_backups).await;
-            results.push((region_config.region.clone(), result));
+            results.push((region_config.name().to_string(), result));
         }
         Ok(results)
     }
@@ -982,7 +984,7 @@ impl S3ClientWrapper {
     ) -> ReplicationRegionStatus {
         let total = source_backups.len() as u64;
         let mut status = ReplicationRegionStatus {
-            region: region_config.region.clone(),
+            region: region_config.name().to_string(),
             bucket: region_config.bucket.clone(),
             status: ReplicationStatus::Completed,
             last_sync_timestamp: None,
@@ -1986,6 +1988,7 @@ mod tests {
     #[test]
     fn test_replication_region_config_display() {
         let config = ReplicationRegionConfig {
+            name: None,
             region: "eu-west-1".to_string(),
             bucket: "backup-eu".to_string(),
             endpoint: Some("https://s3.eu-west-1.amazonaws.com".to_string()),
@@ -2340,6 +2343,7 @@ mod tests {
         let replication = ReplicationConfig {
             enabled: true,
             regions: vec![ReplicationRegionConfig {
+                name: None,
                 region: "eu-west-1".to_string(),
                 bucket: "eu-backup".to_string(),
                 endpoint: None,
@@ -2461,6 +2465,7 @@ mod tests {
 
     fn region_config(path_prefix: Option<&str>) -> ReplicationRegionConfig {
         ReplicationRegionConfig {
+            name: None,
             region: "eu-west-1".to_string(),
             bucket: "eu-backup".to_string(),
             endpoint: Some("https://s3.eu.example.com".to_string()),
@@ -2864,6 +2869,7 @@ mod tests {
     #[test]
     fn test_replication_region_config_serialization() {
         let config = ReplicationRegionConfig {
+            name: None,
             region: "eu-west-1".to_string(),
             bucket: "eu-backup".to_string(),
             endpoint: Some("https://s3.eu-west-1.amazonaws.com".to_string()),
@@ -2891,6 +2897,7 @@ mod tests {
             enabled: true,
             regions: vec![
                 ReplicationRegionConfig {
+                    name: None,
                     region: "us-west-2".to_string(),
                     bucket: "west-backup".to_string(),
                     endpoint: None,
@@ -2901,6 +2908,7 @@ mod tests {
                     kms_key_id: None,
                 },
                 ReplicationRegionConfig {
+                    name: None,
                     region: "eu-west-1".to_string(),
                     bucket: "eu-backup".to_string(),
                     endpoint: None,

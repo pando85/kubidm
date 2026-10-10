@@ -280,7 +280,7 @@ impl OnlineBackupJob {
                     info!(
                         "Replicated backup {} to region {} ({})",
                         key,
-                        region_config.region,
+                        region_config.name(),
                         region.location()
                     );
                     region_clients.push(region);
@@ -288,7 +288,10 @@ impl OnlineBackupJob {
                 Err(err) => warn!(
                     "S3 backup replication of {} to region {} (bucket {}) failed, the \
                      replication monitor copies it later: {}",
-                    key, region_config.region, region_config.bucket, err
+                    key,
+                    region_config.name(),
+                    region_config.bucket,
+                    err
                 ),
             }
         }

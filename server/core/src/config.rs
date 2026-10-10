@@ -211,17 +211,28 @@ fn validate_replication(s3: &S3Config, replication: &ReplicationConfig) -> Resul
                 "online_backup.s3.replication.regions[{index}]: region must not be empty"
             ));
         }
+        if region
+            .name
+            .as_ref()
+            .is_some_and(|name| name.trim().is_empty())
+        {
+            return Err(format!(
+                "online_backup.s3.replication.regions[{index}]: name must not be empty; omit it \
+                 to name the region after its signing region"
+            ));
+        }
         if region.bucket.trim().is_empty() {
             return Err(format!(
                 "online_backup.s3.replication.regions[{index}] ({}): bucket must not be empty",
-                region.region
+                region.name()
             ));
         }
-        if !names.insert(region.region.as_str()) {
+        if !names.insert(region.name()) {
             return Err(format!(
                 "online_backup.s3.replication.regions[{index}]: region name {:?} is used by \
-                 more than one entry; region names must be unique",
-                region.region
+                 more than one entry; region names must be unique. Set `name` to tell apart \
+                 replicas that share a signing region",
+                region.name()
             ));
         }
         if region.kms_key_id.is_some()
@@ -234,14 +245,14 @@ fn validate_replication(s3: &S3Config, replication: &ReplicationConfig) -> Resul
                 "online_backup.s3.replication.regions[{index}] ({}): kms_key_id is a shorthand \
                  for aws:kms server-side encryption and can not be combined with \
                  server_side_encryption.algorithm = \"AES256\"",
-                region.region
+                region.name()
             ));
         }
         let location = region.to_s3_config();
         validate_s3_location(&location).map_err(|reason| {
             format!(
                 "online_backup.s3.replication.regions[{index}] ({}): {reason}",
-                region.region
+                region.name()
             )
         })?;
         if same_s3_location(&location, s3) {
@@ -249,7 +260,8 @@ fn validate_replication(s3: &S3Config, replication: &ReplicationConfig) -> Resul
                 "online_backup.s3.replication.regions[{index}] ({}): bucket {:?} with this \
                  endpoint and path_prefix is the primary backup location itself; a replica \
                  must be stored elsewhere",
-                region.region, region.bucket
+                region.name(),
+                region.bucket
             ));
         }
         if let Some(other) = replication
@@ -261,7 +273,9 @@ fn validate_replication(s3: &S3Config, replication: &ReplicationConfig) -> Resul
             return Err(format!(
                 "online_backup.s3.replication.regions[{index}] ({}): bucket {:?} with this \
                  endpoint and path_prefix is already the location of region {:?}",
-                region.region, region.bucket, other.region
+                region.name(),
+                region.bucket,
+                other.name()
             ));
         }
     }
@@ -1661,6 +1675,41 @@ bucket = \"kubidm-backups-eu-2\"
 "
         );
         assert!(build_from_toml(&duplicate).is_none());
+
+        // Two replicas in one signing region (two accounts or buckets in eu-west-1) are
+        // told apart by their names.
+        let named = format!(
+            "{BASE_V2_CONFIG}{S3_SECTION}
+[online_backup.s3.replication]
+enabled = true
+
+[[online_backup.s3.replication.regions]]
+name = \"eu-a\"
+region = \"eu-west-1\"
+bucket = \"kubidm-backups-eu\"
+
+[[online_backup.s3.replication.regions]]
+name = \"eu-b\"
+region = \"eu-west-1\"
+bucket = \"kubidm-backups-eu-2\"
+"
+        );
+        let config = build_from_toml(&named).expect("distinct names are accepted");
+        let regions = config
+            .online_backup
+            .and_then(|backup| backup.s3)
+            .and_then(|s3| s3.replication)
+            .map(|replication| replication.regions)
+            .unwrap_or_default();
+        let names: Vec<&str> = regions.iter().map(|region| region.name()).collect();
+        assert_eq!(names, ["eu-a", "eu-b"]);
+        assert!(regions.iter().all(|region| region.region == "eu-west-1"));
+
+        // A name may not repeat another entry's default name either.
+        let clash = named.replace("name = \"eu-b\"", "name = \"eu-a\"");
+        assert!(build_from_toml(&clash).is_none());
+        let empty = named.replace("name = \"eu-b\"", "name = \" \"");
+        assert!(build_from_toml(&empty).is_none());
     }
 
     #[test]
@@ -1696,6 +1745,7 @@ bucket = \"kubidm-backups-eu\"
 
     fn region(name: &str, bucket: &str) -> ReplicationRegionConfig {
         ReplicationRegionConfig {
+            name: None,
             region: name.to_string(),
             endpoint: None,
             bucket: bucket.to_string(),

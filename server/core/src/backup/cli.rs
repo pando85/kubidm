@@ -414,7 +414,7 @@ fn replication_region<'a>(
     let regions = configured_replication_regions(config);
     regions
         .iter()
-        .find(|region| region.region == name)
+        .find(|region| region.name() == name)
         .ok_or_else(|| {
             if regions.is_empty() {
                 error!(
@@ -422,7 +422,7 @@ fn replication_region<'a>(
                      [online_backup.s3.replication], so there is no replica to target."
                 );
             } else {
-                let names: Vec<&str> = regions.iter().map(|r| r.region.as_str()).collect();
+                let names: Vec<&str> = regions.iter().map(|r| r.name()).collect();
                 error!(
                     "--region {name}: no replication region of that name is configured. \
                      Configured regions: {}",
@@ -1030,6 +1030,7 @@ mod tests {
 
     fn region(name: &str, bucket: &str) -> ReplicationRegionConfig {
         ReplicationRegionConfig {
+            name: None,
             region: name.to_string(),
             endpoint: Some(format!("https://s3.{name}.example.com")),
             bucket: bucket.to_string(),
@@ -1157,6 +1158,15 @@ mod tests {
         assert_eq!(s3.bucket, "restored-copy");
         assert_eq!(s3.endpoint.as_deref(), Some("https://mirror.example.com"));
         assert_eq!(s3.region.as_deref(), Some("eu-west-1"));
+
+        // A named replica is selected by its name and still signs for its region.
+        let mut named = replication(true);
+        named.regions[1].name = Some("ap-dr".to_string());
+        let config = config_with_s3(Some(named));
+        let s3 = s3_config_for_cli(&config, None, Some("ap-dr"), None).expect("named region");
+        assert_eq!(s3.bucket, "primary-ap");
+        assert_eq!(s3.region.as_deref(), Some("ap-southeast-1"));
+        assert!(s3_config_for_cli(&config, None, Some("ap-southeast-1"), None).is_err());
     }
 
     #[test]

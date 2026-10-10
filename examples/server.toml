@@ -212,20 +212,24 @@ compression = "gzip"
 #   The WAL archive of point-in-time recovery (see [online_backup.wal_archive] below),
 #   when it is uploaded here, is mirrored to the same regions after every archive run;
 #   `pitr-list` and `recover` take `--region <name>` as well.
-#   Requires at least one region, unique region names, a bucket per region, a
-#   location (endpoint, bucket, path_prefix) per region distinct from the primary and
-#   from every other region, and a positive sync_interval_seconds when enabled.
+#   Requires at least one region, unique region names (name, or region without one),
+#   a bucket per region, a location (endpoint, bucket, path_prefix) per region distinct
+#   from the primary and from every other region, and a positive sync_interval_seconds
+#   when enabled.
 #
 # [online_backup.s3.replication]
 # enabled = true
 #   Seconds between two replication sync and health check runs (default 300)
 # sync_interval_seconds = 300
 #
-#   One entry per region. `region` names the entry (for replicate-status and --region)
-#   and is the signing region of its requests; `bucket` is required.
+#   One entry per region. `region` is the signing region of its requests and, unless
+#   `name` is set, names the entry (for replicate-status and --region); `bucket` is
+#   required. Names must be unique: set `name` when two replicas share a region.
 # [[online_backup.s3.replication.regions]]
 # region = "eu-west-1"
 # bucket = "kubidm-backups-eu"
+#   Optional: The name of the replica (default: region)
+# name = "eu-dr"
 #   Optional: Custom endpoint for MinIO or other S3-compatible services
 # endpoint = "https://s3.eu-west-1.example.com"
 #   Optional: Path prefix inside the region's bucket (independent from the primary's)

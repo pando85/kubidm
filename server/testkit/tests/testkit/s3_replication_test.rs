@@ -93,6 +93,7 @@ fn test_setup() -> Option<TestSetup> {
     let run_id = Uuid::new_v4();
 
     let replica = ReplicationRegionConfig {
+        name: None,
         region: REPLICA_REGION.to_string(),
         endpoint: Some(endpoint.clone()),
         bucket: region_bucket,
@@ -105,6 +106,7 @@ fn test_setup() -> Option<TestSetup> {
         kms_key_id: None,
     };
     let broken = ReplicationRegionConfig {
+        name: None,
         region: BROKEN_REGION.to_string(),
         endpoint: Some(endpoint.clone()),
         bucket: format!("kubidm-test-missing-{run_id}"),
@@ -604,6 +606,7 @@ fn test_s3_backup_replication_retention_status_and_recovery() {
         //    while a region that can not be reached is reported without failing the sync
         //    of the others.
         let late = ReplicationRegionConfig {
+            name: None,
             region: "eu-central-1".to_string(),
             path_prefix: Some(format!(
                 "late/{}",

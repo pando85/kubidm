@@ -317,7 +317,7 @@ fn find_region<'a>(config: &'a S3Config, name: &str) -> Option<&'a ReplicationRe
     config
         .replication
         .as_ref()
-        .and_then(|replication| replication.regions.iter().find(|r| r.region == name))
+        .and_then(|replication| replication.regions.iter().find(|r| r.name() == name))
 }
 
 /// A base backup fetched for recovery. The S3 variant is removed when dropped.
@@ -1026,9 +1026,9 @@ impl PitrArchive {
             // index keeps every base it learnt about, which only delays its retention.
             let region_bases = self
                 .settings
-                .for_region(&region.region)
+                .for_region(region.name())
                 .map(|settings| settings.bases)
-                .inspect_err(|err| debug!(%err, region = %region.region, "No base backups to prune the region index with"))
+                .inspect_err(|err| debug!(%err, region = %region.name(), "No base backups to prune the region index with"))
                 .ok();
             let target = RegionTarget {
                 config: region,
@@ -1042,7 +1042,7 @@ impl PitrArchive {
                     report.region_errors += 1;
                     error!(
                         %err,
-                        region = %region.region,
+                        region = %region.name(),
                         bucket = %region.bucket,
                         "Unable to replicate the WAL archive to the region; the next \
                          synchronisation retries"
@@ -1151,7 +1151,7 @@ async fn replicate_to_region(
     manifest: &mut PitrManifest,
     target: &RegionTarget<'_>,
 ) -> Result<usize, PitrError> {
-    let region_name = &target.config.region;
+    let region_name = target.config.name();
     let region_store = PitrStore::S3 {
         client: Box::new(S3ClientWrapper::for_region(target.config).await?),
     };
