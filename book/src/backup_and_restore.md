@@ -361,13 +361,12 @@ region's credentials and server-side encryption settings never give access to th
 encryption of a region is applied on top of the client-side encryption.
 
 The sync and health checks compare the SHA-256 and size of the encrypted objects, which is all they need: a missing or
-differing `.enc` copy is repaired from the primary like a plain one, without the encryption key. `list-backups
---region` shows which copies are encrypted and with which key identifier, and `verify-s3 --region` and `restore-s3
---region` decrypt a region's copy with the `[online_backup.encryption]` section of the configuration they are given,
-exactly as for the primary. Recovering from a replica therefore needs the
-same secret as recovering from the primary; keep it available independently of the primary region. Key rotation applies
-to replicas as well: a replicated backup keeps needing the key it was written with.
-
+differing `.enc` copy is repaired from the primary like a plain one, without the encryption key. With `--region`,
+`list-backups` shows which copies are encrypted and with which key identifier, and `verify-s3` and `restore-s3` decrypt
+a region's copy with the `[online_backup.encryption]` section of the configuration they are given, exactly as for the
+primary. Recovering from a replica therefore needs the same secret as recovering from the primary; keep it available
+independently of the primary region. Key rotation applies to replicas as well: a replicated backup keeps needing the key
+it was written with.
 
 ### Features Not Yet Available
 
