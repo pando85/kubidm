@@ -208,11 +208,11 @@ fn test_backup_verify_rejects_invalid_artifacts() {
         std::fs::write(&garbage, b"this is not a backup").expect("Failed to write garbage");
         assert!(
             !verify_backup_server_core(&config, &garbage, BackupVerifyLevel::Structural).await,
-            "Unparseable data must fail structural verification"
+            "Unparsable data must fail structural verification"
         );
         assert!(
             !verify_backup_server_core(&config, &garbage, BackupVerifyLevel::Full).await,
-            "Unparseable data must fail full verification"
+            "Unparsable data must fail full verification"
         );
 
         // A V1 backup carries neither a version marker nor, here, any entries. It parses
