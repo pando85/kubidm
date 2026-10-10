@@ -1,422 +1,522 @@
+//! End to end tests of WAL archiving and point-in-time recovery (PITR).
+//!
+//! A server runs with `[online_backup.wal_archive]` enabled, so every committed write is
+//! archived. An online backup through the production path becomes the base, more writes
+//! follow, and `kubidmd database recover` logic rebuilds the database at a point in time
+//! between them and at the latest point. The recovered databases are booted as servers and
+//! inspected through the client API.
+//!
+//! The S3 variant needs an S3-compatible service and is skipped unless
+//! `KUBIDM_TEST_S3_ENDPOINT` is set, exactly like `s3_recovery_test`; see there for running
+//! it against a local Silo container.
+
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
+use aws_sdk_s3::Client as SdkClient;
+use kubidm_client::KubidmClient;
 use kubidm_proto::backup::{
-    BackupCompression, PitrManifest, RecoveryTarget, RecoveryTargetType, WalArchiveConfig,
-    WalEntry, WalOperation, WalSegment,
+    BackupCompression, S3Config, S3Credentials, WalArchiveConfig, PITR_MANIFEST_KEY,
 };
-use std::time::Duration;
+use kubidmd_core::backup::pitr::{
+    pitr_list_server_core, pitr_recover_server_core, PitrError, RecoveryTargetSpec,
+};
+use kubidmd_core::config::{Configuration, OnlineBackup};
+use kubidmd_lib::repl::wal::{format_ts_rfc3339, list_segments};
+use kubidmd_testkit::{login_put_admin_idm_admins, setup_async_test, AsyncTestEnvironment};
 use uuid::Uuid;
 
-fn create_test_segment(server_uuid: Uuid, start_ts: Duration, end_ts: Duration) -> WalSegment {
-    WalSegment::new(
-        format!("wal-{}-test.wal", server_uuid),
-        server_uuid,
-        start_ts,
-        end_ts,
-        "checksum123".to_string(),
-        100,
-        BackupCompression::NoCompression,
-    )
-}
+use super::backup_common::{
+    assert_directory_state_restored, config_with_db, populate, run, BACKUP_ENGINEERS_GROUP,
+};
 
-fn create_test_manifest(server_uuid: Uuid) -> PitrManifest {
-    PitrManifest::new(
-        server_uuid,
-        "backup-001".to_string(),
-        "2024-01-01T00:00:00Z".to_string(),
-    )
-}
+/// Created after the base backup and before the recovery target.
+const PITR_USER_BEFORE: &str = "pitr_user_before";
+/// Created after the recovery target.
+const PITR_USER_AFTER: &str = "pitr_user_after";
+/// Created by the server started on the recovered database.
+const PITR_USER_NEW_HISTORY: &str = "pitr_user_new_history";
 
-fn create_test_wal_entry(server_uuid: Uuid, ts: Duration, entry_id: u64) -> WalEntry {
-    WalEntry {
-        cid_ts: ts,
-        cid_server: server_uuid,
-        entry_id,
-        operation: WalOperation::Create {
-            entry_data: vec![1, 2, 3],
-        },
-    }
-}
-
-#[test]
-fn test_pitr_wal_segment_creation() {
-    let server_uuid = Uuid::new_v4();
-    let segment = create_test_segment(
-        server_uuid,
-        Duration::from_secs(0),
-        Duration::from_secs(100),
-    );
-
-    assert!(segment.segment_id.contains("wal"));
-    assert_eq!(segment.server_uuid, server_uuid);
-    assert!(!segment.checksum_sha256.is_empty());
-    assert_eq!(segment.compression, BackupCompression::NoCompression);
-}
-
-#[test]
-fn test_pitr_manifest_creation_and_manipulation() {
-    let server_uuid = Uuid::new_v4();
-    let manifest = create_test_manifest(server_uuid);
-
-    assert_eq!(manifest.server_uuid, server_uuid);
-    assert_eq!(manifest.base_backup_id, "backup-001");
-    assert!(manifest.segments.is_empty());
-}
-
-#[test]
-fn test_pitr_manifest_add_segments() {
-    let server_uuid = Uuid::new_v4();
-    let mut manifest = create_test_manifest(server_uuid);
-
-    for i in 0..5 {
-        let ts = Duration::from_secs(i * 100);
-        manifest.add_segment(create_test_segment(server_uuid, ts, ts));
-    }
-
-    assert_eq!(manifest.segments.len(), 5);
-}
-
-#[test]
-fn test_pitr_recovery_target_time() {
-    let target = RecoveryTarget::to_time("2024-01-15T10:30:00Z");
-    assert!(target.is_ok());
-
-    let target = target.unwrap();
-    assert!(matches!(
-        target.target_type,
-        RecoveryTargetType::Time { .. }
-    ));
-}
-
-#[test]
-fn test_pitr_recovery_target_transaction() {
-    let target = RecoveryTarget::to_transaction("test-cid-12345");
-    assert!(target.is_ok());
-
-    let target = target.unwrap();
-    assert!(matches!(
-        target.target_type,
-        RecoveryTargetType::Transaction { .. }
-    ));
-}
-
-#[test]
-fn test_pitr_recovery_target_latest() {
-    let target = RecoveryTarget::latest();
-    assert!(matches!(target.target_type, RecoveryTargetType::Latest));
-}
-
-#[test]
-fn test_pitr_recovery_target_invalid_time() {
-    let target = RecoveryTarget::to_time("invalid-time");
-    assert!(target.is_err());
-}
-
-#[test]
-fn test_pitr_recovery_target_empty_transaction() {
-    let target = RecoveryTarget::to_transaction("");
-    assert!(target.is_err());
-}
-
-#[test]
-fn test_pitr_wal_entry_operations() {
-    let server_uuid = Uuid::new_v4();
-
-    let create_entry = WalEntry {
-        cid_ts: Duration::from_secs(1000),
-        cid_server: server_uuid,
-        entry_id: 1,
-        operation: WalOperation::Create {
-            entry_data: vec![1, 2, 3],
-        },
-    };
-    assert!(matches!(
-        create_entry.operation,
-        WalOperation::Create { .. }
-    ));
-
-    let modify_entry = WalEntry {
-        cid_ts: Duration::from_secs(2000),
-        cid_server: server_uuid,
-        entry_id: 2,
-        operation: WalOperation::Modify {
-            entry_data: vec![4, 5, 6],
-        },
-    };
-    assert!(matches!(
-        modify_entry.operation,
-        WalOperation::Modify { .. }
-    ));
-
-    let delete_entry = WalEntry {
-        cid_ts: Duration::from_secs(3000),
-        cid_server: server_uuid,
-        entry_id: 3,
-        operation: WalOperation::Delete,
-    };
-    assert!(matches!(delete_entry.operation, WalOperation::Delete));
-}
-
-#[test]
-fn test_pitr_wal_config_default() {
-    let config = WalArchiveConfig::default();
-    assert!(!config.enabled);
-    assert_eq!(config.retention_days, 7);
-    assert_eq!(config.segment_size_bytes, 16 * 1024 * 1024);
-}
-
-#[test]
-fn test_pitr_wal_entry_serialization_deserialization() {
-    let server_uuid = Uuid::new_v4();
-    let entry = create_test_wal_entry(server_uuid, Duration::from_secs(1000), 1);
-
-    let serialized = serde_json::to_string(&entry).expect("Failed to serialize");
-    assert!(serialized.contains("1000"));
-
-    let deserialized: WalEntry = serde_json::from_str(&serialized).expect("Failed to deserialize");
-    assert_eq!(entry.entry_id, deserialized.entry_id);
-    assert_eq!(entry.cid_server, deserialized.cid_server);
-}
-
-#[test]
-fn test_pitr_wal_segment_serialization_deserialization() {
-    let server_uuid = Uuid::new_v4();
-    let segment = create_test_segment(
-        server_uuid,
-        Duration::from_secs(0),
-        Duration::from_secs(100),
-    );
-
-    let serialized = serde_json::to_string(&segment).expect("Failed to serialize");
-    assert!(serialized.contains(server_uuid.to_string().as_str()));
-
-    let deserialized: WalSegment =
-        serde_json::from_str(&serialized).expect("Failed to deserialize");
-    assert_eq!(segment.segment_id, deserialized.segment_id);
-    assert_eq!(segment.server_uuid, deserialized.server_uuid);
-}
-
-#[test]
-fn test_pitr_manifest_serialization_deserialization() {
-    let server_uuid = Uuid::new_v4();
-    let mut manifest = create_test_manifest(server_uuid);
-    manifest.add_segment(create_test_segment(
-        server_uuid,
-        Duration::from_secs(0),
-        Duration::from_secs(100),
-    ));
-
-    let serialized = serde_json::to_string(&manifest).expect("Failed to serialize");
-    assert!(serialized.contains("backup-001"));
-
-    let deserialized: PitrManifest =
-        serde_json::from_str(&serialized).expect("Failed to deserialize");
-    assert_eq!(manifest.server_uuid, deserialized.server_uuid);
-    assert_eq!(manifest.segments.len(), deserialized.segments.len());
-}
-
-#[test]
-fn test_pitr_recovery_target_serialization() {
-    let target_time = RecoveryTarget::to_time("2024-01-15T10:30:00Z").unwrap();
-    let serialized = serde_json::to_string(&target_time).expect("Failed to serialize");
-    assert!(serialized.contains("2024-01-15T10:30:00Z"));
-
-    let target_transaction = RecoveryTarget::to_transaction("test-cid").unwrap();
-    let serialized = serde_json::to_string(&target_transaction).expect("Failed to serialize");
-    assert!(serialized.contains("test-cid"));
-
-    let target_latest = RecoveryTarget::latest();
-    let serialized = serde_json::to_string(&target_latest).expect("Failed to serialize");
-    assert!(serialized.contains("Latest"));
-}
-
-#[test]
-fn test_pitr_recovery_window_calculation() {
-    let server_uuid = Uuid::new_v4();
-    let mut manifest = create_test_manifest(server_uuid);
-
-    let base_time = "2024-01-01T00:00:00Z";
-    assert_eq!(manifest.earliest_recoverable_time, base_time);
-    assert_eq!(manifest.latest_recoverable_time, base_time);
-
-    let segment1 = create_test_segment(
-        server_uuid,
-        Duration::from_secs(0),
-        Duration::from_secs(100),
-    );
-    manifest.add_segment(segment1.clone());
-
-    assert_eq!(manifest.earliest_recoverable_time, segment1.created_at);
-    assert_eq!(manifest.latest_recoverable_time, segment1.created_at);
-
-    let segment2 = create_test_segment(
-        server_uuid,
-        Duration::from_secs(100),
-        Duration::from_secs(200),
-    );
-    manifest.add_segment(segment2.clone());
-
-    assert_eq!(manifest.earliest_recoverable_time, segment1.created_at);
-    assert_eq!(manifest.latest_recoverable_time, segment2.created_at);
-}
-
-#[test]
-fn test_pitr_segment_ordering() {
-    let server_uuid = Uuid::new_v4();
-    let mut manifest = create_test_manifest(server_uuid);
-
-    let segments: Vec<(Duration, Duration)> = vec![
-        (Duration::from_secs(300), Duration::from_secs(400)),
-        (Duration::from_secs(0), Duration::from_secs(100)),
-        (Duration::from_secs(100), Duration::from_secs(200)),
-    ];
-
-    for (start, end) in segments {
-        manifest.add_segment(create_test_segment(server_uuid, start, end));
-    }
-
-    assert_eq!(manifest.segments.len(), 3);
-}
-
-#[test]
-fn test_pitr_checksum_verification() {
-    let server_uuid = Uuid::new_v4();
-    let segment = create_test_segment(
-        server_uuid,
-        Duration::from_secs(0),
-        Duration::from_secs(100),
-    );
-
-    assert!(!segment.checksum_sha256.is_empty());
-}
-
-#[test]
-fn test_pitr_compression_types() {
-    let server_uuid = Uuid::new_v4();
-
-    let uncompressed = WalSegment::new(
-        "test".to_string(),
-        server_uuid,
-        Duration::from_secs(0),
-        Duration::from_secs(100),
-        "checksum".to_string(),
-        100,
-        BackupCompression::NoCompression,
-    );
-    assert_eq!(uncompressed.compression, BackupCompression::NoCompression);
-
-    let compressed = WalSegment::new(
-        "test".to_string(),
-        server_uuid,
-        Duration::from_secs(0),
-        Duration::from_secs(100),
-        "checksum".to_string(),
-        100,
-        BackupCompression::Gzip,
-    );
-    assert_eq!(compressed.compression, BackupCompression::Gzip);
-}
-
-#[test]
-fn test_pitr_empty_manifest_recovery() {
-    let server_uuid = Uuid::new_v4();
-    let manifest = create_test_manifest(server_uuid);
-
-    assert!(manifest.segments.is_empty());
-    assert_eq!(
-        manifest.earliest_recoverable_time,
-        manifest.latest_recoverable_time
-    );
-}
-
-#[test]
-fn test_pitr_manifest_multiple_servers() {
-    let server1 = Uuid::new_v4();
-    let server2 = Uuid::new_v4();
-
-    let mut manifest = create_test_manifest(server1);
-    manifest.add_segment(create_test_segment(
-        server1,
-        Duration::from_secs(0),
-        Duration::from_secs(100),
-    ));
-    manifest.add_segment(create_test_segment(
-        server2,
-        Duration::from_secs(100),
-        Duration::from_secs(200),
-    ));
-
-    assert_eq!(manifest.segments.len(), 2);
-    assert_ne!(
-        manifest.segments[0].server_uuid,
-        manifest.segments[1].server_uuid
-    );
-}
-
-#[test]
-fn test_pitr_wal_entry_ordering() {
-    let server_uuid = Uuid::new_v4();
-    let entries: Vec<WalEntry> = vec![
-        create_test_wal_entry(server_uuid, Duration::from_secs(3000), 3),
-        create_test_wal_entry(server_uuid, Duration::from_secs(1000), 1),
-        create_test_wal_entry(server_uuid, Duration::from_secs(2000), 2),
-    ];
-
-    let timestamps: Vec<Duration> = entries.iter().map(|e| e.cid_ts).collect();
-    assert_eq!(timestamps[0], Duration::from_secs(3000));
-    assert_eq!(timestamps[1], Duration::from_secs(1000));
-    assert_eq!(timestamps[2], Duration::from_secs(2000));
-}
-
-#[test]
-fn test_pitr_segment_size_tracking() {
-    let server_uuid = Uuid::new_v4();
-    let segment = WalSegment::new(
-        "test".to_string(),
-        server_uuid,
-        Duration::from_secs(0),
-        Duration::from_secs(100),
-        "checksum".to_string(),
-        1024 * 1024,
-        BackupCompression::Gzip,
-    );
-
-    assert_eq!(segment.size_bytes, 1024 * 1024);
-}
-
-#[test]
-fn test_pitr_timestamp_precision() {
-    let server_uuid = Uuid::new_v4();
-    let entry = WalEntry {
-        cid_ts: Duration::from_nanos(1234567890),
-        cid_server: server_uuid,
-        entry_id: 1,
-        operation: WalOperation::Create { entry_data: vec![] },
-    };
-
-    assert_eq!(entry.cid_ts.as_nanos(), 1234567890);
-}
-
-#[test]
-fn test_pitr_recovery_target_display() {
-    let time_target = RecoveryTarget::to_time("2024-01-15T10:30:00Z").unwrap();
-    assert!(time_target.to_string().starts_with("time:"));
-
-    let transaction_target = RecoveryTarget::to_transaction("cid-123").unwrap();
-    assert!(transaction_target.to_string().starts_with("transaction:"));
-
-    let latest_target = RecoveryTarget::latest();
-    assert_eq!(latest_target.to_string(), "latest");
-}
-
-#[test]
-fn test_pitr_wal_config_custom_settings() {
-    let config = WalArchiveConfig {
+/// The configuration of a server whose WAL is archived. Segments are written to `wal_dir`
+/// and local base backups to `backup_dir`; with `s3`, base backups and the archive are in
+/// S3 instead.
+fn pitr_config(
+    db_path: &Path,
+    backup_dir: &Path,
+    wal_dir: &Path,
+    s3: Option<S3Config>,
+) -> Configuration {
+    let mut config = config_with_db(db_path);
+    config.online_backup = Some(OnlineBackup {
+        path: Some(backup_dir.to_path_buf()),
         enabled: true,
-        s3: None,
-        retention_days: 30,
-        segment_size_bytes: 32 * 1024 * 1024,
+        s3,
+        wal_archive: Some(WalArchiveConfig {
+            enabled: true,
+            // The tests archive on demand; the periodic task must not interfere.
+            segment_interval_seconds: 3600,
+            local_path: Some(wal_dir.to_path_buf()),
+            ..WalArchiveConfig::default()
+        }),
+        ..OnlineBackup::default()
+    });
+    config
+}
+
+fn now_rfc3339() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("The clock is before the epoch");
+    format_ts_rfc3339(now)
+}
+
+async fn person_exists(rsclient: &KubidmClient, name: &str) -> bool {
+    rsclient
+        .idm_person_account_get(name)
+        .await
+        .expect("Failed to get person")
+        .is_some()
+}
+
+async fn group_exists(rsclient: &KubidmClient, name: &str) -> bool {
+    rsclient
+        .idm_group_get(name)
+        .await
+        .expect("Failed to get group")
+        .is_some()
+}
+
+async fn archive_now(env: &AsyncTestEnvironment) {
+    env.core_handle
+        .sync_wal_archive()
+        .await
+        .expect("WAL archiving must be enabled")
+        .expect("WAL archive synchronisation failed");
+}
+
+/// Write the history the tests recover from on a populated server that archives its WAL
+/// and has just taken a base backup: a person (archived in its own segment), then the
+/// returned target time, then a second person and the deletion of a group. The server is
+/// shut down, which archives the open segment.
+async fn write_history(mut env: AsyncTestEnvironment) -> String {
+    env.rsclient
+        .idm_person_account_create(PITR_USER_BEFORE, "Before")
+        .await
+        .expect("Failed to create the person before the target");
+    archive_now(&env).await;
+
+    // CIDs are taken from the same clock; keep the target clearly between the writes.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let target = now_rfc3339();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    env.rsclient
+        .idm_person_account_create(PITR_USER_AFTER, "After")
+        .await
+        .expect("Failed to create the person after the target");
+    env.rsclient
+        .idm_group_delete(BACKUP_ENGINEERS_GROUP)
+        .await
+        .expect("Failed to delete the engineers group");
+
+    // A clean shutdown closes and archives the open segment.
+    env.core_handle.shutdown().await;
+    target
+}
+
+/// Boot `config`'s database as a server and check it holds the state as of the target:
+/// everything from before it, nothing from after it.
+async fn assert_state_at_target(config: Configuration) -> AsyncTestEnvironment {
+    let env = setup_async_test(config).await;
+    login_put_admin_idm_admins(&env.rsclient).await;
+    assert_directory_state_restored(&env.rsclient).await;
+    assert!(
+        person_exists(&env.rsclient, PITR_USER_BEFORE).await,
+        "A write before the target must be recovered"
+    );
+    assert!(
+        !person_exists(&env.rsclient, PITR_USER_AFTER).await,
+        "A write after the target must not be recovered"
+    );
+    assert!(
+        group_exists(&env.rsclient, BACKUP_ENGINEERS_GROUP).await,
+        "A deletion after the target must not be recovered"
+    );
+    env
+}
+
+#[test]
+fn test_pitr_local_recover_to_time_and_latest() {
+    run(async {
+        let workdir = tempfile::tempdir().expect("Failed to create workdir");
+        let backup_dir = workdir.path().join("backups");
+        let wal_dir = workdir.path().join("wal");
+        std::fs::create_dir(&backup_dir).expect("Failed to create backup directory");
+        let source_config = pitr_config(
+            &workdir.path().join("source.db"),
+            &backup_dir,
+            &wal_dir,
+            None,
+        );
+
+        let env = setup_async_test(source_config.clone()).await;
+        populate(&env).await;
+        env.core_handle
+            .trigger_online_backup(&backup_dir, 7, BackupCompression::Gzip)
+            .await
+            .expect("Online backup failed");
+        let target = write_history(env).await;
+
+        // The local archive: segments and the manifest stay in the WAL directory.
+        assert!(wal_dir.join(PITR_MANIFEST_KEY).is_file());
+        let segments = list_segments(&wal_dir).expect("Failed to list the WAL segments");
+        assert!(
+            segments.len() >= 2,
+            "Expected at least two archived segments, found {segments:?}"
+        );
+        assert!(pitr_list_server_core(&source_config).await);
+
+        // A target before the base backup is refused and touches nothing.
+        let early_db = workdir.path().join("early.db");
+        let early = pitr_recover_server_core(
+            &pitr_config(&early_db, &backup_dir, &wal_dir, None),
+            &RecoveryTargetSpec::Time("2000-01-01T00:00:00Z".to_string()),
+            false,
+        )
+        .await;
+        assert!(
+            matches!(early, Err(PitrError::NotRecoverable(_))),
+            "{early:?}"
+        );
+        assert!(!early_db.exists());
+
+        // The dry run reports the plan and creates nothing.
+        let recovered_db = workdir.path().join("recovered.db");
+        let recovered_config = pitr_config(&recovered_db, &backup_dir, &wal_dir, None);
+        let dry = pitr_recover_server_core(
+            &recovered_config,
+            &RecoveryTargetSpec::Time(target.clone()),
+            true,
+        )
+        .await
+        .expect("Dry run failed");
+        assert!(dry.dry_run);
+        assert!(
+            dry.records > 0,
+            "The person before the target must be replayed"
+        );
+        assert!(
+            !recovered_db.exists(),
+            "A dry run must not create the database"
+        );
+
+        // Recover to the target time.
+        let outcome =
+            pitr_recover_server_core(&recovered_config, &RecoveryTargetSpec::Time(target), false)
+                .await
+                .expect("Recovery to the target time failed");
+        assert_eq!(outcome.records, dry.records);
+        let apply = outcome.apply.expect("Records must have been applied");
+        assert!(apply.created >= 1);
+
+        // The recovered server sees the state as of the target. It archives into the same
+        // archive (the recovered database keeps the server identity) and starts new history.
+        let mut env = assert_state_at_target(recovered_config.clone()).await;
+        env.rsclient
+            .idm_person_account_create(PITR_USER_NEW_HISTORY, "New history")
+            .await
+            .expect("Failed to create the person on the recovered server");
+        env.core_handle.shutdown().await;
+
+        // Latest: the recovered point plus the new history. What the recovery abandoned
+        // (the person and the deletion after the target) never comes back.
+        let latest_db = workdir.path().join("latest.db");
+        let latest_config = pitr_config(&latest_db, &backup_dir, &wal_dir, None);
+        pitr_recover_server_core(&latest_config, &RecoveryTargetSpec::Latest, false)
+            .await
+            .expect("Recovery to the latest point failed");
+        let mut env = assert_state_at_target(latest_config).await;
+        assert!(
+            person_exists(&env.rsclient, PITR_USER_NEW_HISTORY).await,
+            "The history written after the recovery must be recovered"
+        );
+        env.core_handle.shutdown().await;
+    });
+}
+
+/// Created after the last archived segment, right before an unclean stop.
+const PITR_USER_LOST: &str = "pitr_user_lost";
+
+#[test]
+fn test_pitr_unclean_stop_leaves_a_gap_recovery_does_not_cross() {
+    let workdir = tempfile::tempdir().expect("Failed to create workdir");
+    let backup_dir = workdir.path().join("backups");
+    let wal_dir = workdir.path().join("wal");
+    std::fs::create_dir(&backup_dir).expect("Failed to create backup directory");
+    let config = pitr_config(
+        &workdir.path().join("source.db"),
+        &backup_dir,
+        &wal_dir,
+        None,
+    );
+
+    // A server takes a base backup, archives one write and then stops without shutting
+    // down, with a second write only in its open segment.
+    run(async {
+        let env = setup_async_test(config.clone()).await;
+        populate(&env).await;
+        env.core_handle
+            .trigger_online_backup(&backup_dir, 7, BackupCompression::Gzip)
+            .await
+            .expect("Online backup failed");
+        env.rsclient
+            .idm_person_account_create(PITR_USER_BEFORE, "Before")
+            .await
+            .expect("Failed to create the archived person");
+        archive_now(&env).await;
+        env.rsclient
+            .idm_person_account_create(PITR_USER_LOST, "Lost")
+            .await
+            .expect("Failed to create the unarchived person");
+        // No shutdown: the runtime goes away under the server, as in a crash.
+        std::mem::forget(env);
+    });
+
+    // The restarted server notices the unclosed segment and records the gap.
+    run(async {
+        let mut env = setup_async_test(config.clone()).await;
+        login_put_admin_idm_admins(&env.rsclient).await;
+        assert!(person_exists(&env.rsclient, PITR_USER_LOST).await);
+        env.rsclient
+            .idm_person_account_create(PITR_USER_AFTER, "After")
+            .await
+            .expect("Failed to create the person after the restart");
+        env.core_handle.shutdown().await;
+
+        // The gap is in the manifest, and a target past it is refused without touching
+        // the database: replaying across it would silently miss the lost write.
+        let manifest: kubidm_proto::backup::PitrManifest = serde_json::from_slice(
+            &std::fs::read(wal_dir.join(PITR_MANIFEST_KEY)).expect("Failed to read the manifest"),
+        )
+        .expect("Failed to parse the manifest");
+        assert_eq!(manifest.gaps.len(), 1, "{:?}", manifest.gaps);
+        let refused_db = workdir.path().join("refused.db");
+        let refused = pitr_recover_server_core(
+            &pitr_config(&refused_db, &backup_dir, &wal_dir, None),
+            &RecoveryTargetSpec::Time(now_rfc3339()),
+            false,
+        )
+        .await;
+        assert!(
+            matches!(&refused, Err(PitrError::NotRecoverable(msg)) if msg.contains("missing")),
+            "{refused:?}"
+        );
+        assert!(!refused_db.exists());
+
+        // The latest recoverable point stops before the gap.
+        let latest_db = workdir.path().join("latest.db");
+        let latest_config = pitr_config(&latest_db, &backup_dir, &wal_dir, None);
+        pitr_recover_server_core(&latest_config, &RecoveryTargetSpec::Latest, false)
+            .await
+            .expect("Recovery to the latest point before the gap failed");
+        let mut env = setup_async_test(latest_config).await;
+        login_put_admin_idm_admins(&env.rsclient).await;
+        assert!(person_exists(&env.rsclient, PITR_USER_BEFORE).await);
+        assert!(!person_exists(&env.rsclient, PITR_USER_LOST).await);
+        assert!(!person_exists(&env.rsclient, PITR_USER_AFTER).await);
+        env.core_handle.shutdown().await;
+    });
+}
+
+// === S3 ===
+
+const ENDPOINT_ENV: &str = "KUBIDM_TEST_S3_ENDPOINT";
+const BUCKET_ENV: &str = "KUBIDM_TEST_S3_BUCKET";
+const ACCESS_KEY_ENV: &str = "KUBIDM_TEST_S3_ACCESS_KEY";
+const SECRET_KEY_ENV: &str = "KUBIDM_TEST_S3_SECRET_KEY";
+const REGION: &str = "us-east-1";
+
+/// The S3 configuration for this test run, or None (after printing why) when no endpoint
+/// is configured. Every run uses its own prefix.
+fn test_s3_config() -> Option<S3Config> {
+    let Ok(endpoint) = std::env::var(ENDPOINT_ENV) else {
+        eprintln!("skipping: {ENDPOINT_ENV} not set");
+        return None;
+    };
+    let env_or =
+        |name: &str, default: &str| std::env::var(name).unwrap_or_else(|_| default.to_string());
+    Some(S3Config {
+        bucket: env_or(BUCKET_ENV, "kubidm-test"),
+        region: Some(REGION.to_string()),
+        endpoint: Some(endpoint),
+        path_prefix: Some(format!("pitr-test/{}", Uuid::new_v4())),
+        credentials: Some(S3Credentials {
+            access_key_id: env_or(ACCESS_KEY_ENV, "kubidm-test"),
+            secret_access_key: env_or(SECRET_KEY_ENV, "kubidm-test-secret"),
+            session_token: None,
+        }),
+        server_side_encryption: None,
+        storage_class: "STANDARD".to_string(),
+        replication: None,
+    })
+}
+
+async fn sdk_client(s3_config: &S3Config) -> SdkClient {
+    let credentials = s3_config
+        .credentials
+        .as_ref()
+        .expect("Test S3 config has no credentials");
+    let sdk_config = aws_config::defaults(BehaviorVersion::latest())
+        .endpoint_url(
+            s3_config
+                .endpoint
+                .clone()
+                .expect("Test S3 config has no endpoint"),
+        )
+        .region(Region::new(REGION))
+        .credentials_provider(Credentials::new(
+            credentials.access_key_id.clone(),
+            credentials.secret_access_key.clone(),
+            None,
+            None,
+            "kubidm-test",
+        ))
+        .load()
+        .await;
+    SdkClient::from_conf(
+        aws_sdk_s3::config::Builder::from(&sdk_config)
+            .force_path_style(true)
+            .build(),
+    )
+}
+
+/// Every object key below the prefix of `s3_config`, with the prefix stripped, sorted.
+async fn object_keys(sdk: &SdkClient, s3_config: &S3Config) -> Vec<String> {
+    if sdk
+        .head_bucket()
+        .bucket(&s3_config.bucket)
+        .send()
+        .await
+        .is_err()
+    {
+        sdk.create_bucket()
+            .bucket(&s3_config.bucket)
+            .send()
+            .await
+            .expect("Failed to create the test bucket");
+    }
+    let prefix = format!(
+        "{}/",
+        s3_config
+            .path_prefix
+            .as_deref()
+            .expect("Test S3 config has no prefix")
+    );
+    let output = sdk
+        .list_objects_v2()
+        .bucket(&s3_config.bucket)
+        .prefix(&prefix)
+        .send()
+        .await
+        .expect("Failed to list objects");
+    let mut keys: Vec<String> = output
+        .contents()
+        .iter()
+        .filter_map(|object| object.key())
+        .filter_map(|key| key.strip_prefix(&prefix))
+        .map(str::to_string)
+        .collect();
+    keys.sort();
+    keys
+}
+
+#[test]
+fn test_pitr_s3_recover_on_a_new_host() {
+    let Some(s3_config) = test_s3_config() else {
+        return;
     };
 
-    assert!(config.enabled);
-    assert_eq!(config.retention_days, 30);
-    assert_eq!(config.segment_size_bytes, 32 * 1024 * 1024);
+    run(async {
+        let sdk = sdk_client(&s3_config).await;
+        // Creates the bucket when needed; the prefix is fresh.
+        assert!(object_keys(&sdk, &s3_config).await.is_empty());
+
+        let source_host = tempfile::tempdir().expect("Failed to create workdir");
+        let source_wal: PathBuf = source_host.path().join("wal");
+        let source_config = pitr_config(
+            &source_host.path().join("source.db"),
+            &source_host.path().join("backups"),
+            &source_wal,
+            Some(s3_config.clone()),
+        );
+
+        let env = setup_async_test(source_config).await;
+        populate(&env).await;
+        env.core_handle
+            .trigger_s3_backup(s3_config.clone(), 7, BackupCompression::Gzip)
+            .await
+            .expect("S3 backup failed");
+        let target = write_history(env).await;
+
+        // Everything was shipped: the local WAL directory holds no segment any more, and
+        // the prefix holds the base backup, the segments and the manifest, each with its
+        // metadata sidecar. Backup retention left the archive alone.
+        assert!(
+            list_segments(&source_wal)
+                .expect("Failed to list the local WAL directory")
+                .is_empty(),
+            "Uploaded segments must be removed locally"
+        );
+        let keys = object_keys(&sdk, &s3_config).await;
+        assert!(keys.iter().any(|key| key == PITR_MANIFEST_KEY), "{keys:?}");
+        assert_eq!(
+            keys.iter()
+                .filter(|key| key.starts_with("backup-") && key.ends_with(".json.gz"))
+                .count(),
+            1,
+            "{keys:?}"
+        );
+        let segment_count = keys
+            .iter()
+            .filter(|key| key.starts_with("wal/wal-") && key.ends_with(".json.gz"))
+            .count();
+        assert!(segment_count >= 2, "{keys:?}");
+        assert!(keys
+            .iter()
+            .filter(|key| !key.ends_with(".metadata.json"))
+            .all(|key| keys.contains(&format!("{key}.metadata.json"))));
+
+        // A new host: an empty WAL directory and no local backups. Everything comes from
+        // S3.
+        let new_host = tempfile::tempdir().expect("Failed to create workdir");
+        let recovered_config = pitr_config(
+            &new_host.path().join("recovered.db"),
+            &new_host.path().join("backups"),
+            &new_host.path().join("wal"),
+            Some(s3_config.clone()),
+        );
+        assert!(pitr_list_server_core(&recovered_config).await);
+        let outcome =
+            pitr_recover_server_core(&recovered_config, &RecoveryTargetSpec::Time(target), false)
+                .await
+                .expect("Recovery from S3 to the target time failed");
+        assert!(outcome.records > 0);
+
+        let mut env = assert_state_at_target(recovered_config.clone()).await;
+        env.core_handle.shutdown().await;
+
+        // Latest from S3: the abandoned history after the target stays abandoned.
+        let latest_config = pitr_config(
+            &new_host.path().join("latest.db"),
+            &new_host.path().join("backups"),
+            &new_host.path().join("wal"),
+            Some(s3_config.clone()),
+        );
+        pitr_recover_server_core(&latest_config, &RecoveryTargetSpec::Latest, false)
+            .await
+            .expect("Recovery from S3 to the latest point failed");
+        let mut env = assert_state_at_target(latest_config).await;
+        env.core_handle.shutdown().await;
+    });
 }
