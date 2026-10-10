@@ -1217,26 +1217,31 @@ pub struct WalArchiveConfig {
     /// an unclean stop of the server.
     #[serde(default)]
     pub open_segment_journal: WalJournalMode,
-    /// With `open_segment_journal = "Interval"`, the longest time in milliseconds, measured
-    /// on the transaction clock, a commit may wait for its journal to be synced to disk.
+    /// With `open_segment_journal = "Interval"`, how often in milliseconds the server syncs
+    /// the journal to disk when commits wrote to it since the last sync: the longest a
+    /// commit waits for its journal to reach the disk, give or take the scheduling of the
+    /// timer that syncs it.
     #[serde(default = "default_wal_journal_sync_interval_ms")]
     pub journal_sync_interval_ms: u64,
 }
 
 /// How the records of the open WAL segment survive an unclean stop (a crash, a kill, a
 /// power loss). Every mode but `Off` appends the records of every commit to a journal file
-/// next to the segment in the WAL directory; the next start closes the segment from it.
+/// next to the segment in the WAL directory; the next start, or `recover`, closes the
+/// segment from it. Whatever the journal misses is recorded as a gap, never lost silently.
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub enum WalJournalMode {
-    /// The journal is synced to disk by every commit that archives records, before the
-    /// commit returns: nothing committed is lost, whatever stops the server. This costs
-    /// one more disk sync per write transaction.
+    /// The journal is synced to disk by every write commit, before the commit returns, so
+    /// whatever stops the server the journal holds every commit the database holds. This
+    /// costs one more disk sync per write transaction; since write transactions are
+    /// serialised, and every authentication writes its session, it bounds write throughput
+    /// and adds to login latency on slow storage.
     #[default]
     Commit,
-    /// The journal is written by every commit and synced at most every
-    /// `journal_sync_interval_ms`: a crash or kill of the server loses nothing, while a
-    /// power loss or an operating system crash can lose the commits of that interval,
-    /// which are then recorded as a gap.
+    /// The journal is written by every commit and synced every `journal_sync_interval_ms`
+    /// when it changed: a crash or kill of the server loses nothing, while a power loss or
+    /// an operating system crash can lose the commits of that interval, which are then
+    /// recorded as a gap.
     Interval,
     /// No journal: the open segment lives in memory only, and an unclean stop loses it,
     /// which is recorded as a gap.

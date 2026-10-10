@@ -244,6 +244,7 @@ does not open the database, so it can run while the server is running:
 ```bash
 kubidmd database replicate-status -c /data/server.toml
 kubidmd database replicate-status -c /data/server.toml --detailed
+kubidmd database replicate-status -c /data/server.toml --deep
 ```
 
 The output shows the overall status, the primary location, the time of the check and one line per region with its
@@ -257,10 +258,18 @@ follows for it: the primary archive with the time its `pitr-manifest.json` was l
 it names, and one line per region with the state of the region's manifest (`current` when it records every segment, gap
 and abandoned history of the primary's, `behind`, `damaged` when it can not be read or does not match its checksum,
 `missing`, or `unreachable`), the segments it holds intact, those it misses (object or `.metadata.json`) and those whose
-copy differs from the primary's (size, or checksum and size in the sidecar, as for backups), and the lag of its
-manifest: how much older the newest segment it names is than the primary's newest. `--detailed` names every missing or
-differing segment. The command exits non-zero when neither backups nor the WAL archive are replicated, when a primary
-location can not be read, or when any region of either is not healthy, which makes it suitable for monitoring.
+copy differs from the primary's, and the lag of its manifest: how much older the newest segment it names is than the
+primary's newest. By default the listings are compared, a few requests per region, which catches a copy whose object or
+`.metadata.json` is missing or whose size differs; `--deep` also compares the sidecars of every segment (checksum and
+size, as for backups), two reads per segment and region, which catches a copy replaced by one of the same size. A region
+copy is still healthy when it only lacks what the primary archived within the replication's `sync_interval_seconds` plus
+two `segment_interval_seconds`, since the next archive run is due to copy it: its manifest is then `pending`, and
+`--detailed` lists such segments as not copied yet. A segment the primary itself lacks is reported on its own, as a
+problem of the primary that no region can be given, never as a damaged region copy. Before the first archive run there
+is no manifest yet, which is reported as not yet archived and is healthy. `--detailed` names every missing or differing
+segment. The command exits non-zero when neither backups nor the WAL archive are replicated, when a primary location can
+not be read or misses segments its manifest names, or when any region of either is not healthy, which makes it suitable
+for monitoring.
 
 #### Recovering from a Region
 
@@ -542,41 +551,53 @@ backup still present, so the archive always reaches back to the oldest base back
 Records live in memory until their segment is closed, and every commit also appends them to the journal of the open
 segment, `<segment>.journal` in the WAL directory. If the server stops without shutting down (a crash, a kill, a power
 loss), the next start closes the open segment, and any closed segment that was not written yet, from its journal, so the
-archive loses nothing. `open_segment_journal` sets how durable the journal is:
+archive loses nothing. The journal is the record of what was committed and not archived yet: a journal is only removed
+once a written segment holds its records. `open_segment_journal` sets how durable the journal is:
 
-- `Commit` (the default) syncs the journal to disk in every commit that archives changes, before the commit returns.
-  Nothing committed is lost, whatever stops the server. It costs one more disk sync per write transaction, on top of the
-  sync of the database itself (a few milliseconds on most disks; write transactions of an identity server are rare
-  compared with its reads).
-- `Interval` writes the journal in every commit but syncs it at most every `journal_sync_interval_ms` (measured on the
-  transaction clock): a crash or kill of the server still loses nothing, since the operating system holds what was
-  written, while a power loss or an operating system crash can lose the commits of that interval.
+- `Commit` (the default) syncs the journal to disk in every write commit, before the commit returns, so the journal
+  holds every commit the database holds, whatever stops the server. It costs one more disk sync per write transaction,
+  on top of the sync of the database itself. Write transactions are serialised and every authentication writes its
+  session, so on slow storage (a network volume at 5-20 ms per sync) this bounds the write throughput and adds to the
+  latency of every login.
+- `Interval` writes the journal in every commit and syncs it every `journal_sync_interval_ms` when it changed: a crash
+  or kill of the server still loses nothing, since the operating system holds what was written, while a power loss or an
+  operating system crash can lose the commits of that interval.
 - `Off` keeps the open segment in memory only, as before the journal existed: an unclean stop loses it.
 
-Whatever the journal misses is detected: the database records its last committed transaction, and the journal of the
-open segment records every commit, including those that archived no change. The next start compares them, logs
-`WAL ARCHIVE HOLE` and records a **gap** in the manifest from the first transaction the journal misses (the first record
-of the open segment with `Off`) up to the last transaction the database committed. A journal that can not be written
-stops journaling for the rest of the run, with an error. A committed transaction whose changes could not be recorded is
-logged and recorded as a gap the same way, while a closed segment that could not be written (for example on a full disk)
-is kept in memory and retried at least every `segment_interval_seconds`; once more than four such segments wait, the
-write is tried at once, and when it fails again the oldest are dropped and recorded as gaps. A local segment that is
-found damaged is moved aside as `<segment>.corrupt` and its range recorded as a gap. Gaps are kept in the WAL directory
-until the manifest records them, so repeated crashes never lose one. Replaying across a gap would silently skip changes,
-so `recover` refuses any target whose replay would cross one, and `--latest` stops right before it. A base backup taken
-after the gap makes later points recoverable again; take one after any `WAL ARCHIVE HOLE`. With S3, segments that were
-closed but not yet uploaded are lost with the host, which only shortens the recoverable window. After an unclean stop,
-start the server once before running `recover` on the same host: until a start closed the open segment from its journal,
-`recover` treats it as a gap.
+Whatever the journal misses is detected: the database records its last committed transaction, the archive marks a
+transaction as in flight before the database commits it, and the journal of the open segment records every commit,
+including those that archived no change. The next start compares them, logs `WAL ARCHIVE HOLE` and records a **gap** in
+the manifest from the first transaction the journal misses (the first record of the open segment with `Off`) up to the
+last transaction the database committed. A journal that can not be written stops journaling for the rest of the run,
+with an error. A committed transaction whose changes could not be recorded is logged and recorded as a gap the same way,
+while a closed segment that could not be written (for example on a full disk) is kept in memory and retried at least
+every `segment_interval_seconds`; once more than four such segments wait, the write is tried at once, and when it fails
+again the oldest are dropped and recorded as gaps. A local segment that is found damaged is moved aside as
+`<segment>.corrupt` and its range recorded as a gap. Gaps are kept in the WAL directory until the manifest records them,
+so repeated crashes never lose one. Replaying across a gap would silently skip changes, so `recover` refuses any target
+whose replay would cross one, and `--latest` stops right before it. A base backup taken after the gap makes later points
+recoverable again; take one after any `WAL ARCHIVE HOLE`. With S3, segments that were closed but not yet uploaded are
+lost with the host, which only shortens the recoverable window.
+
+`recover` does not need the stopped server to start first, which a damaged database may not allow: it closes the open
+segment from its journal itself, as the next start would, and replays it. Without the database it can not tell whether
+the server committed anything after the last commit the journal holds, so `--latest` stops there; the next start of a
+server on that WAL directory settles this against its database. `recover --dry-run` and `pitr-list` read the journal
+without changing anything, so they may run next to the server.
 
 The offline `kubidmd domain rename` and `kubidmd database reindex` commands archive their writes like the running server
 does; the next server start uploads them. The `kubidmd db-scan quarantine-id2entry` and `restore-quarantined` repair
 commands move an entry in or out of the database without a transaction the archive could record, so each records a
-**gap** before it changes anything: from just after the last transaction the database committed up to the time of the
-command, with a reason naming the command. It goes into the manifest, or, when the archive has no manifest yet or can
-not be reached, into the WAL directory, from where the server records it at its next start and `recover` honours it
-meanwhile; when neither works the command refuses to change the database. Recovery then stops right before the repair,
-and an online backup taken after it makes later points recoverable again: take one after using these commands.
+**gap**: from just after the last transaction the database committed up to the time of the command, with a reason naming
+`db-scan`. The command first makes the change in its write transaction, so that a wrong id or an entry that is not
+quarantined fails before anything is recorded; then it hands the gap over through the WAL directory (a file in
+`.handed-over-gaps/`) and commits. A commit that fails takes the gap back. A server owns the manifest, and the command
+may run next to it, so the command never writes the manifest itself: the server records the gap at its next start or
+archive run, and `recover` and `pitr-list` honour it from the WAL directory meanwhile. When the gap can not be handed
+over, the command refuses to change the database and exits non-zero, as it does when the change fails. Recovery then
+stops right before the repair, and an online backup taken after it makes later points recoverable again: take one after
+using these commands. Start the server after a repair before recovering on another host, which only sees the gaps the
+manifest records.
 
 #### Manual Backups as Recovery Bases
 
@@ -701,8 +722,9 @@ Argon2id is deliberately slow, and segments are small and many, so one derivatio
 archive slow. The segments a server archives are therefore sealed in an encryption session: they share one random salt,
 and so one derived key, from the server start (or the last change of the key) for up to 2^20 segments, while every
 segment keeps a random nonce of its own and its id in the authenticated header. A recovery derives the key once per
-session and keeps the derived keys in memory, wiped when the command ends. Sharing the key does not make segments
-interchangeable: a segment stored under the id of another one is still refused. Backups keep a fresh salt each.
+session and keeps the derived keys in memory, wiped when the command ends. The server likewise keeps the key of its
+session in memory while it runs, wiped when it stops or the configured key changes. Sharing the key does not make
+segments interchangeable: a segment stored under the id of another one is still refused. Backups keep a fresh salt each.
 
 `recover` decrypts with the `[online_backup.encryption]` section of the configuration it is given, exactly like
 `restore`; the key is only obtained when an encrypted segment or base backup is actually read. It fails, and changes
@@ -724,7 +746,9 @@ every archive run mirrors the archive to every region of that section, after its
    primary's checksum; bytes and sidecar unchanged, so encrypted segments stay encrypted and a region never needs the
    key). Every run compares the listings: a copy whose object or `.metadata.json` is missing, or whose size differs from
    the primary's, is copied again. Once per `sync_interval_seconds` of the replication section the sidecars are compared
-   as well, which catches a copy replaced by one of the same size;
+   as well, 16 at a time and after the run released the manifest, so that neither archiving nor the indexing of a base
+   backup waits on it, which catches a copy replaced by one of the same size. A copy that fails is retried by the next
+   run and does not keep the region's manifest from being written; a segment the primary lacks is never copied;
 2. the region's `pitr-manifest.json` is written: the primary's manifest, plus whatever only the region still records (so
    that a region keeps the history a primary that lost its archive no longer has). A region manifest that can not be
    read, or does not match its checksum, is written again from the primary's;

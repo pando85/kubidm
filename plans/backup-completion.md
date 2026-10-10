@@ -102,13 +102,29 @@ Recovery restores the newest base backup at or before the target, then applies l
       the journal with the database's last transaction and records only what the journal misses as a gap. Measured cost:
       one `fdatasync` per write transaction (about 3 ms on the development disk, the same as the database's own commit
       sync)
+- [x] Review of the journal: a journal without the open segment marker (a crash between the journal and the marker) is
+      closed, not removed; the marker covers a transaction from before the database commits it, so a crash between the
+      commit and its archiving is a gap; `Commit` syncs the frames of commits without records too, so a power loss
+      leaves no false gap; `Interval` is synced by a timer of the archive task; `recover` closes (or, dry, reads) the
+      journals itself, so a server that can not start loses nothing; journal records keep the commit order
+- [x] Review of `db-scan` and replication: a failed or refused repair exits non-zero and leaves no gap (the change is
+      made before the gap is handed over, and a failed commit takes it back); the gap is handed over through
+      `.handed-over-gaps/` instead of a read, modify and write of the manifest a running server owns; the sidecar
+      comparison runs once per sync interval, 16 at a time, outside the manifest lock, and in `replicate-status` only
+      with `--deep`; a segment the primary lacks is a primary problem, never a damaged region copy, and a failed copy no
+      longer stops the region's manifest; `replicate-status` tolerates a lag up to the sync interval plus two segment
+      intervals (`pending`) and reports an archive without a manifest as not yet archived
+- [ ] `recover` on a host whose server can not start stops at the last commit the journal holds: without the database it
+      can not tell whether more was committed, which the next start settles
+- [ ] A `db-scan` gap reaches the manifest at the next server start or archive run; a recovery on another host before
+      then does not see it
 - [ ] More than four closed segments that can not be written are dropped and recorded as gaps (their journals go with
       them); only a new base backup makes later points recoverable
 - [ ] A restore whose abandoned history can be recorded neither in the archive nor handed over through the WAL directory
       exits 3; until a new online backup is taken after the start, a recovery past it could replay that history
 - [x] `db-scan` quarantine commands bypassed the WAL archive: `quarantine-id2entry` and `restore-quarantined` record a
-      gap from just after the last committed transaction up to now before they change anything (in the manifest, or
-      handed to the server through the WAL directory, else they refuse), so recovery never replays across them
+      gap from just after the last committed transaction up to now before they commit (handed to the server through the
+      WAL directory, else they refuse), so recovery never replays across them
 - [x] Manual `database backup` files were not PITR bases: one written into the local base directory under a backup name
       is handed over through the WAL directory (`.handed-over-bases/`) with the watermark of its content; the server
       indexes it at its next archive run and recovery uses it meanwhile. With S3 bases a manual backup stays outside the
