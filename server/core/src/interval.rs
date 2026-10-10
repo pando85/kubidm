@@ -1,7 +1,7 @@
 //! This contains scheduled tasks/interval tasks that are run inside of the server on a schedule
 //! as background operations.
 
-use std::{fs, path::Path, str::FromStr, sync::Arc};
+use std::{fs, future::Future, path::Path, str::FromStr, sync::Arc};
 
 use chrono::{DateTime, Utc};
 use cron::Schedule;
@@ -194,8 +194,17 @@ impl IntervalActor {
                 }
 
                 last_run = Some(next_time);
-                if let Err(err) = job.run(server).await {
-                    error!(?err, "An online backup error occurred.");
+                match run_until_shutdown(job.run(server), &mut rx).await {
+                    Some(Ok(_)) => {}
+                    Some(Err(err)) => error!(?err, "An online backup error occurred."),
+                    None => {
+                        warn!(
+                            "Online backup abandoned: the server is shutting down. The WAL \
+                             archive is still synchronised, and the next scheduled run takes \
+                             a new backup"
+                        );
+                        break;
+                    }
                 }
             }
             info!("Stopped {}", TaskName::BackupActor);
@@ -235,19 +244,7 @@ impl IntervalActor {
                     }
                     _ = ticks.tick() => {
                         let run = sync_and_report_replication(&s3_config, &replication);
-                        tokio::pin!(run);
-                        let shutdown = loop {
-                            tokio::select! {
-                                _ = &mut run => break false,
-                                action = rx.recv() => match action {
-                                    Ok(CoreAction::Shutdown)
-                                    | Err(broadcast::error::RecvError::Closed) => break true,
-                                    Ok(CoreAction::Reload)
-                                    | Err(broadcast::error::RecvError::Lagged(_)) => {}
-                                },
-                            }
-                        };
-                        if shutdown {
+                        if run_until_shutdown(run, &mut rx).await.is_none() {
                             break;
                         }
                     }
@@ -255,6 +252,32 @@ impl IntervalActor {
             }
             info!("Stopped {}", TaskName::BackupReplicationMonitor);
         })
+    }
+}
+
+/// Drive `run` to completion unless the server shuts down first, in which case `run` is
+/// dropped and None is returned. A reload does not interrupt it.
+///
+/// The backup actor and the replication monitor run their work through this so that a
+/// shutdown never waits for a backup, an upload or a region copy in progress: the
+/// shutdown has to reach the final WAL archive synchronisation before the service
+/// manager's stop timeout. Blocking work already handed to the blocking thread pool
+/// finishes on its own.
+async fn run_until_shutdown<F: Future>(
+    run: F,
+    rx: &mut broadcast::Receiver<CoreAction>,
+) -> Option<F::Output> {
+    tokio::pin!(run);
+    loop {
+        tokio::select! {
+            output = &mut run => return Some(output),
+            action = rx.recv() => match action {
+                Ok(CoreAction::Shutdown) | Err(broadcast::error::RecvError::Closed) => {
+                    return None
+                }
+                Ok(CoreAction::Reload) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+            },
+        }
     }
 }
 
@@ -446,6 +469,43 @@ mod tests {
         let after_reload = next_backup_time(&schedule, at(9, 30, 0), Some(at(8, 0, 0)));
         assert_eq!(before, Some(at(22, 0, 0)));
         assert_eq!(after_reload, before);
+    }
+
+    #[tokio::test]
+    async fn run_until_shutdown_abandons_the_run_on_shutdown() {
+        let (tx, mut rx) = broadcast::channel(4);
+        let run = async {
+            // A backup stuck on an unreachable region.
+            std::future::pending::<()>().await;
+            "finished"
+        };
+        let sender = tokio::spawn(async move {
+            tx.send(CoreAction::Reload).expect("send reload");
+            tx.send(CoreAction::Shutdown).expect("send shutdown");
+            tx
+        });
+        let outcome =
+            tokio::time::timeout(Duration::from_secs(10), run_until_shutdown(run, &mut rx))
+                .await
+                .expect("a shutdown must not wait for the run");
+        assert_eq!(outcome, None);
+        drop(sender.await.expect("sender"));
+    }
+
+    #[tokio::test]
+    async fn run_until_shutdown_completes_the_run_across_a_reload() {
+        let (tx, mut rx) = broadcast::channel(4);
+        tx.send(CoreAction::Reload).expect("send reload");
+        let run = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            "finished"
+        };
+        assert_eq!(run_until_shutdown(run, &mut rx).await, Some("finished"));
+
+        // A closed channel means the server is gone.
+        drop(tx);
+        let run = std::future::pending::<()>();
+        assert_eq!(run_until_shutdown(run, &mut rx).await, None);
     }
 
     #[test]
