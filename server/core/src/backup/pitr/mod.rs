@@ -48,8 +48,9 @@ pub use archive::*;
 pub use offline::*;
 pub use recover::*;
 pub use replicate::{
-    check_wal_replication, format_wal_replication_report, wal_replication_status,
-    RegionManifestState, RegionSegments, WalRegionHealth, WalReplicationHealth,
+    check_wal_replication, format_wal_replication_report, replication_tolerance,
+    wal_replication_status, RegionManifestState, RegionSegments, WalRegionHealth,
+    WalReplicationHealth,
 };
 pub use settings::*;
 

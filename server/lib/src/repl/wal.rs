@@ -768,9 +768,8 @@ fn missing_from(
 }
 
 /// After an unclean stop, when the server starts: close the segments the journals left in
-/// `dir` hold (see [`plan_left_history`]), and record the history they miss, if any, as a
-/// gap up to `db_ts_max`, the last transaction the database committed, in the pending
-/// events of `dir`. The journals and the open segment marker go only once that is on
+/// `dir` hold, and record the history they miss, if any, as a gap up to `db_ts_max`, the
+/// last transaction the database committed, in the pending events of `dir`. The journals and the open segment marker go only once that is on
 /// disk, so that a crash half way through starts over. Returns the gap.
 pub fn close_left_segments(
     dir: &Path,
