@@ -1204,6 +1204,26 @@ pub struct PitrBaseBackup {
     pub watermark_ts: Duration,
     /// Server version that wrote the backup.
     pub server_version: String,
+    /// The server uuid the backup carries. None for a base indexed before it was
+    /// recorded; such a base never replays across a [`PitrServerUuidChange`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_uuid: Option<Uuid>,
+}
+
+/// The server of an archive took a new identity at `at_ts`: a replication refresh replaced
+/// the whole database and its server uuid, or a restore or recovery put a database with
+/// another server uuid in place. The archive goes on with the new uuid, and the change is
+/// a boundary for recovery: the state after it does not follow from the history before
+/// it, so a base backup taken under another identity never replays across it.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct PitrServerUuidChange {
+    pub from_server_uuid: Uuid,
+    pub to_server_uuid: Uuid,
+    /// The CID timestamp from which on the new identity holds: the CID of the refresh, or
+    /// the end of the history a restore or recovery abandoned.
+    pub at_ts: Duration,
+    /// What caused it, for display.
+    pub reason: String,
 }
 
 /// A range of history abandoned by a restore or a point-in-time recovery.
@@ -1266,6 +1286,9 @@ pub struct PitrManifest {
     /// Ordered by `from_ts`.
     #[serde(default)]
     pub gaps: Vec<PitrWalGap>,
+    /// The identities the server had before `server_uuid`, in the order they changed.
+    #[serde(default)]
+    pub server_uuid_changes: Vec<PitrServerUuidChange>,
     /// RFC3339 time of the last update, for display.
     pub updated_at: String,
 }
@@ -1279,8 +1302,59 @@ impl PitrManifest {
             segments: Vec::new(),
             timeline_breaks: Vec::new(),
             gaps: Vec::new(),
+            server_uuid_changes: Vec::new(),
             updated_at: String::new(),
         }
+    }
+
+    /// Whether `server_uuid` is, or was, the identity of the server of this archive.
+    pub fn knows_server(&self, server_uuid: Uuid) -> bool {
+        self.server_uuid == server_uuid
+            || self.server_uuid_changes.iter().any(|change| {
+                change.from_server_uuid == server_uuid || change.to_server_uuid == server_uuid
+            })
+    }
+
+    /// Record that the server took the identity `change.to_server_uuid`. Recording a change
+    /// twice changes nothing. Returns whether the manifest changed, or an error when the
+    /// change does not start from the current identity: it then belongs to another archive.
+    pub fn apply_server_uuid_change(
+        &mut self,
+        change: &PitrServerUuidChange,
+    ) -> Result<bool, String> {
+        let known = |known: &PitrServerUuidChange| {
+            known.from_server_uuid == change.from_server_uuid
+                && known.to_server_uuid == change.to_server_uuid
+                && known.at_ts == change.at_ts
+        };
+        if self.server_uuid_changes.iter().any(known) {
+            return Ok(false);
+        }
+        if self.server_uuid != change.from_server_uuid {
+            return Err(format!(
+                "the server changed its identity from {} to {}, but this archive belongs to {}",
+                change.from_server_uuid, change.to_server_uuid, self.server_uuid
+            ));
+        }
+        self.server_uuid = change.to_server_uuid;
+        self.server_uuid_changes.push(change.clone());
+        Ok(true)
+    }
+
+    /// The first change of identity a replay from `base` up to `target_ts` would cross
+    /// without `base` belonging to the identity it changed to. A change in abandoned
+    /// history is ignored, since that history is never replayed.
+    pub fn identity_change_blocking(
+        &self,
+        base: &PitrBaseBackup,
+        target_ts: Duration,
+    ) -> Option<&PitrServerUuidChange> {
+        self.server_uuid_changes.iter().find(|change| {
+            base.watermark_ts < change.at_ts
+                && change.at_ts <= target_ts
+                && base.server_uuid != Some(change.to_server_uuid)
+                && !self.is_abandoned(change.at_ts)
+        })
     }
 
     /// Record a base backup, replacing any earlier record of the same key.
@@ -1390,6 +1464,18 @@ impl PitrManifest {
             self.add_gap(gap.clone());
             changed |= self.gaps.len() != before;
         }
+        for change in &other.server_uuid_changes {
+            if self.server_uuid_changes.contains(change) {
+                continue;
+            }
+            // A change the other side recorded from this identity is taken over; any other
+            // is kept as a boundary only, which can only refuse more recoveries.
+            if self.apply_server_uuid_change(change).is_err() {
+                self.server_uuid_changes.push(change.clone());
+                self.server_uuid_changes.sort_by_key(|change| change.at_ts);
+            }
+            changed = true;
+        }
         changed
     }
 
@@ -1489,13 +1575,19 @@ impl PitrManifest {
             .chain(self.timeline_breaks.iter().map(|b| b.after_ts))
             .filter(|ts| !self.is_abandoned(*ts))
             .max()?;
-        // Each step moves `latest` strictly back past one gap, so this ends.
+        // Each step moves `latest` strictly back past one gap or change of identity, so
+        // this ends.
         while let Some(base) = self.base_backup_for(latest) {
-            let Some(gap) = self.gap_blocking(base.watermark_ts, latest) else {
-                break;
+            let barrier = match (
+                self.gap_blocking(base.watermark_ts, latest),
+                self.identity_change_blocking(base, latest),
+            ) {
+                (Some(gap), Some(change)) => gap.from_ts.min(change.at_ts),
+                (Some(gap), None) => gap.from_ts,
+                (None, Some(change)) => change.at_ts,
+                (None, None) => break,
             };
-            latest = gap
-                .from_ts
+            latest = barrier
                 .checked_sub(Duration::from_nanos(1))
                 .map_or(base.watermark_ts, |before| before.max(base.watermark_ts));
         }
@@ -1595,7 +1687,101 @@ mod wal_tests {
             timestamp: String::new(),
             watermark_ts: Duration::from_secs(watermark),
             server_version: "test".to_string(),
+            server_uuid: None,
         }
+    }
+
+    fn base_of(key: &str, watermark: u64, server: Uuid) -> PitrBaseBackup {
+        PitrBaseBackup {
+            server_uuid: Some(server),
+            ..base(key, watermark)
+        }
+    }
+
+    fn uuid_change(from: Uuid, to: Uuid, at: u64, reason: &str) -> PitrServerUuidChange {
+        PitrServerUuidChange {
+            from_server_uuid: from,
+            to_server_uuid: to,
+            at_ts: Duration::from_secs(at),
+            reason: reason.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_pitr_manifest_server_uuid_changes() {
+        let u1 = Uuid::new_v4();
+        let u2 = Uuid::new_v4();
+        let mut m = PitrManifest::new(u1);
+        m.add_base_backup(base_of("b1", 100, u1));
+        m.add_segment(segment("s1", 110, 300));
+        m.add_segment(segment("s2", 310, 500));
+
+        // A replication refresh at 200 gives the server a new identity. Recording it twice
+        // changes nothing; a change from an identity the archive does not have is refused.
+        let refresh = uuid_change(u1, u2, 200, "replication refresh");
+        assert_eq!(m.apply_server_uuid_change(&refresh), Ok(true));
+        assert_eq!(m.apply_server_uuid_change(&refresh), Ok(false));
+        assert_eq!(m.server_uuid, u2);
+        assert!(m.knows_server(u1) && m.knows_server(u2));
+        assert!(!m.knows_server(Uuid::new_v4()));
+        assert!(m
+            .apply_server_uuid_change(&uuid_change(Uuid::new_v4(), u1, 250, "restore"))
+            .is_err());
+
+        // A base of the old identity reaches up to just before the refresh, never past it.
+        let b1 = m.base_backups[0].clone();
+        assert!(m
+            .identity_change_blocking(&b1, Duration::from_secs(199))
+            .is_none());
+        assert_eq!(
+            m.identity_change_blocking(&b1, Duration::from_secs(200)),
+            Some(&refresh)
+        );
+        assert_eq!(
+            m.latest_recoverable_ts(),
+            Some(Duration::from_secs(200) - Duration::from_nanos(1))
+        );
+
+        // A base taken under the new identity after the refresh recovers past it.
+        m.add_base_backup(base_of("b2", 200, u2));
+        assert_eq!(m.latest_recoverable_ts(), Some(Duration::from_secs(500)));
+        let b2 = m.base_backups[1].clone();
+        assert!(m
+            .identity_change_blocking(&b2, Duration::from_secs(500))
+            .is_none());
+
+        // A recovery to 150 abandons the refresh and goes back to the old identity: the
+        // refresh no longer blocks, and the old identity's base replays past the switch.
+        m.add_timeline_break(PitrTimelineBreak {
+            after_ts: Duration::from_secs(150),
+            until_ts: Duration::from_secs(600),
+            at: String::new(),
+            reason: "recover".to_string(),
+        });
+        let back = uuid_change(u2, u1, 601, "recover");
+        assert_eq!(m.apply_server_uuid_change(&back), Ok(true));
+        m.add_segment(segment("s3", 700, 800));
+        assert!(m
+            .identity_change_blocking(&b1, Duration::from_secs(800))
+            .is_none());
+        assert_eq!(m.latest_recoverable_ts(), Some(Duration::from_secs(800)));
+
+        // A base of a foreign identity never replays into it.
+        let foreign = base_of("b9", 50, Uuid::new_v4());
+        assert_eq!(
+            m.identity_change_blocking(&foreign, Duration::from_secs(800)),
+            Some(&back)
+        );
+
+        // Old manifests without the field still parse; the changes merge into a region.
+        let json = serde_json::to_string(&PitrManifest::new(u1)).unwrap();
+        let legacy = json.replace(",\"server_uuid_changes\":[]", "");
+        assert!(!legacy.contains("server_uuid_changes"));
+        let parsed: PitrManifest = serde_json::from_str(&legacy).unwrap();
+        assert!(parsed.server_uuid_changes.is_empty());
+        let mut region = PitrManifest::new(u1);
+        assert!(region.merge_markers(&m));
+        assert_eq!(region.server_uuid_changes, m.server_uuid_changes);
     }
 
     #[test]

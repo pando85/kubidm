@@ -206,11 +206,14 @@ pub struct WalPendingEvents {
     /// Gaps, oldest first.
     #[serde(default)]
     pub gaps: Vec<WalGap>,
+    /// Changes of the server identity, in the order they happened.
+    #[serde(default)]
+    pub server_uuid_changes: Vec<WalServerUuidChange>,
 }
 
 impl WalPendingEvents {
     pub fn is_empty(&self) -> bool {
-        self.gaps.is_empty()
+        self.gaps.is_empty() && self.server_uuid_changes.is_empty()
     }
 
     /// Remove the events of `recorded`, each once.
@@ -220,7 +223,26 @@ impl WalPendingEvents {
                 self.gaps.remove(index);
             }
         }
+        for change in &recorded.server_uuid_changes {
+            if let Some(index) = self
+                .server_uuid_changes
+                .iter()
+                .position(|known| known == change)
+            {
+                self.server_uuid_changes.remove(index);
+            }
+        }
     }
+}
+
+/// The database took a new server uuid: from `at_ts` on, its transactions belong to
+/// `to`. A replication refresh does this, as it replaces the whole database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WalServerUuidChange {
+    pub from: Uuid,
+    pub to: Uuid,
+    /// The CID timestamp of the transaction that changed it.
+    pub at_ts: Duration,
 }
 
 /// Content of [`WAL_OPEN_SEGMENT_MARKER`].
@@ -496,6 +518,33 @@ impl WalArchiver {
             until_ts: cid_ts,
             reason: WalGapReason::ArchiveFailure,
         });
+    }
+
+    /// The database took the server uuid `to` in the transaction at `cid_ts` (a
+    /// replication refresh). The open segment is closed, since a segment holds the
+    /// transactions of one server; the records that follow go to segments of `to`, and the
+    /// change is kept on disk until the archive index records it as a boundary recovery
+    /// never replays across.
+    pub fn change_server_uuid(&mut self, to: Uuid, cid_ts: Option<Duration>) {
+        if to == self.server_uuid {
+            return;
+        }
+        self.seal_current();
+        let change = WalServerUuidChange {
+            from: self.server_uuid,
+            to,
+            at_ts: cid_ts.or(self.last_ts).unwrap_or(Duration::ZERO),
+        };
+        warn!(
+            from = %change.from,
+            to = %change.to,
+            at = %format_ts_rfc3339(change.at_ts),
+            "The server uuid changed; the WAL archive continues under the new one, and \
+             point-in-time recovery past this point needs a base backup taken after it"
+        );
+        self.server_uuid = to;
+        self.pending.server_uuid_changes.push(change);
+        self.persist_pending();
     }
 
     /// Remember `gap` until the archive index records it, on disk first.
@@ -974,6 +1023,7 @@ fn unreadable_pending_events() -> WalPendingEvents {
             until_ts: None,
             reason: WalGapReason::ArchiveFailure,
         }],
+        server_uuid_changes: Vec::new(),
     }
 }
 
@@ -988,6 +1038,20 @@ pub fn write_pending_events(dir: &Path, events: &WalPendingEvents) -> Result<(),
         };
     }
     write_file_durably(dir, WAL_PENDING_EVENTS_FILE, &serde_json::to_vec(events)?)
+}
+
+/// Hand `change` to the next archiver started on `dir`, for an offline command that put a
+/// database with another server uuid in place.
+pub fn add_pending_server_uuid_change(
+    dir: &Path,
+    change: WalServerUuidChange,
+) -> Result<(), WalError> {
+    fs::create_dir_all(dir)?;
+    let mut events = read_pending_events(dir);
+    if !events.server_uuid_changes.contains(&change) {
+        events.server_uuid_changes.push(change);
+    }
+    write_pending_events(dir, &events)
 }
 
 /// The gap the open segment marker left in `dir` by a run that stopped without closing

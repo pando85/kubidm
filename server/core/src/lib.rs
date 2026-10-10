@@ -611,10 +611,7 @@ pub async fn restore_server_core(config: &Configuration, dst_path: &Path) {
         Err(_) => std::process::exit(1),
     };
 
-    if note_restore_in_wal_archive(config, outcome.watermark)
-        .await
-        .is_err()
-    {
+    if note_restore_in_wal_archive(config, &outcome).await.is_err() {
         std::process::exit(1);
     }
 
@@ -626,17 +623,19 @@ pub async fn restore_server_core(config: &Configuration, dst_path: &Path) {
 /// point-in-time recovery never replays it.
 async fn note_restore_in_wal_archive(
     config: &Configuration,
-    watermark: Duration,
+    outcome: &RestoreOutcome,
 ) -> Result<(), OperationError> {
-    pitr::note_restore(config, watermark).await.map_err(|err| {
-        error!(
-            %err,
-            "The database WAS restored, but the abandoned history could not be recorded in \
-             the WAL archive. A later point-in-time recovery past this point could replay it: \
-             take a new online backup right after starting the server."
-        );
-        OperationError::InvalidState
-    })
+    pitr::note_restore(config, outcome.watermark, outcome.server_uuid)
+        .await
+        .map_err(|err| {
+            error!(
+                %err,
+                "The database WAS restored, but the abandoned history could not be recorded in \
+                 the WAL archive. A later point-in-time recovery past this point could replay it: \
+                 take a new online backup right after starting the server."
+            );
+            OperationError::InvalidState
+        })
 }
 
 /// Restore the backup at `src_path` into the database described by `config` and
@@ -653,6 +652,8 @@ pub async fn restore_database(
 pub(crate) struct RestoreOutcome {
     /// The CID watermark of the restored backup.
     pub watermark: Duration,
+    /// The server uuid the restored database carries.
+    pub server_uuid: uuid::Uuid,
     /// The WAL records applied on top of it, if any were given.
     pub apply: Option<WalApplyReport>,
 }
@@ -707,6 +708,7 @@ pub(crate) async fn restore_and_replay(
             error!(?err, "Failed to restore database");
         })?;
     let watermark = be_wr_txn.get_db_ts_max(Duration::ZERO)?;
+    let server_uuid = be_wr_txn.get_db_s_uuid()?;
 
     let apply = if records.is_empty() {
         None
@@ -726,7 +728,11 @@ pub(crate) async fn restore_and_replay(
     info!("Database loaded successfully");
 
     reindex_inner(be, schema, config).await?;
-    Ok(RestoreOutcome { watermark, apply })
+    Ok(RestoreOutcome {
+        watermark,
+        server_uuid,
+        apply,
+    })
 }
 
 /// How deeply `verify_backup_server_core` inspects a backup artifact.
@@ -1023,7 +1029,7 @@ pub async fn restore_s3_database(
     // Remove the downloaded artifact.
     drop(fetched);
 
-    note_restore_in_wal_archive(config, outcome.watermark).await
+    note_restore_in_wal_archive(config, &outcome).await
 }
 
 /// Verify the backup stored under `key` in S3. The SHA-256 of the stored object is checked

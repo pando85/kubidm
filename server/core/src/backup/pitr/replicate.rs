@@ -98,7 +98,10 @@ async fn replicate_to_region(
 
     let region_manifest = region_store.load_manifest().await?;
     if let Some(region_manifest) = &region_manifest {
-        if region_manifest.server_uuid != manifest.server_uuid {
+        // The same archive: the region lags behind or is ahead by a change of identity.
+        if !manifest.knows_server(region_manifest.server_uuid)
+            && !region_manifest.knows_server(manifest.server_uuid)
+        {
             return Err(PitrError::Manifest(format!(
                 "{PITR_MANIFEST_KEY} in region {region_name} ({}) belongs to server {}, this \
                  server is {}; refusing to mix archives",

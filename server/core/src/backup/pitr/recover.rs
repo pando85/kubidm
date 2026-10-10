@@ -5,16 +5,17 @@ use std::fmt;
 use std::time::Duration;
 
 use kubidm_proto::backup::{
-    is_encrypted_backup_name, PitrBaseBackup, PitrManifest, PitrTimelineBreak, WalSegment,
-    PITR_MANIFEST_KEY,
+    is_encrypted_backup_name, PitrBaseBackup, PitrManifest, PitrServerUuidChange,
+    PitrTimelineBreak, WalSegment, PITR_MANIFEST_KEY,
 };
 use kubidm_proto::internal::OperationError;
 use kubidmd_lib::be::WalApplyReport;
 use kubidmd_lib::prelude::duration_from_epoch_now;
 use kubidmd_lib::repl::wal::{
-    format_ts_rfc3339, list_segments, parse_recovery_target_cid, parse_recovery_target_time,
-    parse_segment, select_records, WalEntryRecord,
+    add_pending_server_uuid_change, format_ts_rfc3339, list_segments, parse_recovery_target_cid,
+    parse_recovery_target_time, parse_segment, select_records, WalEntryRecord, WalServerUuidChange,
 };
+use uuid::Uuid;
 
 use super::store::{PitrStore, SegmentKeys};
 use super::{blocking, PitrError, PitrSettings};
@@ -67,7 +68,7 @@ pub fn resolve_target(
         RecoveryTargetSpec::Cid(cid) => {
             let cid =
                 parse_recovery_target_cid(cid).map_err(|err| PitrError::Target(err.to_string()))?;
-            if cid.s_uuid != manifest.server_uuid {
+            if !manifest.knows_server(cid.s_uuid) {
                 return Err(PitrError::Target(format!(
                     "CID belongs to server {}, the archive belongs to server {}",
                     cid.s_uuid, manifest.server_uuid
@@ -128,6 +129,23 @@ pub fn plan_recovery(
             gap.reason,
             base.key,
             format_ts_rfc3339(resolved.ts),
+        )));
+    }
+    if let Some(change) = manifest.identity_change_blocking(&base, resolved.ts) {
+        let latest = manifest
+            .latest_recoverable_ts()
+            .map(format_ts_rfc3339)
+            .unwrap_or_else(|| "none".to_string());
+        return Err(PitrError::NotRecoverable(format!(
+            "the server changed its identity from {} to {} at {} ({}); the state after it \
+             does not follow from base backup {} and the history before it. Choose a target \
+             before the change (the latest recoverable point is {latest}), or one after a base \
+             backup taken after it",
+            change.from_server_uuid,
+            change.to_server_uuid,
+            format_ts_rfc3339(change.at_ts),
+            change.reason,
+            base.key,
         )));
     }
     let segments = manifest
@@ -225,7 +243,7 @@ async fn open_archive(
         blocking(move || Ok(list_segments(&local_dir)?)).await?
     };
     for segment in local_segments {
-        if segment.server_uuid != manifest.server_uuid || manifest.has_segment(&segment.segment_id)
+        if !manifest.knows_server(segment.server_uuid) || manifest.has_segment(&segment.segment_id)
         {
             continue;
         }
@@ -407,7 +425,7 @@ async fn load_records(
             .await?;
         let compression = segment.compression;
         let file = blocking(move || Ok(parse_segment(&data, compression)?)).await?;
-        if file.server_uuid != opened.manifest.server_uuid {
+        if !opened.manifest.knows_server(file.server_uuid) {
             return Err(PitrError::NotRecoverable(format!(
                 "segment {} belongs to server {}, the archive belongs to {}",
                 segment.segment_id, file.server_uuid, opened.manifest.server_uuid
@@ -522,7 +540,7 @@ pub async fn pitr_recover_server_core(
         plan.base.key,
         records.len()
     );
-    let apply = crate::restore_and_replay(config, base.path(), &records)
+    let restored = crate::restore_and_replay(config, base.path(), &records)
         .await
         .map_err(|err| {
             error!(
@@ -531,8 +549,8 @@ pub async fn pitr_recover_server_core(
                  says otherwise"
             );
             PitrError::Operation(err)
-        })?
-        .apply;
+        })?;
+    let apply = restored.apply;
     drop(base);
 
     if let Some(report) = &apply {
@@ -562,7 +580,13 @@ pub async fn pitr_recover_server_core(
         )));
     }
 
-    record_timeline_break(&opened.settings, recovered_ts, "recover")
+    let restored = RestoredDatabase {
+        after_ts: recovered_ts,
+        server_uuid: restored.server_uuid,
+        reason: "recover",
+        now: duration_from_epoch_now(),
+    };
+    let identity_change = record_timeline_break(&opened.settings, &restored)
         .await
         .inspect_err(|err| {
             error!(
@@ -579,7 +603,28 @@ pub async fn pitr_recover_server_core(
     // region is used, so this is best effort; the server merges what the region recorded
     // into the primary archive at its first synchronisation that reaches both.
     if let Some(primary) = &opened.primary {
-        if let Err(err) = record_timeline_break(primary, recovered_ts, "recover").await {
+        if let Err(err) = record_timeline_break(primary, &restored).await {
+            // A change of identity must reach the primary archive before the server
+            // archives into it under the new one: hand it to the server's first
+            // synchronisation.
+            if let Some(change) = &identity_change {
+                let change = WalServerUuidChange {
+                    from: change.from_server_uuid,
+                    to: change.to_server_uuid,
+                    at_ts: change.at_ts,
+                };
+                let local_dir = primary.local_dir.clone();
+                blocking(move || Ok(add_pending_server_uuid_change(&local_dir, change)?))
+                    .await
+                    .unwrap_or_else(|err| {
+                        error!(
+                            %err,
+                            "Unable to hand the change of server uuid to the server; it will \
+                             refuse to archive into {} until the change is recorded there",
+                            primary.location
+                        )
+                    });
+            }
             warn!(
                 %err,
                 "The abandoned history was recorded in the region, but not in the primary WAL \
@@ -606,20 +651,37 @@ pub async fn pitr_recover_server_core(
     })
 }
 
+/// What a restore or recovery did to the database, for the archive.
+pub(super) struct RestoredDatabase<'a> {
+    /// The CID timestamp the database was restored or recovered to.
+    pub after_ts: Duration,
+    /// The server uuid the database carries now.
+    pub server_uuid: Uuid,
+    /// The command, for display.
+    pub reason: &'a str,
+    pub now: Duration,
+}
+
 /// Record in the archive that the database was restored or recovered to `after_ts`, so
 /// that everything archived after that point up to now is never replayed again. `until_ts`
 /// also covers any CID the archive holds, in case the clock of the old server was ahead.
+///
+/// When the database now carries another server uuid than the archive (a backup taken
+/// before a replication refresh, or one of another server), the archive continues under
+/// that identity from the end of the abandoned history on, and the change is a boundary
+/// no base backup of another identity replays across.
+///
+/// Returns the change of identity recorded, if any.
 pub(super) async fn record_timeline_break(
     settings: &PitrSettings,
-    after_ts: Duration,
-    reason: &str,
-) -> Result<(), PitrError> {
+    restored: &RestoredDatabase<'_>,
+) -> Result<Option<PitrServerUuidChange>, PitrError> {
+    let now = restored.now;
     let store = PitrStore::open(&settings.location).await?;
     let Some(mut manifest) = store.load_manifest().await? else {
         // Nothing was ever archived, so there is no history to abandon.
-        return Ok(());
+        return Ok(None);
     };
-    let now = duration_from_epoch_now();
     let local_segments = {
         let local_dir = settings.local_dir.clone();
         blocking(move || Ok(list_segments(&local_dir)?)).await?
@@ -632,28 +694,59 @@ pub(super) async fn record_timeline_break(
         .chain(manifest.base_backups.iter().map(|b| b.watermark_ts))
         .fold(now, Duration::max);
     manifest.add_timeline_break(PitrTimelineBreak {
-        after_ts,
+        after_ts: restored.after_ts,
         until_ts,
         at: format_ts_rfc3339(now),
-        reason: reason.to_string(),
+        reason: restored.reason.to_string(),
     });
+    let mut identity_change = None;
+    if restored.server_uuid != manifest.server_uuid {
+        let change = PitrServerUuidChange {
+            from_server_uuid: manifest.server_uuid,
+            to_server_uuid: restored.server_uuid,
+            at_ts: until_ts + Duration::from_nanos(1),
+            reason: restored.reason.to_string(),
+        };
+        manifest
+            .apply_server_uuid_change(&change)
+            .map_err(PitrError::Manifest)?;
+        warn!(
+            from = %change.from_server_uuid,
+            to = %change.to_server_uuid,
+            "The database carries another server uuid than the archive; the archive continues \
+             under it"
+        );
+        identity_change = Some(change);
+    }
     store.save_manifest(&mut manifest, now).await?;
     info!(
-        after = %format_ts_rfc3339(after_ts),
+        after = %format_ts_rfc3339(restored.after_ts),
         until = %format_ts_rfc3339(until_ts),
         "Abandoned history recorded in the PITR archive"
     );
-    Ok(())
+    Ok(identity_change)
 }
 
 /// After `kubidmd database restore` or `restore-s3`: when WAL archiving is configured,
 /// record that the history after the watermark of the restored backup was abandoned.
 /// Without WAL archiving this does nothing.
-pub async fn note_restore(config: &Configuration, watermark: Duration) -> Result<(), PitrError> {
+pub async fn note_restore(
+    config: &Configuration,
+    watermark: Duration,
+    server_uuid: Uuid,
+) -> Result<(), PitrError> {
     let Some(settings) = PitrSettings::from_config(config)? else {
         return Ok(());
     };
-    record_timeline_break(&settings, watermark, "restore").await
+    let restored = RestoredDatabase {
+        after_ts: watermark,
+        server_uuid,
+        reason: "restore",
+        now: duration_from_epoch_now(),
+    };
+    record_timeline_break(&settings, &restored)
+        .await
+        .map(|_| ())
 }
 
 #[cfg(test)]

@@ -5,13 +5,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kubidm_proto::backup::{
-    PitrBaseBackup, PitrManifest, PitrWalGap, WalSegment, PITR_MANIFEST_KEY,
+    PitrBaseBackup, PitrManifest, PitrServerUuidChange, PitrWalGap, WalSegment, PITR_MANIFEST_KEY,
 };
 use kubidmd_lib::be::{lock_wal, BackupStructuralReport, SharedWalArchiver};
 use kubidmd_lib::prelude::duration_from_epoch_now;
 use kubidmd_lib::repl::wal::{
     format_ts_rfc3339, parse_segment_file_name, quarantine_segment, rebuild_sidecar,
-    remove_segment, scan_segments, write_closed_segments, WalArchiver, WalGap,
+    remove_segment, scan_segments, write_closed_segments, WalArchiver, WalGap, WalPendingEvents,
+    WalServerUuidChange,
 };
 use tokio::sync::broadcast;
 use tokio::time::{interval, MissedTickBehavior};
@@ -22,23 +23,59 @@ use super::{blocking, BaseLocation, PitrError, PitrLocation, PitrSettings};
 use crate::backup::BackupEncryptor;
 use crate::CoreAction;
 
-/// Load the manifest at `store`, or start a new one for `server_uuid`; the flag says
-/// whether it existed. A manifest of another server is refused, so that two servers never
-/// share one archive.
+/// The manifest record of a change of the server identity the archiver reported.
+pub(super) fn manifest_uuid_change(change: &WalServerUuidChange) -> PitrServerUuidChange {
+    PitrServerUuidChange {
+        from_server_uuid: change.from,
+        to_server_uuid: change.to,
+        at_ts: change.at_ts,
+        reason: "replication refresh".to_string(),
+    }
+}
+
+/// Load the manifest at `store`, or start a new one, and apply the changes of the server
+/// identity in `changes` to it; the flag says whether it changed (a new manifest always
+/// does). The manifest must then belong to `server_uuid`: one of another server is
+/// refused, so that two servers never share one archive. A server that changed its
+/// identity (a replication refresh, a restore or recovery of a backup with another server
+/// uuid) keeps its archive, since the change was recorded where it happened.
 async fn load_or_new_manifest(
     store: &PitrStore,
     location: &PitrLocation,
     server_uuid: Uuid,
+    changes: &[WalServerUuidChange],
 ) -> Result<(PitrManifest, bool), PitrError> {
-    match store.load_manifest().await? {
-        Some(manifest) if manifest.server_uuid != server_uuid => Err(PitrError::Manifest(format!(
-            "{PITR_MANIFEST_KEY} at {location} belongs to server {}, this server is \
-                 {server_uuid}; refusing to mix archives. Give this server its own location.",
-            manifest.server_uuid
-        ))),
-        Some(manifest) => Ok((manifest, true)),
-        None => Ok((PitrManifest::new(server_uuid), false)),
+    let (mut manifest, mut changed) = match store.load_manifest().await? {
+        Some(manifest) => (manifest, false),
+        None => (
+            PitrManifest::new(changes.first().map_or(server_uuid, |change| change.from)),
+            true,
+        ),
+    };
+    for change in changes {
+        let change = manifest_uuid_change(change);
+        let applied = manifest.apply_server_uuid_change(&change).map_err(|err| {
+            PitrError::Manifest(format!("{PITR_MANIFEST_KEY} at {location}: {err}"))
+        })?;
+        if applied {
+            warn!(
+                from = %change.from_server_uuid,
+                to = %change.to_server_uuid,
+                at = %format_ts_rfc3339(change.at_ts),
+                "The WAL archive continues under the new server uuid; recovery never replays \
+                 across the change from a base backup taken before it"
+            );
+        }
+        changed |= applied;
     }
+    if manifest.server_uuid != server_uuid {
+        return Err(PitrError::Manifest(format!(
+            "{PITR_MANIFEST_KEY} at {location} belongs to server {}, this server is \
+             {server_uuid}; refusing to mix archives. Give this server its own location.",
+            manifest.server_uuid
+        )));
+    }
+    Ok((manifest, changed))
 }
 
 /// The manifest record of a gap the archiver reported at `now`.
@@ -192,13 +229,7 @@ impl PitrArchive {
         // pending in the archiver, on disk, until a saved manifest records them.
         let mut events_recorded = false;
         let mut result = self
-            .sync_locked(
-                now,
-                &events.gaps,
-                server_uuid,
-                &mut events_recorded,
-                &mut report,
-            )
+            .sync_locked(now, &events, server_uuid, &mut events_recorded, &mut report)
             .await;
         if events_recorded && !events.is_empty() {
             self.with_archiver(move |archiver| Ok(archiver.acknowledge_events(&events)?))
@@ -218,7 +249,13 @@ impl PitrArchive {
                     report.flush_failed = false;
                     if written {
                         result = self
-                            .sync_locked(now, &[], server_uuid, &mut false, &mut report)
+                            .sync_locked(
+                                now,
+                                &WalPendingEvents::default(),
+                                server_uuid,
+                                &mut false,
+                                &mut report,
+                            )
                             .await;
                     }
                 }
@@ -252,7 +289,7 @@ impl PitrArchive {
     async fn sync_locked(
         &self,
         now: Duration,
-        gaps: &[WalGap],
+        events: &WalPendingEvents,
         server_uuid: Uuid,
         events_recorded: &mut bool,
         report: &mut PitrSyncReport,
@@ -262,11 +299,15 @@ impl PitrArchive {
             blocking(move || Ok(scan_segments(&local_dir)?)).await?
         };
         let store = PitrStore::open(&self.settings.location).await?;
-        let (mut manifest, existed) =
-            load_or_new_manifest(&store, &self.settings.location, server_uuid).await?;
-        let mut changed = !existed;
+        let (mut manifest, mut changed) = load_or_new_manifest(
+            &store,
+            &self.settings.location,
+            server_uuid,
+            &events.server_uuid_changes,
+        )
+        .await?;
 
-        changed |= record_gaps(&mut manifest, gaps, now);
+        changed |= record_gaps(&mut manifest, &events.gaps, now);
         let mut local_segments = scan.segments;
         if !scan.unreadable.is_empty() {
             let repaired = self.repair_local(scan.unreadable, now).await?;
@@ -278,7 +319,7 @@ impl PitrArchive {
             local_segments.sort_by_key(|segment| segment.start_ts);
         }
 
-        let pending = self.pending_segments(&store, &manifest, local_segments, server_uuid);
+        let pending = self.pending_segments(&store, &manifest, local_segments);
         let archived = self
             .archive_pending(&store, &mut manifest, pending, now)
             .await;
@@ -326,13 +367,13 @@ impl PitrArchive {
         store: &PitrStore,
         manifest: &PitrManifest,
         local_segments: Vec<WalSegment>,
-        server_uuid: Uuid,
     ) -> Vec<WalSegment> {
         let moves_segments = self.moves_segments(store);
         local_segments
             .into_iter()
             .filter(|segment| {
-                if segment.server_uuid != server_uuid {
+                // Segments written before a change of identity are archived as well.
+                if !manifest.knows_server(segment.server_uuid) {
                     warn!(
                         segment = %segment.segment_id,
                         "WAL segment of another server in {}, not archived",
@@ -587,8 +628,15 @@ impl PitrArchive {
 
         let _guard = self.manifest_lock.lock().await;
         let store = PitrStore::open(&self.settings.location).await?;
-        let server_uuid = self
-            .with_archiver(|archiver| Ok(archiver.server_uuid()))
+        // The identity changes the archiver noticed are applied first: a backup taken
+        // right after a replication refresh carries the new server uuid already.
+        let (server_uuid, changes) = self
+            .with_archiver(|archiver| {
+                Ok((
+                    archiver.server_uuid(),
+                    archiver.pending_events().server_uuid_changes,
+                ))
+            })
             .await?;
         if let Some(db_s_uuid) = report.db_s_uuid {
             if db_s_uuid != server_uuid {
@@ -598,14 +646,26 @@ impl PitrArchive {
             }
         }
         let (mut manifest, _) =
-            load_or_new_manifest(&store, &self.settings.location, server_uuid).await?;
+            load_or_new_manifest(&store, &self.settings.location, server_uuid, &changes).await?;
         manifest.add_base_backup(PitrBaseBackup {
             key: key.to_string(),
             timestamp: timestamp.to_string(),
             watermark_ts,
             server_version,
+            server_uuid: report.db_s_uuid,
         });
         store.save_manifest(&mut manifest, now).await?;
+        if !changes.is_empty() {
+            let recorded = WalPendingEvents {
+                gaps: Vec::new(),
+                server_uuid_changes: changes,
+            };
+            self.with_archiver(move |archiver| Ok(archiver.acknowledge_events(&recorded)?))
+                .await
+                .unwrap_or_else(|err| {
+                    warn!(%err, "Unable to forget the server uuid changes the manifest records");
+                });
+        }
         info!(
             key,
             watermark = %format_ts_rfc3339(watermark_ts),
@@ -702,7 +762,7 @@ mod tests {
         WAL_QUARANTINE_SUFFIX,
     };
 
-    use super::super::recover::record_timeline_break;
+    use super::super::recover::{record_timeline_break, RestoredDatabase};
     use super::super::test_util::*;
     use super::super::{plan_recovery, resolve_target, RecoveryTargetSpec};
 
@@ -864,9 +924,13 @@ mod tests {
         assert_eq!(plan.segments.len(), 1);
 
         // A restore to the base abandons the history after its watermark.
-        record_timeline_break(&settings, Duration::from_secs(1000), "restore")
-            .await
-            .unwrap();
+        let restored = RestoredDatabase {
+            after_ts: Duration::from_secs(1000),
+            server_uuid: server,
+            reason: "restore",
+            now: Duration::from_secs(1150),
+        };
+        record_timeline_break(&settings, &restored).await.unwrap();
         let manifest = store.load_manifest().await.unwrap().unwrap();
         assert_eq!(manifest.timeline_breaks.len(), 1);
         assert!(manifest.is_abandoned(Duration::from_secs(1100)));
@@ -1077,6 +1141,120 @@ mod tests {
         assert!(matches!(
             store.load_manifest().await,
             Err(PitrError::Manifest(msg)) if msg.contains("invalid base backup")
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_archive_follows_a_server_uuid_change_and_recovery_never_crosses_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("wal");
+        let backup_dir = dir.path().join("backups");
+        fs::create_dir_all(&backup_dir).unwrap();
+        let old_uuid = Uuid::new_v4();
+        let new_uuid = Uuid::new_v4();
+        let wal_cfg = WalArchiveConfig {
+            enabled: true,
+            local_path: Some(wal_dir.clone()),
+            ..WalArchiveConfig::default()
+        };
+        let settings = PitrSettings {
+            wal: wal_cfg.clone(),
+            local_dir: wal_dir.clone(),
+            location: PitrLocation::Local(wal_dir.clone()),
+            bases: BaseLocation::Local(backup_dir.clone()),
+            encryption: BackupEncryptionConfig::default(),
+        };
+        let bases = settings.bases.clone();
+        let archiver: SharedWalArchiver = Arc::new(Mutex::new(
+            WalArchiver::new(wal_cfg.clone(), old_uuid, wal_dir.clone()).unwrap(),
+        ));
+        let archive = PitrArchive::new(settings.clone(), archiver.clone());
+        let key1 = "backup-2024-01-01T00:00:00Z.json";
+        fs::write(backup_dir.join(key1), b"{}").unwrap();
+        archive
+            .register_base_backup(&bases, key1, "t", &report(1000, old_uuid))
+            .await
+            .unwrap();
+        append_create(&archiver, old_uuid, 1100, b"before");
+        archive.sync(Duration::from_secs(1150), true).await.unwrap();
+
+        // A replication refresh at 1200 resets the server uuid. The server stops before
+        // any synchronisation and starts again under the new uuid.
+        archiver
+            .lock()
+            .unwrap()
+            .change_server_uuid(new_uuid, Some(Duration::from_secs(1200)));
+        append_create(&archiver, new_uuid, 1200, b"refresh");
+        archiver.lock().unwrap().flush_current_segment().unwrap();
+        drop(archive);
+        drop(archiver);
+        let archiver: SharedWalArchiver = Arc::new(Mutex::new(
+            WalArchiver::new(wal_cfg, new_uuid, wal_dir.clone()).unwrap(),
+        ));
+        let archive = PitrArchive::new(settings, archiver.clone());
+
+        // The archive follows the server under its new identity instead of refusing it.
+        append_create(&archiver, new_uuid, 1300, b"after");
+        let report_sync = archive.sync(Duration::from_secs(1350), true).await.unwrap();
+        assert_eq!(report_sync.archived, 2);
+        assert!(archiver.lock().unwrap().pending_events().is_empty());
+        let store = PitrStore::open(&archive.settings.location).await.unwrap();
+        let manifest = store.load_manifest().await.unwrap().unwrap();
+        assert_eq!(manifest.server_uuid, new_uuid);
+        assert!(manifest.knows_server(old_uuid));
+        assert_eq!(manifest.server_uuid_changes.len(), 1);
+        assert_eq!(
+            manifest.server_uuid_changes[0].at_ts,
+            Duration::from_secs(1200)
+        );
+
+        // The base of the old identity recovers up to just before the refresh, never past
+        // it: the refresh replaced the database and its identity.
+        plan_recovery(
+            &manifest,
+            &RecoveryTargetSpec::Time(format_ts_rfc3339(Duration::from_secs(1150))),
+        )
+        .unwrap();
+        let err = plan_recovery(
+            &manifest,
+            &RecoveryTargetSpec::Time(format_ts_rfc3339(Duration::from_secs(1300))),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("changed its identity"), "{err}");
+        assert!(
+            resolve_target(&manifest, &RecoveryTargetSpec::Latest)
+                .unwrap()
+                .ts
+                < Duration::from_secs(1200)
+        );
+        // A CID of the earlier identity is still a valid target.
+        let cid = Cid {
+            ts: Duration::from_secs(1150),
+            s_uuid: old_uuid,
+        };
+        resolve_target(&manifest, &RecoveryTargetSpec::Cid(cid.to_string())).unwrap();
+
+        // A backup taken under the new identity is indexed and recovers past the refresh.
+        let key2 = "backup-2024-01-02T00:00:00Z.json";
+        fs::write(backup_dir.join(key2), b"{}").unwrap();
+        archive
+            .register_base_backup(&bases, key2, "t", &report(1250, new_uuid))
+            .await
+            .unwrap();
+        let manifest = store.load_manifest().await.unwrap().unwrap();
+        let plan = plan_recovery(&manifest, &RecoveryTargetSpec::Latest).unwrap();
+        assert_eq!(plan.base.key, key2);
+        assert_eq!(plan.target.ts, Duration::from_secs(1300));
+
+        // A manifest of a server that is not in the lineage is still refused.
+        let mut foreign = PitrManifest::new(Uuid::new_v4());
+        store
+            .save_manifest(&mut foreign, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(matches!(
+            archive.sync(Duration::from_secs(1400), false).await,
+            Err(PitrError::Manifest(_))
         ));
     }
 

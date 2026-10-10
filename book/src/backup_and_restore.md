@@ -440,7 +440,8 @@ WAL archiving requires `online_backup.enabled = true`, since recovery always sta
 - **Manifest.** `pitr-manifest.json`, in the archive location, indexes the base backups with their CID watermark (the
   last transaction they contain), the segments, and the gaps and abandoned history described below. It records the
   server it belongs to, and a server refuses to archive into another server's manifest: give every server its own
-  location.
+  location. A server that changes its own identity keeps its archive, see
+  [Server Identity Changes](#server-identity-changes).
 - **Base backups.** Every successful scheduled online backup is indexed as a base: the S3 backup when
   `[online_backup.s3]` is configured, otherwise the local one. Manual `kubidmd database backup` artifacts are not
   indexed. Recovery becomes possible with the first online backup taken after WAL archiving was enabled. When only
@@ -464,14 +465,31 @@ Records live in memory until their segment is closed. If the server stops withou
 power loss) the open segment is lost from the archive, although the transactions themselves are safely committed in the
 database. The next start notices this, logs `WAL ARCHIVE HOLE`, and records a **gap** in the manifest. A committed
 transaction whose changes could not be recorded is logged and recorded as a gap the same way, while a closed segment
-that could not be written (for example on a full disk) is kept in memory and retried. Replaying across a gap would
-silently skip changes, so `recover` refuses any target whose replay would cross one, and `--latest` stops right before
-it. A base backup taken after the gap makes later points recoverable again; take one after any `WAL ARCHIVE HOLE`. With
-S3, segments that were closed but not yet uploaded are lost with the host, which only shortens the recoverable window.
+that could not be written (for example on a full disk) is kept in memory and retried at least every
+`segment_interval_seconds`; beyond four such segments the oldest is dropped and recorded as a gap. A local segment that
+is found damaged is moved aside as `<segment>.corrupt` and its range recorded as a gap. Gaps are kept in the WAL
+directory until the manifest records them, so repeated crashes never lose one. Replaying across a gap would silently
+skip changes, so `recover` refuses any target whose replay would cross one, and `--latest` stops right before it. A base
+backup taken after the gap makes later points recoverable again; take one after any `WAL ARCHIVE HOLE`. With S3,
+segments that were closed but not yet uploaded are lost with the host, which only shortens the recoverable window.
 
 The offline `kubidmd domain rename` and `kubidmd database reindex` commands archive their writes like the running server
 does; the next server start uploads them. The `kubidmd db-scan quarantine-id2entry` and `restore-quarantined` repair
 commands bypass the archive: take an online backup after using them.
+
+#### Server Identity Changes
+
+A replication refresh (a server joining a topology, or catching up after it fell too far behind) replaces the whole
+database together with its domain and server uuids, and restoring or recovering a backup can put a database with another
+server uuid in place (a backup taken before a refresh, or one of another server). The archive follows the server under
+its new identity: the open segment is closed under the old uuid, the change is recorded in the manifest
+(`server_uuid_changes`), and segments, base backups and `--target-cid` CIDs of every earlier identity stay valid.
+
+A change of identity is a boundary for recovery. The state after it does not follow from the history before it, so a
+base backup taken under another identity never replays across it: `recover` refuses such a target, naming the change,
+and `--latest` stops right before it. Take an online backup after a refresh to make later points recoverable. A change
+that a later restore or recovery abandoned no longer counts, and a recovery to a point before a refresh continues the
+archive under the identity it restored.
 
 #### Listing Recovery Points
 

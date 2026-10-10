@@ -342,13 +342,11 @@ pub fn lock_wal(archiver: &SharedWalArchiver) -> MutexGuard<'_, WalArchiver> {
 /// What [`BackendWriteTransaction::wal_apply`] did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WalApplyReport {
-    /// Records applied, including truncations.
+    /// Records applied.
     pub applied: usize,
     pub created: usize,
     pub modified: usize,
     pub deleted: usize,
-    /// Whether a truncation record removed every entry of the base backup.
-    pub truncated: bool,
     /// The CID of the last record applied: the point the database now represents.
     pub last_cid: Option<Cid>,
 }
@@ -393,6 +391,8 @@ pub struct BackendWriteTransaction<'a> {
     wal_pending: BTreeMap<u64, WalPendingOp>,
     /// Whether this transaction removed every entry before writing `wal_pending`.
     wal_truncate: bool,
+    /// The server uuid this transaction gave the database, when it changed it.
+    wal_server_uuid: Option<Uuid>,
     /// The CID the archived records are tagged with. Set by the operations that carry a
     /// CID and, authoritatively, by the query server at commit.
     wal_cid: Option<Cid>,
@@ -2332,6 +2332,7 @@ impl<'a> BackendWriteTransaction<'a> {
             wal,
             wal_pending,
             wal_truncate,
+            wal_server_uuid,
             wal_cid,
             wal_stage_failed,
         } = self;
@@ -2354,6 +2355,7 @@ impl<'a> BackendWriteTransaction<'a> {
                 &wal,
                 wal_cid.as_ref(),
                 wal_truncate,
+                wal_server_uuid,
                 wal_pending,
                 wal_stage_failed,
             );
@@ -2366,15 +2368,22 @@ impl<'a> BackendWriteTransaction<'a> {
         wal: &SharedWalArchiver,
         wal_cid: Option<&Cid>,
         wal_truncate: bool,
+        wal_server_uuid: Option<Uuid>,
         wal_pending: BTreeMap<u64, WalPendingOp>,
         wal_stage_failed: bool,
     ) {
-        if wal_pending.is_empty() && !wal_truncate && !wal_stage_failed {
+        if wal_pending.is_empty() && !wal_truncate && !wal_stage_failed && wal_server_uuid.is_none()
+        {
             return;
         }
 
         {
             let mut archiver = lock_wal(wal);
+
+            // The records of this transaction already belong to the new identity.
+            if let Some(server_uuid) = wal_server_uuid {
+                archiver.change_server_uuid(server_uuid, wal_cid.map(|cid| cid.ts));
+            }
 
             if wal_stage_failed {
                 archiver.note_failure(wal_cid.map(|cid| cid.ts));
@@ -2516,11 +2525,16 @@ impl<'a> BackendWriteTransaction<'a> {
         for record in ordered {
             match &record.operation {
                 WalOperationRecord::Truncate => {
-                    self.get_ruv().clear();
-                    self.get_idlayer().danger_purge_id2entry()?;
-                    uuid_to_id.clear();
-                    final_state.clear();
-                    report.truncated = true;
+                    // A replication refresh: it also replaced the domain and server uuids
+                    // and the key material, which the archive does not hold. Replaying the
+                    // entries alone would mix the refreshed directory with the identity of
+                    // the base, so recovery needs a base taken after the refresh.
+                    admin_error!(
+                        cid = %record.cid(),
+                        "The WAL records include a replication refresh; recovery can not \
+                         replay across it. Recover from a base backup taken after it."
+                    );
+                    return Err(OperationError::InvalidState);
                 }
                 WalOperationRecord::Create { entry_data } => {
                     final_state.insert(record.entry_uuid, Some(entry_data.clone()));
@@ -2626,6 +2640,10 @@ impl<'a> BackendWriteTransaction<'a> {
             error!(?err, "Unable to persist server uuid");
             err
         })?;
+        // The archive learns about the new identity when this transaction commits.
+        if self.wal.is_some() {
+            self.wal_server_uuid = Some(nsid);
+        }
         Ok(nsid)
     }
     pub fn get_db_s_uuid(&mut self) -> Result<Uuid, OperationError> {
@@ -2827,6 +2845,7 @@ impl Backend {
             wal: self.wal.clone(),
             wal_pending: BTreeMap::new(),
             wal_truncate: false,
+            wal_server_uuid: None,
             wal_cid: None,
             wal_stage_failed: false,
         })
@@ -4722,6 +4741,53 @@ mod tests {
     }
 
     #[test]
+    fn test_be_wal_server_uuid_change_starts_a_new_identity_in_the_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let be = wal_backend(dir.path(), 1024 * 1024);
+        let archiver = be.wal_archiver().expect("WAL archiving must be enabled");
+        let old_uuid = archiver.lock().unwrap().server_uuid();
+
+        // A write under the old identity, still in the open segment.
+        let mut be_txn = be.write().unwrap();
+        be_txn
+            .create(
+                &CID_ZERO,
+                vec![
+                    wal_test_entry("william", "db237e8a-0079-4b8c-8a56-593b22aa44d1")
+                        .into_sealed_new(),
+                ],
+            )
+            .unwrap();
+        be_txn.commit().unwrap();
+
+        // A refresh resets the server uuid. Until the commit the archive knows nothing.
+        let mut be_txn = be.write().unwrap();
+        let new_uuid = be_txn.reset_db_s_uuid().unwrap();
+        be_txn.set_wal_cid(&CID_TWO);
+        assert_eq!(archiver.lock().unwrap().server_uuid(), old_uuid);
+        be_txn.commit().unwrap();
+
+        // The segment of the old identity is closed under it, the archiver goes on under
+        // the new one, and the change waits on disk for the archive index.
+        let archiver = archiver.lock().unwrap();
+        assert_eq!(archiver.server_uuid(), new_uuid);
+        assert!(!archiver.has_pending_records());
+        let segments = crate::repl::wal::list_segments(&dir.path().join("wal")).unwrap();
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].server_uuid, old_uuid);
+        let changes =
+            crate::repl::wal::read_pending_events(&dir.path().join("wal")).server_uuid_changes;
+        assert_eq!(
+            changes,
+            vec![crate::repl::wal::WalServerUuidChange {
+                from: old_uuid,
+                to: new_uuid,
+                at_ts: CID_TWO.ts,
+            }]
+        );
+    }
+
+    #[test]
     fn test_be_wal_records_committed_writes_and_deletes() {
         let dir = tempfile::tempdir().unwrap();
         let be = wal_backend(dir.path(), 1024 * 1024);
@@ -5028,7 +5094,6 @@ mod tests {
         assert_eq!(report.created, 1);
         assert_eq!(report.modified, 2);
         assert_eq!(report.deleted, 1);
-        assert!(!report.truncated);
         assert_eq!(report.last_cid, Some(CID_ADV.clone()));
         assert_eq!(
             rec_txn.get_db_ts_max(Duration::ZERO).unwrap(),
@@ -5073,7 +5138,8 @@ mod tests {
         assert!(!entry_exists!(rec_txn, e1));
         rec_txn.commit().unwrap();
 
-        // A truncate record wipes the base before the records that follow it.
+        // A truncate record is a replication refresh, which also replaced the identity of
+        // the database: it is refused, and nothing is applied.
         let mut rec_txn = recovered.write().unwrap();
         let truncate_then_create = vec![
             WalEntryRecord {
@@ -5093,12 +5159,15 @@ mod tests {
                 },
             },
         ];
-        let report = rec_txn.wal_apply(&truncate_then_create).unwrap();
-        assert!(report.truncated);
+        assert_eq!(
+            rec_txn.wal_apply(&truncate_then_create),
+            Err(OperationError::InvalidState)
+        );
+        drop(rec_txn);
+        let mut rec_txn = recovered.write().unwrap();
         rec_txn.reindex(false).unwrap();
-        assert!(entry_exists!(rec_txn, e1));
-        assert!(!entry_exists!(rec_txn, e2));
-        assert!(!entry_exists!(rec_txn, e3));
+        assert!(entry_exists!(rec_txn, e2));
+        assert!(entry_exists!(rec_txn, e3));
         rec_txn.commit().unwrap();
 
         // Bytes that are not an entry are rejected before anything is written.

@@ -35,6 +35,7 @@ pub(super) fn base(key: &str, watermark: u64) -> PitrBaseBackup {
         timestamp: String::new(),
         watermark_ts: Duration::from_secs(watermark),
         server_version: env!("KUBIDM_PKG_SERIES").to_string(),
+        server_uuid: Some(Uuid::nil()),
     }
 }
 
