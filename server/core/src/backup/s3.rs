@@ -485,6 +485,39 @@ impl S3ClientWrapper {
         Ok((data, metadata))
     }
 
+    /// Download `key` exactly like [`Self::download_backup`], or return None when the
+    /// object has no metadata sidecar, which is the case when it was never written. Any
+    /// other failure, including a missing object behind an existing sidecar, is an error.
+    pub async fn download_backup_if_exists(
+        &self,
+        key: &str,
+    ) -> Result<Option<(Vec<u8>, S3BackupMetadata)>, S3BackupError> {
+        let metadata_key = format!("{}.metadata.json", self.build_object_key(key));
+        match self
+            .client
+            .head_object()
+            .bucket(&self.config.bucket)
+            .key(&metadata_key)
+            .send()
+            .await
+        {
+            Ok(_) => {}
+            Err(err)
+                if err
+                    .as_service_error()
+                    .is_some_and(|service_err| service_err.is_not_found()) =>
+            {
+                return Ok(None)
+            }
+            Err(err) => {
+                return Err(S3BackupError::SdkError(format!(
+                    "Failed to look up {metadata_key}: {err}"
+                )))
+            }
+        }
+        self.download_backup(key).await.map(Some)
+    }
+
     /// Download the whole object at `object_key` (a full key, prefix included).
     async fn download_object(&self, object_key: &str) -> Result<Vec<u8>, S3BackupError> {
         let output = self

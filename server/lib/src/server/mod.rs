@@ -3093,6 +3093,8 @@ impl<'a> QueryServerWriteTransaction<'a> {
         // Write the cid to the db. If this fails, we can't assume replication
         // will be stable, so return if it fails.
         be_txn.set_db_ts_max(cid.ts)?;
+        // The WAL archive records this transaction's changes under its CID.
+        be_txn.set_wal_cid(&cid);
         cid.commit();
 
         // We don't care if this passes/fails, committing this is fine.

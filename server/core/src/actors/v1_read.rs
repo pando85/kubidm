@@ -13,7 +13,7 @@ use kubidm_proto::{
     },
 };
 use kubidmd_lib::{
-    be::BackendTransaction,
+    be::{BackendTransaction, BackupStructuralReport},
     event::{OnlineBackupEvent, SearchEvent, SearchResult, WhoamiResult},
     filter::{Filter, FilterInvalid},
     idm::{
@@ -59,6 +59,17 @@ use crate::backup::{
 use kubidm_proto::backup::BackupEncryptionConfig;
 
 // ===========================================================
+
+/// A successful online backup: what it is called and what the structural verification
+/// read back from it, including the CID watermark point-in-time recovery indexes.
+#[derive(Debug, Clone)]
+pub struct OnlineBackupOutcome {
+    /// File name (local) or object key relative to the S3 prefix.
+    pub key: String,
+    /// RFC3339 time of the backup.
+    pub timestamp: String,
+    pub report: BackupStructuralReport,
+}
 
 impl QueryServerReadV1 {
     // The server only receives "Message" structures, which
@@ -213,7 +224,7 @@ impl QueryServerReadV1 {
         compression: BackupCompression,
         encryption: &BackupEncryptionConfig,
         s3_client: Option<S3ClientWrapper>,
-    ) -> Result<(), OperationError> {
+    ) -> Result<OnlineBackupOutcome, OperationError> {
         trace!(eventid = ?msg.eventid, "Begin online backup event");
 
         #[allow(clippy::disallowed_methods)]
@@ -247,11 +258,8 @@ impl QueryServerReadV1 {
         }
 
         // Handle local file backup
-        let dest_file = outpath.join(backup_artifact_name(
-            &timestamp,
-            compression,
-            encryptor.is_some(),
-        ));
+        let file_name = backup_artifact_name(&timestamp, compression, encryptor.is_some());
+        let dest_file = outpath.join(&file_name);
 
         if dest_file.exists() {
             error!(
@@ -383,7 +391,11 @@ impl QueryServerReadV1 {
             debug!("Online backup cleanup had no files to remove");
         };
 
-        Ok(())
+        Ok(OnlineBackupOutcome {
+            key: file_name,
+            timestamp,
+            report,
+        })
     }
 
     /// Produce the complete backup artifact in memory: the backend serialises and
@@ -431,7 +443,7 @@ impl QueryServerReadV1 {
         compression: BackupCompression,
         encryptor: Option<&BackupEncryptor>,
         s3_client: S3ClientWrapper,
-    ) -> Result<(), OperationError> {
+    ) -> Result<OnlineBackupOutcome, OperationError> {
         trace!(eventid = ?msg.eventid, "Begin S3 backup event");
 
         let backup_data = Arc::new(self.produce_backup_artifact(compression, encryptor).await?);
@@ -518,7 +530,11 @@ impl QueryServerReadV1 {
             prune_s3_backups(region_client, versions).await;
         }
 
-        Ok(())
+        Ok(OnlineBackupOutcome {
+            key: object_key,
+            timestamp: timestamp.to_string(),
+            report,
+        })
     }
 
     #[instrument(

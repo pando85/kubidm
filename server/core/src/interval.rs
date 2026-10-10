@@ -1,7 +1,7 @@
 //! This contains scheduled tasks/interval tasks that are run inside of the server on a schedule
 //! as background operations.
 
-use std::{fs, path::Path, str::FromStr};
+use std::{fs, path::Path, str::FromStr, sync::Arc};
 
 use chrono::Utc;
 use cron::Schedule;
@@ -12,12 +12,13 @@ use tokio::{
     time::{interval, interval_at, sleep, Duration, Instant, MissedTickBehavior},
 };
 
+use crate::backup::pitr::{BaseLocation, PitrArchive};
 use crate::backup::{region_is_healthy, S3ClientWrapper};
 use crate::config::OnlineBackup;
 use crate::{CoreAction, TaskName};
 
 use crate::actors::{QueryServerReadV1, QueryServerWriteV1};
-use kubidm_proto::backup::{PitrManifest, ReplicationConfig, S3Config};
+use kubidm_proto::backup::{ReplicationConfig, S3Config};
 use kubidmd_lib::constants::PURGE_FREQUENCY;
 use kubidmd_lib::event::{
     OnlineBackupEvent, PurgeDeleteAfterEvent, PurgeRecycledEvent, PurgeTombstoneEvent,
@@ -72,6 +73,7 @@ impl IntervalActor {
     pub fn start_online_backup(
         server: &'static QueryServerReadV1,
         online_backup_config: &OnlineBackup,
+        pitr_archive: Option<Arc<PitrArchive>>,
         mut rx: broadcast::Receiver<CoreAction>,
     ) -> Result<Vec<(TaskName, JoinHandle<()>)>, ()> {
         let outpath = online_backup_config.path.to_owned();
@@ -147,7 +149,6 @@ impl IntervalActor {
         let backup_compression = online_backup_config.compression;
         let encryption = online_backup_config.encryption.clone();
         let s3_config = online_backup_config.s3.clone();
-        let wal_archive_config = online_backup_config.wal_archive.clone();
 
         let mut handles = Vec::with_capacity(2);
 
@@ -182,12 +183,9 @@ impl IntervalActor {
                         }
                     }
                     _ = sleep(Duration::from_secs(wait_seconds)) => {
-                        let backup_timestamp = Utc::now().format("%Y%m%d%H%M%S").to_string();
-                        let backup_id = format!("backup-{}.json", backup_timestamp);
-
                         // Perform local backup if path is configured
                         if let Some(ref path) = outpath {
-                            if let Err(e) = server
+                            match server
                                 .handle_online_backup(
                                     OnlineBackupEvent::new(),
                                     path,
@@ -198,7 +196,20 @@ impl IntervalActor {
                                 )
                                 .await
                             {
-                                error!(?e, "An online backup error occurred.");
+                                Ok(outcome) => {
+                                    // Index the backup as a base for point-in-time recovery.
+                                    if let Some(archive) = &pitr_archive {
+                                        archive
+                                            .register_base_backup_logged(
+                                                &BaseLocation::Local(path.clone()),
+                                                &outcome.key,
+                                                &outcome.timestamp,
+                                                &outcome.report,
+                                            )
+                                            .await;
+                                    }
+                                }
+                                Err(e) => error!(?e, "An online backup error occurred."),
                             }
                         }
 
@@ -206,16 +217,7 @@ impl IntervalActor {
                         if let Some(s3_cfg) = &s3_config {
                             match S3ClientWrapper::new(s3_cfg.clone()).await {
                                 Ok(s3_client) => {
-                                    // Update PITR manifest after successful S3 backup
-                                    if let Some(wal_cfg) = &wal_archive_config {
-                                        if wal_cfg.enabled {
-                                            if let Err(e) = update_pitr_manifest(&s3_client, &backup_id, &backup_timestamp).await {
-                                                error!(?e, "Failed to update PITR manifest.");
-                                            }
-                                        }
-                                    }
-
-                                    if let Err(e) = server
+                                    match server
                                         .handle_online_backup(
                                             OnlineBackupEvent::new(),
                                             &std::path::PathBuf::from("s3://backup"),
@@ -226,7 +228,19 @@ impl IntervalActor {
                                         )
                                         .await
                                     {
-                                        error!(?e, "An S3 backup error occurred.");
+                                        Ok(outcome) => {
+                                            if let Some(archive) = &pitr_archive {
+                                                archive
+                                                    .register_base_backup_logged(
+                                                        &BaseLocation::S3(s3_cfg.clone()),
+                                                        &outcome.key,
+                                                        &outcome.timestamp,
+                                                        &outcome.report,
+                                                    )
+                                                    .await;
+                                            }
+                                        }
+                                        Err(e) => error!(?e, "An S3 backup error occurred."),
                                     }
                                 }
                                 Err(e) => {
@@ -412,60 +426,6 @@ async fn sync_and_report_replication(s3_config: &S3Config, replication: &Replica
             health.overall_status, health.healthy_regions, health.max_lag_seconds
         );
     }
-}
-
-async fn update_pitr_manifest(
-    s3_client: &S3ClientWrapper,
-    backup_id: &str,
-    backup_timestamp: &str,
-) -> Result<(), String> {
-    use uuid::Uuid;
-
-    let manifest_key = "pitr-manifest.json";
-
-    let existing_manifest = match s3_client.download_backup(manifest_key).await {
-        Ok((data, _)) => serde_json::from_slice::<PitrManifest>(&data).ok(),
-        Err(_) => None,
-    };
-
-    let server_uuid = Uuid::new_v4();
-
-    let mut manifest = existing_manifest.unwrap_or_else(|| {
-        PitrManifest::new(
-            server_uuid,
-            backup_id.to_string(),
-            backup_timestamp.to_string(),
-        )
-    });
-
-    manifest.base_backup_id = backup_id.to_string();
-    manifest.base_backup_timestamp = backup_timestamp.to_string();
-
-    if !manifest.segments.is_empty() {
-        manifest.earliest_recoverable_time = manifest
-            .segments
-            .first()
-            .map(|s| s.created_at.clone())
-            .unwrap_or_else(|| backup_timestamp.to_string());
-    }
-    manifest.latest_recoverable_time = backup_timestamp.to_string();
-
-    let manifest_json = serde_json::to_string(&manifest)
-        .map_err(|e| format!("Failed to serialize PITR manifest: {}", e))?;
-
-    s3_client
-        .upload_backup(
-            manifest_json.as_bytes(),
-            manifest_key,
-            backup_timestamp,
-            kubidm_proto::backup::BackupCompression::NoCompression,
-            None,
-        )
-        .await
-        .map_err(|e| format!("Failed to upload PITR manifest: {}", e))?;
-
-    info!("Updated PITR manifest with base backup: {}", backup_id);
-    Ok(())
 }
 
 #[cfg(test)]

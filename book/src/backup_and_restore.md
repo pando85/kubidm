@@ -368,14 +368,127 @@ primary. Recovering from a replica therefore needs the same secret as recovering
 independently of the primary region. Key rotation applies to replicas as well: a replicated backup keeps needing the key
 it was written with.
 
-### Features Not Yet Available
+### Point-in-Time Recovery
 
-The following backup features are planned but are not implemented in this release:
+Online backups capture the database at the moment they run. Point-in-time recovery (PITR) closes the window between
+them: with WAL archiving enabled, the server archives the full state of every entry each committed write transaction
+changed, tagged with the transaction's change identifier (CID). `kubidmd database recover` then rebuilds the database as
+it was at any moment covered by the archive, by restoring the newest base backup taken at or before that moment and
+replaying the archived changes up to it.
 
-- Point-in-time recovery and WAL archiving (`online_backup.wal_archive`)
+```toml
+[online_backup]
+path = "/var/lib/kubidm/backups/"
+schedule = "00 22 * * *"
+versions = 7
 
-Its configuration keys are still parsed so that existing files load, but enabling it is rejected when the server starts
-and by `kubidmd configtest`. Remove or disable these keys until the feature ships.
+[online_backup.wal_archive]
+enabled = true
+# Close the open segment at least this often (also the upload period). Default 300.
+# segment_interval_seconds = 300
+# Close a segment once its records reach this size. Default 16 MiB.
+# segment_size_bytes = 16777216
+# Keep archived segments at least this long. Default 7.
+# retention_days = 7
+# Where segments are written before they are uploaded. Default: "wal" next to db_path.
+# local_path = "/var/lib/kubidm/wal"
+# Archive in another S3 location than [online_backup.s3]:
+# [online_backup.wal_archive.s3]
+# bucket = "kubidm-wal"
+# region = "us-east-1"
+```
+
+WAL archiving requires `online_backup.enabled = true`, since recovery always starts from an online backup.
+
+#### Where the Archive Lives
+
+- **Segments.** Committed changes are collected into segments. A segment is closed when its records reach
+  `segment_size_bytes` or when it is `segment_interval_seconds` old, and written to the local WAL directory as a gzip
+  JSON file with a `.meta.json` sidecar that records its CID range and SHA-256.
+- **Archive location.** When `[online_backup.wal_archive.s3]` or `[online_backup.s3]` is configured, closed segments are
+  uploaded under `<path_prefix>/wal/` (each with a `.metadata.json` object) and removed locally once the upload
+  succeeded. Otherwise they stay in the local WAL directory.
+- **Manifest.** `pitr-manifest.json`, in the archive location, indexes the base backups with their CID watermark (the
+  last transaction they contain), the segments, and the gaps and abandoned history described below. It records the
+  server it belongs to, and a server refuses to archive into another server's manifest: give every server its own
+  location.
+- **Base backups.** Every successful scheduled online backup is indexed as a base: the S3 backup when
+  `[online_backup.s3]` is configured, otherwise the local one. Manual `kubidmd database backup` artifacts are not
+  indexed. Recovery becomes possible with the first online backup taken after WAL archiving was enabled. When only
+  `[online_backup.wal_archive.s3]` is set, segments go to S3 but base backups stay in the local directory, so recovery
+  needs that directory too.
+
+The archive task runs every `segment_interval_seconds`: it closes a segment older than that, uploads closed segments,
+updates the manifest and applies retention. A clean shutdown closes and archives the open segment, so nothing committed
+is left behind.
+
+#### Retention
+
+Backup retention (`versions`) is unchanged. Base backups that it deletes drop out of the manifest at the next archive
+run. An archived segment is deleted once it is older than `retention_days` **and** no longer needed by the oldest base
+backup still present, so the archive always reaches back to the oldest base backup, however small `retention_days` is.
+
+#### What Can Be Lost
+
+Records live in memory until their segment is closed. If the server stops without shutting down (a crash, a kill, a
+power loss) the open segment is lost from the archive, although the transactions themselves are safely committed in the
+database. The next start notices this, logs `WAL ARCHIVE HOLE`, and records a **gap** in the manifest. A committed
+transaction whose changes could not be recorded is logged and recorded as a gap the same way, while a closed segment
+that could not be written (for example on a full disk) is kept in memory and retried. Replaying across a gap would
+silently skip changes, so `recover` refuses any target whose replay would cross one, and `--latest` stops right before
+it. A base backup taken after the gap makes later points recoverable again; take one after any `WAL ARCHIVE HOLE`. With
+S3, segments that were closed but not yet uploaded are lost with the host, which only shortens the recoverable window.
+
+The offline `kubidmd domain rename` and `kubidmd database reindex` commands archive their writes like the running server
+does; the next server start uploads them. The `kubidmd db-scan quarantine-id2entry` and `restore-quarantined` repair
+commands bypass the archive: take an online backup after using them.
+
+#### Listing Recovery Points
+
+```bash
+kubidmd database pitr-list -c /data/server.toml
+```
+
+prints the base backups with their watermarks, the segments with their CID ranges and record counts (marking the
+segments still only in the local WAL directory), any gaps and abandoned history, and the recoverable window. It does not
+open the database, so it can run while the server is running. It exits non-zero when nothing is recoverable yet.
+
+#### Recovering
+
+Like `restore`, `recover` must run while the server is stopped. Exactly one target is required:
+
+```bash
+docker stop <container name>
+docker run --rm -i -t -v kubidmd:/data \
+    kubidm/server:latest /sbin/kubidmd database recover -c /data/server.toml \
+    --target-time 2024-01-15T10:30:00Z
+docker start <container name>
+```
+
+- `--target-time <RFC3339>` recovers every transaction committed at or before that time, as the server's clock recorded
+  it.
+- `--target-cid <CID>` recovers up to and including the transaction with that change identifier
+  (`<nanoseconds>-<server uuid>`, as the server logs it).
+- `--latest` recovers everything the archive holds.
+- `--dry-run` prints the plan (base backup, segments, number of records, resulting point) and changes nothing.
+
+The command reads the `[online_backup]` section of the configuration to find the archive and the base backups, so the
+same `server.toml` works on a replacement host. It uses the segments of the same server still in the local WAL directory
+that were never archived. It then:
+
+1. downloads (from S3) or opens the base backup and checks every segment against the SHA-256 the manifest recorded;
+2. restores the base backup into the configured database and replays the records after its watermark, in CID order, in
+   the same database transaction, so that a failure leaves the database untouched;
+3. reindexes, boots and verifies the recovered database like `verify-backup --level full`;
+4. records in the manifest that the history after the recovered point was **abandoned**.
+
+Abandoned history is never replayed again: after recovering to 10:30, the server started on the recovered database
+writes new history, and a later recovery to any point after it replays the recovered state plus the new history, never
+the transactions that were discarded. `kubidmd database restore` and `restore-s3` record abandoned history the same way
+when WAL archiving is configured.
+
+Base backups and segments can only be used by the server version that wrote them, like backups. In a replicated
+topology, treat a recovered node like a restored one: the other nodes must be refreshed from it.
 
 ## Verifying That a Backup Can Be Restored
 

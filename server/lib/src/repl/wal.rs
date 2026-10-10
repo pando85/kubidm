@@ -1,59 +1,128 @@
-//! Write-Ahead Log (WAL) archiving for Point-in-Time Recovery (PITR)
+//! Write-ahead log (WAL) archiving for point-in-time recovery (PITR).
 //!
-//! This module provides WAL archiving capabilities that allow recovery to
-//! any point in time within the configured retention window.
+//! The archive is *state based*: for every entry a committed write transaction changed,
+//! the backend records the full serialised entry (the same `DbEntry` JSON that `id2entry`
+//! stores) under the transaction's CID; for every entry it removed, a delete record. Replay
+//! is therefore a deterministic overwrite of entries keyed by their UUID, never a replay of
+//! operations, and applying a record twice is harmless.
+//!
+//! Records are grouped into segments. A segment is closed ("rolled") once its records reach
+//! `segment_size_bytes` or once it is `segment_interval_seconds` old, and a transaction is
+//! never split across two segments. A closed segment is written to the local WAL directory
+//! as a gzip compressed JSON file together with a `.meta.json` sidecar that describes it
+//! ([`WalSegment`]) so that it can be indexed without being read.
+//!
+//! This module is synchronous and knows nothing about S3. Uploading closed segments,
+//! retention and the recovery commands live in the server core.
 
+use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use flate2::write::GzEncoder;
 use flate2::Compression;
-use kubidm_proto::backup::{BackupCompression, PitrManifest, WalArchiveConfig, WalSegment};
+use kubidm_proto::backup::{BackupCompression, WalArchiveConfig, WalSegment};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tracing::info;
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::repl::cid::Cid;
 
-#[allow(dead_code)]
-pub const WAL_SEGMENT_PREFIX: &str = "wal";
-#[allow(dead_code)]
-pub const WAL_MANIFEST_FILE: &str = "pitr-manifest.json";
+/// Version of the segment file format. Bumped whenever [`WalSegmentFile`] changes shape.
+pub const WAL_SEGMENT_FORMAT_VERSION: u32 = 1;
+/// Suffix of a segment file. Segments are always gzip compressed JSON.
+pub const WAL_SEGMENT_SUFFIX: &str = ".json.gz";
+/// Suffix of the sidecar that describes a segment file.
+pub const WAL_SEGMENT_META_SUFFIX: &str = ".meta.json";
+/// Prefix of every segment file name.
+pub const WAL_SEGMENT_PREFIX: &str = "wal-";
+/// Suffix of a segment that is still being written. Never listed or uploaded.
+const WAL_TMP_SUFFIX: &str = ".tmp";
+/// Marker present in the WAL directory while a segment holds records that only live in
+/// memory. Finding it at startup means the previous run stopped without closing that
+/// segment, so its records are missing from the archive.
+pub const WAL_OPEN_SEGMENT_MARKER: &str = ".open-segment.json";
+/// Fixed per record overhead assumed when measuring a segment against `segment_size_bytes`.
+const RECORD_OVERHEAD_BYTES: u64 = 96;
 
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub struct WalSegmentData {
-    pub segment_id: String,
-    pub server_uuid: Uuid,
-    pub entries: Vec<WalEntryRecord>,
-    pub start_ts: Duration,
-    pub end_ts: Duration,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// One archived change: the state of entry `entry_uuid` after the transaction `cid`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WalEntryRecord {
+    /// Nanoseconds since the epoch of the transaction CID.
     pub cid_ts: u64,
     pub cid_server: Uuid,
+    /// The `id2entry` id the entry had on the archiving server. Informational only: a
+    /// restored backup renumbers entries, so replay resolves entries by `entry_uuid`.
     pub entry_id: u64,
+    pub entry_uuid: Uuid,
     pub operation: WalOperationRecord,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum WalOperationRecord {
-    Create { entry_data: Vec<u8> },
-    Modify { entry_data: Vec<u8> },
-    Delete,
+impl WalEntryRecord {
+    pub fn ts(&self) -> Duration {
+        Duration::from_nanos(self.cid_ts)
+    }
+
+    pub fn cid(&self) -> Cid {
+        Cid {
+            ts: self.ts(),
+            s_uuid: self.cid_server,
+        }
+    }
 }
 
-#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum WalOperationRecord {
+    /// The entry was created; `entry_data` is its full serialised state.
+    Create { entry_data: Vec<u8> },
+    /// The entry was changed; `entry_data` is its full serialised state.
+    Modify { entry_data: Vec<u8> },
+    /// The entry was removed from `id2entry` (a reaped tombstone).
+    Delete,
+    /// Every entry was removed before the records that follow in the same transaction
+    /// were written (a replication refresh).
+    Truncate,
+}
+
+/// A change staged by a write transaction, archived if and when the transaction commits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WalPendingOp {
+    Create {
+        entry_uuid: Uuid,
+        entry_data: Vec<u8>,
+    },
+    Modify {
+        entry_uuid: Uuid,
+        entry_data: Vec<u8>,
+    },
+    Delete {
+        entry_uuid: Uuid,
+    },
+}
+
+/// The content of a segment file.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WalSegmentFile {
+    pub format_version: u32,
+    pub segment_id: String,
+    pub server_uuid: Uuid,
+    /// Server version that wrote the segment.
+    pub server_version: String,
+    pub start_ts: Duration,
+    pub end_ts: Duration,
+    /// In CID order.
+    pub entries: Vec<WalEntryRecord>,
+}
+
 #[derive(Debug)]
 pub enum WalError {
     IoError(std::io::Error),
     SerializationError(String),
     InvalidSegment(String),
-    RetentionError(String),
     ConfigError(String),
 }
 
@@ -63,7 +132,6 @@ impl std::fmt::Display for WalError {
             WalError::IoError(e) => write!(f, "WAL IO error: {}", e),
             WalError::SerializationError(msg) => write!(f, "WAL serialization error: {}", msg),
             WalError::InvalidSegment(msg) => write!(f, "Invalid WAL segment: {}", msg),
-            WalError::RetentionError(msg) => write!(f, "WAL retention error: {}", msg),
             WalError::ConfigError(msg) => write!(f, "WAL config error: {}", msg),
         }
     }
@@ -83,388 +151,654 @@ impl From<serde_json::Error> for WalError {
     }
 }
 
-#[allow(dead_code)]
+/// CID timestamps whose records are missing from the archive: a transaction that could
+/// not be recorded, or the open segment of a run that stopped without closing it.
+/// Recovery can not replay across a gap; only a base backup taken after it can.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalGap {
+    /// The first CID timestamp that may be missing.
+    pub from_ts: Duration,
+    /// The last CID timestamp that may be missing. None when it is unknown, in which case
+    /// every CID up to the moment the gap is reported may be missing.
+    pub until_ts: Option<Duration>,
+    /// Why the records are missing, for the operator.
+    pub reason: WalGapReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalGapReason {
+    /// A committed transaction could not be recorded.
+    ArchiveFailure,
+    /// The previous run stopped without closing its open segment.
+    UnclosedSegment,
+}
+
+impl std::fmt::Display for WalGapReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WalGapReason::ArchiveFailure => write!(f, "a committed transaction was not archived"),
+            WalGapReason::UnclosedSegment => {
+                write!(f, "the server stopped without archiving its open segment")
+            }
+        }
+    }
+}
+
+/// Content of [`WAL_OPEN_SEGMENT_MARKER`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct OpenSegmentMarker {
+    start_ts: Duration,
+}
+
+/// Counters an operator can use to notice that archiving is not keeping up.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WalArchiverStats {
+    /// Records appended to a segment (closed or still open).
+    pub records_archived: u64,
+    /// Segments written to the WAL directory.
+    pub segments_closed: u64,
+    /// Transactions whose records could not be archived. Each one is a hole in the WAL
+    /// that only a new base backup closes.
+    pub failures: u64,
+    /// Attempts to write a closed segment that failed. The records stay in memory and the
+    /// write is retried, so nothing is lost unless the server stops first.
+    pub flush_failures: u64,
+}
+
+/// Collects the records of committed transactions into segments and writes closed
+/// segments to a local directory.
 pub struct WalArchiver {
     config: WalArchiveConfig,
     server_uuid: Uuid,
-    current_segment: Option<WalSegmentBuilder>,
     segments_path: PathBuf,
+    current_segment: Option<WalSegmentBuilder>,
+    stats: WalArchiverStats,
+    /// Gaps not yet reported to the archive index.
+    gaps: Vec<WalGap>,
+    /// CID timestamp of the last record appended, the lower bound of a gap whose
+    /// transaction carried no CID.
+    last_ts: Option<Duration>,
 }
 
-#[allow(dead_code)]
 struct WalSegmentBuilder {
     entries: Vec<WalEntryRecord>,
     start_ts: Duration,
     current_size: u64,
-    segment_id: String,
 }
 
-#[allow(dead_code)]
 impl WalArchiver {
-    pub fn new(config: WalArchiveConfig, server_uuid: Uuid, base_path: &Path) -> Self {
-        let segments_path = base_path.join("wal");
-        Self {
+    /// Create an archiver writing to `segments_path`, which is created when it does not
+    /// exist and probed for writability so that a misconfiguration fails at startup
+    /// rather than at the first commit.
+    pub fn new(
+        config: WalArchiveConfig,
+        server_uuid: Uuid,
+        segments_path: PathBuf,
+    ) -> Result<Self, WalError> {
+        config.validate().map_err(WalError::ConfigError)?;
+
+        fs::create_dir_all(&segments_path)?;
+        if !segments_path.is_dir() {
+            return Err(WalError::ConfigError(format!(
+                "{} is not a directory",
+                segments_path.display()
+            )));
+        }
+        let probe = segments_path.join(".write-probe");
+        fs::write(&probe, b"").map_err(|err| {
+            WalError::ConfigError(format!(
+                "WAL directory {} is not writable: {err}",
+                segments_path.display()
+            ))
+        })?;
+        let _ = fs::remove_file(&probe);
+
+        // A marker left behind means the previous run stopped with records that were never
+        // written to a segment.
+        let mut gaps = Vec::new();
+        let marker_path = segments_path.join(WAL_OPEN_SEGMENT_MARKER);
+        if marker_path.exists() {
+            let from_ts = fs::read(&marker_path)
+                .ok()
+                .and_then(|data| serde_json::from_slice::<OpenSegmentMarker>(&data).ok())
+                .map(|marker| marker.start_ts)
+                .unwrap_or(Duration::ZERO);
+            error!(
+                from = %format_ts_rfc3339(from_ts),
+                "WAL ARCHIVE HOLE: the previous run stopped without archiving its open segment. \
+                 Point-in-time recovery can not replay the transactions committed since then \
+                 until a new base backup is taken."
+            );
+            gaps.push(WalGap {
+                from_ts,
+                until_ts: None,
+                reason: WalGapReason::UnclosedSegment,
+            });
+            fs::remove_file(&marker_path)?;
+        }
+
+        info!(
+            path = %segments_path.display(),
+            segment_size_bytes = config.segment_size_bytes,
+            segment_interval_seconds = config.segment_interval_seconds,
+            "WAL archiving enabled"
+        );
+
+        Ok(Self {
             config,
             server_uuid,
-            current_segment: None,
             segments_path,
-        }
+            current_segment: None,
+            stats: WalArchiverStats::default(),
+            gaps,
+            last_ts: None,
+        })
     }
 
     pub fn is_enabled(&self) -> bool {
         self.config.enabled
     }
 
+    pub fn config(&self) -> &WalArchiveConfig {
+        &self.config
+    }
+
+    pub fn server_uuid(&self) -> Uuid {
+        self.server_uuid
+    }
+
+    pub fn segments_path(&self) -> &Path {
+        &self.segments_path
+    }
+
+    pub fn stats(&self) -> WalArchiverStats {
+        self.stats
+    }
+
+    /// Whether records are waiting in a segment that has not been closed yet.
+    pub fn has_pending_records(&self) -> bool {
+        self.current_segment
+            .as_ref()
+            .is_some_and(|segment| !segment.entries.is_empty())
+    }
+
+    /// Number of records in the segment that is still open.
+    pub fn pending_record_count(&self) -> usize {
+        self.current_segment
+            .as_ref()
+            .map(|segment| segment.entries.len())
+            .unwrap_or(0)
+    }
+
+    /// Count a transaction whose records were lost and remember the gap it leaves. Called
+    /// by the backend when staging or appending failed. `cid_ts` is the CID timestamp of
+    /// the transaction, when it is known.
+    pub fn note_failure(&mut self, cid_ts: Option<Duration>) {
+        self.stats.failures += 1;
+        self.gaps.push(WalGap {
+            from_ts: cid_ts.or(self.last_ts).unwrap_or(Duration::ZERO),
+            until_ts: cid_ts,
+            reason: WalGapReason::ArchiveFailure,
+        });
+    }
+
+    /// The gaps not yet reported, which the caller must record in the archive index. Hand
+    /// them back with [`Self::restore_gaps`] when that fails.
+    pub fn take_gaps(&mut self) -> Vec<WalGap> {
+        std::mem::take(&mut self.gaps)
+    }
+
+    /// Return gaps taken with [`Self::take_gaps`] that could not be recorded.
+    pub fn restore_gaps(&mut self, gaps: Vec<WalGap>) {
+        let mut gaps = gaps;
+        gaps.append(&mut self.gaps);
+        self.gaps = gaps;
+    }
+
+    /// Hand the gaps not yet reported to the next start: when the process ends before
+    /// they reach the archive index, the open segment marker is written so that the next
+    /// [`WalArchiver::new`] reports them again (from the earliest one on). Call after the
+    /// last flush.
+    pub fn defer_gaps_to_next_start(&mut self) -> Result<(), WalError> {
+        let Some(from_ts) = self.gaps.iter().map(|gap| gap.from_ts).min() else {
+            return Ok(());
+        };
+        let marker = OpenSegmentMarker {
+            start_ts: self
+                .current_segment
+                .as_ref()
+                .map_or(from_ts, |segment| segment.start_ts.min(from_ts)),
+        };
+        fs::write(self.marker_path(), serde_json::to_vec(&marker)?)?;
+        self.gaps.clear();
+        Ok(())
+    }
+
+    fn marker_path(&self) -> PathBuf {
+        self.segments_path.join(WAL_OPEN_SEGMENT_MARKER)
+    }
+
     pub fn record_create(
         &mut self,
         cid: &Cid,
         entry_id: u64,
+        entry_uuid: Uuid,
         entry_data: Vec<u8>,
-    ) -> Result<(), WalError> {
-        if !self.is_enabled() {
-            return Ok(());
-        }
-
-        let record = WalEntryRecord {
-            cid_ts: cid.ts.as_nanos() as u64,
-            cid_server: cid.s_uuid,
-            entry_id,
-            operation: WalOperationRecord::Create { entry_data },
-        };
-
-        self.add_record(record)
+    ) -> Result<Option<WalSegment>, WalError> {
+        self.append_transaction(
+            cid,
+            false,
+            [(
+                entry_id,
+                WalPendingOp::Create {
+                    entry_uuid,
+                    entry_data,
+                },
+            )],
+        )
     }
 
     pub fn record_modify(
         &mut self,
         cid: &Cid,
         entry_id: u64,
+        entry_uuid: Uuid,
         entry_data: Vec<u8>,
-    ) -> Result<(), WalError> {
-        if !self.is_enabled() {
-            return Ok(());
-        }
-
-        let record = WalEntryRecord {
-            cid_ts: cid.ts.as_nanos() as u64,
-            cid_server: cid.s_uuid,
-            entry_id,
-            operation: WalOperationRecord::Modify { entry_data },
-        };
-
-        self.add_record(record)
+    ) -> Result<Option<WalSegment>, WalError> {
+        self.append_transaction(
+            cid,
+            false,
+            [(
+                entry_id,
+                WalPendingOp::Modify {
+                    entry_uuid,
+                    entry_data,
+                },
+            )],
+        )
     }
 
-    pub fn record_delete(&mut self, cid: &Cid, entry_id: u64) -> Result<(), WalError> {
-        if !self.is_enabled() {
-            return Ok(());
-        }
-
-        let record = WalEntryRecord {
-            cid_ts: cid.ts.as_nanos() as u64,
-            cid_server: cid.s_uuid,
-            entry_id,
-            operation: WalOperationRecord::Delete,
-        };
-
-        self.add_record(record)
+    pub fn record_delete(
+        &mut self,
+        cid: &Cid,
+        entry_id: u64,
+        entry_uuid: Uuid,
+    ) -> Result<Option<WalSegment>, WalError> {
+        self.append_transaction(
+            cid,
+            false,
+            [(entry_id, WalPendingOp::Delete { entry_uuid })],
+        )
     }
 
-    fn add_record(&mut self, record: WalEntryRecord) -> Result<(), WalError> {
-        let record_size = self.estimate_record_size(&record);
-
-        if self.current_segment.is_none() {
-            self.start_new_segment(Duration::from_nanos(record.cid_ts))?;
+    /// Append the changes of one committed transaction. All records share `cid` and land
+    /// in the same segment. The current segment is closed first when it is older than the
+    /// segment interval (the transaction CID is the clock), and closed afterwards when the
+    /// appended records took it over the size limit. Returns the segment that was closed
+    /// by this call, if any.
+    pub fn append_transaction<I>(
+        &mut self,
+        cid: &Cid,
+        truncate: bool,
+        ops: I,
+    ) -> Result<Option<WalSegment>, WalError>
+    where
+        I: IntoIterator<Item = (u64, WalPendingOp)>,
+    {
+        if !self.is_enabled() {
+            return Ok(None);
         }
 
-        if let Some(segment) = self.current_segment.as_mut() {
-            segment.entries.push(record);
-            segment.current_size += record_size;
+        // A segment that can not be written stays in memory and is retried, so a failed
+        // flush loses nothing; it is logged and counted.
+        let mut rolled = self
+            .flush_if_stale(cid.ts)
+            .unwrap_or_else(|err| self.note_flush_failure(&err));
 
-            if segment.current_size >= self.config.segment_size_bytes {
-                self.flush_current_segment()?;
+        let mut records: Vec<WalEntryRecord> = Vec::new();
+        if truncate {
+            records.push(WalEntryRecord {
+                cid_ts: cid.ts.as_nanos() as u64,
+                cid_server: cid.s_uuid,
+                entry_id: 0,
+                entry_uuid: Uuid::nil(),
+                operation: WalOperationRecord::Truncate,
+            });
+        }
+        for (entry_id, op) in ops {
+            let (entry_uuid, operation) = match op {
+                WalPendingOp::Create {
+                    entry_uuid,
+                    entry_data,
+                } => (entry_uuid, WalOperationRecord::Create { entry_data }),
+                WalPendingOp::Modify {
+                    entry_uuid,
+                    entry_data,
+                } => (entry_uuid, WalOperationRecord::Modify { entry_data }),
+                WalPendingOp::Delete { entry_uuid } => (entry_uuid, WalOperationRecord::Delete),
+            };
+            records.push(WalEntryRecord {
+                cid_ts: cid.ts.as_nanos() as u64,
+                cid_server: cid.s_uuid,
+                entry_id,
+                entry_uuid,
+                operation,
+            });
+        }
+
+        if records.is_empty() {
+            return Ok(rolled);
+        }
+
+        if !self.has_pending_records() {
+            // The first records of a segment only live in memory until it is closed.
+            let marker = OpenSegmentMarker { start_ts: cid.ts };
+            if let Err(err) = serde_json::to_vec(&marker)
+                .map_err(WalError::from)
+                .and_then(|data| fs::write(self.marker_path(), data).map_err(WalError::from))
+            {
+                warn!(
+                    %err,
+                    "Unable to write the WAL open segment marker; a crash before the segment \
+                     is closed would go unnoticed"
+                );
             }
         }
 
-        Ok(())
+        let segment = self
+            .current_segment
+            .get_or_insert_with(|| WalSegmentBuilder {
+                entries: Vec::new(),
+                start_ts: cid.ts,
+                current_size: 0,
+            });
+
+        for record in records {
+            segment.current_size += estimate_record_size(&record);
+            segment.entries.push(record);
+            self.stats.records_archived += 1;
+        }
+        self.last_ts = Some(cid.ts);
+
+        if segment.current_size >= self.config.segment_size_bytes {
+            match self.flush_current_segment() {
+                Ok(Some(closed)) => rolled = Some(closed),
+                Ok(None) => {}
+                Err(err) => {
+                    self.note_flush_failure(&err);
+                }
+            }
+        }
+
+        Ok(rolled)
     }
 
-    fn estimate_record_size(&self, record: &WalEntryRecord) -> u64 {
-        let base_size = std::mem::size_of::<WalEntryRecord>() as u64;
-        match &record.operation {
-            WalOperationRecord::Create { entry_data }
-            | WalOperationRecord::Modify { entry_data } => base_size + entry_data.len() as u64,
-            WalOperationRecord::Delete => base_size,
+    fn note_flush_failure(&mut self, err: &WalError) -> Option<WalSegment> {
+        self.stats.flush_failures += 1;
+        error!(
+            %err,
+            flush_failures = self.stats.flush_failures,
+            "Unable to write a closed WAL segment to {}; its records are kept in memory and \
+             the write is retried",
+            self.segments_path.display()
+        );
+        None
+    }
+
+    /// Close the current segment when it was opened at least one segment interval before
+    /// `now`. Returns the closed segment.
+    pub fn flush_if_stale(&mut self, now: Duration) -> Result<Option<WalSegment>, WalError> {
+        let stale = self.current_segment.as_ref().is_some_and(|segment| {
+            !segment.entries.is_empty() && now >= segment.start_ts + self.config.segment_interval()
+        });
+        if stale {
+            self.flush_current_segment()
+        } else {
+            Ok(None)
         }
     }
 
-    fn start_new_segment(&mut self, start_ts: Duration) -> Result<(), WalError> {
-        let segment_id = format!(
-            "{}-{}-{}.wal",
-            WAL_SEGMENT_PREFIX,
-            self.server_uuid,
-            chrono::Utc::now().format("%Y%m%d%H%M%S%3f")
-        );
-
-        self.current_segment = Some(WalSegmentBuilder {
-            entries: Vec::new(),
-            start_ts,
-            current_size: 0,
-            segment_id,
-        });
-
-        Ok(())
-    }
-
+    /// Close the current segment and write it to the WAL directory. Returns the closed
+    /// segment, or None when no record was pending. When the write fails the segment stays
+    /// open, so that a later call retries it.
     pub fn flush_current_segment(&mut self) -> Result<Option<WalSegment>, WalError> {
-        let Some(segment_builder) = self.current_segment.take() else {
+        let Some(builder) = self.current_segment.take() else {
             return Ok(None);
         };
-
-        if segment_builder.entries.is_empty() {
+        if builder.entries.is_empty() {
             return Ok(None);
         }
 
-        let end_ts = segment_builder
+        let start_ts = builder
+            .entries
+            .first()
+            .map(WalEntryRecord::ts)
+            .unwrap_or(builder.start_ts);
+        let end_ts = builder
             .entries
             .last()
-            .map(|e| Duration::from_nanos(e.cid_ts))
-            .unwrap_or(segment_builder.start_ts);
+            .map(WalEntryRecord::ts)
+            .unwrap_or(start_ts);
 
-        let segment_data = WalSegmentData {
-            segment_id: segment_builder.segment_id.clone(),
+        let file = WalSegmentFile {
+            format_version: WAL_SEGMENT_FORMAT_VERSION,
+            segment_id: segment_file_name(self.server_uuid, start_ts),
             server_uuid: self.server_uuid,
-            entries: segment_builder.entries,
-            start_ts: segment_builder.start_ts,
+            server_version: env!("KUBIDM_PKG_SERIES").to_string(),
+            start_ts,
             end_ts,
+            entries: builder.entries,
         };
 
-        let (segment, _) = self.serialize_and_save_segment(segment_data)?;
-
+        let segment = match write_segment_file(&self.segments_path, &file) {
+            Ok(segment) => segment,
+            Err(err) => {
+                self.current_segment = Some(WalSegmentBuilder {
+                    entries: file.entries,
+                    start_ts: builder.start_ts,
+                    current_size: builder.current_size,
+                });
+                return Err(err);
+            }
+        };
+        if let Err(err) = fs::remove_file(self.marker_path()) {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                warn!(%err, "Unable to remove the WAL open segment marker");
+            }
+        }
+        self.stats.segments_closed += 1;
+        info!(
+            segment = %segment.segment_id,
+            entries = segment.entry_count,
+            size_bytes = segment.size_bytes,
+            "WAL segment closed"
+        );
         Ok(Some(segment))
     }
+}
 
-    fn serialize_and_save_segment(
-        &self,
-        segment_data: WalSegmentData,
-    ) -> Result<(WalSegment, Vec<u8>), WalError> {
-        let serialized = serde_json::to_vec(&segment_data.entries)?;
+fn estimate_record_size(record: &WalEntryRecord) -> u64 {
+    let data_len = match &record.operation {
+        WalOperationRecord::Create { entry_data } | WalOperationRecord::Modify { entry_data } => {
+            entry_data.len() as u64
+        }
+        WalOperationRecord::Delete | WalOperationRecord::Truncate => 0,
+    };
+    RECORD_OVERHEAD_BYTES + data_len
+}
 
-        let (compressed, compression) = match self.compress_segment(&serialized)? {
-            (data, BackupCompression::Gzip) => (data, BackupCompression::Gzip),
-            (data, BackupCompression::NoCompression) => (data, BackupCompression::NoCompression),
+/// The file name of the segment of `server_uuid` starting at `start_ts`. The timestamp
+/// is zero padded so that lexical order is CID order.
+pub fn segment_file_name(server_uuid: Uuid, start_ts: Duration) -> String {
+    format!(
+        "{WAL_SEGMENT_PREFIX}{server_uuid}-{:020}{WAL_SEGMENT_SUFFIX}",
+        start_ts.as_nanos()
+    )
+}
+
+/// Whether `name` is the file name of a closed segment.
+pub fn is_wal_segment_name(name: &str) -> bool {
+    name.starts_with(WAL_SEGMENT_PREFIX) && name.ends_with(WAL_SEGMENT_SUFFIX)
+}
+
+/// The sidecar path of the segment `segment_id` in `dir`.
+pub fn segment_meta_path(dir: &Path, segment_id: &str) -> PathBuf {
+    dir.join(format!("{segment_id}{WAL_SEGMENT_META_SUFFIX}"))
+}
+
+/// Serialise, compress, checksum and atomically write `file` and its sidecar into `dir`.
+pub fn write_segment_file(dir: &Path, file: &WalSegmentFile) -> Result<WalSegment, WalError> {
+    let serialized = serde_json::to_vec(file)?;
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&serialized)?;
+    let compressed = encoder.finish()?;
+
+    let segment = WalSegment {
+        segment_id: file.segment_id.clone(),
+        server_uuid: file.server_uuid,
+        start_ts: file.start_ts,
+        end_ts: file.end_ts,
+        first_cid: file
+            .entries
+            .first()
+            .map(|r| r.cid().to_string())
+            .unwrap_or_default(),
+        last_cid: file
+            .entries
+            .last()
+            .map(|r| r.cid().to_string())
+            .unwrap_or_default(),
+        entry_count: file.entries.len() as u64,
+        checksum_sha256: hex::encode(Sha256::digest(&compressed)),
+        size_bytes: compressed.len() as u64,
+        compression: BackupCompression::Gzip,
+        server_version: file.server_version.clone(),
+        created_at: format_ts_rfc3339(file.end_ts),
+    };
+
+    let segment_path = dir.join(&file.segment_id);
+    let tmp_path = dir.join(format!("{}{WAL_TMP_SUFFIX}", file.segment_id));
+    fs::write(&tmp_path, &compressed)?;
+    fs::rename(&tmp_path, &segment_path)?;
+
+    let meta_path = segment_meta_path(dir, &file.segment_id);
+    let meta_tmp = dir.join(format!(
+        "{}{WAL_SEGMENT_META_SUFFIX}{WAL_TMP_SUFFIX}",
+        file.segment_id
+    ));
+    fs::write(&meta_tmp, serde_json::to_vec_pretty(&segment)?)?;
+    fs::rename(&meta_tmp, &meta_path)?;
+
+    debug!(path = %segment_path.display(), "WAL segment written");
+    Ok(segment)
+}
+
+/// The closed segments in `dir`, from their sidecars, in CID order. A segment file
+/// without a sidecar, a sidecar without its segment file, or a file still being written
+/// is skipped.
+pub fn list_segments(dir: &Path) -> Result<Vec<WalSegment>, WalError> {
+    let mut segments = Vec::new();
+    if !dir.exists() {
+        return Ok(segments);
+    }
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
         };
-
-        let checksum = hex::encode(Sha256::digest(&compressed));
-        let size = compressed.len() as u64;
-
-        let segment = WalSegment::new(
-            segment_data.segment_id,
-            segment_data.server_uuid,
-            segment_data.start_ts,
-            segment_data.end_ts,
-            checksum,
-            size,
-            compression,
-        );
-
-        Ok((segment, compressed))
-    }
-
-    fn compress_segment(&self, data: &[u8]) -> Result<(Vec<u8>, BackupCompression), WalError> {
-        match self.config.s3.as_ref() {
-            Some(_) => {
-                let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-                encoder.write_all(data)?;
-                let compressed = encoder.finish()?;
-                Ok((compressed, BackupCompression::Gzip))
-            }
-            None => Ok((data.to_vec(), BackupCompression::NoCompression)),
+        if !name.ends_with(WAL_SEGMENT_META_SUFFIX) || !path.is_file() {
+            continue;
         }
-    }
-
-    pub fn apply_retention_policy(
-        &mut self,
-        manifest: &mut PitrManifest,
-    ) -> Result<Vec<String>, WalError> {
-        let retention_duration =
-            Duration::from_secs(self.config.retention_days as u64 * 24 * 60 * 60);
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default();
-
-        let cutoff_time = now - retention_duration;
-        let cutoff_ts = Duration::from_secs(cutoff_time.as_secs());
-
-        let mut deleted_segments = Vec::new();
-        let mut retained_segments = Vec::new();
-
-        for segment in manifest.segments.drain(..) {
-            if segment.end_ts < cutoff_ts {
-                deleted_segments.push(segment.segment_id.clone());
-                info!("Deleting expired WAL segment: {}", segment.segment_id);
-            } else {
-                retained_segments.push(segment);
-            }
+        let segment: WalSegment = serde_json::from_slice(&fs::read(&path)?).map_err(|err| {
+            WalError::InvalidSegment(format!("sidecar {} is not readable: {err}", path.display()))
+        })?;
+        if !dir.join(&segment.segment_id).is_file() {
+            debug!(
+                segment = %segment.segment_id,
+                "WAL sidecar without segment file, skipping"
+            );
+            continue;
         }
+        segments.push(segment);
+    }
+    segments.sort_by(|a, b| {
+        a.start_ts
+            .cmp(&b.start_ts)
+            .then(a.segment_id.cmp(&b.segment_id))
+    });
+    Ok(segments)
+}
 
-        manifest.segments = retained_segments;
+/// Remove the segment `segment_id` and its sidecar from `dir`.
+pub fn remove_segment(dir: &Path, segment_id: &str) -> Result<(), WalError> {
+    let segment_path = dir.join(segment_id);
+    if segment_path.exists() {
+        fs::remove_file(&segment_path)?;
+    }
+    let meta_path = segment_meta_path(dir, segment_id);
+    if meta_path.exists() {
+        fs::remove_file(&meta_path)?;
+    }
+    Ok(())
+}
 
-        if !manifest.segments.is_empty() {
-            manifest.earliest_recoverable_time = manifest
-                .segments
-                .first()
-                .map(|s| s.created_at.clone())
-                .unwrap_or_else(|| manifest.base_backup_timestamp.clone());
-            manifest.latest_recoverable_time = manifest
-                .segments
-                .last()
-                .map(|s| s.created_at.clone())
-                .unwrap_or_else(|| manifest.base_backup_timestamp.clone());
+/// Parse the content of a segment file.
+pub fn parse_segment(
+    data: &[u8],
+    compression: BackupCompression,
+) -> Result<WalSegmentFile, WalError> {
+    let decompressed = match compression {
+        BackupCompression::Gzip => {
+            let mut decoder = flate2::read::GzDecoder::new(data);
+            let mut decompressed = Vec::new();
+            decoder.read_to_end(&mut decompressed)?;
+            decompressed
         }
+        BackupCompression::NoCompression => data.to_vec(),
+    };
 
-        Ok(deleted_segments)
+    let file: WalSegmentFile = serde_json::from_slice(&decompressed)?;
+    if file.format_version != WAL_SEGMENT_FORMAT_VERSION {
+        return Err(WalError::InvalidSegment(format!(
+            "segment {} has format version {}, this server reads version {}",
+            file.segment_id, file.format_version, WAL_SEGMENT_FORMAT_VERSION
+        )));
     }
+    Ok(file)
 }
 
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub struct RecoveryState {
-    pub target: kubidm_proto::backup::RecoveryTarget,
-    pub available_segments: Vec<WalSegment>,
-    pub base_backup_id: String,
-    pub base_backup_timestamp: String,
+/// Read and parse the segment file at `path`.
+pub fn read_segment_file(path: &Path) -> Result<WalSegmentFile, WalError> {
+    let data = fs::read(path)?;
+    parse_segment(&data, BackupCompression::identify_file(path))
 }
 
-#[allow(dead_code)]
-impl RecoveryState {
-    pub fn validate_target(&self) -> Result<(), WalError> {
-        match &self.target.target_type {
-            kubidm_proto::backup::RecoveryTargetType::Time { timestamp } => {
-                let target_time = chrono::DateTime::parse_from_rfc3339(timestamp)
-                    .map_err(|e| WalError::InvalidSegment(format!("Invalid timestamp: {}", e)))?;
-
-                let earliest = chrono::DateTime::parse_from_rfc3339(&self.base_backup_timestamp)
-                    .map_err(|e| {
-                        WalError::InvalidSegment(format!("Invalid base backup time: {}", e))
-                    })?;
-
-                let latest = chrono::DateTime::parse_from_rfc3339(
-                    self.available_segments
-                        .last()
-                        .map(|s| s.created_at.as_str())
-                        .unwrap_or(&self.base_backup_timestamp),
-                )
-                .map_err(|e| WalError::InvalidSegment(format!("Invalid segment time: {}", e)))?;
-
-                if target_time < earliest {
-                    return Err(WalError::InvalidSegment(format!(
-                        "Target time {} is before earliest recoverable time {}",
-                        timestamp, self.base_backup_timestamp
-                    )));
-                }
-
-                if target_time > latest {
-                    return Err(WalError::InvalidSegment(format!(
-                        "Target time {} is after latest recoverable time {}",
-                        timestamp,
-                        latest.to_rfc3339()
-                    )));
-                }
-            }
-            kubidm_proto::backup::RecoveryTargetType::Transaction { cid } => {
-                let cid_found = self.available_segments.iter().any(|s| {
-                    s.segment_id.contains(cid)
-                        || format!("{}-{}", s.server_uuid, s.start_ts.as_nanos()).contains(cid)
-                });
-
-                if !cid_found {
-                    return Err(WalError::InvalidSegment(format!(
-                        "Transaction CID {} not found in available segments",
-                        cid
-                    )));
-                }
-            }
-            kubidm_proto::backup::RecoveryTargetType::Latest => {}
-        }
-
-        Ok(())
-    }
-
-    pub fn get_segments_for_recovery(&self) -> Vec<WalSegment> {
-        let mut segments = self.available_segments.clone();
-        segments.sort_by_key(|s| s.start_ts);
-        segments
-    }
+/// The records of `records` with `after_ts < cid_ts <= up_to_ts`, in their original order.
+pub fn select_records<'a>(
+    records: &'a [WalEntryRecord],
+    after_ts: Duration,
+    up_to_ts: Duration,
+) -> impl Iterator<Item = &'a WalEntryRecord> + 'a {
+    records
+        .iter()
+        .filter(move |record| record.ts() > after_ts && record.ts() <= up_to_ts)
 }
 
-#[allow(dead_code)]
-pub struct WalReplayer {
-    server_uuid: Uuid,
-}
-
-#[allow(dead_code)]
-impl WalReplayer {
-    pub fn new(server_uuid: Uuid) -> Self {
-        Self { server_uuid }
-    }
-
-    pub fn load_segment(
-        &self,
-        data: &[u8],
-        compression: BackupCompression,
-    ) -> Result<Vec<WalEntryRecord>, WalError> {
-        let decompressed = match compression {
-            BackupCompression::Gzip => {
-                let mut decoder = flate2::read::GzDecoder::new(data);
-                let mut decompressed = Vec::new();
-                decoder.read_to_end(&mut decompressed)?;
-                decompressed
-            }
-            BackupCompression::NoCompression => data.to_vec(),
-        };
-
-        let entries: Vec<WalEntryRecord> = serde_json::from_slice(&decompressed)?;
-        Ok(entries)
-    }
-
-    pub fn replay_until<'a>(
-        &self,
-        entries: &'a [WalEntryRecord],
-        target_ts: Option<Duration>,
-        target_cid: Option<&Cid>,
-    ) -> Vec<&'a WalEntryRecord> {
-        entries
-            .iter()
-            .filter(|entry| {
-                if let Some(ts) = target_ts {
-                    if Duration::from_nanos(entry.cid_ts) > ts {
-                        return false;
-                    }
-                }
-                if let Some(cid) = target_cid {
-                    if entry.cid_ts > cid.ts.as_nanos() as u64 || entry.cid_server != cid.s_uuid {
-                        return false;
-                    }
-                }
-                true
-            })
-            .collect()
-    }
-}
-
-#[allow(dead_code)]
+/// Parse an RFC3339 recovery target into a duration since the epoch.
 pub fn parse_recovery_target_time(timestamp: &str) -> Result<Duration, WalError> {
-    let dt = chrono::DateTime::parse_from_rfc3339(timestamp)
+    let dt = OffsetDateTime::parse(timestamp, &Rfc3339)
         .map_err(|e| WalError::InvalidSegment(format!("Invalid timestamp format: {}", e)))?;
-
-    let unix_ts = dt.timestamp();
-    let nanos = dt.timestamp_subsec_nanos();
-
-    Ok(Duration::new(unix_ts as u64, nanos))
+    let nanos = dt.unix_timestamp_nanos();
+    if nanos < 0 {
+        return Err(WalError::InvalidSegment(format!(
+            "Timestamp {timestamp} is before the epoch"
+        )));
+    }
+    Ok(Duration::from_nanos(nanos as u64))
 }
 
-#[allow(dead_code)]
+/// Parse a CID as printed by the server (`<nanos>-<server uuid>`).
 pub fn parse_recovery_target_cid(cid_str: &str) -> Result<Cid, WalError> {
     let Some((ts_str, uuid_str)) = cid_str.split_once('-') else {
         return Err(WalError::InvalidSegment(format!(
@@ -486,895 +820,569 @@ pub fn parse_recovery_target_cid(cid_str: &str) -> Result<Cid, WalError> {
     })
 }
 
+/// Render a duration since the epoch as an RFC3339 UTC timestamp.
+pub fn format_ts_rfc3339(ts: Duration) -> String {
+    OffsetDateTime::from_unix_timestamp_nanos(ts.as_nanos() as i128)
+        .ok()
+        .and_then(|dt| dt.format(&Rfc3339).ok())
+        .unwrap_or_else(|| format!("{}ns", ts.as_nanos()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kubidm_proto::backup::{PitrManifest, RecoveryTarget, RecoveryTargetType};
-    use std::time::SystemTime;
 
-    fn create_test_config() -> WalArchiveConfig {
+    fn test_config() -> WalArchiveConfig {
         WalArchiveConfig {
             enabled: true,
             s3: None,
             retention_days: 7,
-            segment_size_bytes: 1024,
+            segment_size_bytes: 1024 * 1024,
+            segment_interval_seconds: 300,
+            local_path: None,
         }
     }
 
-    fn create_test_cid(ts_nanos: u64) -> Cid {
+    fn cid(server: Uuid, secs: u64) -> Cid {
         Cid {
-            ts: Duration::from_nanos(ts_nanos),
-            s_uuid: Uuid::new_v4(),
+            ts: Duration::from_secs(secs),
+            s_uuid: server,
         }
     }
 
-    fn create_test_segment(server_uuid: Uuid, start_ts: Duration, end_ts: Duration) -> WalSegment {
-        WalSegment::new(
-            format!("wal-{}-test.wal", server_uuid),
-            server_uuid,
-            start_ts,
-            end_ts,
-            "checksum123".to_string(),
-            100,
-            BackupCompression::NoCompression,
-        )
-    }
-
-    fn create_test_manifest(server_uuid: Uuid) -> PitrManifest {
-        PitrManifest::new(
-            server_uuid,
-            "backup-001".to_string(),
-            "2024-01-01T00:00:00Z".to_string(),
-        )
+    fn archiver(config: WalArchiveConfig, server: Uuid) -> (tempfile::TempDir, WalArchiver) {
+        let dir = tempfile::tempdir().unwrap();
+        let archiver = WalArchiver::new(config, server, dir.path().join("wal")).unwrap();
+        (dir, archiver)
     }
 
     #[test]
-    fn test_wal_segment_builder() {
-        let server_uuid = Uuid::new_v4();
-        let config = WalArchiveConfig::default();
-        let base_path = std::env::temp_dir();
-
-        let archiver = WalArchiver::new(config, server_uuid, &base_path);
-
-        assert!(!archiver.is_enabled());
-    }
-
-    #[test]
-    fn test_wal_archiver_enabled() {
-        let server_uuid = Uuid::new_v4();
-        let config = create_test_config();
-        let base_path = std::env::temp_dir();
-
-        let archiver = WalArchiver::new(config, server_uuid, &base_path);
-
+    fn test_archiver_new_creates_and_probes_directory() {
+        let server = Uuid::new_v4();
+        let (dir, mut archiver) = archiver(test_config(), server);
+        assert!(archiver.segments_path().is_dir());
         assert!(archiver.is_enabled());
+        assert_eq!(archiver.server_uuid(), server);
+        assert!(!archiver.has_pending_records());
+        assert!(dir.path().join("wal").is_dir());
+        assert!(!dir.path().join("wal").join(".write-probe").exists());
+        assert!(archiver.flush_current_segment().unwrap().is_none());
+
+        let invalid = WalArchiveConfig {
+            segment_size_bytes: 0,
+            ..test_config()
+        };
+        assert!(matches!(
+            WalArchiver::new(invalid, server, dir.path().join("wal2")),
+            Err(WalError::ConfigError(_))
+        ));
+
+        // A file where the directory should be is rejected.
+        std::fs::write(dir.path().join("file"), b"x").unwrap();
+        assert!(WalArchiver::new(test_config(), server, dir.path().join("file")).is_err());
     }
 
     #[test]
-    fn test_wal_entry_record_create() {
-        let cid = create_test_cid(1000);
-        let entry_id = 1u64;
-        let entry_data = vec![1, 2, 3, 4];
+    fn test_disabled_archiver_records_nothing() {
+        let server = Uuid::new_v4();
+        let (_dir, mut archiver) = archiver(
+            WalArchiveConfig {
+                enabled: false,
+                ..test_config()
+            },
+            server,
+        );
+        assert!(archiver
+            .record_create(&cid(server, 1), 1, Uuid::new_v4(), vec![1])
+            .unwrap()
+            .is_none());
+        assert!(!archiver.has_pending_records());
+        assert_eq!(archiver.stats().records_archived, 0);
+    }
 
-        let record = WalEntryRecord {
-            cid_ts: cid.ts.as_nanos() as u64,
-            cid_server: cid.s_uuid,
-            entry_id,
-            operation: WalOperationRecord::Create { entry_data },
-        };
+    #[test]
+    fn test_segment_roundtrip_preserves_records_cid_and_bytes() {
+        let server = Uuid::new_v4();
+        let (_dir, mut archiver) = archiver(test_config(), server);
+        let u1 = Uuid::new_v4();
+        let u2 = Uuid::new_v4();
+        let txn1 = cid(server, 10);
+        let txn2 = cid(server, 11);
 
-        assert_eq!(record.cid_ts, 1000);
-        assert_eq!(record.entry_id, 1);
+        assert!(archiver
+            .record_create(&txn1, 1, u1, b"entry-1".to_vec())
+            .unwrap()
+            .is_none());
+        assert!(archiver
+            .append_transaction(
+                &txn2,
+                false,
+                vec![
+                    (
+                        1,
+                        WalPendingOp::Modify {
+                            entry_uuid: u1,
+                            entry_data: b"entry-1-v2".to_vec()
+                        }
+                    ),
+                    (2, WalPendingOp::Delete { entry_uuid: u2 }),
+                ],
+            )
+            .unwrap()
+            .is_none());
+        assert_eq!(archiver.pending_record_count(), 3);
+        assert_eq!(archiver.stats().records_archived, 3);
+
+        let segment = archiver.flush_current_segment().unwrap().unwrap();
+        assert!(!archiver.has_pending_records());
+        assert_eq!(archiver.stats().segments_closed, 1);
+        assert_eq!(segment.server_uuid, server);
+        assert_eq!(segment.start_ts, Duration::from_secs(10));
+        assert_eq!(segment.end_ts, Duration::from_secs(11));
+        assert_eq!(segment.entry_count, 3);
+        assert_eq!(segment.first_cid, txn1.to_string());
+        assert_eq!(segment.last_cid, txn2.to_string());
+        assert_eq!(segment.compression, BackupCompression::Gzip);
+        assert_eq!(segment.server_version, env!("KUBIDM_PKG_SERIES"));
+        assert_eq!(
+            segment.segment_id,
+            segment_file_name(server, Duration::from_secs(10))
+        );
+        assert!(is_wal_segment_name(&segment.segment_id));
+
+        let path = archiver.segments_path().join(&segment.segment_id);
+        let data = std::fs::read(&path).unwrap();
+        assert_eq!(data.len() as u64, segment.size_bytes);
+        assert_eq!(hex::encode(Sha256::digest(&data)), segment.checksum_sha256);
+
+        let file = read_segment_file(&path).unwrap();
+        assert_eq!(file.format_version, WAL_SEGMENT_FORMAT_VERSION);
+        assert_eq!(file.entries.len(), 3);
+        assert_eq!(file.entries[0].cid(), txn1);
+        assert_eq!(file.entries[0].entry_uuid, u1);
+        assert_eq!(file.entries[0].entry_id, 1);
+        assert_eq!(
+            file.entries[0].operation,
+            WalOperationRecord::Create {
+                entry_data: b"entry-1".to_vec()
+            }
+        );
+        assert_eq!(file.entries[1].cid(), txn2);
+        assert_eq!(
+            file.entries[1].operation,
+            WalOperationRecord::Modify {
+                entry_data: b"entry-1-v2".to_vec()
+            }
+        );
+        assert_eq!(file.entries[2].entry_uuid, u2);
+        assert_eq!(file.entries[2].operation, WalOperationRecord::Delete);
+
+        // The sidecar describes the same segment and the listing finds it.
+        let listed = list_segments(archiver.segments_path()).unwrap();
+        assert_eq!(listed, vec![segment.clone()]);
+
+        remove_segment(archiver.segments_path(), &segment.segment_id).unwrap();
+        assert!(list_segments(archiver.segments_path()).unwrap().is_empty());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn test_truncate_record_comes_first() {
+        let server = Uuid::new_v4();
+        let (_dir, mut archiver) = archiver(test_config(), server);
+        let u1 = Uuid::new_v4();
+        archiver
+            .append_transaction(
+                &cid(server, 5),
+                true,
+                vec![(
+                    1,
+                    WalPendingOp::Create {
+                        entry_uuid: u1,
+                        entry_data: b"e".to_vec(),
+                    },
+                )],
+            )
+            .unwrap();
+        let segment = archiver.flush_current_segment().unwrap().unwrap();
+        let file = read_segment_file(&archiver.segments_path().join(segment.segment_id)).unwrap();
+        assert_eq!(file.entries.len(), 2);
+        assert_eq!(file.entries[0].operation, WalOperationRecord::Truncate);
+        assert_eq!(file.entries[0].entry_uuid, Uuid::nil());
         assert!(matches!(
-            record.operation,
+            file.entries[1].operation,
             WalOperationRecord::Create { .. }
         ));
     }
 
     #[test]
-    fn test_wal_entry_record_modify() {
-        let cid = create_test_cid(2000);
-        let entry_id = 2u64;
-        let entry_data = vec![5, 6, 7, 8];
+    fn test_segment_rolls_by_size_after_whole_transaction() {
+        let server = Uuid::new_v4();
+        let (_dir, mut archiver) = archiver(
+            WalArchiveConfig {
+                segment_size_bytes: 300,
+                ..test_config()
+            },
+            server,
+        );
 
-        let record = WalEntryRecord {
-            cid_ts: cid.ts.as_nanos() as u64,
-            cid_server: cid.s_uuid,
-            entry_id,
-            operation: WalOperationRecord::Modify { entry_data },
+        // One transaction with two records of 100 bytes each: 2 * (96 + 100) >= 300, so
+        // the segment is closed right after the transaction, holding both records.
+        let rolled = archiver
+            .append_transaction(
+                &cid(server, 1),
+                false,
+                vec![
+                    (
+                        1,
+                        WalPendingOp::Create {
+                            entry_uuid: Uuid::new_v4(),
+                            entry_data: vec![1; 100],
+                        },
+                    ),
+                    (
+                        2,
+                        WalPendingOp::Create {
+                            entry_uuid: Uuid::new_v4(),
+                            entry_data: vec![2; 100],
+                        },
+                    ),
+                ],
+            )
+            .unwrap()
+            .expect("segment must roll by size");
+        assert_eq!(rolled.entry_count, 2);
+        assert!(!archiver.has_pending_records());
+
+        // A small transaction stays pending.
+        assert!(archiver
+            .record_delete(&cid(server, 2), 3, Uuid::new_v4())
+            .unwrap()
+            .is_none());
+        assert!(archiver.has_pending_records());
+        assert_eq!(archiver.stats().segments_closed, 1);
+    }
+
+    #[test]
+    fn test_segment_rolls_by_time() {
+        let server = Uuid::new_v4();
+        let (_dir, mut archiver) = archiver(
+            WalArchiveConfig {
+                segment_interval_seconds: 60,
+                ..test_config()
+            },
+            server,
+        );
+
+        archiver
+            .record_create(&cid(server, 100), 1, Uuid::new_v4(), vec![1])
+            .unwrap();
+        archiver
+            .record_create(&cid(server, 130), 2, Uuid::new_v4(), vec![2])
+            .unwrap();
+
+        // Not stale yet.
+        assert!(archiver
+            .flush_if_stale(Duration::from_secs(159))
+            .unwrap()
+            .is_none());
+        assert_eq!(archiver.pending_record_count(), 2);
+
+        // A transaction one interval after the segment opened closes it first; the new
+        // transaction opens the next segment.
+        let rolled = archiver
+            .record_create(&cid(server, 160), 3, Uuid::new_v4(), vec![3])
+            .unwrap()
+            .expect("segment must roll by time");
+        assert_eq!(rolled.entry_count, 2);
+        assert_eq!(rolled.start_ts, Duration::from_secs(100));
+        assert_eq!(rolled.end_ts, Duration::from_secs(130));
+        assert_eq!(archiver.pending_record_count(), 1);
+
+        // The periodic check closes a stale segment without a new transaction.
+        let rolled = archiver
+            .flush_if_stale(Duration::from_secs(220))
+            .unwrap()
+            .expect("stale segment must be flushed");
+        assert_eq!(rolled.entry_count, 1);
+        assert_eq!(rolled.start_ts, Duration::from_secs(160));
+        assert!(!archiver.has_pending_records());
+
+        let listed = list_segments(archiver.segments_path()).unwrap();
+        assert_eq!(listed.len(), 2);
+        assert!(listed[0].start_ts < listed[1].start_ts);
+    }
+
+    #[test]
+    fn test_unclosed_segment_is_reported_as_a_gap_at_the_next_start() {
+        let server = Uuid::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("wal");
+        let marker = wal_dir.join(WAL_OPEN_SEGMENT_MARKER);
+
+        let mut archiver = WalArchiver::new(test_config(), server, wal_dir.clone()).unwrap();
+        assert!(archiver.take_gaps().is_empty());
+        assert!(!marker.exists());
+
+        // The first record of a segment leaves the marker behind until the segment closes.
+        archiver
+            .record_create(&cid(server, 10), 1, Uuid::new_v4(), vec![1])
+            .unwrap();
+        assert!(marker.exists());
+        archiver
+            .record_create(&cid(server, 11), 2, Uuid::new_v4(), vec![2])
+            .unwrap();
+        archiver.flush_current_segment().unwrap().unwrap();
+        assert!(!marker.exists());
+
+        // A run that stops with records in memory leaves the marker; the next start
+        // reports everything from the first of those records on as missing.
+        archiver
+            .record_create(&cid(server, 20), 3, Uuid::new_v4(), vec![3])
+            .unwrap();
+        drop(archiver);
+        let mut restarted = WalArchiver::new(test_config(), server, wal_dir.clone()).unwrap();
+        assert!(!marker.exists());
+        let gaps = restarted.take_gaps();
+        assert_eq!(
+            gaps,
+            vec![WalGap {
+                from_ts: Duration::from_secs(20),
+                until_ts: None,
+                reason: WalGapReason::UnclosedSegment,
+            }]
+        );
+        assert!(restarted.take_gaps().is_empty());
+
+        // Gaps that could not be recorded are handed back, ahead of newer ones.
+        restarted.note_failure(Some(Duration::from_secs(30)));
+        restarted.restore_gaps(gaps.clone());
+        let all = restarted.take_gaps();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0], gaps[0]);
+        assert_eq!(
+            all[1],
+            WalGap {
+                from_ts: Duration::from_secs(30),
+                until_ts: Some(Duration::from_secs(30)),
+                reason: WalGapReason::ArchiveFailure,
+            }
+        );
+        assert_eq!(restarted.stats().failures, 1);
+    }
+
+    #[test]
+    fn test_unreported_gaps_are_handed_to_the_next_start() {
+        let server = Uuid::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("wal");
+
+        let mut archiver = WalArchiver::new(test_config(), server, wal_dir.clone()).unwrap();
+        // Nothing to hand over: no marker.
+        archiver.defer_gaps_to_next_start().unwrap();
+        assert!(!wal_dir.join(WAL_OPEN_SEGMENT_MARKER).exists());
+
+        archiver.note_failure(Some(Duration::from_secs(50)));
+        archiver.note_failure(Some(Duration::from_secs(30)));
+        archiver.defer_gaps_to_next_start().unwrap();
+        assert!(archiver.take_gaps().is_empty());
+        drop(archiver);
+
+        let mut restarted = WalArchiver::new(test_config(), server, wal_dir).unwrap();
+        let gaps = restarted.take_gaps();
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0].from_ts, Duration::from_secs(30));
+        assert_eq!(gaps[0].until_ts, None);
+    }
+
+    #[test]
+    fn test_failure_without_cid_starts_the_gap_at_the_last_record() {
+        let server = Uuid::new_v4();
+        let (_dir, mut archiver) = archiver(test_config(), server);
+        archiver.note_failure(None);
+        assert_eq!(archiver.take_gaps()[0].from_ts, Duration::ZERO);
+
+        archiver
+            .record_create(&cid(server, 40), 1, Uuid::new_v4(), vec![1])
+            .unwrap();
+        archiver.note_failure(None);
+        let gaps = archiver.take_gaps();
+        assert_eq!(gaps[0].from_ts, Duration::from_secs(40));
+        assert_eq!(gaps[0].until_ts, None);
+    }
+
+    #[test]
+    fn test_failed_flush_keeps_the_records_and_retries() {
+        let server = Uuid::new_v4();
+        let (_dir, mut archiver) = archiver(
+            WalArchiveConfig {
+                segment_size_bytes: 1,
+                ..test_config()
+            },
+            server,
+        );
+        // A non-empty directory where the segment file goes makes the write fail.
+        let blocker = archiver
+            .segments_path()
+            .join(segment_file_name(server, Duration::from_secs(5)));
+        std::fs::create_dir(&blocker).unwrap();
+        std::fs::write(blocker.join("x"), b"x").unwrap();
+
+        // The size limit is reached, the flush fails, nothing is lost or reported as lost.
+        let rolled = archiver
+            .record_create(&cid(server, 5), 1, Uuid::new_v4(), vec![1])
+            .unwrap();
+        assert!(rolled.is_none());
+        assert_eq!(archiver.pending_record_count(), 1);
+        assert_eq!(archiver.stats().flush_failures, 1);
+        assert_eq!(archiver.stats().failures, 0);
+        assert!(archiver.take_gaps().is_empty());
+        assert!(archiver.flush_current_segment().is_err());
+        assert_eq!(archiver.pending_record_count(), 1);
+
+        // Once the obstacle is gone the retry writes every record.
+        std::fs::remove_dir_all(&blocker).unwrap();
+        let rolled = archiver
+            .record_create(&cid(server, 6), 2, Uuid::new_v4(), vec![2])
+            .unwrap()
+            .expect("the retried segment must be written");
+        assert_eq!(rolled.entry_count, 2);
+        assert!(!archiver.has_pending_records());
+        assert!(!archiver
+            .segments_path()
+            .join(WAL_OPEN_SEGMENT_MARKER)
+            .exists());
+    }
+
+    #[test]
+    fn test_list_segments_skips_incomplete_files() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(list_segments(&dir.path().join("missing"))
+            .unwrap()
+            .is_empty());
+
+        let server = Uuid::new_v4();
+        let file = WalSegmentFile {
+            format_version: WAL_SEGMENT_FORMAT_VERSION,
+            segment_id: segment_file_name(server, Duration::from_secs(1)),
+            server_uuid: server,
+            server_version: "test".to_string(),
+            start_ts: Duration::from_secs(1),
+            end_ts: Duration::from_secs(1),
+            entries: vec![],
         };
+        let segment = write_segment_file(dir.path(), &file).unwrap();
+        assert_eq!(list_segments(dir.path()).unwrap().len(), 1);
 
-        assert_eq!(record.cid_ts, 2000);
-        assert_eq!(record.entry_id, 2);
+        // A sidecar whose segment file vanished is skipped.
+        std::fs::remove_file(dir.path().join(&segment.segment_id)).unwrap();
+        assert!(list_segments(dir.path()).unwrap().is_empty());
+
+        // A segment file without a sidecar is skipped too.
+        std::fs::remove_file(segment_meta_path(dir.path(), &segment.segment_id)).unwrap();
+        std::fs::write(dir.path().join(&segment.segment_id), b"x").unwrap();
+        assert!(list_segments(dir.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_parse_segment_rejects_other_format_versions() {
+        let server = Uuid::new_v4();
+        let file = WalSegmentFile {
+            format_version: WAL_SEGMENT_FORMAT_VERSION + 1,
+            segment_id: "x".to_string(),
+            server_uuid: server,
+            server_version: "test".to_string(),
+            start_ts: Duration::ZERO,
+            end_ts: Duration::ZERO,
+            entries: vec![],
+        };
+        let data = serde_json::to_vec(&file).unwrap();
         assert!(matches!(
-            record.operation,
-            WalOperationRecord::Modify { .. }
+            parse_segment(&data, BackupCompression::NoCompression),
+            Err(WalError::InvalidSegment(_))
+        ));
+        assert!(matches!(
+            parse_segment(b"garbage", BackupCompression::NoCompression),
+            Err(WalError::SerializationError(_))
         ));
     }
 
     #[test]
-    fn test_wal_entry_record_delete() {
-        let cid = create_test_cid(3000);
-        let entry_id = 3u64;
-
-        let record = WalEntryRecord {
-            cid_ts: cid.ts.as_nanos() as u64,
-            cid_server: cid.s_uuid,
-            entry_id,
-            operation: WalOperationRecord::Delete,
-        };
-
-        assert_eq!(record.cid_ts, 3000);
-        assert_eq!(record.entry_id, 3);
-        assert!(matches!(record.operation, WalOperationRecord::Delete));
-    }
-
-    #[test]
-    fn test_wal_entry_serialization() {
-        let record = WalEntryRecord {
-            cid_ts: 1000,
-            cid_server: Uuid::new_v4(),
-            entry_id: 1,
-            operation: WalOperationRecord::Create {
-                entry_data: vec![1, 2, 3],
-            },
-        };
-
-        let serialized = serde_json::to_vec(&record);
-        assert!(serialized.is_ok());
-
-        let deserialized: WalEntryRecord = serde_json::from_slice(&serialized.unwrap()).unwrap();
-        assert_eq!(record.cid_ts, deserialized.cid_ts);
-        assert_eq!(record.entry_id, deserialized.entry_id);
-    }
-
-    #[test]
-    fn test_wal_entry_deserialization() {
-        let json = r#"{"cid_ts":1000,"cid_server":"00000000-0000-0000-0000-000000000001","entry_id":1,"operation":{"Create":{"entry_data":[1,2,3]}}}"#;
-        let record: WalEntryRecord = serde_json::from_str(json).unwrap();
-        assert_eq!(record.cid_ts, 1000);
-        assert_eq!(record.entry_id, 1);
-    }
-
-    #[test]
-    fn test_wal_entry_ordering() {
-        let records: Vec<WalEntryRecord> = vec![
-            WalEntryRecord {
-                cid_ts: 3000,
-                cid_server: Uuid::new_v4(),
-                entry_id: 3,
+    fn test_select_records_is_exclusive_inclusive() {
+        let server = Uuid::new_v4();
+        let records: Vec<WalEntryRecord> = [10u64, 20, 30, 40]
+            .iter()
+            .map(|secs| WalEntryRecord {
+                cid_ts: Duration::from_secs(*secs).as_nanos() as u64,
+                cid_server: server,
+                entry_id: *secs,
+                entry_uuid: Uuid::new_v4(),
                 operation: WalOperationRecord::Delete,
-            },
-            WalEntryRecord {
-                cid_ts: 1000,
-                cid_server: Uuid::new_v4(),
-                entry_id: 1,
-                operation: WalOperationRecord::Create {
-                    entry_data: vec![1],
-                },
-            },
-            WalEntryRecord {
-                cid_ts: 2000,
-                cid_server: Uuid::new_v4(),
-                entry_id: 2,
-                operation: WalOperationRecord::Modify {
-                    entry_data: vec![2],
-                },
-            },
-        ];
+            })
+            .collect();
 
-        let sorted: Vec<u64> = records.iter().map(|r| r.cid_ts).collect();
-        assert_eq!(sorted, vec![3000, 1000, 2000]);
+        let selected: Vec<u64> =
+            select_records(&records, Duration::from_secs(20), Duration::from_secs(40))
+                .map(|r| r.entry_id)
+                .collect();
+        assert_eq!(selected, vec![30, 40]);
+
+        let selected: Vec<u64> =
+            select_records(&records, Duration::from_secs(0), Duration::from_secs(25))
+                .map(|r| r.entry_id)
+                .collect();
+        assert_eq!(selected, vec![10, 20]);
+
+        assert_eq!(
+            select_records(&records, Duration::from_secs(40), Duration::from_secs(50)).count(),
+            0
+        );
     }
 
     #[test]
     fn test_parse_recovery_target_time() {
-        let timestamp = "2024-01-15T10:30:00Z";
-        let result = parse_recovery_target_time(timestamp);
-        assert!(result.is_ok());
-        let duration = result.unwrap();
-        assert!(duration.as_secs() > 0);
-    }
+        let ts = parse_recovery_target_time("2024-01-15T10:30:00Z").unwrap();
+        assert_eq!(ts, Duration::from_secs(1705314600));
+        let ts = parse_recovery_target_time("2024-01-15T10:30:00.123456Z").unwrap();
+        assert_eq!(ts.subsec_nanos(), 123_456_000);
+        let ts = parse_recovery_target_time("2024-01-15T10:30:00+05:00").unwrap();
+        assert_eq!(ts, Duration::from_secs(1705314600 - 5 * 3600));
+        assert!(parse_recovery_target_time("not-a-timestamp").is_err());
+        assert!(parse_recovery_target_time("1960-01-01T00:00:00Z").is_err());
 
-    #[test]
-    fn test_parse_recovery_target_time_invalid() {
-        let timestamp = "not-a-timestamp";
-        let result = parse_recovery_target_time(timestamp);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_parse_recovery_target_time_with_timezone() {
-        let timestamp = "2024-01-15T10:30:00+05:00";
-        let result = parse_recovery_target_time(timestamp);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_parse_recovery_target_time_microsecond_precision() {
-        let timestamp = "2024-01-15T10:30:00.123456Z";
-        let result = parse_recovery_target_time(timestamp);
-        assert!(result.is_ok());
-        let duration = result.unwrap();
-        assert!(duration.subsec_nanos() > 0);
-    }
-
-    #[test]
-    fn test_timestamp_range_query() {
-        let start_ts = Duration::from_secs(1704067200);
-        let end_ts = Duration::from_secs(1704153600);
-        let test_ts = Duration::from_secs(1704100000);
-
-        assert!(test_ts >= start_ts);
-        assert!(test_ts <= end_ts);
-    }
-
-    #[test]
-    fn test_timestamp_comparison() {
-        let ts1 = Duration::from_nanos(1000);
-        let ts2 = Duration::from_nanos(2000);
-        let ts3 = Duration::from_nanos(1000);
-
-        assert!(ts1 < ts2);
-        assert!(ts1 == ts3);
-        assert!(ts2 > ts1);
-    }
-
-    #[test]
-    fn test_recovery_state_creation() {
-        let server_uuid = Uuid::new_v4();
-        let target = RecoveryTarget::latest();
-        let segments = vec![create_test_segment(
-            server_uuid,
-            Duration::from_secs(0),
-            Duration::from_secs(100),
-        )];
-
-        let state = RecoveryState {
-            target,
-            available_segments: segments,
-            base_backup_id: "backup-001".to_string(),
-            base_backup_timestamp: "2024-01-01T00:00:00Z".to_string(),
-        };
-
-        assert_eq!(state.available_segments.len(), 1);
-        assert_eq!(state.base_backup_id, "backup-001");
-    }
-
-    #[test]
-    fn test_recovery_state_validate_target_latest() {
-        let server_uuid = Uuid::new_v4();
-        let target = RecoveryTarget::latest();
-        let segments = vec![create_test_segment(
-            server_uuid,
-            Duration::from_secs(0),
-            Duration::from_secs(100),
-        )];
-
-        let state = RecoveryState {
-            target,
-            available_segments: segments,
-            base_backup_id: "backup-001".to_string(),
-            base_backup_timestamp: "2024-01-01T00:00:00Z".to_string(),
-        };
-
-        assert!(state.validate_target().is_ok());
-    }
-
-    #[test]
-    fn test_recovery_state_validate_target_time_valid() {
-        let server_uuid = Uuid::new_v4();
-        let target = RecoveryTarget::to_time("2024-01-01T01:00:00Z").unwrap();
-        let segments = vec![create_test_segment(
-            server_uuid,
-            Duration::from_secs(0),
-            Duration::from_secs(3600),
-        )];
-
-        let state = RecoveryState {
-            target,
-            available_segments: segments,
-            base_backup_id: "backup-001".to_string(),
-            base_backup_timestamp: "2024-01-01T00:00:00Z".to_string(),
-        };
-
-        assert!(state.validate_target().is_ok());
-    }
-
-    #[test]
-    fn test_recovery_state_validate_target_time_before_backup() {
-        let server_uuid = Uuid::new_v4();
-        let target = RecoveryTarget::to_time("2023-12-31T00:00:00Z").unwrap();
-        let segments = vec![create_test_segment(
-            server_uuid,
-            Duration::from_secs(0),
-            Duration::from_secs(3600),
-        )];
-
-        let state = RecoveryState {
-            target,
-            available_segments: segments,
-            base_backup_id: "backup-001".to_string(),
-            base_backup_timestamp: "2024-01-01T00:00:00Z".to_string(),
-        };
-
-        assert!(state.validate_target().is_err());
-    }
-
-    #[test]
-    fn test_recovery_state_validate_target_time_after_latest() {
-        let server_uuid = Uuid::new_v4();
-        let target = RecoveryTarget::to_time("2030-01-01T00:00:00Z").unwrap();
-        let segments = vec![create_test_segment(
-            server_uuid,
-            Duration::from_secs(0),
-            Duration::from_secs(3600),
-        )];
-
-        let state = RecoveryState {
-            target,
-            available_segments: segments,
-            base_backup_id: "backup-001".to_string(),
-            base_backup_timestamp: "2024-01-01T00:00:00Z".to_string(),
-        };
-
-        assert!(state.validate_target().is_err());
-    }
-
-    #[test]
-    fn test_recovery_state_get_segments_for_recovery() {
-        let server_uuid = Uuid::new_v4();
-        let target = RecoveryTarget::latest();
-        let segments = vec![
-            create_test_segment(
-                server_uuid,
-                Duration::from_secs(200),
-                Duration::from_secs(300),
-            ),
-            create_test_segment(
-                server_uuid,
-                Duration::from_secs(0),
-                Duration::from_secs(100),
-            ),
-            create_test_segment(
-                server_uuid,
-                Duration::from_secs(100),
-                Duration::from_secs(200),
-            ),
-        ];
-
-        let state = RecoveryState {
-            target,
-            available_segments: segments,
-            base_backup_id: "backup-001".to_string(),
-            base_backup_timestamp: "2024-01-01T00:00:00Z".to_string(),
-        };
-
-        let sorted_segments = state.get_segments_for_recovery();
-        assert_eq!(sorted_segments.len(), 3);
-        assert!(sorted_segments[0].start_ts <= sorted_segments[1].start_ts);
-        assert!(sorted_segments[1].start_ts <= sorted_segments[2].start_ts);
-    }
-
-    #[test]
-    fn test_wal_segment_creation() {
-        let server_uuid = Uuid::new_v4();
-        let segment = create_test_segment(
-            server_uuid,
-            Duration::from_secs(0),
-            Duration::from_secs(100),
+        assert_eq!(
+            format_ts_rfc3339(Duration::from_secs(1705314600)),
+            "2024-01-15T10:30:00Z"
         );
-
-        assert!(segment.segment_id.contains("wal"));
-        assert_eq!(segment.server_uuid, server_uuid);
-        assert_eq!(segment.start_ts, Duration::from_secs(0));
-        assert_eq!(segment.end_ts, Duration::from_secs(100));
     }
 
     #[test]
-    fn test_wal_segment_display() {
-        let server_uuid = Uuid::new_v4();
-        let segment = create_test_segment(
-            server_uuid,
-            Duration::from_secs(0),
-            Duration::from_secs(100),
-        );
-        let display = format!("{}", segment);
-        assert!(display.contains("WalSegment"));
-        assert!(display.contains(server_uuid.to_string().as_str()));
-    }
-
-    #[test]
-    fn test_wal_archiver_record_create() {
-        let server_uuid = Uuid::new_v4();
-        let config = create_test_config();
-        let base_path = std::env::temp_dir();
-        let mut archiver = WalArchiver::new(config, server_uuid, &base_path);
-
-        let cid = create_test_cid(1000);
-        let result = archiver.record_create(&cid, 1, vec![1, 2, 3]);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_wal_archiver_record_modify() {
-        let server_uuid = Uuid::new_v4();
-        let config = create_test_config();
-        let base_path = std::env::temp_dir();
-        let mut archiver = WalArchiver::new(config, server_uuid, &base_path);
-
-        let cid = create_test_cid(1000);
-        let result = archiver.record_modify(&cid, 1, vec![4, 5, 6]);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_wal_archiver_record_delete() {
-        let server_uuid = Uuid::new_v4();
-        let config = create_test_config();
-        let base_path = std::env::temp_dir();
-        let mut archiver = WalArchiver::new(config, server_uuid, &base_path);
-
-        let cid = create_test_cid(1000);
-        let result = archiver.record_delete(&cid, 1);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_wal_archiver_disabled_operations() {
-        let server_uuid = Uuid::new_v4();
-        let config = WalArchiveConfig::default();
-        let base_path = std::env::temp_dir();
-        let mut archiver = WalArchiver::new(config, server_uuid, &base_path);
-
-        let cid = create_test_cid(1000);
-        let create_result = archiver.record_create(&cid, 1, vec![1, 2, 3]);
-        let modify_result = archiver.record_modify(&cid, 1, vec![4, 5, 6]);
-        let delete_result = archiver.record_delete(&cid, 1);
-
-        assert!(create_result.is_ok());
-        assert!(modify_result.is_ok());
-        assert!(delete_result.is_ok());
-    }
-
-    #[test]
-    fn test_wal_archiver_flush_empty_segment() {
-        let server_uuid = Uuid::new_v4();
-        let config = create_test_config();
-        let base_path = std::env::temp_dir();
-        let mut archiver = WalArchiver::new(config, server_uuid, &base_path);
-
-        let result = archiver.flush_current_segment();
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_none());
-    }
-
-    #[test]
-    fn test_wal_replayer_load_segment_uncompressed() {
-        let server_uuid = Uuid::new_v4();
-        let replayer = WalReplayer::new(server_uuid);
-
-        let entries = vec![WalEntryRecord {
-            cid_ts: 1000,
-            cid_server: server_uuid,
-            entry_id: 1,
-            operation: WalOperationRecord::Create {
-                entry_data: vec![1, 2, 3],
-            },
-        }];
-
-        let data = serde_json::to_vec(&entries).unwrap();
-        let result = replayer.load_segment(&data, BackupCompression::NoCompression);
-        assert!(result.is_ok());
-        let loaded = result.unwrap();
-        assert_eq!(loaded.len(), 1);
-    }
-
-    #[test]
-    fn test_wal_replayer_replay_until_time() {
-        let server_uuid = Uuid::new_v4();
-        let replayer = WalReplayer::new(server_uuid);
-
-        let entries = vec![
-            WalEntryRecord {
-                cid_ts: 1000,
-                cid_server: server_uuid,
-                entry_id: 1,
-                operation: WalOperationRecord::Create {
-                    entry_data: vec![1],
-                },
-            },
-            WalEntryRecord {
-                cid_ts: 2000,
-                cid_server: server_uuid,
-                entry_id: 2,
-                operation: WalOperationRecord::Create {
-                    entry_data: vec![2],
-                },
-            },
-            WalEntryRecord {
-                cid_ts: 3000,
-                cid_server: server_uuid,
-                entry_id: 3,
-                operation: WalOperationRecord::Create {
-                    entry_data: vec![3],
-                },
-            },
-        ];
-
-        let target_ts = Some(Duration::from_nanos(2500));
-        let filtered = replayer.replay_until(&entries, target_ts, None);
-        assert_eq!(filtered.len(), 2);
-    }
-
-    #[test]
-    fn test_wal_replayer_replay_all() {
-        let server_uuid = Uuid::new_v4();
-        let replayer = WalReplayer::new(server_uuid);
-
-        let entries = vec![
-            WalEntryRecord {
-                cid_ts: 1000,
-                cid_server: server_uuid,
-                entry_id: 1,
-                operation: WalOperationRecord::Create {
-                    entry_data: vec![1],
-                },
-            },
-            WalEntryRecord {
-                cid_ts: 2000,
-                cid_server: server_uuid,
-                entry_id: 2,
-                operation: WalOperationRecord::Create {
-                    entry_data: vec![2],
-                },
-            },
-        ];
-
-        let filtered = replayer.replay_until(&entries, None, None);
-        assert_eq!(filtered.len(), 2);
-    }
-
-    #[test]
-    fn test_wal_replayer_replay_until_cid() {
-        let server_uuid = Uuid::new_v4();
-        let replayer = WalReplayer::new(server_uuid);
-
-        let target_cid = Cid {
-            ts: Duration::from_nanos(1500),
-            s_uuid: server_uuid,
-        };
-
-        let entries = vec![
-            WalEntryRecord {
-                cid_ts: 1000,
-                cid_server: server_uuid,
-                entry_id: 1,
-                operation: WalOperationRecord::Create {
-                    entry_data: vec![1],
-                },
-            },
-            WalEntryRecord {
-                cid_ts: 2000,
-                cid_server: server_uuid,
-                entry_id: 2,
-                operation: WalOperationRecord::Create {
-                    entry_data: vec![2],
-                },
-            },
-        ];
-
-        let filtered = replayer.replay_until(&entries, None, Some(&target_cid));
-        assert_eq!(filtered.len(), 1);
-    }
-
-    #[test]
-    fn test_parse_recovery_target_cid_valid() {
+    fn test_parse_recovery_target_cid() {
         let uuid = Uuid::new_v4();
-        let cid_str = format!("{:032}-{}", 1000u64, uuid);
-        let result = parse_recovery_target_cid(&cid_str);
-        assert!(result.is_ok());
-        let cid = result.unwrap();
-        assert_eq!(cid.ts, Duration::from_nanos(1000));
-        assert_eq!(cid.s_uuid, uuid);
-    }
-
-    #[test]
-    fn test_parse_recovery_target_cid_invalid_format() {
-        let cid_str = "invalid-cid";
-        let result = parse_recovery_target_cid(cid_str);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_parse_recovery_target_cid_missing_uuid() {
-        let cid_str = "1000";
-        let result = parse_recovery_target_cid(cid_str);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_apply_retention_policy() {
-        let server_uuid = Uuid::new_v4();
-        let config = WalArchiveConfig {
-            enabled: true,
-            s3: None,
-            retention_days: 1,
-            segment_size_bytes: 1024,
+        let c = Cid {
+            ts: Duration::from_nanos(1000),
+            s_uuid: uuid,
         };
-        let base_path = std::env::temp_dir();
-        let mut archiver = WalArchiver::new(config, server_uuid, &base_path);
-
-        let mut manifest = create_test_manifest(server_uuid);
-
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap();
-
-        let old_ts = Duration::from_secs(now.as_secs() - 86400 * 2);
-        let new_ts = Duration::from_secs(now.as_secs() - 3600);
-
-        manifest.add_segment(create_test_segment(server_uuid, old_ts, old_ts));
-        manifest.add_segment(create_test_segment(server_uuid, new_ts, new_ts));
-
-        let deleted = archiver.apply_retention_policy(&mut manifest).unwrap();
-        assert!(!deleted.is_empty());
-        assert!(manifest.segments.len() < 2);
-    }
-
-    #[test]
-    fn test_apply_retention_policy_empty_manifest() {
-        let server_uuid = Uuid::new_v4();
-        let config = create_test_config();
-        let base_path = std::env::temp_dir();
-        let mut archiver = WalArchiver::new(config, server_uuid, &base_path);
-
-        let mut manifest = create_test_manifest(server_uuid);
-        assert!(manifest.segments.is_empty());
-
-        let deleted = archiver.apply_retention_policy(&mut manifest).unwrap();
-        assert!(deleted.is_empty());
+        let parsed = parse_recovery_target_cid(&c.to_string()).unwrap();
+        assert_eq!(parsed, c);
+        assert!(parse_recovery_target_cid("invalid-cid").is_err());
+        assert!(parse_recovery_target_cid("1000").is_err());
+        assert!(parse_recovery_target_cid("abc-00000000-0000-0000-0000-000000000000").is_err());
     }
 
     #[test]
     fn test_wal_error_display() {
         let error = WalError::IoError(std::io::Error::new(std::io::ErrorKind::NotFound, "test"));
         assert!(error.to_string().contains("IO error"));
-
         let error = WalError::SerializationError("test".to_string());
         assert!(error.to_string().contains("serialization error"));
-
         let error = WalError::InvalidSegment("test".to_string());
         assert!(error.to_string().contains("Invalid WAL segment"));
-
-        let error = WalError::RetentionError("test".to_string());
-        assert!(error.to_string().contains("retention error"));
-
         let error = WalError::ConfigError("test".to_string());
         assert!(error.to_string().contains("config error"));
-    }
-
-    #[test]
-    fn test_wal_error_from_io() {
-        let io_error = std::io::Error::new(std::io::ErrorKind::NotFound, "test");
-        let wal_error: WalError = io_error.into();
-        assert!(matches!(wal_error, WalError::IoError(_)));
-    }
-
-    #[test]
-    fn test_wal_error_from_serde_json() {
-        let serde_error = serde_json::from_str::<WalEntryRecord>("invalid json").unwrap_err();
-        let wal_error: WalError = serde_error.into();
+        let wal_error: WalError = serde_json::from_str::<WalEntryRecord>("x")
+            .unwrap_err()
+            .into();
         assert!(matches!(wal_error, WalError::SerializationError(_)));
-    }
-
-    #[test]
-    fn test_empty_transaction_log_recovery() {
-        let server_uuid = Uuid::new_v4();
-        let replayer = WalReplayer::new(server_uuid);
-
-        let entries: Vec<WalEntryRecord> = vec![];
-        let filtered = replayer.replay_until(&entries, None, None);
-        assert!(filtered.is_empty());
-    }
-
-    #[test]
-    fn test_wal_segment_data_creation() {
-        let server_uuid = Uuid::new_v4();
-        let entries = vec![WalEntryRecord {
-            cid_ts: 1000,
-            cid_server: server_uuid,
-            entry_id: 1,
-            operation: WalOperationRecord::Create {
-                entry_data: vec![1, 2, 3],
-            },
-        }];
-
-        let segment_data = WalSegmentData {
-            segment_id: "test-segment".to_string(),
-            server_uuid,
-            entries,
-            start_ts: Duration::from_secs(0),
-            end_ts: Duration::from_secs(100),
-        };
-
-        assert_eq!(segment_data.entries.len(), 1);
-        assert_eq!(segment_data.segment_id, "test-segment");
-    }
-
-    #[test]
-    fn test_wal_config_default() {
-        let config = WalArchiveConfig::default();
-        assert!(!config.enabled);
-        assert_eq!(config.retention_days, 7);
-        assert_eq!(config.segment_size_bytes, 16 * 1024 * 1024);
-    }
-
-    #[test]
-    fn test_estimate_record_size_create() {
-        let server_uuid = Uuid::new_v4();
-        let config = create_test_config();
-        let base_path = std::env::temp_dir();
-        let archiver = WalArchiver::new(config, server_uuid, &base_path);
-
-        let record = WalEntryRecord {
-            cid_ts: 1000,
-            cid_server: server_uuid,
-            entry_id: 1,
-            operation: WalOperationRecord::Create {
-                entry_data: vec![1; 100],
-            },
-        };
-
-        let size = archiver.estimate_record_size(&record);
-        assert!(size > 100);
-    }
-
-    #[test]
-    fn test_estimate_record_size_delete() {
-        let server_uuid = Uuid::new_v4();
-        let config = create_test_config();
-        let base_path = std::env::temp_dir();
-        let archiver = WalArchiver::new(config, server_uuid, &base_path);
-
-        let record = WalEntryRecord {
-            cid_ts: 1000,
-            cid_server: server_uuid,
-            entry_id: 1,
-            operation: WalOperationRecord::Delete,
-        };
-
-        let size = archiver.estimate_record_size(&record);
-        let base_size = std::mem::size_of::<WalEntryRecord>() as u64;
-        assert_eq!(size, base_size);
-    }
-
-    #[test]
-    fn test_multiple_recovery_points() {
-        let server_uuid = Uuid::new_v4();
-        let mut manifest = create_test_manifest(server_uuid);
-
-        for i in 0..5 {
-            let ts = Duration::from_secs(i * 100);
-            manifest.add_segment(create_test_segment(server_uuid, ts, ts));
-        }
-
-        assert_eq!(manifest.segments.len(), 5);
-        assert!(manifest.earliest_recoverable_time != manifest.latest_recoverable_time);
-    }
-
-    #[test]
-    fn test_pitr_manifest_add_segment_updates_times() {
-        let server_uuid = Uuid::new_v4();
-        let mut manifest = create_test_manifest(server_uuid);
-
-        let segment1 = create_test_segment(
-            server_uuid,
-            Duration::from_secs(0),
-            Duration::from_secs(100),
-        );
-        let segment2 = create_test_segment(
-            server_uuid,
-            Duration::from_secs(100),
-            Duration::from_secs(200),
-        );
-
-        manifest.add_segment(segment1.clone());
-        assert_eq!(manifest.earliest_recoverable_time, segment1.created_at);
-        assert_eq!(manifest.latest_recoverable_time, segment1.created_at);
-
-        manifest.add_segment(segment2.clone());
-        assert_eq!(manifest.earliest_recoverable_time, segment1.created_at);
-        assert_eq!(manifest.latest_recoverable_time, segment2.created_at);
-    }
-
-    #[test]
-    fn test_timestamp_future() {
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap();
-        let future_ts = Duration::from_secs(now.as_secs() + 86400 * 365);
-
-        let server_uuid = Uuid::new_v4();
-        let segment = create_test_segment(server_uuid, future_ts, future_ts);
-        assert!(segment.start_ts > now);
-    }
-
-    #[test]
-    fn test_timestamp_before_database_creation() {
-        let old_ts = Duration::from_secs(0);
-        let server_uuid = Uuid::new_v4();
-        let segment = create_test_segment(server_uuid, old_ts, old_ts);
-        assert_eq!(segment.start_ts, Duration::from_secs(0));
-    }
-
-    #[test]
-    fn test_wal_archiver_segment_rotation() {
-        let server_uuid = Uuid::new_v4();
-        let config = WalArchiveConfig {
-            enabled: true,
-            s3: None,
-            retention_days: 7,
-            segment_size_bytes: 1,
-        };
-        let base_path = std::env::temp_dir();
-        let mut archiver = WalArchiver::new(config, server_uuid, &base_path);
-
-        let cid1 = create_test_cid(1000);
-        let result = archiver.record_create(&cid1, 1, vec![1; 10]);
-        assert!(result.is_ok());
-
-        let cid2 = create_test_cid(2000);
-        let result = archiver.record_create(&cid2, 2, vec![2; 10]);
-        assert!(result.is_ok());
-
-        let result = archiver.flush_current_segment();
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_recovery_target_time_creation() {
-        let target = RecoveryTarget::to_time("2024-01-15T10:30:00Z");
-        assert!(target.is_ok());
-        let target = target.unwrap();
-        assert!(matches!(
-            target.target_type,
-            RecoveryTargetType::Time { .. }
-        ));
-    }
-
-    #[test]
-    fn test_recovery_target_transaction_creation() {
-        let target = RecoveryTarget::to_transaction("1000-uuid");
-        assert!(target.is_ok());
-        let target = target.unwrap();
-        assert!(matches!(
-            target.target_type,
-            RecoveryTargetType::Transaction { .. }
-        ));
-    }
-
-    #[test]
-    fn test_recovery_target_transaction_empty() {
-        let target = RecoveryTarget::to_transaction("");
-        assert!(target.is_err());
-    }
-
-    #[test]
-    fn test_recovery_target_latest() {
-        let target = RecoveryTarget::latest();
-        assert!(matches!(target.target_type, RecoveryTargetType::Latest));
-    }
-
-    #[test]
-    fn test_recovery_target_display() {
-        let time_target = RecoveryTarget::to_time("2024-01-15T10:30:00Z").unwrap();
-        assert!(time_target.to_string().starts_with("time:"));
-
-        let cid_target = RecoveryTarget::to_transaction("test-cid").unwrap();
-        assert!(cid_target.to_string().starts_with("transaction:"));
-
-        let latest_target = RecoveryTarget::latest();
-        assert_eq!(latest_target.to_string(), "latest");
     }
 }

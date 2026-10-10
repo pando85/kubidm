@@ -99,6 +99,7 @@ compact_jwt = { workspace = true, features = ["unsafe_release_without_verify"] }
 futures = { workspace = true }
 kubidmd_lib_macros = { workspace = true }
 kubidm_proto = { workspace = true, features = ["test"] }
+tempfile = { workspace = true }
 toml = { workspace = true }
 webauthn-authenticator-rs = { workspace = true, features = [
     "softpasskey",

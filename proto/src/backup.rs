@@ -1025,16 +1025,34 @@ impl S3BackupMetadata {
     }
 }
 
+/// Configuration of write-ahead log (WAL) archiving for point-in-time recovery.
+///
+/// When enabled, every committed write transaction appends the full serialised state of
+/// each entry it changed to a local WAL segment. Closed segments are uploaded to S3 when
+/// an S3 configuration is present (this section's, or otherwise the one of
+/// `[online_backup.s3]`) and are otherwise kept in `local_path`.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct WalArchiveConfig {
     #[serde(default = "default_wal_enabled")]
     pub enabled: bool,
+    /// S3 location of the archived segments. Defaults to the `[online_backup.s3]` section.
     #[serde(default)]
     pub s3: Option<S3Config>,
+    /// How long archived segments are kept. A segment is never deleted while it is newer
+    /// than the oldest base backup that is still available, whatever this value.
     #[serde(default = "default_wal_retention_days")]
     pub retention_days: u32,
+    /// A segment is closed once the records it holds reach this size.
     #[serde(default = "default_wal_segment_size")]
     pub segment_size_bytes: u64,
+    /// A segment is also closed once it is this old, so that a quiet server still archives
+    /// its changes regularly. This is also the period of the upload task.
+    #[serde(default = "default_wal_segment_interval_seconds")]
+    pub segment_interval_seconds: u64,
+    /// Directory the server writes segments to before they are uploaded, and where they
+    /// stay when no S3 location is configured. Defaults to `wal` next to the database.
+    #[serde(default)]
+    pub local_path: Option<PathBuf>,
 }
 
 fn default_wal_enabled() -> bool {
@@ -1049,6 +1067,10 @@ fn default_wal_segment_size() -> u64 {
     16 * 1024 * 1024
 }
 
+fn default_wal_segment_interval_seconds() -> u64 {
+    300
+}
+
 impl Default for WalArchiveConfig {
     fn default() -> Self {
         Self {
@@ -1056,7 +1078,33 @@ impl Default for WalArchiveConfig {
             s3: None,
             retention_days: default_wal_retention_days(),
             segment_size_bytes: default_wal_segment_size(),
+            segment_interval_seconds: default_wal_segment_interval_seconds(),
+            local_path: None,
         }
+    }
+}
+
+impl WalArchiveConfig {
+    /// Check the numeric settings. Returns the offending key and the reason.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.segment_size_bytes == 0 {
+            return Err("segment_size_bytes must be greater than zero".to_string());
+        }
+        if self.retention_days == 0 {
+            return Err("retention_days must be greater than zero".to_string());
+        }
+        if self.segment_interval_seconds == 0 {
+            return Err("segment_interval_seconds must be greater than zero".to_string());
+        }
+        Ok(())
+    }
+
+    pub fn segment_interval(&self) -> Duration {
+        Duration::from_secs(self.segment_interval_seconds)
+    }
+
+    pub fn retention(&self) -> Duration {
+        Duration::from_secs(u64::from(self.retention_days) * 24 * 60 * 60)
     }
 }
 
@@ -1064,44 +1112,51 @@ impl Display for WalArchiveConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "WalArchiveConfig {{ enabled: {}, retention_days: {}, segment_size: {} }}",
-            self.enabled, self.retention_days, self.segment_size_bytes
+            "WalArchiveConfig {{ enabled: {}, retention_days: {}, segment_size: {}, segment_interval_seconds: {}, local_path: {:?} }}",
+            self.enabled,
+            self.retention_days,
+            self.segment_size_bytes,
+            self.segment_interval_seconds,
+            self.local_path
         )
     }
 }
 
+/// The name of the PITR manifest, in the WAL directory or under the S3 prefix.
+pub const PITR_MANIFEST_KEY: &str = "pitr-manifest.json";
+/// The S3 key prefix, below the configured `path_prefix`, under which segments are stored.
+pub const WAL_SEGMENT_KEY_PREFIX: &str = "wal/";
+/// Current version of the manifest format.
+pub const PITR_MANIFEST_VERSION: u32 = 1;
+
+/// A closed, archived WAL segment as the manifest describes it.
+///
+/// `start_ts` and `end_ts` are the CID timestamps of the first and last record. All CIDs
+/// of a segment belong to one server (`server_uuid`), and records are ordered by CID.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct WalSegment {
+    /// The file name of the segment. Lexical order is CID order.
     pub segment_id: String,
     pub server_uuid: Uuid,
     pub start_ts: Duration,
     pub end_ts: Duration,
+    pub first_cid: String,
+    pub last_cid: String,
+    pub entry_count: u64,
     pub checksum_sha256: String,
     pub size_bytes: u64,
     pub compression: BackupCompression,
+    /// Server version that wrote the segment. Segments can only be replayed by the same
+    /// version, like backups.
+    pub server_version: String,
+    /// RFC3339 rendering of `end_ts`, for display.
     pub created_at: String,
 }
 
 impl WalSegment {
-    pub fn new(
-        segment_id: String,
-        server_uuid: Uuid,
-        start_ts: Duration,
-        end_ts: Duration,
-        checksum_sha256: String,
-        size_bytes: u64,
-        compression: BackupCompression,
-    ) -> Self {
-        Self {
-            segment_id,
-            server_uuid,
-            start_ts,
-            end_ts,
-            checksum_sha256,
-            size_bytes,
-            compression,
-            created_at: chrono::Utc::now().to_rfc3339(),
-        }
+    /// The S3 key of this segment relative to the configured `path_prefix`.
+    pub fn object_key(&self) -> String {
+        format!("{WAL_SEGMENT_KEY_PREFIX}{}", self.segment_id)
     }
 }
 
@@ -1109,33 +1164,284 @@ impl Display for WalSegment {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "WalSegment {{ id: {}, server: {}, range: {:?}-{:?}, size: {} }}",
-            self.segment_id, self.server_uuid, self.start_ts, self.end_ts, self.size_bytes
+            "WalSegment {{ id: {}, server: {}, range: {:?}-{:?}, entries: {}, size: {} }}",
+            self.segment_id,
+            self.server_uuid,
+            self.start_ts,
+            self.end_ts,
+            self.entry_count,
+            self.size_bytes
         )
     }
 }
 
+/// A base backup the manifest knows about.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-pub struct WalSegmentMetadata {
-    pub segment: WalSegment,
-    pub entry_count: u64,
-    pub first_cid: String,
-    pub last_cid: String,
+pub struct PitrBaseBackup {
+    /// File name (local) or object key relative to `path_prefix` (S3) of the backup.
+    pub key: String,
+    /// RFC3339 time the backup was taken.
+    pub timestamp: String,
+    /// The CID timestamp watermark of the backup: the timestamp of the last transaction
+    /// the backup contains. WAL records with a CID timestamp above it are not in the
+    /// backup and must be replayed on top of it.
+    pub watermark_ts: Duration,
+    /// Server version that wrote the backup.
+    pub server_version: String,
 }
 
+/// A range of history abandoned by a restore or a point-in-time recovery.
+///
+/// Restoring or recovering the database to the CID timestamp `after_ts` discards everything
+/// the server committed after it. Those transactions are still in the WAL archive, and base
+/// backups may have been taken while they were live, but they no longer describe the
+/// database: replaying them on a later recovery would resurrect state the operator chose to
+/// discard. Every WAL record and base backup watermark in `(after_ts, until_ts]` is
+/// therefore ignored. `until_ts` is at least the time of the restore or recovery, so the
+/// transactions of the server started on the recovered database lie after it.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-pub struct WalEntry {
-    pub cid_ts: Duration,
-    pub cid_server: Uuid,
-    pub entry_id: u64,
-    pub operation: WalOperation,
+pub struct PitrTimelineBreak {
+    /// The CID timestamp the database was restored or recovered to.
+    pub after_ts: Duration,
+    /// The end of the abandoned range.
+    pub until_ts: Duration,
+    /// RFC3339 time of the restore or recovery, for display.
+    pub at: String,
+    /// The command that caused it, for display.
+    pub reason: String,
 }
 
+impl PitrTimelineBreak {
+    /// Whether the CID timestamp `ts` lies in the abandoned range.
+    pub fn contains(&self, ts: Duration) -> bool {
+        ts > self.after_ts && ts <= self.until_ts
+    }
+}
+
+/// CID timestamps whose WAL records are missing from the archive, because a committed
+/// transaction could not be recorded or the server stopped without archiving its open
+/// segment. Replaying from a base backup across a gap would silently skip changes, so a
+/// recovery whose replay range overlaps `[from_ts, until_ts]` is refused; a base backup
+/// taken after `until_ts` closes the gap.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-pub enum WalOperation {
-    Create { entry_data: Vec<u8> },
-    Modify { entry_data: Vec<u8> },
-    Delete,
+pub struct PitrWalGap {
+    pub from_ts: Duration,
+    pub until_ts: Duration,
+    /// Why the records are missing, for display.
+    pub reason: String,
+}
+
+/// Index of the base backups and WAL segments a server has archived.
+///
+/// The manifest is the source of truth for recovery: it pairs every base backup with its
+/// CID watermark so that the segments that follow it can be selected, and records the
+/// ranges of history that a restore or recovery abandoned.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct PitrManifest {
+    pub version: u32,
+    pub server_uuid: Uuid,
+    /// Ordered by `watermark_ts`.
+    pub base_backups: Vec<PitrBaseBackup>,
+    /// Ordered by `start_ts`.
+    pub segments: Vec<WalSegment>,
+    /// Ordered by `until_ts`.
+    #[serde(default)]
+    pub timeline_breaks: Vec<PitrTimelineBreak>,
+    /// Ordered by `from_ts`.
+    #[serde(default)]
+    pub gaps: Vec<PitrWalGap>,
+    /// RFC3339 time of the last update, for display.
+    pub updated_at: String,
+}
+
+impl PitrManifest {
+    pub fn new(server_uuid: Uuid) -> Self {
+        Self {
+            version: PITR_MANIFEST_VERSION,
+            server_uuid,
+            base_backups: Vec::new(),
+            segments: Vec::new(),
+            timeline_breaks: Vec::new(),
+            gaps: Vec::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    /// Record a base backup, replacing any earlier record of the same key.
+    pub fn add_base_backup(&mut self, base: PitrBaseBackup) {
+        self.base_backups
+            .retain(|existing| existing.key != base.key);
+        self.base_backups.push(base);
+        self.base_backups
+            .sort_by(|a, b| a.watermark_ts.cmp(&b.watermark_ts).then(a.key.cmp(&b.key)));
+    }
+
+    /// Record a segment, replacing any earlier record of the same id.
+    pub fn add_segment(&mut self, segment: WalSegment) {
+        self.segments
+            .retain(|existing| existing.segment_id != segment.segment_id);
+        self.segments.push(segment);
+        self.segments.sort_by(|a, b| {
+            a.start_ts
+                .cmp(&b.start_ts)
+                .then(a.segment_id.cmp(&b.segment_id))
+        });
+    }
+
+    /// Record that a restore or recovery abandoned the history in `(after_ts, until_ts]`.
+    /// The base backups taken during that history are dropped from the index, since they
+    /// hold state that no longer exists; their artifacts are left to backup retention.
+    pub fn add_timeline_break(&mut self, timeline_break: PitrTimelineBreak) {
+        self.base_backups
+            .retain(|base| !timeline_break.contains(base.watermark_ts));
+        self.timeline_breaks.push(timeline_break);
+        self.timeline_breaks.sort_by(|a, b| {
+            a.until_ts
+                .cmp(&b.until_ts)
+                .then(a.after_ts.cmp(&b.after_ts))
+        });
+    }
+
+    /// Record a gap in the archive, ignoring one already recorded.
+    pub fn add_gap(&mut self, gap: PitrWalGap) {
+        if self
+            .gaps
+            .iter()
+            .any(|known| known.from_ts == gap.from_ts && known.until_ts == gap.until_ts)
+        {
+            return;
+        }
+        self.gaps.push(gap);
+        self.gaps
+            .sort_by(|a, b| a.from_ts.cmp(&b.from_ts).then(a.until_ts.cmp(&b.until_ts)));
+    }
+
+    /// The first gap that makes replaying from a base with watermark `watermark_ts` up to
+    /// `target_ts` incomplete: one that overlaps `(watermark_ts, target_ts]`. A gap that
+    /// lies entirely in abandoned history is ignored, since that history is never
+    /// replayed.
+    pub fn gap_blocking(&self, watermark_ts: Duration, target_ts: Duration) -> Option<&PitrWalGap> {
+        self.gaps.iter().find(|gap| {
+            target_ts > watermark_ts
+                && gap.from_ts <= target_ts
+                && gap.until_ts > watermark_ts
+                && !self
+                    .timeline_breaks
+                    .iter()
+                    .any(|b| gap.from_ts > b.after_ts && gap.until_ts <= b.until_ts)
+        })
+    }
+
+    /// Whether the CID timestamp `ts` belongs to history a restore or recovery abandoned.
+    pub fn is_abandoned(&self, ts: Duration) -> bool {
+        self.timeline_breaks.iter().any(|b| b.contains(ts))
+    }
+
+    /// Drop the base backups whose key is not in `existing` any more, for example because
+    /// backup retention deleted them.
+    pub fn retain_base_backups(&mut self, existing: &[String]) {
+        self.base_backups
+            .retain(|base| existing.iter().any(|key| key == &base.key));
+    }
+
+    pub fn remove_segment(&mut self, segment_id: &str) {
+        self.segments.retain(|s| s.segment_id != segment_id);
+    }
+
+    /// Drop the timeline breaks that no retained base backup or segment precedes: once all
+    /// archived history is newer than a break, it can not affect any recovery.
+    pub fn prune_timeline_breaks(&mut self) {
+        let oldest_base = self.base_backups.iter().map(|b| b.watermark_ts).min();
+        let oldest_segment = self.segments.iter().map(|s| s.start_ts).min();
+        let oldest = match (oldest_base, oldest_segment) {
+            (Some(b), Some(s)) => Some(b.min(s)),
+            (b, s) => b.or(s),
+        };
+        match oldest {
+            Some(oldest) => self.timeline_breaks.retain(|b| oldest <= b.until_ts),
+            None => self.timeline_breaks.clear(),
+        }
+    }
+
+    /// Drop the gaps no retained base backup or segment precedes: a recovery can only start
+    /// from a base taken after them, and replays nothing from before that base.
+    pub fn prune_gaps(&mut self) {
+        let oldest_base = self.base_backups.iter().map(|b| b.watermark_ts).min();
+        let oldest_segment = self.segments.iter().map(|s| s.start_ts).min();
+        let oldest = match (oldest_base, oldest_segment) {
+            (Some(b), Some(s)) => Some(b.min(s)),
+            (b, s) => b.or(s),
+        };
+        match oldest {
+            Some(oldest) => self.gaps.retain(|gap| oldest < gap.until_ts),
+            None => self.gaps.clear(),
+        }
+    }
+
+    pub fn oldest_base_backup(&self) -> Option<&PitrBaseBackup> {
+        self.base_backups.first()
+    }
+
+    /// The newest base backup whose watermark is at or before `target_ts` and does not
+    /// belong to abandoned history.
+    pub fn base_backup_for(&self, target_ts: Duration) -> Option<&PitrBaseBackup> {
+        self.base_backups
+            .iter()
+            .rfind(|base| base.watermark_ts <= target_ts && !self.is_abandoned(base.watermark_ts))
+    }
+
+    /// The segments that hold records after `watermark_ts` and up to `target_ts`, in CID
+    /// order. A segment that straddles either bound is included; the records themselves
+    /// are filtered at replay time.
+    pub fn segments_between(
+        &self,
+        watermark_ts: Duration,
+        target_ts: Duration,
+    ) -> Vec<&WalSegment> {
+        self.segments
+            .iter()
+            .filter(|segment| segment.end_ts > watermark_ts && segment.start_ts <= target_ts)
+            .collect()
+    }
+
+    /// The latest CID timestamp recovery can reach: the end of the last segment, the
+    /// watermark of the newest base backup, or the point an earlier recovery restored to,
+    /// whichever is newest and does not belong to abandoned history, moved back to just
+    /// before any gap the replay from the base backup in use would cross.
+    pub fn latest_recoverable_ts(&self) -> Option<Duration> {
+        let mut latest = self
+            .segments
+            .iter()
+            .map(|s| s.end_ts)
+            .chain(self.base_backups.iter().map(|b| b.watermark_ts))
+            .chain(self.timeline_breaks.iter().map(|b| b.after_ts))
+            .filter(|ts| !self.is_abandoned(*ts))
+            .max()?;
+        // Each step moves `latest` strictly back past one gap, so this ends.
+        while let Some(base) = self.base_backup_for(latest) {
+            let Some(gap) = self.gap_blocking(base.watermark_ts, latest) else {
+                break;
+            };
+            latest = gap
+                .from_ts
+                .checked_sub(Duration::from_nanos(1))
+                .map_or(base.watermark_ts, |before| before.max(base.watermark_ts));
+        }
+        Some(latest)
+    }
+
+    /// The recoverable window `(earliest, latest)` in CID timestamps: from the watermark of
+    /// the oldest usable base backup to [`Self::latest_recoverable_ts`]. None without a
+    /// base backup, since segments alone can not be recovered.
+    pub fn recoverable_window(&self) -> Option<(Duration, Duration)> {
+        let earliest = self
+            .base_backups
+            .iter()
+            .map(|b| b.watermark_ts)
+            .find(|ts| !self.is_abandoned(*ts))?;
+        let latest = self.latest_recoverable_ts()?;
+        Some((earliest, latest.max(earliest)))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -1189,547 +1495,398 @@ impl Display for RecoveryTarget {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-pub struct PitrManifest {
-    pub server_uuid: Uuid,
-    pub segments: Vec<WalSegment>,
-    pub base_backup_id: String,
-    pub base_backup_timestamp: String,
-    pub earliest_recoverable_time: String,
-    pub latest_recoverable_time: String,
-}
+#[cfg(test)]
+mod wal_tests {
+    use super::*;
 
-impl PitrManifest {
-    pub fn new(server_uuid: Uuid, base_backup_id: String, base_backup_timestamp: String) -> Self {
-        let timestamp = base_backup_timestamp.clone();
-        Self {
-            server_uuid,
-            segments: Vec::new(),
-            base_backup_id,
-            base_backup_timestamp,
-            earliest_recoverable_time: timestamp.clone(),
-            latest_recoverable_time: timestamp,
+    fn segment(id: &str, start: u64, end: u64) -> WalSegment {
+        WalSegment {
+            segment_id: id.to_string(),
+            server_uuid: Uuid::nil(),
+            start_ts: Duration::from_secs(start),
+            end_ts: Duration::from_secs(end),
+            first_cid: String::new(),
+            last_cid: String::new(),
+            entry_count: 1,
+            checksum_sha256: String::new(),
+            size_bytes: 1,
+            compression: BackupCompression::Gzip,
+            server_version: "test".to_string(),
+            created_at: String::new(),
         }
     }
 
-    pub fn add_segment(&mut self, segment: WalSegment) {
-        if self.segments.is_empty() {
-            self.earliest_recoverable_time = segment.created_at.clone();
+    fn base(key: &str, watermark: u64) -> PitrBaseBackup {
+        PitrBaseBackup {
+            key: key.to_string(),
+            timestamp: String::new(),
+            watermark_ts: Duration::from_secs(watermark),
+            server_version: "test".to_string(),
         }
-        self.latest_recoverable_time = segment.created_at.clone();
-        self.segments.push(segment);
     }
-}
 
-#[test]
-fn test_wal_archive_config_default() {
-    let config = WalArchiveConfig::default();
-    assert!(!config.enabled);
-    assert_eq!(config.retention_days, 7);
-    assert_eq!(config.segment_size_bytes, 16 * 1024 * 1024);
-    assert!(config.s3.is_none());
-}
+    #[test]
+    fn test_wal_archive_config_default() {
+        let config = WalArchiveConfig::default();
+        assert!(!config.enabled);
+        assert_eq!(config.retention_days, 7);
+        assert_eq!(config.segment_size_bytes, 16 * 1024 * 1024);
+        assert_eq!(config.segment_interval_seconds, 300);
+        assert!(config.s3.is_none());
+        assert!(config.local_path.is_none());
+        assert!(config.validate().is_ok());
+        assert_eq!(config.retention(), Duration::from_secs(7 * 86400));
+        assert_eq!(config.segment_interval(), Duration::from_secs(300));
+    }
 
-#[test]
-fn test_wal_archive_config_display() {
-    let config = WalArchiveConfig {
-        enabled: true,
-        s3: None,
-        retention_days: 30,
-        segment_size_bytes: 1024,
-    };
-    let display = config.to_string();
-    assert!(display.contains("enabled: true"));
-    assert!(display.contains("retention_days: 30"));
-}
+    #[test]
+    fn test_wal_archive_config_validate() {
+        let zero_size = WalArchiveConfig {
+            segment_size_bytes: 0,
+            ..WalArchiveConfig::default()
+        };
+        assert!(zero_size
+            .validate()
+            .unwrap_err()
+            .contains("segment_size_bytes"));
 
-#[test]
-fn test_wal_segment_creation() {
-    let server_uuid = uuid::Uuid::new_v4();
-    let segment = WalSegment::new(
-        "test-segment-id".to_string(),
-        server_uuid,
-        Duration::from_secs(0),
-        Duration::from_secs(100),
-        "sha256-checksum".to_string(),
-        1024,
-        BackupCompression::Gzip,
-    );
+        let zero_retention = WalArchiveConfig {
+            retention_days: 0,
+            ..WalArchiveConfig::default()
+        };
+        assert!(zero_retention
+            .validate()
+            .unwrap_err()
+            .contains("retention_days"));
 
-    assert_eq!(segment.segment_id, "test-segment-id");
-    assert_eq!(segment.server_uuid, server_uuid);
-    assert_eq!(segment.start_ts, Duration::from_secs(0));
-    assert_eq!(segment.end_ts, Duration::from_secs(100));
-    assert_eq!(segment.checksum_sha256, "sha256-checksum");
-    assert_eq!(segment.size_bytes, 1024);
-    assert_eq!(segment.compression, BackupCompression::Gzip);
-    assert!(!segment.created_at.is_empty());
-}
+        let zero_interval = WalArchiveConfig {
+            segment_interval_seconds: 0,
+            ..WalArchiveConfig::default()
+        };
+        assert!(zero_interval
+            .validate()
+            .unwrap_err()
+            .contains("segment_interval_seconds"));
+    }
 
-#[test]
-fn test_wal_segment_display() {
-    let server_uuid = uuid::Uuid::new_v4();
-    let segment = WalSegment::new(
-        "test-segment".to_string(),
-        server_uuid,
-        Duration::from_secs(0),
-        Duration::from_secs(100),
-        "checksum".to_string(),
-        1024,
-        BackupCompression::NoCompression,
-    );
+    #[test]
+    fn test_wal_archive_config_deserialize_defaults() {
+        let config: WalArchiveConfig = serde_json::from_str(r#"{"enabled": true}"#).unwrap();
+        assert!(config.enabled);
+        assert_eq!(config.segment_interval_seconds, 300);
+        assert_eq!(config.retention_days, 7);
 
-    let display = segment.to_string();
-    assert!(display.contains("WalSegment"));
-    assert!(display.contains("test-segment"));
-    assert!(display.contains(server_uuid.to_string().as_str()));
-}
+        let config: WalArchiveConfig = serde_json::from_str(
+            r#"{"enabled": true, "segment_interval_seconds": 5, "local_path": "/tmp/wal"}"#,
+        )
+        .unwrap();
+        assert_eq!(config.segment_interval_seconds, 5);
+        assert_eq!(config.local_path, Some(PathBuf::from("/tmp/wal")));
+        assert!(config.to_string().contains("segment_interval_seconds: 5"));
+    }
 
-#[test]
-fn test_wal_segment_serialization() {
-    let server_uuid = uuid::Uuid::new_v4();
-    let segment = WalSegment::new(
-        "test-segment".to_string(),
-        server_uuid,
-        Duration::from_secs(0),
-        Duration::from_secs(100),
-        "checksum".to_string(),
-        1024,
-        BackupCompression::Gzip,
-    );
+    #[test]
+    fn test_wal_segment_object_key_and_display() {
+        let s = segment("wal-x.json.gz", 1, 2);
+        assert_eq!(s.object_key(), "wal/wal-x.json.gz");
+        assert!(s.to_string().contains("wal-x.json.gz"));
+        let json = serde_json::to_string(&s).unwrap();
+        let back: WalSegment = serde_json::from_str(&json).unwrap();
+        assert_eq!(s, back);
+    }
 
-    let json = serde_json::to_string(&segment).expect("Failed to serialize");
-    assert!(json.contains("test-segment"));
-    assert!(json.contains(server_uuid.to_string().as_str()));
+    #[test]
+    fn test_pitr_manifest_add_sorts_and_dedups() {
+        let mut manifest = PitrManifest::new(Uuid::nil());
+        manifest.add_segment(segment("b", 20, 30));
+        manifest.add_segment(segment("a", 10, 20));
+        manifest.add_segment(segment("a", 10, 25));
+        assert_eq!(manifest.segments.len(), 2);
+        assert_eq!(manifest.segments[0].segment_id, "a");
+        assert_eq!(manifest.segments[0].end_ts, Duration::from_secs(25));
 
-    let deserialized: WalSegment = serde_json::from_str(&json).expect("Failed to deserialize");
-    assert_eq!(segment.segment_id, deserialized.segment_id);
-    assert_eq!(segment.server_uuid, deserialized.server_uuid);
-}
-
-#[test]
-fn test_wal_entry_creation() {
-    let server_uuid = uuid::Uuid::new_v4();
-    let entry = WalEntry {
-        cid_ts: Duration::from_secs(1000),
-        cid_server: server_uuid,
-        entry_id: 1,
-        operation: WalOperation::Create {
-            entry_data: vec![1, 2, 3],
-        },
-    };
-
-    assert_eq!(entry.cid_ts, Duration::from_secs(1000));
-    assert_eq!(entry.cid_server, server_uuid);
-    assert_eq!(entry.entry_id, 1);
-    assert!(matches!(entry.operation, WalOperation::Create { .. }));
-}
-
-#[test]
-fn test_wal_operation_types() {
-    let create_op = WalOperation::Create {
-        entry_data: vec![1, 2, 3],
-    };
-    let modify_op = WalOperation::Modify {
-        entry_data: vec![4, 5, 6],
-    };
-    let delete_op = WalOperation::Delete;
-
-    assert!(matches!(create_op, WalOperation::Create { .. }));
-    assert!(matches!(modify_op, WalOperation::Modify { .. }));
-    assert!(matches!(delete_op, WalOperation::Delete));
-}
-
-#[test]
-fn test_wal_entry_serialization() {
-    let server_uuid = uuid::Uuid::new_v4();
-    let entry = WalEntry {
-        cid_ts: Duration::from_secs(1000),
-        cid_server: server_uuid,
-        entry_id: 1,
-        operation: WalOperation::Create {
-            entry_data: vec![1, 2, 3],
-        },
-    };
-
-    let json = serde_json::to_string(&entry).expect("Failed to serialize");
-    let deserialized: WalEntry = serde_json::from_str(&json).expect("Failed to deserialize");
-    assert_eq!(entry.entry_id, deserialized.entry_id);
-}
-
-#[test]
-fn test_recovery_target_to_time_valid() {
-    let target = RecoveryTarget::to_time("2024-01-15T10:30:00Z");
-    assert!(target.is_ok());
-    let target = target.unwrap();
-    assert!(matches!(
-        target.target_type,
-        RecoveryTargetType::Time { .. }
-    ));
-}
-
-#[test]
-fn test_recovery_target_to_time_invalid() {
-    let target = RecoveryTarget::to_time("invalid-timestamp");
-    assert!(target.is_err());
-}
-
-#[test]
-fn test_recovery_target_to_time_with_timezone() {
-    let target = RecoveryTarget::to_time("2024-01-15T10:30:00+05:00");
-    assert!(target.is_ok());
-}
-
-#[test]
-fn test_recovery_target_to_time_microseconds() {
-    let target = RecoveryTarget::to_time("2024-01-15T10:30:00.123456Z");
-    assert!(target.is_ok());
-}
-
-#[test]
-fn test_recovery_target_to_transaction_valid() {
-    let target = RecoveryTarget::to_transaction("123456789-uuid");
-    assert!(target.is_ok());
-    let target = target.unwrap();
-    assert!(matches!(
-        target.target_type,
-        RecoveryTargetType::Transaction { .. }
-    ));
-}
-
-#[test]
-fn test_recovery_target_to_transaction_empty() {
-    let target = RecoveryTarget::to_transaction("");
-    assert!(target.is_err());
-}
-
-#[test]
-fn test_recovery_target_latest() {
-    let target = RecoveryTarget::latest();
-    assert!(matches!(target.target_type, RecoveryTargetType::Latest));
-}
-
-#[test]
-fn test_recovery_target_display_time() {
-    let target = RecoveryTarget::to_time("2024-01-15T10:30:00Z").unwrap();
-    let display = target.to_string();
-    assert_eq!(display, "time:2024-01-15T10:30:00Z");
-}
-
-#[test]
-fn test_recovery_target_display_transaction() {
-    let target = RecoveryTarget::to_transaction("test-cid").unwrap();
-    let display = target.to_string();
-    assert_eq!(display, "transaction:test-cid");
-}
-
-#[test]
-fn test_recovery_target_display_latest() {
-    let target = RecoveryTarget::latest();
-    let display = target.to_string();
-    assert_eq!(display, "latest");
-}
-
-#[test]
-fn test_recovery_target_serialization() {
-    let target = RecoveryTarget::to_time("2024-01-15T10:30:00Z").unwrap();
-    let json = serde_json::to_string(&target).expect("Failed to serialize");
-    assert!(json.contains("2024-01-15T10:30:00Z"));
-
-    let deserialized: RecoveryTarget = serde_json::from_str(&json).expect("Failed to deserialize");
-    assert_eq!(target.to_string(), deserialized.to_string());
-}
-
-#[test]
-fn test_recovery_target_type_serialization() {
-    let time_type = RecoveryTargetType::Time {
-        timestamp: "2024-01-15T10:30:00Z".to_string(),
-    };
-    let json = serde_json::to_string(&time_type).expect("Failed to serialize");
-    assert!(json.contains("Time"));
-
-    let transaction_type = RecoveryTargetType::Transaction {
-        cid: "test-cid".to_string(),
-    };
-    let json = serde_json::to_string(&transaction_type).expect("Failed to serialize");
-    assert!(json.contains("Transaction"));
-
-    let latest_type = RecoveryTargetType::Latest;
-    let json = serde_json::to_string(&latest_type).expect("Failed to serialize");
-    assert!(json.contains("Latest"));
-}
-
-#[test]
-fn test_pitr_manifest_creation() {
-    let server_uuid = uuid::Uuid::new_v4();
-    let manifest = PitrManifest::new(
-        server_uuid,
-        "backup-001".to_string(),
-        "2024-01-01T00:00:00Z".to_string(),
-    );
-
-    assert_eq!(manifest.server_uuid, server_uuid);
-    assert_eq!(manifest.base_backup_id, "backup-001");
-    assert_eq!(manifest.base_backup_timestamp, "2024-01-01T00:00:00Z");
-    assert!(manifest.segments.is_empty());
-    assert_eq!(manifest.earliest_recoverable_time, "2024-01-01T00:00:00Z");
-    assert_eq!(manifest.latest_recoverable_time, "2024-01-01T00:00:00Z");
-}
-
-#[test]
-fn test_pitr_manifest_add_segment() {
-    let server_uuid = uuid::Uuid::new_v4();
-    let mut manifest = PitrManifest::new(
-        server_uuid,
-        "backup-001".to_string(),
-        "2024-01-01T00:00:00Z".to_string(),
-    );
-
-    let segment1 = WalSegment::new(
-        "segment-1".to_string(),
-        server_uuid,
-        Duration::from_secs(0),
-        Duration::from_secs(100),
-        "checksum1".to_string(),
-        1024,
-        BackupCompression::Gzip,
-    );
-
-    let segment2 = WalSegment::new(
-        "segment-2".to_string(),
-        server_uuid,
-        Duration::from_secs(100),
-        Duration::from_secs(200),
-        "checksum2".to_string(),
-        2048,
-        BackupCompression::Gzip,
-    );
-
-    manifest.add_segment(segment1.clone());
-    assert_eq!(manifest.segments.len(), 1);
-    assert_eq!(manifest.earliest_recoverable_time, segment1.created_at);
-    assert_eq!(manifest.latest_recoverable_time, segment1.created_at);
-
-    manifest.add_segment(segment2.clone());
-    assert_eq!(manifest.segments.len(), 2);
-    assert_eq!(manifest.earliest_recoverable_time, segment1.created_at);
-    assert_eq!(manifest.latest_recoverable_time, segment2.created_at);
-}
-
-#[test]
-fn test_pitr_manifest_serialization() {
-    let server_uuid = uuid::Uuid::new_v4();
-    let manifest = PitrManifest::new(
-        server_uuid,
-        "backup-001".to_string(),
-        "2024-01-01T00:00:00Z".to_string(),
-    );
-
-    let json = serde_json::to_string(&manifest).expect("Failed to serialize");
-    assert!(json.contains("backup-001"));
-    assert!(json.contains(server_uuid.to_string().as_str()));
-
-    let deserialized: PitrManifest = serde_json::from_str(&json).expect("Failed to deserialize");
-    assert_eq!(manifest.server_uuid, deserialized.server_uuid);
-    assert_eq!(manifest.base_backup_id, deserialized.base_backup_id);
-}
-
-#[test]
-fn test_pitr_manifest_empty_segments() {
-    let server_uuid = uuid::Uuid::new_v4();
-    let manifest = PitrManifest::new(
-        server_uuid,
-        "backup-001".to_string(),
-        "2024-01-01T00:00:00Z".to_string(),
-    );
-
-    assert_eq!(manifest.segments.len(), 0);
-    assert_eq!(
-        manifest.earliest_recoverable_time,
-        manifest.latest_recoverable_time
-    );
-}
-
-#[test]
-fn test_pitr_manifest_multiple_segments() {
-    let server_uuid = uuid::Uuid::new_v4();
-    let mut manifest = PitrManifest::new(
-        server_uuid,
-        "backup-001".to_string(),
-        "2024-01-01T00:00:00Z".to_string(),
-    );
-
-    for i in 0..10 {
-        let segment = WalSegment::new(
-            format!("segment-{}", i),
-            server_uuid,
-            Duration::from_secs(i * 100),
-            Duration::from_secs((i + 1) * 100),
-            format!("checksum-{}", i),
-            1024,
-            BackupCompression::Gzip,
+        manifest.add_base_backup(base("backup-2", 50));
+        manifest.add_base_backup(base("backup-1", 5));
+        manifest.add_base_backup(base("backup-2", 40));
+        assert_eq!(manifest.base_backups.len(), 2);
+        assert_eq!(manifest.oldest_base_backup().unwrap().key, "backup-1");
+        assert_eq!(
+            manifest.base_backups[1].watermark_ts,
+            Duration::from_secs(40)
         );
-        manifest.add_segment(segment);
+
+        manifest.retain_base_backups(&["backup-2".to_string()]);
+        assert_eq!(manifest.base_backups.len(), 1);
+        manifest.remove_segment("a");
+        assert_eq!(manifest.segments.len(), 1);
     }
 
-    assert_eq!(manifest.segments.len(), 10);
-}
+    #[test]
+    fn test_pitr_manifest_base_selection_and_window() {
+        let mut manifest = PitrManifest::new(Uuid::nil());
+        assert!(manifest.recoverable_window().is_none());
+        assert!(manifest.latest_recoverable_ts().is_none());
 
-#[test]
-fn test_wal_segment_metadata_creation() {
-    let server_uuid = uuid::Uuid::new_v4();
-    let segment = WalSegment::new(
-        "segment-1".to_string(),
-        server_uuid,
-        Duration::from_secs(0),
-        Duration::from_secs(100),
-        "checksum".to_string(),
-        1024,
-        BackupCompression::Gzip,
-    );
+        manifest.add_base_backup(base("backup-1", 10));
+        manifest.add_base_backup(base("backup-2", 40));
+        manifest.add_segment(segment("s1", 11, 20));
+        manifest.add_segment(segment("s2", 21, 45));
+        manifest.add_segment(segment("s3", 46, 60));
 
-    let metadata = WalSegmentMetadata {
-        segment,
-        entry_count: 100,
-        first_cid: "cid-1".to_string(),
-        last_cid: "cid-100".to_string(),
-    };
+        assert!(manifest.base_backup_for(Duration::from_secs(9)).is_none());
+        assert_eq!(
+            manifest
+                .base_backup_for(Duration::from_secs(10))
+                .unwrap()
+                .key,
+            "backup-1"
+        );
+        assert_eq!(
+            manifest
+                .base_backup_for(Duration::from_secs(39))
+                .unwrap()
+                .key,
+            "backup-1"
+        );
+        assert_eq!(
+            manifest
+                .base_backup_for(Duration::from_secs(40))
+                .unwrap()
+                .key,
+            "backup-2"
+        );
+        assert_eq!(
+            manifest
+                .base_backup_for(Duration::from_secs(1000))
+                .unwrap()
+                .key,
+            "backup-2"
+        );
 
-    assert_eq!(metadata.entry_count, 100);
-    assert_eq!(metadata.first_cid, "cid-1");
-    assert_eq!(metadata.last_cid, "cid-100");
-}
+        // From backup-2 (watermark 40) to 50: s2 straddles the watermark, s3 the target.
+        let ids: Vec<&str> = manifest
+            .segments_between(Duration::from_secs(40), Duration::from_secs(50))
+            .iter()
+            .map(|s| s.segment_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["s2", "s3"]);
 
-#[test]
-fn test_wal_segment_metadata_serialization() {
-    let server_uuid = uuid::Uuid::new_v4();
-    let segment = WalSegment::new(
-        "segment-1".to_string(),
-        server_uuid,
-        Duration::from_secs(0),
-        Duration::from_secs(100),
-        "checksum".to_string(),
-        1024,
-        BackupCompression::Gzip,
-    );
+        // A segment ending exactly on the watermark holds nothing new.
+        let ids: Vec<&str> = manifest
+            .segments_between(Duration::from_secs(20), Duration::from_secs(20))
+            .iter()
+            .map(|s| s.segment_id.as_str())
+            .collect();
+        assert!(ids.is_empty());
 
-    let metadata = WalSegmentMetadata {
-        segment,
-        entry_count: 100,
-        first_cid: "cid-1".to_string(),
-        last_cid: "cid-100".to_string(),
-    };
+        assert_eq!(
+            manifest.recoverable_window(),
+            Some((Duration::from_secs(10), Duration::from_secs(60)))
+        );
 
-    let json = serde_json::to_string(&metadata).expect("Failed to serialize");
-    assert!(json.contains("entry_count"));
+        // A base newer than every segment extends the window.
+        manifest.add_base_backup(base("backup-3", 70));
+        assert_eq!(
+            manifest.latest_recoverable_ts(),
+            Some(Duration::from_secs(70))
+        );
+    }
 
-    let deserialized: WalSegmentMetadata =
-        serde_json::from_str(&json).expect("Failed to deserialize");
-    assert_eq!(metadata.entry_count, deserialized.entry_count);
-}
+    #[test]
+    fn test_pitr_manifest_timeline_breaks() {
+        let mut manifest = PitrManifest::new(Uuid::nil());
+        manifest.add_base_backup(base("backup-1", 10));
+        manifest.add_base_backup(base("backup-2", 40));
+        manifest.add_segment(segment("s1", 11, 50));
+        manifest.add_segment(segment("s2", 51, 60));
 
-#[test]
-fn test_wal_segment_equality() {
-    let server_uuid = uuid::Uuid::new_v4();
-    let segment1 = WalSegment::new(
-        "segment-1".to_string(),
-        server_uuid,
-        Duration::from_secs(0),
-        Duration::from_secs(100),
-        "checksum".to_string(),
-        1024,
-        BackupCompression::Gzip,
-    );
+        // Recovered to 30 at 70: everything in (30, 70] is abandoned, including the base
+        // backup taken at 40.
+        manifest.add_timeline_break(PitrTimelineBreak {
+            after_ts: Duration::from_secs(30),
+            until_ts: Duration::from_secs(70),
+            at: String::new(),
+            reason: "recover".to_string(),
+        });
+        assert_eq!(manifest.base_backups.len(), 1);
+        assert!(!manifest.is_abandoned(Duration::from_secs(30)));
+        assert!(manifest.is_abandoned(Duration::from_secs(31)));
+        assert!(manifest.is_abandoned(Duration::from_secs(70)));
+        assert!(!manifest.is_abandoned(Duration::from_secs(71)));
+        assert_eq!(
+            manifest
+                .base_backup_for(Duration::from_secs(1000))
+                .unwrap()
+                .key,
+            "backup-1"
+        );
+        // The segments end in abandoned history; the latest point is the recovered one.
+        assert_eq!(
+            manifest.latest_recoverable_ts(),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(
+            manifest.recoverable_window(),
+            Some((Duration::from_secs(10), Duration::from_secs(30)))
+        );
 
-    let segment2 = WalSegment::new(
-        "segment-1".to_string(),
-        server_uuid,
-        Duration::from_secs(0),
-        Duration::from_secs(100),
-        "checksum".to_string(),
-        1024,
-        BackupCompression::Gzip,
-    );
+        // The new history after the recovery extends the window again.
+        manifest.add_segment(segment("s3", 80, 90));
+        assert_eq!(
+            manifest.latest_recoverable_ts(),
+            Some(Duration::from_secs(90))
+        );
 
-    assert_eq!(segment1.segment_id, segment2.segment_id);
-    assert_eq!(segment1.server_uuid, segment2.server_uuid);
-}
+        // A second recovery to an earlier point abandons the first recovered point too.
+        manifest.add_timeline_break(PitrTimelineBreak {
+            after_ts: Duration::from_secs(20),
+            until_ts: Duration::from_secs(100),
+            at: String::new(),
+            reason: "recover".to_string(),
+        });
+        assert_eq!(
+            manifest.latest_recoverable_ts(),
+            Some(Duration::from_secs(20))
+        );
 
-#[test]
-fn test_wal_entry_equality() {
-    let server_uuid = uuid::Uuid::new_v4();
-    let entry1 = WalEntry {
-        cid_ts: Duration::from_secs(1000),
-        cid_server: server_uuid,
-        entry_id: 1,
-        operation: WalOperation::Create {
-            entry_data: vec![1, 2, 3],
-        },
-    };
+        // Breaks stay while archived history precedes them, and go once it does not.
+        manifest.prune_timeline_breaks();
+        assert_eq!(manifest.timeline_breaks.len(), 2);
+        manifest.retain_base_backups(&[]);
+        manifest.remove_segment("s1");
+        manifest.remove_segment("s2");
+        manifest.remove_segment("s3");
+        manifest.add_segment(segment("s4", 85, 95));
+        manifest.prune_timeline_breaks();
+        assert_eq!(manifest.timeline_breaks.len(), 1);
+        assert_eq!(
+            manifest.timeline_breaks[0].until_ts,
+            Duration::from_secs(100)
+        );
+        manifest.remove_segment("s4");
+        manifest.prune_timeline_breaks();
+        assert!(manifest.timeline_breaks.is_empty());
 
-    let entry2 = WalEntry {
-        cid_ts: Duration::from_secs(1000),
-        cid_server: server_uuid,
-        entry_id: 1,
-        operation: WalOperation::Create {
-            entry_data: vec![1, 2, 3],
-        },
-    };
+        // Manifests written before timeline breaks existed still load.
+        let mut json: serde_json::Value = serde_json::to_value(&manifest).unwrap();
+        json.as_object_mut().unwrap().remove("timeline_breaks");
+        let back: PitrManifest = serde_json::from_value(json).unwrap();
+        assert!(back.timeline_breaks.is_empty());
+    }
 
-    assert_eq!(entry1, entry2);
-}
+    #[test]
+    fn test_pitr_manifest_gaps() {
+        let gap = |from: u64, until: u64| PitrWalGap {
+            from_ts: Duration::from_secs(from),
+            until_ts: Duration::from_secs(until),
+            reason: "test".to_string(),
+        };
+        let mut manifest = PitrManifest::new(Uuid::nil());
+        manifest.add_base_backup(base("backup-1", 10));
+        manifest.add_segment(segment("s1", 11, 100));
 
-#[test]
-fn test_recovery_target_equality() {
-    let target1 = RecoveryTarget::to_time("2024-01-15T10:30:00Z").unwrap();
-    let target2 = RecoveryTarget::to_time("2024-01-15T10:30:00Z").unwrap();
-    assert_eq!(target1, target2);
+        // Records from 40 to 50 are missing.
+        manifest.add_gap(gap(40, 50));
+        manifest.add_gap(gap(40, 50));
+        assert_eq!(manifest.gaps.len(), 1);
 
-    let target3 = RecoveryTarget::latest();
-    let target4 = RecoveryTarget::latest();
-    assert_eq!(target3, target4);
-}
+        let w = Duration::from_secs(10);
+        assert!(manifest.gap_blocking(w, Duration::from_secs(39)).is_none());
+        assert!(manifest.gap_blocking(w, Duration::from_secs(40)).is_some());
+        assert!(manifest.gap_blocking(w, Duration::from_secs(90)).is_some());
+        // A base that already holds the gap's history is not blocked; nor is a replay of
+        // nothing.
+        assert!(manifest
+            .gap_blocking(Duration::from_secs(50), Duration::from_secs(90))
+            .is_none());
+        assert!(manifest
+            .gap_blocking(Duration::from_secs(45), Duration::from_secs(45))
+            .is_none());
 
-#[test]
-fn test_pitr_manifest_equality() {
-    let server_uuid = uuid::Uuid::new_v4();
-    let manifest1 = PitrManifest::new(
-        server_uuid,
-        "backup-001".to_string(),
-        "2024-01-01T00:00:00Z".to_string(),
-    );
+        // The latest point stops just before the gap.
+        assert_eq!(
+            manifest.latest_recoverable_ts(),
+            Some(Duration::from_secs(40) - Duration::from_nanos(1))
+        );
 
-    let manifest2 = PitrManifest::new(
-        server_uuid,
-        "backup-001".to_string(),
-        "2024-01-01T00:00:00Z".to_string(),
-    );
+        // A base taken after the gap closes it.
+        manifest.add_base_backup(base("backup-2", 60));
+        assert_eq!(
+            manifest.latest_recoverable_ts(),
+            Some(Duration::from_secs(100))
+        );
+        // A gap starting before the base it follows limits the latest point to that base.
+        manifest.add_gap(gap(55, 70));
+        assert_eq!(
+            manifest.latest_recoverable_ts(),
+            Some(Duration::from_secs(60))
+        );
 
-    assert_eq!(manifest1, manifest2);
-}
+        // A gap inside abandoned history does not matter.
+        manifest.add_timeline_break(PitrTimelineBreak {
+            after_ts: Duration::from_secs(62),
+            until_ts: Duration::from_secs(80),
+            at: String::new(),
+            reason: "recover".to_string(),
+        });
+        manifest.add_segment(segment("s2", 81, 120));
+        assert!(manifest
+            .gap_blocking(Duration::from_secs(60), Duration::from_secs(120))
+            .is_some());
+        manifest
+            .gaps
+            .retain(|g| g.from_ts != Duration::from_secs(55));
+        manifest.add_gap(gap(65, 70));
+        assert!(manifest
+            .gap_blocking(Duration::from_secs(60), Duration::from_secs(120))
+            .is_none());
 
-#[test]
-fn test_wal_archive_config_with_s3() {
-    let s3_config = S3Config {
-        bucket: "test-bucket".to_string(),
-        region: Some("us-west-2".to_string()),
-        endpoint: None,
-        path_prefix: None,
-        credentials: None,
-        server_side_encryption: None,
-        storage_class: "STANDARD".to_string(),
-        replication: None,
-    };
+        // Gaps go once no retained history precedes them.
+        manifest.prune_gaps();
+        assert_eq!(manifest.gaps.len(), 2);
+        manifest.retain_base_backups(&["backup-2".to_string()]);
+        manifest.remove_segment("s1");
+        manifest.prune_gaps();
+        assert_eq!(manifest.gaps.len(), 1);
+        assert_eq!(manifest.gaps[0].from_ts, Duration::from_secs(65));
+    }
 
-    let config = WalArchiveConfig {
-        enabled: true,
-        s3: Some(s3_config),
-        retention_days: 30,
-        segment_size_bytes: 32 * 1024 * 1024,
-    };
+    #[test]
+    fn test_pitr_manifest_serialization() {
+        let mut manifest = PitrManifest::new(Uuid::nil());
+        manifest.add_base_backup(base("backup-1", 10));
+        manifest.add_segment(segment("s1", 11, 20));
+        let json = serde_json::to_string(&manifest).unwrap();
+        let back: PitrManifest = serde_json::from_str(&json).unwrap();
+        assert_eq!(manifest, back);
+        assert_eq!(back.version, PITR_MANIFEST_VERSION);
+    }
 
-    assert!(config.enabled);
-    assert!(config.s3.is_some());
-    assert_eq!(config.retention_days, 30);
-    assert_eq!(config.segment_size_bytes, 32 * 1024 * 1024);
+    #[test]
+    fn test_recovery_target() {
+        assert!(RecoveryTarget::to_time("2024-01-15T10:30:00Z").is_ok());
+        assert!(RecoveryTarget::to_time("2024-01-15T10:30:00+05:00").is_ok());
+        assert!(RecoveryTarget::to_time("2024-01-15T10:30:00.123456Z").is_ok());
+        assert!(RecoveryTarget::to_time("invalid-timestamp").is_err());
+        assert!(RecoveryTarget::to_transaction("").is_err());
+
+        let time = RecoveryTarget::to_time("2024-01-15T10:30:00Z").unwrap();
+        assert!(matches!(time.target_type, RecoveryTargetType::Time { .. }));
+        assert_eq!(time.to_string(), "time:2024-01-15T10:30:00Z");
+
+        let txn = RecoveryTarget::to_transaction("123-uuid").unwrap();
+        assert!(matches!(
+            txn.target_type,
+            RecoveryTargetType::Transaction { .. }
+        ));
+        assert_eq!(txn.to_string(), "transaction:123-uuid");
+
+        let latest = RecoveryTarget::latest();
+        assert!(matches!(latest.target_type, RecoveryTargetType::Latest));
+        assert_eq!(latest.to_string(), "latest");
+
+        let json = serde_json::to_string(&time).unwrap();
+        let back: RecoveryTarget = serde_json::from_str(&json).unwrap();
+        assert_eq!(time, back);
+    }
 }

@@ -32,6 +32,7 @@ use kubidmd_core::{
         AdminTaskRequest, AdminTaskResponse, ClientCodec, ProtoDomainInfo,
         ProtoDomainUpgradeCheckReport, ProtoDomainUpgradeCheckStatus,
     },
+    backup::pitr::{pitr_list_server_core, pitr_recover_server_core, RecoveryTargetSpec},
     backup_server_core, cert_generate_core,
     config::{Configuration, ServerConfigUntagged},
     create_server_core, dbscan_get_id2entry_core, dbscan_list_id2entry_core,
@@ -617,10 +618,10 @@ async fn start_daemon(opt: KubidmdParser, config: Configuration) -> ExitCode {
         | KubidmdOpt::RecoverAccount { .. }
         | KubidmdOpt::DisableAccount { .. }
         | KubidmdOpt::Database {
-            commands: DbCommands::ListBackups { .. },
-        }
-        | KubidmdOpt::Database {
-            commands: DbCommands::ReplicateStatus { .. },
+            commands:
+                DbCommands::ListBackups { .. }
+                | DbCommands::PitrList
+                | DbCommands::ReplicateStatus { .. },
         } => None,
         _ => {
             // Okay - Lets now create our lock and go.
@@ -1235,24 +1236,34 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
             vacuum_server_core(&config);
         }
         KubidmdOpt::Database {
-            commands: DbCommands::Recover(_),
+            commands: DbCommands::Recover(ropt),
         } => {
-            error!(
-                "The 'database recover' command is not implemented in this release. \
-                 Point-in-time recovery is not yet available. \
-                 See the Backup and Restore chapter of the book for the supported procedures."
-            );
-            return ExitCode::FAILURE;
+            let target = match (
+                &ropt.target.target_time,
+                &ropt.target.target_cid,
+                ropt.target.latest,
+            ) {
+                (Some(time), _, _) => RecoveryTargetSpec::Time(time.clone()),
+                (None, Some(cid), _) => RecoveryTargetSpec::Cid(cid.clone()),
+                (None, None, _) => RecoveryTargetSpec::Latest,
+            };
+            info!("Running point-in-time recovery to {target} ...");
+            match pitr_recover_server_core(&config, &target, ropt.dry_run).await {
+                Ok(_) if ropt.dry_run => {}
+                Ok(_) => info!("✅ Recovery Success!"),
+                Err(err) => {
+                    error!(%err, "Point-in-time recovery failed");
+                    return ExitCode::FAILURE;
+                }
+            }
         }
         KubidmdOpt::Database {
             commands: DbCommands::PitrList,
         } => {
-            error!(
-                "The 'database pitr-list' command is not implemented in this release. \
-                 Point-in-time recovery is not yet available. \
-                 See the Backup and Restore chapter of the book for the supported procedures."
-            );
-            return ExitCode::FAILURE;
+            info!("Running in PITR listing mode ...");
+            if !pitr_list_server_core(&config).await {
+                return ExitCode::FAILURE;
+            }
         }
         KubidmdOpt::Database {
             commands: DbCommands::ReplicateStatus { detailed },

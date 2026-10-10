@@ -89,20 +89,29 @@ struct VerifyS3Opt {
 }
 
 #[derive(Debug, Args)]
-struct PitrRecoverOpt {
-    /// Target time for recovery (RFC3339 format, e.g., "2024-01-15T10:30:00Z")
+#[group(required = true, multiple = false)]
+struct PitrRecoverTarget {
+    /// Recover the state as of this time (RFC3339, for example "2024-01-15T10:30:00Z").
     #[clap(long)]
     target_time: Option<String>,
 
-    /// Target transaction CID for recovery
+    /// Recover the state right after the transaction with this CID
+    /// ("<nanoseconds>-<server uuid>", as the server logs it).
     #[clap(long)]
     target_cid: Option<String>,
 
-    /// Recover to the latest available point
-    #[clap(long, conflicts_with_all = ["target_time", "target_cid"])]
+    /// Recover the latest state the archive holds.
+    #[clap(long)]
     latest: bool,
+}
 
-    /// Perform a dry run without actually applying changes
+#[derive(Debug, Args)]
+struct PitrRecoverOpt {
+    #[command(flatten)]
+    target: PitrRecoverTarget,
+
+    /// Print the base backup, the segments and the number of records the recovery would
+    /// use, and change nothing.
     #[clap(long)]
     dry_run: bool,
 }
@@ -176,12 +185,14 @@ enum DbCommands {
     #[clap(name = "reindex")]
     /// Reindex the database (offline)
     Reindex,
-    #[clap(name = "recover", hide = true)]
-    /// Point-in-Time Recovery (PITR) - recover database to a specific point in time.
-    /// Not yet implemented.
+    #[clap(name = "recover")]
+    /// Point-in-time recovery: restore the newest base backup at or before the target and
+    /// replay the WAL archive up to it (offline)
+    ///
+    /// Requires [online_backup.wal_archive] to be enabled, which locates the archive.
     Recover(PitrRecoverOpt),
-    #[clap(name = "pitr-list", hide = true)]
-    /// List available recovery points for Point-in-Time Recovery. Not yet implemented.
+    #[clap(name = "pitr-list")]
+    /// List the base backups, WAL segments and the recoverable window of the WAL archive
     PitrList,
     #[clap(name = "replicate-status")]
     /// Report the state of cross-region backup replication.
