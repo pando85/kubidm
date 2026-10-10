@@ -881,6 +881,21 @@ async fn prepare_restore(
     let local_dir = local_dir.to_path_buf();
     let (abandoned, local_segments) =
         blocking(move || Ok((read_local_events(&local_dir), list_segments(&local_dir)?))).await?;
+    // The identity the history in the WAL directory starts with: the one before the first
+    // restore or change of identity it records, or else the one of its oldest segment.
+    let local_server_uuid = local_segments.first().map(|oldest| {
+        abandoned
+            .restores
+            .first()
+            .and_then(|restore| restore.local_server_uuid)
+            .or_else(|| {
+                abandoned
+                    .server_uuid_changes
+                    .first()
+                    .map(|change| change.from)
+            })
+            .unwrap_or(oldest.server_uuid)
+    });
     Ok(WalRestore {
         after_ts: restored.after_ts,
         until_ts: local_segments
@@ -888,22 +903,29 @@ async fn prepare_restore(
             .map(|s| s.end_ts)
             .fold(restored.now, Duration::max),
         server_uuid: restored.server_uuid,
+        local_server_uuid,
         at: restored.now,
         reason: restored.reason.to_string(),
         abandoned,
     })
 }
 
-/// Record `restore` in the archive at `location`. An archive with no manifest yet has no
-/// history to abandon, and nothing is recorded. Returns the change of identity recorded,
-/// if any.
+/// Record `restore` in the archive at `location`. An archive with no manifest yet archived
+/// no history, but the stopped server may have left some in its WAL directory: the
+/// archive then starts with the restore, under the identity of that history, so that it
+/// is archived as abandoned. When it left none, nothing is recorded. Returns the change of
+/// identity recorded, if any.
 async fn record_restore(
     location: &PitrLocation,
     restore: &WalRestore,
 ) -> Result<Option<PitrServerUuidChange>, PitrError> {
     let store = PitrStore::open(location).await?;
-    let Some(mut manifest) = store.load_manifest().await? else {
-        return Ok(None);
+    let mut manifest = match store.load_manifest().await? {
+        Some(manifest) => manifest,
+        None => match restore.local_server_uuid {
+            Some(server_uuid) => PitrManifest::new(server_uuid),
+            None => return Ok(None),
+        },
     };
     let change = apply_restore(&mut manifest, restore);
     store.save_manifest(&mut manifest, restore.at).await?;

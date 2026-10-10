@@ -261,6 +261,12 @@ pub struct WalRestore {
     pub until_ts: Duration,
     /// The server uuid the restored database carries.
     pub server_uuid: Uuid,
+    /// The first identity of the history the stopped server left in the WAL directory as
+    /// closed segments, when it left any. An archive without a manifest starts from it, so
+    /// that those segments are archived as the abandoned history they are rather than as
+    /// history of the restored database.
+    #[serde(default)]
+    pub local_server_uuid: Option<Uuid>,
     /// When the restore happened.
     pub at: Duration,
     /// The command, for display.

@@ -51,7 +51,7 @@ async fn load_or_new_manifest(
     let changes = &events.server_uuid_changes;
     let (mut manifest, mut changed) = match store.load_manifest().await? {
         Some(mut manifest) => {
-            // A restore abandons the history of an archive; a new one has none.
+            // A restore abandons the history of an archive, and of the WAL directory.
             let breaks = manifest.timeline_breaks.len();
             for restore in &events.restores {
                 apply_restore(&mut manifest, restore);
@@ -59,10 +59,25 @@ async fn load_or_new_manifest(
             let changed = manifest.timeline_breaks.len() != breaks;
             (manifest, changed)
         }
-        None => (
-            PitrManifest::new(changes.first().map_or(server_uuid, |change| change.from)),
-            true,
-        ),
+        None => match events
+            .restores
+            .first()
+            .and_then(|restore| restore.local_server_uuid)
+        {
+            // The stopped server left history in the WAL directory that no archive holds
+            // yet: the archive starts with it, abandoned by the restore.
+            Some(local_server_uuid) => {
+                let mut manifest = PitrManifest::new(local_server_uuid);
+                for restore in &events.restores {
+                    apply_restore(&mut manifest, restore);
+                }
+                (manifest, true)
+            }
+            None => (
+                PitrManifest::new(changes.first().map_or(server_uuid, |change| change.from)),
+                true,
+            ),
+        },
     };
     for change in changes {
         let change = manifest_uuid_change(change);
@@ -1485,6 +1500,121 @@ mod tests {
         let manifest = store.load_manifest().await.unwrap().unwrap();
         assert_eq!(manifest.server_uuid, b);
         assert!(manifest.gaps.is_empty(), "{:?}", manifest.gaps);
+    }
+
+    /// A server whose archive was never reachable keeps its closed segments in its WAL
+    /// directory. A restore then meets an archive without a manifest, recorded at once or
+    /// handed to the server, and the archive must start with it: those segments are
+    /// archived as abandoned history, never replayed onto the restored backup, and a
+    /// restored backup of another server still archives them.
+    async fn restore_into_an_archive_without_a_manifest(deferred: bool, other_server: bool) {
+        use std::collections::BTreeMap;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use super::super::recover::AbandonedHistory;
+        use crate::backup::s3::fake_s3;
+
+        let objects = Arc::new(Mutex::new(BTreeMap::new()));
+        let down = Arc::new(AtomicBool::new(true));
+        let fake = {
+            let store = fake_s3::store(Arc::clone(&objects));
+            let down = Arc::clone(&down);
+            fake_s3::FakeS3::start(Arc::new(move |request: &fake_s3::Recorded| {
+                if down.load(Ordering::SeqCst) {
+                    fake_s3::error(403, "AccessDenied")
+                } else {
+                    store(request)
+                }
+            }))
+            .await
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("wal");
+        let backup_dir = dir.path().join("backups");
+        fs::create_dir_all(&backup_dir).unwrap();
+        let x = Uuid::new_v4();
+        let restored_uuid = if other_server { Uuid::new_v4() } else { x };
+        let wal_cfg = WalArchiveConfig {
+            enabled: true,
+            local_path: Some(wal_dir.clone()),
+            ..WalArchiveConfig::default()
+        };
+        let settings = PitrSettings {
+            wal: wal_cfg.clone(),
+            local_dir: wal_dir.clone(),
+            location: PitrLocation::S3(fake.config("bucket")),
+            bases: BaseLocation::Local(backup_dir.clone()),
+            encryption: BackupEncryptionConfig::default(),
+        };
+
+        // The server never reaches its archive: its segments stay in the WAL directory.
+        let archiver: SharedWalArchiver = Arc::new(Mutex::new(
+            WalArchiver::new(wal_cfg.clone(), x, wal_dir.clone()).unwrap(),
+        ));
+        let archive = PitrArchive::new(settings.clone(), archiver.clone());
+        append_create(&archiver, x, 1100, b"abandoned");
+        append_create(&archiver, x, 1200, b"abandoned too");
+        assert!(archive.sync(Duration::from_secs(1300), true).await.is_err());
+        assert_eq!(list_segments(&wal_dir).unwrap().len(), 1);
+        drop(archive);
+        drop(archiver);
+
+        // A backup with the watermark 1000 is restored.
+        down.store(deferred, Ordering::SeqCst);
+        let restored = RestoredDatabase {
+            after_ts: Duration::from_secs(1000),
+            server_uuid: restored_uuid,
+            reason: "restore",
+            now: Duration::from_secs(1400),
+        };
+        let history = record_timeline_break(&settings, &restored).await.unwrap();
+        assert_eq!(
+            matches!(history, AbandonedHistory::Deferred(_)),
+            deferred,
+            "{history:?}"
+        );
+        down.store(false, Ordering::SeqCst);
+
+        // The server starts on it, archives the old segments, and the restored backup is
+        // indexed before anything new is committed.
+        let archiver: SharedWalArchiver = Arc::new(Mutex::new(
+            WalArchiver::new(wal_cfg, restored_uuid, wal_dir.clone()).unwrap(),
+        ));
+        let archive = PitrArchive::new(settings.clone(), archiver.clone());
+        archive.sync(Duration::from_secs(1500), true).await.unwrap();
+        let key = "backup-2024-01-01T00:00:00Z.json";
+        fs::write(backup_dir.join(key), b"{}").unwrap();
+        archive
+            .register_base_backup_at(
+                Duration::from_secs(1500),
+                &settings.bases,
+                key,
+                "t",
+                &report(1000, restored_uuid),
+            )
+            .await
+            .unwrap();
+
+        assert!(list_segments(&wal_dir).unwrap().is_empty());
+        let store = PitrStore::open(&settings.location).await.unwrap();
+        let manifest = store.load_manifest().await.unwrap().unwrap();
+        assert_eq!(manifest.server_uuid, restored_uuid);
+        assert!(manifest.knows_server(x));
+        assert_eq!(manifest.segments.len(), 1);
+        assert_eq!(manifest.timeline_breaks.len(), 1);
+        assert!(manifest.is_abandoned(Duration::from_secs(1200)));
+        // Recovery never replays the abandoned history onto the restored backup.
+        let plan = plan_recovery(&manifest, &RecoveryTargetSpec::Latest).unwrap();
+        assert_eq!(plan.base.key, key);
+        assert_eq!(plan.target.ts, Duration::from_secs(1000));
+    }
+
+    #[tokio::test]
+    async fn test_a_restore_into_an_archive_without_a_manifest_abandons_the_local_history() {
+        restore_into_an_archive_without_a_manifest(false, false).await;
+        restore_into_an_archive_without_a_manifest(true, false).await;
+        restore_into_an_archive_without_a_manifest(false, true).await;
+        restore_into_an_archive_without_a_manifest(true, true).await;
     }
 
     #[tokio::test]
