@@ -242,17 +242,17 @@ nix = { version = "0.31.3", features = ["mount"] }
 nonempty = "0.12.0"
 notify-debouncer-full = { version = "0.7" }
 num_enum = "0.7.6"
-opentelemetry = { version = "0.32.0" }
-opentelemetry-otlp = { version = "0.32.0", default-features = false, features = [
-    "serde",
+opentelemetry = { version = "0.33.0" }
+opentelemetry-otlp = { version = "0.33.0", default-features = false, features = [
+    "serde_json",
     "logs",
     "metrics",
     "http-proto",
     "grpc-tonic",
 ] }
-opentelemetry_sdk = { version = "0.32.1", features = ["rt-tokio"] }
-opentelemetry-semantic-conventions = "0.32.0"
-tracing-opentelemetry = "0.33.0"
+opentelemetry_sdk = { version = "0.33.0", features = ["rt-tokio"] }
+opentelemetry-semantic-conventions = "0.33.0"
+tracing-opentelemetry = "0.34.0"
 tracing-core = "0.1.36"
 peg = "0.8"
 pin-project-lite = "0.2.17"
