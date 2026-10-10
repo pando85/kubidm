@@ -106,6 +106,13 @@ name. No other object under the prefix is ever deleted, and neither is the backu
 must be at least 1; the server and `kubidmd configtest` reject `versions = 0`, also when it is given as
 `--online-backup-versions`.
 
+#### Large Backups
+
+Backups larger than 100 MiB are uploaded in 10 MiB parts. An upload that fails, or that is interrupted by a shutdown, is
+aborted so that its parts are not kept, and billed, by the storage service. Only a crash can leave the parts of an
+unfinished upload behind; a bucket lifecycle rule that aborts incomplete multipart uploads after a day or so removes
+them.
+
 #### Custom Endpoints
 
 When `endpoint` is set, objects are addressed in path style (`<endpoint>/<bucket>/<key>`), as MinIO, Ceph RGW and most

@@ -306,24 +306,35 @@ impl S3ClientWrapper {
         metadata: &S3BackupMetadata,
     ) -> Result<(), S3BackupError> {
         let create_output = self.create_multipart_upload(key, metadata).await?;
-        let upload_id = create_output.upload_id().unwrap_or_default();
+        let upload_id = create_output
+            .upload_id()
+            .filter(|upload_id| !upload_id.is_empty())
+            .ok_or_else(|| {
+                S3BackupError::UploadError(format!(
+                    "The multipart upload of {key} was created without an upload id"
+                ))
+            })?
+            .to_string();
 
-        // A failed upload is aborted, so that its parts do not linger (and get billed) in
-        // the bucket. Replication retries uploads, which would otherwise pile them up.
-        if let Err(err) = self.upload_parts_and_complete(key, upload_id, data).await {
-            if let Err(abort_err) = self
-                .client
-                .abort_multipart_upload()
-                .bucket(&self.config.bucket)
-                .key(key)
-                .upload_id(upload_id)
-                .send()
-                .await
+        // An upload that fails is aborted, so that its parts do not linger (and get billed)
+        // in the bucket. One whose future is dropped half way, such as a backup run or a
+        // replication sync abandoned on shutdown, is aborted by the guard.
+        let mut abort_guard = MultipartAbortGuard::new(
+            self.client.clone(),
+            self.config.bucket.clone(),
+            key.to_string(),
+            upload_id.clone(),
+        );
+        let uploaded = self.upload_parts_and_complete(key, &upload_id, data).await;
+        abort_guard.disarm();
+
+        if let Err(err) = uploaded {
+            if let Err(abort_err) =
+                abort_multipart_upload(&self.client, &self.config.bucket, key, &upload_id).await
             {
                 warn!(
                     "Failed to abort the multipart upload of {}: {}",
-                    key,
-                    DisplayErrorContext(&abort_err)
+                    key, abort_err
                 );
             }
             return Err(err);
@@ -1034,6 +1045,69 @@ impl S3ClientWrapper {
     }
 }
 
+/// Abort the multipart upload `upload_id` of `key` (a full key, prefix included).
+async fn abort_multipart_upload(
+    client: &S3Client,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+) -> Result<(), String> {
+    client
+        .abort_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .send()
+        .await
+        .map(|_| ())
+        .map_err(|err| DisplayErrorContext(&err).to_string())
+}
+
+/// Aborts a multipart upload when dropped while armed: the upload future was dropped
+/// before it completed or failed, so its parts would otherwise stay in the bucket, billed,
+/// until a lifecycle rule removes them. The abort is spawned on the current runtime, so it
+/// is best effort; a runtime that is shutting down may not run it.
+struct MultipartAbortGuard {
+    upload: Option<(S3Client, String, String, String)>,
+}
+
+impl MultipartAbortGuard {
+    fn new(client: S3Client, bucket: String, key: String, upload_id: String) -> Self {
+        Self {
+            upload: Some((client, bucket, key, upload_id)),
+        }
+    }
+
+    /// The upload completed or failed, and the caller handles it.
+    fn disarm(&mut self) {
+        self.upload = None;
+    }
+}
+
+impl Drop for MultipartAbortGuard {
+    fn drop(&mut self) {
+        let Some((client, bucket, key, upload_id)) = self.upload.take() else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            warn!(
+                "The multipart upload of {} was interrupted and can not be aborted",
+                key
+            );
+            return;
+        };
+        runtime.spawn(async move {
+            match abort_multipart_upload(&client, &bucket, &key, &upload_id).await {
+                Ok(()) => info!("Aborted the interrupted multipart upload of {}", key),
+                Err(err) => warn!(
+                    "Failed to abort the interrupted multipart upload of {}: {}",
+                    key, err
+                ),
+            }
+        });
+    }
+}
+
 /// Suffix of the metadata sidecar of a backup object.
 const METADATA_SUFFIX: &str = ".metadata.json";
 
@@ -1318,6 +1392,7 @@ pub(crate) mod fake_s3 {
     pub struct Recorded {
         pub method: String,
         pub path: String,
+        pub query: String,
         pub headers: BTreeMap<String, String>,
     }
 
@@ -1367,6 +1442,7 @@ pub(crate) mod fake_s3 {
                         method: parts.method.to_string(),
                         // Backup names carry the `:` of their timestamp.
                         path: parts.uri.path().replace("%3A", ":"),
+                        query: parts.uri.query().unwrap_or_default().to_string(),
                         headers: parts
                             .headers
                             .iter()
@@ -1461,6 +1537,87 @@ mod tests {
                 "/bucket/backup-2024-01-01T22:00:00Z.json.gz".to_string()
             )),
             "the object left without a sidecar must be removed: {requests:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_multipart_upload_without_an_upload_id_fails() {
+        // A CreateMultipartUpload answer without an UploadId.
+        let fake = fake_s3::FakeS3::start(Arc::new(|request: &fake_s3::Recorded| {
+            if request.method == "POST" && request.query.starts_with("uploads") {
+                (
+                    200,
+                    vec![("content-type", "application/xml".to_string())],
+                    "<InitiateMultipartUploadResult><Bucket>bucket</Bucket>\
+                     <Key>big</Key></InitiateMultipartUploadResult>"
+                        .to_string(),
+                )
+            } else {
+                fake_s3::ok(request)
+            }
+        }))
+        .await;
+        let client = S3ClientWrapper::new(fake.config("bucket"))
+            .await
+            .expect("client");
+
+        let err = client
+            .upload_multipart(
+                b"artifact",
+                "big",
+                &metadata("checksum", "2024-01-01T22:00:00Z", 8),
+            )
+            .await
+            .expect_err("an upload without an id must fail");
+        assert!(err.to_string().contains("without an upload id"), "{err}");
+        // Nothing was sent with an empty upload id.
+        let requests = fake.requests();
+        assert_eq!(requests.len(), 1, "{requests:?}");
+    }
+
+    #[tokio::test]
+    async fn test_an_interrupted_multipart_upload_is_aborted() {
+        let fake = fake_s3::FakeS3::start(Arc::new(fake_s3::ok)).await;
+        let client = S3ClientWrapper::new(fake.config("bucket"))
+            .await
+            .expect("client");
+
+        // Disarmed: the caller handled the outcome, nothing is sent.
+        let mut guard = MultipartAbortGuard::new(
+            client.client.clone(),
+            "bucket".to_string(),
+            "done".to_string(),
+            "id-1".to_string(),
+        );
+        guard.disarm();
+        drop(guard);
+
+        // Dropped while armed, as when the upload future is dropped half way.
+        drop(MultipartAbortGuard::new(
+            client.client.clone(),
+            "bucket".to_string(),
+            "interrupted".to_string(),
+            "id-2".to_string(),
+        ));
+
+        let aborted = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let requests = fake.requests();
+                if !requests.is_empty() {
+                    return requests;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the abort must be sent");
+        assert_eq!(aborted.len(), 1, "{aborted:?}");
+        assert_eq!(aborted[0].method, "DELETE");
+        assert_eq!(aborted[0].path, "/bucket/interrupted");
+        assert!(
+            aborted[0].query.contains("uploadId=id-2"),
+            "{:?}",
+            aborted[0]
         );
     }
 
