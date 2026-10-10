@@ -154,6 +154,25 @@ fn partial_backup_name(name: &str) -> Option<&str> {
         .filter(|backup| is_backup_artifact_name(backup))
 }
 
+/// Remove the partial file of a backup at `path` unless a backup still writes it. Age
+/// alone can not tell: a manual backup under an older automatic name may still be writing
+/// or verifying it. The writer holds a lock on it until it is renamed into place (see
+/// [`super::write_verified_local_backup`]), and the file is only removed while this
+/// cleanup holds that lock itself. Returns whether it was removed; a file that can not be
+/// locked, whatever the reason, is kept.
+fn remove_abandoned_partial(path: &Path) -> std::io::Result<bool> {
+    // Opened for writing: some filesystems (NFS) only grant a write lock on such a handle.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?;
+    match file.try_lock() {
+        Ok(()) => std::fs::remove_file(path).map(|()| true),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(false),
+        Err(std::fs::TryLockError::Error(err)) => Err(err),
+    }
+}
+
 /// Apply the `versions` retention to the local online backup directory `dir` with
 /// [`select_backups_to_delete`], the rule the S3 locations use. Only regular files named
 /// like an automatically generated backup are considered; anything else in the directory,
@@ -161,7 +180,8 @@ fn partial_backup_name(name: &str) -> Option<&str> {
 ///
 /// The `.<backup>.partial` file of a backup whose writer was killed or lost power is
 /// removed by the rule S3 applies to incomplete uploads,
-/// [`select_incomplete_backups_to_delete`]: once a newer backup is complete.
+/// [`select_incomplete_backups_to_delete`]: once a newer backup is complete, and only
+/// when no backup still writes it: its writer holds a lock on it until it is done.
 ///
 /// Never fails: the backup that triggered the cleanup has already succeeded, so an
 /// unreadable directory or entry, or a file that can not be removed, is logged and the
@@ -213,9 +233,13 @@ pub fn prune_local_backups(dir: &Path, versions: usize, keep: Option<&str>) {
 
     for stale in select_incomplete_backups_to_delete(&partials, &names, keep) {
         let path = dir.join(format!(".{stale}{PARTIAL_BACKUP_SUFFIX}"));
-        match std::fs::remove_file(&path) {
-            Ok(()) => info!(
+        match remove_abandoned_partial(&path) {
+            Ok(true) => info!(
                 "Online backup cleanup removed {}, left by an interrupted backup",
+                path.display()
+            ),
+            Ok(false) => debug!(
+                "Online backup cleanup keeps {}: a backup is still writing it",
                 path.display()
             ),
             Err(err) => error!(
@@ -635,6 +659,29 @@ mod tests {
                 "manual.json",
             ])
         );
+    }
+
+    #[test]
+    fn test_prune_local_backups_keeps_a_partial_file_a_backup_still_writes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A manual backup under an older automatic name, still being written, and a newer
+        // complete backup whose retention run comes meanwhile.
+        let partial = ".backup-2024-01-01T22:00:00Z.json.gz.partial";
+        touch(dir.path(), partial);
+        touch(dir.path(), "backup-2024-01-02T22:00:00Z.json.gz");
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.path().join(partial))
+            .expect("open");
+        writer.lock().expect("lock");
+
+        prune_local_backups(dir.path(), 2, None);
+        assert!(dir.path().join(partial).exists());
+
+        // Once its writer is gone, it was left behind by an interrupted backup.
+        drop(writer);
+        prune_local_backups(dir.path(), 2, None);
+        assert!(!dir.path().join(partial).exists());
     }
 
     #[cfg(unix)]

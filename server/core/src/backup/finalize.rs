@@ -234,7 +234,8 @@ fn discard_partial(partial: &Path, mut err: BackupVerifyError) -> BackupVerifyEr
 /// holds a complete, durable and verified backup.
 ///
 /// The artifact is written to [`partial_backup_path`], created exclusively so that two
-/// backups to the same destination can never interleave their bytes, and synced to disk.
+/// backups to the same destination can never interleave their bytes, locked until the
+/// backup ends so that retention never removes it, and synced to disk.
 /// It is then read back and verified as [`verify_backup_output`] does, under the rules of
 /// its final name, renamed to `dest` and the directory synced, so that the rename
 /// survives a power loss. A destination that already exists is never overwritten. When
@@ -277,8 +278,16 @@ pub fn write_verified_local_backup(
                 format!("unable to create {}: {err}", partial.display())
             })
         })?;
+    // Held until the backup is renamed into place or given up: retention never removes a
+    // partial file that is locked, see `prune_local_backups`. A filesystem without locks
+    // leaves the partial file unprotected, and retention then keeps it too.
+    if let Err(err) = file.lock() {
+        warn!(
+            "Unable to lock {}; a concurrent retention run will not remove it: {err}",
+            partial.display()
+        );
+    }
     let written = file.write_all(artifact).and_then(|()| file.sync_all());
-    drop(file);
     if let Err(err) = written {
         return Err(discard_partial(
             &partial,
