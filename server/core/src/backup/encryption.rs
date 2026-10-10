@@ -28,7 +28,7 @@
 use std::fmt;
 use std::fs;
 use std::net::IpAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use argon2::{Algorithm, Argon2, Params, Version};
@@ -382,6 +382,20 @@ fn read_key_file(path: &Path) -> Result<Zeroizing<Vec<u8>>, String> {
     Ok(key)
 }
 
+/// Run a read of a passphrase or key file on the blocking thread pool: the file may live on
+/// a slow or hung network or FUSE file system, which must not stall the async runtime.
+async fn read_secret_off_runtime<F>(read: F) -> Result<Zeroizing<Vec<u8>>, BackupEncryptionError>
+where
+    F: FnOnce() -> Result<Zeroizing<Vec<u8>>, String> + Send + 'static,
+{
+    tokio::task::spawn_blocking(read)
+        .await
+        .map_err(|err| {
+            BackupEncryptionError::KeySourceError(format!("the key source task failed: {err}"))
+        })?
+        .map_err(BackupEncryptionError::KeySourceError)
+}
+
 /// The HTTP client of a key endpoint. The check of [`validate_key_endpoint`] only holds for
 /// the URL that is actually contacted, so the key must never travel anywhere else:
 ///
@@ -406,10 +420,13 @@ pub async fn resolve_key_material(
     config: &BackupEncryptionConfig,
 ) -> Result<Zeroizing<Vec<u8>>, BackupEncryptionError> {
     match &config.key_source {
-        EncryptionKeySource::Passphrase => resolve_passphrase(config.passphrase_file.as_deref())
-            .map_err(BackupEncryptionError::KeySourceError),
+        EncryptionKeySource::Passphrase => {
+            let passphrase_file = config.passphrase_file.clone();
+            read_secret_off_runtime(move || resolve_passphrase(passphrase_file.as_deref())).await
+        }
         EncryptionKeySource::File { path } => {
-            read_key_file(Path::new(path)).map_err(BackupEncryptionError::KeySourceError)
+            let path = PathBuf::from(path);
+            read_secret_off_runtime(move || read_key_file(&path)).await
         }
         EncryptionKeySource::HttpEndpoint { url } => {
             let parsed =
@@ -1282,6 +1299,53 @@ mod tests {
             BackupEncryptor::from_config(&missing).await,
             Err(BackupEncryptionError::KeySourceError(_))
         ));
+    }
+
+    /// The key file is read off the async runtime: on a current thread runtime, a key file
+    /// that only becomes readable once another task of the same runtime has run (a FIFO
+    /// whose writer is started by that task) must still resolve. Read on the runtime thread,
+    /// it would block that task forever; a watchdog then feeds other bytes to end the test.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_resolve_key_material_reads_files_off_the_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("key.fifo");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo");
+        assert!(status.success());
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let watchdog_fifo = fifo.clone();
+        std::thread::spawn(move || {
+            if done_rx.recv_timeout(Duration::from_secs(10)).is_err() {
+                // The runtime is blocked in the read: unblock it with the wrong bytes, then
+                // drain the writer that the freed runtime starts next.
+                let _ = std::fs::write(&watchdog_fifo, b"watchdog");
+                let _ = std::fs::read(&watchdog_fifo);
+            }
+        });
+
+        let writer_fifo = fifo.clone();
+        let writer = tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            tokio::task::spawn_blocking(move || std::fs::write(writer_fifo, b"from-runtime"))
+                .await
+                .unwrap()
+                .unwrap();
+        });
+
+        let key_file = BackupEncryptionConfig {
+            key_source: EncryptionKeySource::File {
+                path: fifo.to_string_lossy().into_owned(),
+            },
+            ..config(None)
+        };
+        let material = resolve_key_material(&key_file).await.unwrap();
+        let _ = done_tx.send(());
+        writer.await.unwrap();
+        assert_eq!(*material, b"from-runtime".to_vec());
     }
 
     #[test]
