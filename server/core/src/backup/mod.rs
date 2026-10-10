@@ -3,6 +3,7 @@ pub mod cli;
 pub mod encryption;
 pub mod finalize;
 pub mod mock_s3;
+pub mod online;
 pub mod pitr;
 pub mod restore;
 pub mod retention;

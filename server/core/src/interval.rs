@@ -12,7 +12,8 @@ use tokio::{
     time::{interval, interval_at, sleep, Duration, Instant, MissedTickBehavior},
 };
 
-use crate::backup::pitr::{BaseLocation, PitrArchive};
+use crate::backup::online::OnlineBackupJob;
+use crate::backup::pitr::PitrArchive;
 use crate::backup::{region_is_healthy, S3ClientWrapper};
 use crate::config::OnlineBackup;
 use crate::{CoreAction, TaskName};
@@ -20,9 +21,7 @@ use crate::{CoreAction, TaskName};
 use crate::actors::{QueryServerReadV1, QueryServerWriteV1};
 use kubidm_proto::backup::{ReplicationConfig, S3Config};
 use kubidmd_lib::constants::PURGE_FREQUENCY;
-use kubidmd_lib::event::{
-    OnlineBackupEvent, PurgeDeleteAfterEvent, PurgeRecycledEvent, PurgeTombstoneEvent,
-};
+use kubidmd_lib::event::{PurgeDeleteAfterEvent, PurgeRecycledEvent, PurgeTombstoneEvent};
 
 pub(crate) struct IntervalActor;
 
@@ -85,7 +84,6 @@ impl IntervalActor {
             return Err(());
         }
 
-        let versions = online_backup_config.versions;
         let crono_expr = online_backup_config.schedule.as_str().to_string();
         let mut crono_expr_values = crono_expr.split_ascii_whitespace().collect::<Vec<&str>>();
         let chrono_expr_uses_standard_syntax = crono_expr_values.len() == 5;
@@ -146,8 +144,7 @@ impl IntervalActor {
             }
         }
 
-        let backup_compression = online_backup_config.compression;
-        let encryption = online_backup_config.encryption.clone();
+        let job = OnlineBackupJob::from_config(online_backup_config, pitr_archive);
         let s3_config = online_backup_config.s3.clone();
 
         let mut handles = Vec::with_capacity(2);
@@ -183,70 +180,8 @@ impl IntervalActor {
                         }
                     }
                     _ = sleep(Duration::from_secs(wait_seconds)) => {
-                        // Perform local backup if path is configured
-                        if let Some(ref path) = outpath {
-                            match server
-                                .handle_online_backup(
-                                    OnlineBackupEvent::new(),
-                                    path,
-                                    versions,
-                                    backup_compression,
-                                    &encryption,
-                                    None,
-                                )
-                                .await
-                            {
-                                Ok(outcome) => {
-                                    // Index the backup as a base for point-in-time recovery.
-                                    if let Some(archive) = &pitr_archive {
-                                        archive
-                                            .register_base_backup_logged(
-                                                &BaseLocation::Local(path.clone()),
-                                                &outcome.key,
-                                                &outcome.timestamp,
-                                                &outcome.report,
-                                            )
-                                            .await;
-                                    }
-                                }
-                                Err(e) => error!(?e, "An online backup error occurred."),
-                            }
-                        }
-
-                        // Perform S3 backup if configured
-                        if let Some(s3_cfg) = &s3_config {
-                            match S3ClientWrapper::new(s3_cfg.clone()).await {
-                                Ok(s3_client) => {
-                                    match server
-                                        .handle_online_backup(
-                                            OnlineBackupEvent::new(),
-                                            &std::path::PathBuf::from("s3://backup"),
-                                            versions,
-                                            backup_compression,
-                                            &encryption,
-                                            Some(s3_client),
-                                        )
-                                        .await
-                                    {
-                                        Ok(outcome) => {
-                                            if let Some(archive) = &pitr_archive {
-                                                archive
-                                                    .register_base_backup_logged(
-                                                        &BaseLocation::S3(s3_cfg.clone()),
-                                                        &outcome.key,
-                                                        &outcome.timestamp,
-                                                        &outcome.report,
-                                                    )
-                                                    .await;
-                                            }
-                                        }
-                                        Err(e) => error!(?e, "An S3 backup error occurred."),
-                                    }
-                                }
-                                Err(e) => {
-                                    error!(?e, "Failed to create S3 client.");
-                                }
-                            }
+                        if let Err(err) = job.run(server).await {
+                            error!(?err, "An online backup error occurred.");
                         }
                     }
                 }

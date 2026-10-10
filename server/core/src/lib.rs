@@ -57,8 +57,8 @@ use crate::{
     actors::{QueryServerReadV1, QueryServerWriteV1},
     admin::AdminActor,
     backup::{
+        online::OnlineBackupJob,
         pitr::{self, BaseLocation, PitrArchive, PitrError, PitrSettings, PitrSyncReport},
-        S3ClientWrapper,
     },
     config::{Configuration, ServerRole},
     interval::IntervalActor,
@@ -1041,33 +1041,19 @@ impl CoreHandle {
         compression: BackupCompression,
         encryption: &BackupEncryptionConfig,
     ) -> Result<(), OperationError> {
-        let outcome = self
-            .server_read_ref
-            .handle_online_backup(
-                kubidmd_lib::event::OnlineBackupEvent::new(),
-                outpath,
-                versions,
-                compression,
-                encryption,
-                None,
-            )
-            .await?;
-        if let Some(archive) = &self.pitr_archive {
-            archive
-                .register_base_backup_logged(
-                    &BaseLocation::Local(outpath.to_path_buf()),
-                    &outcome.key,
-                    &outcome.timestamp,
-                    &outcome.report,
-                )
-                .await;
-        }
-        Ok(())
+        self.trigger_backup(
+            BaseLocation::Local(outpath.to_path_buf()),
+            versions,
+            compression,
+            encryption,
+        )
+        .await
     }
 
     /// Run an online backup to S3 now, through the same code path the scheduled S3 backup
-    /// uses, including retention of `versions` backups under the configured prefix. This
-    /// exists so tests can exercise the production S3 backup path on demand.
+    /// uses, including replication and retention of `versions` backups under the
+    /// configured prefix. This exists so tests can exercise the production S3 backup path
+    /// on demand.
     pub async fn trigger_s3_backup(
         &self,
         s3_config: S3Config,
@@ -1075,35 +1061,32 @@ impl CoreHandle {
         compression: BackupCompression,
         encryption: &BackupEncryptionConfig,
     ) -> Result<(), OperationError> {
-        let client = S3ClientWrapper::new(s3_config.clone())
-            .await
-            .map_err(|err| {
-                error!(%err, "Unable to create the S3 client");
-                OperationError::InvalidState
-            })?;
+        self.trigger_backup(
+            BaseLocation::S3(s3_config),
+            versions,
+            compression,
+            encryption,
+        )
+        .await
+    }
 
-        let outcome = self
-            .server_read_ref
-            .handle_online_backup(
-                kubidmd_lib::event::OnlineBackupEvent::new(),
-                Path::new("s3://backup"),
-                versions,
-                compression,
-                encryption,
-                Some(client),
-            )
-            .await?;
-        if let Some(archive) = &self.pitr_archive {
-            archive
-                .register_base_backup_logged(
-                    &BaseLocation::S3(s3_config),
-                    &outcome.key,
-                    &outcome.timestamp,
-                    &outcome.report,
-                )
-                .await;
+    async fn trigger_backup(
+        &self,
+        target: BaseLocation,
+        versions: usize,
+        compression: BackupCompression,
+        encryption: &BackupEncryptionConfig,
+    ) -> Result<(), OperationError> {
+        OnlineBackupJob {
+            targets: vec![target],
+            versions,
+            compression,
+            encryption: encryption.clone(),
+            pitr_archive: self.pitr_archive.clone(),
         }
-        Ok(())
+        .run(self.server_read_ref)
+        .await
+        .map(|_| ())
     }
 }
 
