@@ -287,8 +287,8 @@ struct OpenSegmentMarker {
     start_ts: Duration,
 }
 
-/// What the archiver did since it started. Every failure counted here is also logged when
-/// it happens, with the running count.
+/// What the archiver did since it started, for tests. Every failure counted here is also
+/// logged when it happens, with the running count.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct WalArchiverStats {
     /// Records appended to a segment (closed or still open).
@@ -528,6 +528,7 @@ impl WalArchiver {
         &self.segments_path
     }
 
+    #[cfg(test)]
     pub fn stats(&self) -> WalArchiverStats {
         self.stats
     }
@@ -539,6 +540,7 @@ impl WalArchiver {
     }
 
     /// Number of records that only live in memory.
+    #[cfg(test)]
     pub fn pending_record_count(&self) -> usize {
         self.current_segment
             .iter()
@@ -961,6 +963,7 @@ impl WalArchiver {
 
     /// Close the current segment when it is stale and write every closed segment, holding
     /// the caller's lock. Returns the last segment written.
+    #[cfg(test)]
     pub fn flush_if_stale(&mut self, now: Duration) -> Result<Option<WalSegment>, WalError> {
         self.seal_if_stale(now);
         self.write_due(now, true)

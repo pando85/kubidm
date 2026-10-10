@@ -1326,7 +1326,13 @@ mod tests {
         let key = "backup-2024-01-01T00:00:00Z.json.gz.enc";
         fs::write(backup_dir.join(key), b"base").unwrap();
         plain_archive
-            .register_base_backup(&bases, key, "2024-01-01T00:00:00Z", &report(1000, server))
+            .register_base_backup_at(
+                Duration::from_secs(1000),
+                &bases,
+                key,
+                "2024-01-01T00:00:00Z",
+                &report(1000, server),
+            )
             .await
             .unwrap();
         append_create(&archiver, server, 1100, b"credential before encryption");

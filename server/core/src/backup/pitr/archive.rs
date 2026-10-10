@@ -630,8 +630,9 @@ impl PitrArchive {
             .await
     }
 
-    /// [`Self::register_base_backup`] at `now`.
-    pub async fn register_base_backup_at(
+    /// [`Self::register_base_backup`] at `now`, the clock everything the registration
+    /// records and the retention of the regions it replicates to go by.
+    pub(super) async fn register_base_backup_at(
         &self,
         now: Duration,
         location: &BaseLocation,
@@ -880,11 +881,18 @@ mod tests {
         let key = "backup-2024-01-01T00:00:00Z.json";
         fs::write(backup_dir.join(key), b"{}").unwrap();
         archive
-            .register_base_backup(&bases, key, "2024-01-01T00:00:00Z", &report(1000, server))
+            .register_base_backup_at(
+                Duration::from_secs(1000),
+                &bases,
+                key,
+                "2024-01-01T00:00:00Z",
+                &report(1000, server),
+            )
             .await
             .unwrap();
         archive
-            .register_base_backup(
+            .register_base_backup_at(
+                Duration::from_secs(1000),
                 &BaseLocation::Local(dir.path().join("elsewhere")),
                 "ignored.json",
                 "t",
@@ -902,7 +910,13 @@ mod tests {
         // A backup of another server is refused.
         assert!(matches!(
             archive
-                .register_base_backup(&bases, "other.json", "t", &report(1000, Uuid::new_v4()))
+                .register_base_backup_at(
+                    Duration::from_secs(1000),
+                    &bases,
+                    "other.json",
+                    "t",
+                    &report(1000, Uuid::new_v4())
+                )
                 .await,
             Err(PitrError::Manifest(_))
         ));
@@ -1094,7 +1108,8 @@ mod tests {
         let key = "backup-2024-01-01T00:00:00Z.json";
         fs::write(backup_dir.join(key), b"{}").unwrap();
         archive
-            .register_base_backup(
+            .register_base_backup_at(
+                Duration::from_secs(1000),
                 &BaseLocation::Local(backup_dir),
                 key,
                 "t",
@@ -1205,7 +1220,13 @@ mod tests {
         let key1 = "backup-2024-01-01T00:00:00Z.json";
         fs::write(backup_dir.join(key1), b"{}").unwrap();
         archive
-            .register_base_backup(&bases, key1, "t", &report(1000, old_uuid))
+            .register_base_backup_at(
+                Duration::from_secs(1000),
+                &bases,
+                key1,
+                "t",
+                &report(1000, old_uuid),
+            )
             .await
             .unwrap();
         append_create(&archiver, old_uuid, 1100, b"before");
@@ -1271,7 +1292,13 @@ mod tests {
         let key2 = "backup-2024-01-02T00:00:00Z.json";
         fs::write(backup_dir.join(key2), b"{}").unwrap();
         archive
-            .register_base_backup(&bases, key2, "t", &report(1250, new_uuid))
+            .register_base_backup_at(
+                Duration::from_secs(1250),
+                &bases,
+                key2,
+                "t",
+                &report(1250, new_uuid),
+            )
             .await
             .unwrap();
         let manifest = store.load_manifest().await.unwrap().unwrap();
@@ -1338,7 +1365,13 @@ mod tests {
         let key = "backup-2024-01-01T00:00:00Z.json";
         fs::write(backup_dir.join(key), b"{}").unwrap();
         archive
-            .register_base_backup(&settings.bases, key, "t", &report(1000, u1))
+            .register_base_backup_at(
+                Duration::from_secs(1000),
+                &settings.bases,
+                key,
+                "t",
+                &report(1000, u1),
+            )
             .await
             .unwrap();
         append_create(&archiver, u1, 1100, b"before the refresh");
@@ -1480,7 +1513,13 @@ mod tests {
         let key = "backup-2024-01-01T00:00:00Z.json";
         fs::write(backup_dir.join(key), b"{}").unwrap();
         archive
-            .register_base_backup(&settings.bases, key, "t", &report(1000, server))
+            .register_base_backup_at(
+                Duration::from_secs(1000),
+                &settings.bases,
+                key,
+                "t",
+                &report(1000, server),
+            )
             .await
             .unwrap();
         append_create(&archiver, server, 1100, b"archived");
@@ -1561,7 +1600,13 @@ mod tests {
         let key = "backup-2024-01-01T00:00:00Z.json";
         fs::write(backup_dir.join(key), b"{}").unwrap();
         archive
-            .register_base_backup(&bases, key, "t", &report(1000, server))
+            .register_base_backup_at(
+                Duration::from_secs(1000),
+                &bases,
+                key,
+                "t",
+                &report(1000, server),
+            )
             .await
             .unwrap();
 
@@ -1621,7 +1666,13 @@ mod tests {
         let key2 = "backup-2024-01-02T00:00:00Z.json";
         fs::write(backup_dir.join(key2), b"{}").unwrap();
         archive
-            .register_base_backup(&bases, key2, "t", &report(1250, server))
+            .register_base_backup_at(
+                Duration::from_secs(1250),
+                &bases,
+                key2,
+                "t",
+                &report(1250, server),
+            )
             .await
             .unwrap();
         let manifest = store.load_manifest().await.unwrap().unwrap();
