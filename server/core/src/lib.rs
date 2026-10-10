@@ -606,7 +606,7 @@ fn report_backup_verification(verified: Result<BackupStructuralReport, BackupVer
 }
 
 pub async fn restore_server_core(config: &Configuration, dst_path: &Path) {
-    let committed = match restore_and_replay_commit(config, dst_path, &[]).await {
+    let committed = match restore_and_replay_commit(config, dst_path, Vec::new()).await {
         Ok(committed) => committed,
         Err(_) => std::process::exit(1),
     };
@@ -648,7 +648,9 @@ pub async fn restore_database(
     config: &Configuration,
     src_path: &Path,
 ) -> Result<(), OperationError> {
-    restore_and_replay(config, src_path, &[]).await.map(|_| ())
+    restore_and_replay(config, src_path, Vec::new())
+        .await
+        .map(|_| ())
 }
 
 /// What [`restore_and_replay`] did.
@@ -667,7 +669,7 @@ pub(crate) struct RestoreOutcome {
 pub(crate) async fn restore_and_replay(
     config: &Configuration,
     src_path: &Path,
-    records: &[WalEntryRecord],
+    records: Vec<WalEntryRecord>,
 ) -> Result<RestoreOutcome, OperationError> {
     restore_and_replay_commit(config, src_path, records)
         .await?
@@ -708,7 +710,7 @@ impl CommittedRestore {
 pub(crate) async fn restore_and_replay_commit(
     config: &Configuration,
     src_path: &Path,
-    records: &[WalEntryRecord],
+    records: Vec<WalEntryRecord>,
 ) -> Result<CommittedRestore, OperationError> {
     // The artifact is opened before the database is touched, so that a backup that can
     // not be read (missing, or encrypted with a key this configuration does not have)
@@ -1072,7 +1074,7 @@ pub async fn restore_s3_database(
         fetched.metadata.size_bytes, fetched.metadata.checksum_sha256
     );
 
-    let committed = restore_and_replay_commit(config, &fetched.path, &[]).await?;
+    let committed = restore_and_replay_commit(config, &fetched.path, Vec::new()).await?;
     // Remove the downloaded artifact.
     drop(fetched);
 

@@ -2499,49 +2499,52 @@ impl<'a> BackendWriteTransaction<'a> {
     /// start, exactly as after a restore.
     pub fn wal_apply(
         &mut self,
-        records: &[WalEntryRecord],
+        mut records: Vec<WalEntryRecord>,
     ) -> Result<WalApplyReport, OperationError> {
-        let mut ordered: Vec<&WalEntryRecord> = records.iter().collect();
-        ordered.sort_by_key(|record| (record.cid_ts, record.entry_id));
+        records.sort_by_key(|record| (record.cid_ts, record.entry_id));
 
-        // The ids the restored database assigned to each entry.
-        let existing = self
-            .get_idlayer()
-            .get_identry(&IdList::AllIds)
-            .map_err(|e| {
-                admin_error!(?e, "get_identry failed");
-                e
-            })?;
-        let mut uuid_to_id: BTreeMap<Uuid, u64> = existing
-            .iter()
-            .map(|e| (e.get_uuid(), e.get_id()))
-            .collect();
+        // The ids the restored database assigned to each entry, read from the raw rows
+        // without loading every entry.
+        let mut uuid_to_id: BTreeMap<Uuid, u64> = BTreeMap::new();
+        let mut id_max_in_use = 0;
+        for raw in self.get_idlayer().get_identry_raw(&IdList::AllIds)? {
+            let entry_uuid = serde_json::from_slice::<DbEntry>(&raw.data)
+                .ok()
+                .and_then(|entry| entry.stored_uuid())
+                .ok_or_else(|| {
+                    admin_error!(entry_id = raw.id, "Restored entry has no readable uuid");
+                    OperationError::CorruptedEntry(raw.id)
+                })?;
+            uuid_to_id.insert(entry_uuid, raw.id);
+            id_max_in_use = id_max_in_use.max(raw.id);
+        }
 
         let mut report = WalApplyReport::default();
         // The final state of every entry the records touch: Some(bytes) to write, None to
-        // remove. A truncation drops everything staged before it.
+        // remove.
         let mut final_state: BTreeMap<Uuid, Option<Vec<u8>>> = BTreeMap::new();
 
-        for record in ordered {
-            match &record.operation {
+        for record in records {
+            report.last_cid = Some(record.cid());
+            match record.operation {
                 WalOperationRecord::Truncate => {
                     // A replication refresh: it also replaced the domain and server uuids
                     // and the key material, which the archive does not hold. Replaying the
                     // entries alone would mix the refreshed directory with the identity of
                     // the base, so recovery needs a base taken after the refresh.
                     admin_error!(
-                        cid = %record.cid(),
+                        cid = ?report.last_cid,
                         "The WAL records include a replication refresh; recovery can not \
                          replay across it. Recover from a base backup taken after it."
                     );
                     return Err(OperationError::InvalidState);
                 }
                 WalOperationRecord::Create { entry_data } => {
-                    final_state.insert(record.entry_uuid, Some(entry_data.clone()));
+                    final_state.insert(record.entry_uuid, Some(entry_data));
                     report.created += 1;
                 }
                 WalOperationRecord::Modify { entry_data } => {
-                    final_state.insert(record.entry_uuid, Some(entry_data.clone()));
+                    final_state.insert(record.entry_uuid, Some(entry_data));
                     report.modified += 1;
                 }
                 WalOperationRecord::Delete => {
@@ -2550,18 +2553,12 @@ impl<'a> BackendWriteTransaction<'a> {
                 }
             }
             report.applied += 1;
-            report.last_cid = Some(record.cid());
         }
 
         // The cached maximum id is not refreshed by a raw restore in the same transaction,
         // so take the highest id actually in use as well.
         let id_max_cached = self.get_idlayer().get_id2entry_max_id()?;
-        let mut id_max = existing
-            .iter()
-            .map(|e| e.get_id())
-            .max()
-            .unwrap_or(0)
-            .max(id_max_cached);
+        let mut id_max = id_max_in_use.max(id_max_cached);
         let mut writes: Vec<IdRawEntry> = Vec::new();
         let mut deletes: Vec<u64> = Vec::new();
 
@@ -5078,9 +5075,19 @@ mod tests {
         .cloned()
         .collect();
         assert_eq!(to_apply.len(), 4);
+        // A restore numbers the entries afresh, here exactly as the source did. Make the
+        // ids the records carry differ from the restored ones, so that only a replay that
+        // resolves entries by uuid passes.
+        let to_apply: Vec<WalEntryRecord> = to_apply
+            .into_iter()
+            .map(|mut record| {
+                record.entry_id += 100;
+                record
+            })
+            .collect();
 
-        // Recover: restore the base into a fresh backend (which renumbers the ids), apply
-        // the records, reindex, and compare with the live state.
+        // Recover: restore the base into a fresh backend, apply the records, reindex, and
+        // compare with the live state.
         sketching::test_init();
         let recovered =
             Backend::new(BackendConfig::new_test("main"), wal_test_idxmeta(), false).unwrap();
@@ -5089,7 +5096,7 @@ mod tests {
         rec_txn
             .restore(&mut backup, BackupCompression::NoCompression)
             .unwrap();
-        let report = rec_txn.wal_apply(&to_apply).unwrap();
+        let report = rec_txn.wal_apply(to_apply.clone()).unwrap();
         assert_eq!(report.applied, 4);
         assert_eq!(report.created, 1);
         assert_eq!(report.modified, 2);
@@ -5131,7 +5138,7 @@ mod tests {
         assert!(rec_txn.verify().is_empty());
 
         // Applying the same records again is a no-op in state terms.
-        let report = rec_txn.wal_apply(&to_apply).unwrap();
+        let report = rec_txn.wal_apply(to_apply.clone()).unwrap();
         assert_eq!(report.applied, 4);
         rec_txn.reindex(false).unwrap();
         assert!(entry_exists!(rec_txn, e3));
@@ -5160,7 +5167,7 @@ mod tests {
             },
         ];
         assert_eq!(
-            rec_txn.wal_apply(&truncate_then_create),
+            rec_txn.wal_apply(truncate_then_create),
             Err(OperationError::InvalidState)
         );
         drop(rec_txn);
@@ -5181,6 +5188,6 @@ mod tests {
                 entry_data: b"garbage".to_vec(),
             },
         }];
-        assert!(rec_txn.wal_apply(&garbage).is_err());
+        assert!(rec_txn.wal_apply(garbage).is_err());
     }
 }

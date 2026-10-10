@@ -1,6 +1,6 @@
 //! Recovery: planning, reading the archive, and the `pitr-list` and `recover` commands.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::time::Duration;
 
@@ -14,7 +14,7 @@ use kubidmd_lib::prelude::duration_from_epoch_now;
 use kubidmd_lib::repl::wal::{
     add_pending_server_uuid_change, clear_local_events, format_ts_rfc3339, list_segments,
     parse_recovery_target_cid, parse_recovery_target_time, parse_segment, read_local_events,
-    select_records, WalEntryRecord, WalPendingEvents, WalServerUuidChange,
+    select_records, WalEntryRecord, WalOperationRecord, WalPendingEvents, WalServerUuidChange,
 };
 use uuid::Uuid;
 
@@ -426,12 +426,69 @@ pub async fn pitr_list_server_core(config: &Configuration, region: Option<&str>)
     }
 }
 
-/// Fetch and parse the segments of `plan`, returning the records to replay in CID order.
-async fn load_records(
-    opened: &OpenedArchive,
-    plan: &RecoveryPlan,
-) -> Result<Vec<WalEntryRecord>, PitrError> {
-    let mut records: Vec<WalEntryRecord> = Vec::new();
+/// The records a recovery replays, reduced while the segments are read, one at a time:
+/// replay overwrites every entry with its latest state by uuid, so only that state is
+/// kept, and memory follows the number of entries changed rather than the size of the
+/// archive.
+#[derive(Debug, Default)]
+struct ReplaySet {
+    latest: BTreeMap<Uuid, WalEntryRecord>,
+    /// The records in the replay range, before the reduction.
+    total: usize,
+    /// The CID timestamp of the last of them.
+    last_ts: Option<Duration>,
+}
+
+impl ReplaySet {
+    fn add(&mut self, record: WalEntryRecord) -> Result<(), PitrError> {
+        if record.operation == WalOperationRecord::Truncate {
+            return Err(PitrError::NotRecoverable(format!(
+                "the archive holds a replication refresh at {} in the range to replay; the \
+                 refresh also replaced the identity of the database, which the archive does not \
+                 hold. Recover from a base backup taken after it.",
+                format_ts_rfc3339(record.ts())
+            )));
+        }
+        self.total += 1;
+        self.last_ts = self.last_ts.max(Some(record.ts()));
+        let key = |record: &WalEntryRecord| (record.cid_ts, record.entry_id);
+        let merged = match self.latest.remove(&record.entry_uuid) {
+            None => record,
+            Some(known) if key(&known) <= key(&record) => Self::merge(known, record),
+            Some(known) => Self::merge(record, known),
+        };
+        self.latest.insert(merged.entry_uuid, merged);
+        Ok(())
+    }
+
+    /// The state `older` then `newer` leave an entry in. An entry created after the base
+    /// backup stays a create when it is changed again.
+    fn merge(older: WalEntryRecord, newer: WalEntryRecord) -> WalEntryRecord {
+        match (older.operation, newer.operation) {
+            (
+                WalOperationRecord::Create { .. },
+                WalOperationRecord::Modify { entry_data }
+                | WalOperationRecord::Create { entry_data },
+            ) => WalEntryRecord {
+                operation: WalOperationRecord::Create { entry_data },
+                ..newer
+            },
+            (_, operation) => WalEntryRecord { operation, ..newer },
+        }
+    }
+
+    /// The records to apply, in CID order.
+    fn into_records(self) -> Vec<WalEntryRecord> {
+        let mut records: Vec<WalEntryRecord> = self.latest.into_values().collect();
+        records.sort_by_key(|record| (record.cid_ts, record.entry_id));
+        records
+    }
+}
+
+/// Fetch and parse the segments of `plan`, one at a time, and collect the records to
+/// replay.
+async fn load_records(opened: &OpenedArchive, plan: &RecoveryPlan) -> Result<ReplaySet, PitrError> {
+    let mut records = ReplaySet::default();
     let mut keys = SegmentKeys::new(&opened.settings.encryption);
     for segment in &plan.segments {
         if segment.server_version != env!("KUBIDM_PKG_SERIES") {
@@ -459,9 +516,15 @@ async fn load_records(
                 segment.segment_id, file.server_uuid, opened.manifest.server_uuid
             )));
         }
-        records.extend(records_to_replay(&opened.manifest, plan, &file.entries).cloned());
+        for record in file.entries {
+            if record.ts() > plan.base.watermark_ts
+                && record.ts() <= plan.target.ts
+                && !opened.manifest.is_abandoned(record.ts())
+            {
+                records.add(record)?;
+            }
+        }
     }
-    records.sort_by_key(|record| (record.cid_ts, record.entry_id));
     Ok(records)
 }
 
@@ -537,18 +600,16 @@ pub async fn pitr_recover_server_core(
     }
 
     // Reading segments changes nothing, so the dry run can report the exact record count.
-    let records = load_records(&opened, &plan).await?;
-    let recovered_ts = records
-        .last()
-        .map(WalEntryRecord::ts)
-        .unwrap_or(plan.base.watermark_ts);
-    print_plan(&opened, &plan, records.len(), recovered_ts);
+    let replay = load_records(&opened, &plan).await?;
+    let record_count = replay.total;
+    let recovered_ts = replay.last_ts.unwrap_or(plan.base.watermark_ts);
+    print_plan(&opened, &plan, record_count, recovered_ts);
 
     if dry_run {
         eprintln!("Dry run: no changes were made.");
         return Ok(RecoveryOutcome {
             plan,
-            records: records.len(),
+            records: record_count,
             recovered_ts,
             dry_run: true,
             apply: None,
@@ -565,10 +626,9 @@ pub async fn pitr_recover_server_core(
 
     info!(
         "Restoring base backup {} and replaying {} WAL records into {db_path}",
-        plan.base.key,
-        records.len()
+        plan.base.key, record_count
     );
-    let committed = crate::restore_and_replay_commit(config, base.path(), &records)
+    let committed = crate::restore_and_replay_commit(config, base.path(), replay.into_records())
         .await
         .map_err(|err| {
             error!(
@@ -615,13 +675,13 @@ pub async fn pitr_recover_server_core(
     eprintln!(
         "Recovered {db_path} to {} ({} records replayed on {})",
         format_ts_rfc3339(recovered_ts),
-        records.len(),
+        record_count,
         plan.base.key
     );
 
     Ok(RecoveryOutcome {
         plan,
-        records: records.len(),
+        records: record_count,
         recovered_ts,
         dry_run: false,
         apply,
@@ -925,6 +985,98 @@ mod tests {
     }
 
     #[test]
+    fn test_replay_set_keeps_only_the_latest_state_of_each_entry() {
+        let created = Uuid::new_v4();
+        let changed = Uuid::new_v4();
+        let removed = Uuid::new_v4();
+        let record = |secs: u64, entry_uuid: Uuid, operation: WalOperationRecord| WalEntryRecord {
+            cid_ts: Duration::from_secs(secs).as_nanos() as u64,
+            cid_server: Uuid::nil(),
+            entry_id: 1,
+            entry_uuid,
+            operation,
+        };
+        let data = |bytes: &[u8]| bytes.to_vec();
+        let mut replay = ReplaySet::default();
+        for added in [
+            record(
+                10,
+                created,
+                WalOperationRecord::Create {
+                    entry_data: data(b"c1"),
+                },
+            ),
+            // Out of order: an older state never replaces a newer one.
+            record(
+                30,
+                changed,
+                WalOperationRecord::Modify {
+                    entry_data: data(b"m3"),
+                },
+            ),
+            record(
+                20,
+                changed,
+                WalOperationRecord::Modify {
+                    entry_data: data(b"m2"),
+                },
+            ),
+            record(
+                40,
+                created,
+                WalOperationRecord::Modify {
+                    entry_data: data(b"c4"),
+                },
+            ),
+            record(
+                50,
+                removed,
+                WalOperationRecord::Modify {
+                    entry_data: data(b"r5"),
+                },
+            ),
+            record(60, removed, WalOperationRecord::Delete),
+        ] {
+            replay.add(added).unwrap();
+        }
+        assert_eq!(replay.total, 6);
+        assert_eq!(replay.last_ts, Some(Duration::from_secs(60)));
+        let records = replay.into_records();
+        let states: Vec<(Uuid, u64, WalOperationRecord)> = records
+            .into_iter()
+            .map(|r| (r.entry_uuid, r.ts().as_secs(), r.operation))
+            .collect();
+        assert_eq!(
+            states,
+            vec![
+                (
+                    changed,
+                    30,
+                    WalOperationRecord::Modify {
+                        entry_data: data(b"m3")
+                    }
+                ),
+                // Created after the base backup and changed since: still a create.
+                (
+                    created,
+                    40,
+                    WalOperationRecord::Create {
+                        entry_data: data(b"c4")
+                    }
+                ),
+                (removed, 60, WalOperationRecord::Delete),
+            ]
+        );
+
+        // A replication refresh is refused with a message saying what to do.
+        let mut replay = ReplaySet::default();
+        let err = replay
+            .add(record(70, Uuid::nil(), WalOperationRecord::Truncate))
+            .unwrap_err();
+        assert!(err.to_string().contains("replication refresh"), "{err}");
+    }
+
+    #[test]
     fn test_plan_recovery_selects_base_and_segments() {
         let m = manifest();
 
@@ -1129,7 +1281,8 @@ mod tests {
         assert_eq!(plan.segments.len(), 2);
         let records = load_records(&opened(&encrypted_settings, manifest.clone()), &plan)
             .await
-            .unwrap();
+            .unwrap()
+            .into_records();
         let payloads: Vec<&[u8]> = records
             .iter()
             .map(|record| match &record.operation {
