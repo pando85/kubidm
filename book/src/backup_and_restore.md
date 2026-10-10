@@ -285,17 +285,22 @@ fail to open. Nothing but the secret is needed to open it.
 derivation and never as the cipher key itself.
 
 - `"Passphrase"` (default): the passphrase is read from the `KUBIDM_BACKUP_PASSPHRASE` environment variable of the
-  `kubidmd` process. When `passphrase_file` is set, the passphrase is read from that file instead (trailing whitespace
-  and newlines are ignored) and the environment variable is not consulted. One of the two must be present, or the server
-  refuses to start.
+  `kubidmd` process. When `passphrase_file` is set, the passphrase is read from that file instead and the environment
+  variable is not consulted. Trailing whitespace and newlines are ignored in both, so moving a passphrase from one to
+  the other keeps the key. One of the two must be present, or the server refuses to start.
 - `{ File = { path = "/etc/kubidm/backup.key" } }`: the content of the file is the secret, byte for byte. Generate it
   with for example `head -c 32 /dev/urandom > /etc/kubidm/backup.key` and keep it readable only by the server user.
-- `{ HttpEndpoint = { url = "https://vault.example.com/v1/kubidm-backup-key" } }`: the response body of a GET request to
-  the URL is the secret (at most 64 KiB, within 30 seconds). The endpoint is called every time a backup is made or
-  restored, and with point-in-time recovery also at every WAL archive run that has segments to archive and at every
-  `recover`, so it has to be reachable from the server and from the host that restores. The URL must use `https`; plain
-  `http` is only accepted for a loopback address such as a local secrets agent, because it would send the secret in the
-  clear.
+- `{ HttpEndpoint = { url = "https://secrets.example.com/kubidm-backup-key" } }`: the raw response body of a GET
+  request to the URL is the secret, byte for byte (at most 64 KiB, within 30 seconds). The request carries no
+  credentials, and the body is not parsed, so the endpoint must return the bare key and exactly the same bytes every
+  time: a JSON envelope with a per-request field, such as a Vault API response, would yield a different key on every
+  call and the backups could never be decrypted again. A local agent or sidecar that renders the secret is the usual
+  way to serve it. The endpoint is called every time a backup is made or restored, and with point-in-time recovery also
+  at every WAL archive run that has segments to archive and at every `recover`, so it has to be reachable from the
+  server and from the host that restores. The URL must use `https`; plain `http` is only accepted for a loopback
+  address such as a local secrets agent, because it would send the secret in the clear. The request never goes through
+  a proxy (`HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` are ignored) and redirects are not followed: any answer but a
+  `2xx` fails.
 
 At startup, and in `kubidmd configtest`, the key source is checked to be usable: the passphrase file or environment
 variable is present and not empty, the key file exists and is readable, the URL is a well formed `https` URL, or `http`
