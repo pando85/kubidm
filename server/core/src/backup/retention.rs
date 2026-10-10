@@ -93,8 +93,15 @@ pub fn backup_artifact_name(
 
 /// Given the names found in a backup location, return the ones retention should delete so
 /// that at most `versions` backup artifacts remain. Names that are not backup artifacts are
-/// never returned. The result is ordered oldest first, by the time in the names.
-pub fn select_backups_to_delete(names: &[String], versions: usize) -> Vec<String> {
+/// never returned, and neither is `keep`, the backup the run that triggers the retention
+/// has just written: it is never deleted, whatever its name says about its age (a wall
+/// clock that went backwards) and whatever `versions` is. The result is ordered oldest
+/// first, by the time in the names.
+pub fn select_backups_to_delete(
+    names: &[String],
+    versions: usize,
+    keep: Option<&str>,
+) -> Vec<String> {
     let mut backups: Vec<String> = names
         .iter()
         .filter(|name| is_backup_artifact_name(name))
@@ -103,8 +110,11 @@ pub fn select_backups_to_delete(names: &[String], versions: usize) -> Vec<String
     sort_backup_names(&mut backups);
 
     let excess = backups.len().saturating_sub(versions);
-    backups.truncate(excess);
     backups
+        .into_iter()
+        .filter(|name| Some(name.as_str()) != keep)
+        .take(excess)
+        .collect()
 }
 
 /// Apply the `versions` retention to the local online backup directory `dir` with
@@ -114,8 +124,9 @@ pub fn select_backups_to_delete(names: &[String], versions: usize) -> Vec<String
 ///
 /// Never fails: the backup that triggered the cleanup has already succeeded, so an
 /// unreadable directory or entry, or a file that can not be removed, is logged and the
-/// cleanup carries on or stops, as an S3 cleanup does.
-pub fn prune_local_backups(dir: &Path, versions: usize) {
+/// cleanup carries on or stops, as an S3 cleanup does. `keep` is never deleted, see
+/// [`select_backups_to_delete`].
+pub fn prune_local_backups(dir: &Path, versions: usize, keep: Option<&str>) {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(err) => {
@@ -153,7 +164,7 @@ pub fn prune_local_backups(dir: &Path, versions: usize) {
         }
     }
 
-    let to_delete = select_backups_to_delete(&names, versions);
+    let to_delete = select_backups_to_delete(&names, versions, keep);
     if to_delete.is_empty() {
         debug!("Online backup cleanup had no files to remove");
         return;
@@ -275,7 +286,7 @@ mod tests {
             "backup-2024-01-04T22:00:00Z.json.gz.enc",
         ]);
         assert_eq!(
-            select_backups_to_delete(&listing, 2),
+            select_backups_to_delete(&listing, 2, None),
             names(&[
                 "backup-2024-01-01T22:00:00Z.json.gz",
                 "backup-2024-01-02T22:00:00Z.json.gz",
@@ -293,15 +304,15 @@ mod tests {
         ]);
 
         assert_eq!(
-            select_backups_to_delete(&listing, 2),
+            select_backups_to_delete(&listing, 2, None),
             names(&[
                 "backup-2024-01-01T22:00:00Z.json.gz",
                 "backup-2024-01-02T22:00:00Z.json.gz",
             ])
         );
-        assert!(select_backups_to_delete(&listing, 4).is_empty());
-        assert!(select_backups_to_delete(&listing, 10).is_empty());
-        assert_eq!(select_backups_to_delete(&listing, 0), {
+        assert!(select_backups_to_delete(&listing, 4, None).is_empty());
+        assert!(select_backups_to_delete(&listing, 10, None).is_empty());
+        assert_eq!(select_backups_to_delete(&listing, 0, None), {
             let mut all = listing.clone();
             all.sort();
             all
@@ -322,14 +333,14 @@ mod tests {
 
         // Even with a retention of zero, only backup artifacts are selected.
         assert_eq!(
-            select_backups_to_delete(&listing, 0),
+            select_backups_to_delete(&listing, 0, None),
             names(&[
                 "backup-2024-01-01T22:00:00Z.json.gz",
                 "backup-2024-01-02T22:00:00Z.json.gz",
             ])
         );
         assert_eq!(
-            select_backups_to_delete(&listing, 1),
+            select_backups_to_delete(&listing, 1, None),
             names(&["backup-2024-01-01T22:00:00Z.json.gz"])
         );
     }
@@ -345,7 +356,7 @@ mod tests {
             "backup-2024-01-01T22:00:00.5Z.json.gz",
         ]);
         assert_eq!(
-            select_backups_to_delete(&listing, 1),
+            select_backups_to_delete(&listing, 1, None),
             names(&[
                 "backup-2024-01-01T22:00:00Z.json.gz",
                 "backup-2024-01-01T22:00:00.1Z.json.gz",
@@ -391,9 +402,34 @@ mod tests {
     }
 
     #[test]
+    fn test_select_backups_to_delete_never_deletes_the_backup_just_written() {
+        let listing = names(&[
+            "backup-2024-01-01T22:00:00Z.json.gz",
+            "backup-2024-01-02T22:00:00Z.json.gz",
+            "backup-2024-01-03T22:00:00Z.json.gz",
+        ]);
+
+        // Even when retention would remove everything, the new backup stays.
+        assert_eq!(
+            select_backups_to_delete(&listing, 0, Some("backup-2024-01-03T22:00:00Z.json.gz")),
+            names(&[
+                "backup-2024-01-01T22:00:00Z.json.gz",
+                "backup-2024-01-02T22:00:00Z.json.gz",
+            ])
+        );
+
+        // The wall clock went backwards: the new backup looks like the oldest one, and
+        // the oldest other backup goes instead.
+        assert_eq!(
+            select_backups_to_delete(&listing, 2, Some("backup-2024-01-01T22:00:00Z.json.gz")),
+            names(&["backup-2024-01-02T22:00:00Z.json.gz"])
+        );
+    }
+
+    #[test]
     fn test_select_backups_to_delete_empty() {
-        assert!(select_backups_to_delete(&[], 3).is_empty());
-        assert!(select_backups_to_delete(&names(&["pitr-manifest.json"]), 0).is_empty());
+        assert!(select_backups_to_delete(&[], 3, None).is_empty());
+        assert!(select_backups_to_delete(&names(&["pitr-manifest.json"]), 0, None).is_empty());
     }
 
     fn touch(dir: &Path, name: &str) {
@@ -430,7 +466,7 @@ mod tests {
         // A directory named like a backup is not a backup.
         std::fs::create_dir(dir.path().join("backup-2024-01-00T22:00:00Z.json.gz")).expect("mkdir");
 
-        prune_local_backups(dir.path(), 2);
+        prune_local_backups(dir.path(), 2, None);
 
         assert_eq!(
             remaining(dir.path()),
@@ -459,7 +495,7 @@ mod tests {
         std::fs::write(&stray, b"stray").expect("write");
 
         // Used to fail the whole cleanup, and with it the backup that had succeeded.
-        prune_local_backups(dir.path(), 1);
+        prune_local_backups(dir.path(), 1, None);
 
         assert!(stray.exists());
         assert!(!dir
@@ -475,6 +511,6 @@ mod tests {
     #[test]
     fn test_prune_local_backups_survives_a_missing_directory() {
         let dir = tempfile::tempdir().expect("tempdir");
-        prune_local_backups(&dir.path().join("missing"), 1);
+        prune_local_backups(&dir.path().join("missing"), 1, None);
     }
 }

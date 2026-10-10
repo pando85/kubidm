@@ -78,7 +78,8 @@ pub struct OnlineBackup {
     /// (it's very similar to the standard cron syntax, it just allows to specify the seconds at the beginning and the year at the end)
     pub schedule: String,
     #[serde(default = "default_online_backup_versions")]
-    /// How many past backup versions to keep, defaults to 7
+    /// How many past backup versions to keep in every backup location, defaults to 7.
+    /// Must be at least 1.
     pub versions: usize,
     /// Enabled by default
     #[serde(default = "default_online_backup_enabled")]
@@ -128,6 +129,17 @@ impl OnlineBackup {
     /// The WAL directory itself is checked for writability when the server starts (the
     /// backend creates and probes it), not here, since `configtest` must not create it.
     pub fn validate(&self) -> Result<(), String> {
+        if self.versions == 0 {
+            // Retention keeps the newest `versions` backups, so zero would delete every
+            // backup, in every location and region, right after it was taken.
+            return Err(
+                "online_backup.versions must be at least 1: it is the number of backups kept \
+                 in every backup location, and 0 would delete every backup right after it was \
+                 taken"
+                    .to_string(),
+            );
+        }
+
         validate_encryption_config(&self.encryption)
             .map_err(|reason| format!("online_backup.encryption: {reason}"))?;
 
@@ -1308,6 +1320,28 @@ schedule = "@daily"
     #[test]
     fn online_backup_without_unavailable_features_is_accepted() {
         assert!(build_from_toml(BASE_V2_CONFIG).is_some());
+    }
+
+    #[test]
+    fn online_backup_versions_must_keep_at_least_one_backup() {
+        let config = build_from_toml(&format!("{BASE_V2_CONFIG}versions = 1\n"))
+            .expect("one version is accepted");
+        assert_eq!(config.online_backup.map(|backup| backup.versions), Some(1));
+
+        assert!(
+            build_from_toml(&format!("{BASE_V2_CONFIG}versions = 0\n")).is_none(),
+            "versions = 0 must be rejected"
+        );
+
+        // `--online-backup-versions` lands in the same section before `finish` validates
+        // it, so the override is rejected the same way.
+        let err = OnlineBackup {
+            versions: 0,
+            ..OnlineBackup::default()
+        }
+        .validate()
+        .expect_err("versions = 0 must be rejected");
+        assert!(err.starts_with("online_backup.versions"), "{err}");
     }
 
     #[test]

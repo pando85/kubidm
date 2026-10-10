@@ -155,7 +155,7 @@ schedule = "00 22 * * *"
 #   sec  min   hour   day of month   month   day of week   year
 #   (it's very similar to the standard cron syntax, it just allows to specify the seconds
 #   at the beginning and the year at the end)
-#   Number of backups to keep (default 7)
+#   Number of backups to keep in every backup location (default 7, at least 1)
 # versions = 7
 
 # Compression can either be "gzip" or "nocompression".

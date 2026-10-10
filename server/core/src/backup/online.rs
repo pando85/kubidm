@@ -179,9 +179,9 @@ impl OnlineBackupJob {
         );
 
         // The backup has succeeded: the cleanup only ever logs.
-        let (dir, versions) = (dir.to_path_buf(), self.versions);
+        let (dir, versions, keep) = (dir.to_path_buf(), self.versions, key.to_string());
         if let Err(err) = run_blocking(move || {
-            prune_local_backups(&dir, versions);
+            prune_local_backups(&dir, versions, Some(&keep));
             Ok(())
         })
         .await
@@ -292,9 +292,9 @@ impl OnlineBackupJob {
             }
         }
 
-        prune_s3_backups(&s3_client, self.versions).await;
+        prune_s3_backups(&s3_client, self.versions, key).await;
         for region_client in &region_clients {
-            prune_s3_backups(region_client, self.versions).await;
+            prune_s3_backups(region_client, self.versions, key).await;
         }
 
         Ok(report)
@@ -305,8 +305,9 @@ impl OnlineBackupJob {
 /// or the prefix of a replication region. Only automatically generated backup artifacts
 /// are ever deleted, together with their metadata sidecar; the PITR manifest and any other
 /// object under the prefix are kept. Failures are logged and never propagated, because the
-/// backup that triggered the cleanup has already succeeded.
-async fn prune_s3_backups(client: &S3ClientWrapper, versions: usize) {
+/// backup that triggered the cleanup has already succeeded. `keep`, that backup, is never
+/// deleted.
+async fn prune_s3_backups(client: &S3ClientWrapper, versions: usize, keep: &str) {
     let location = client.location();
 
     let existing = match client.list_backups().await {
@@ -317,7 +318,7 @@ async fn prune_s3_backups(client: &S3ClientWrapper, versions: usize) {
         }
     };
 
-    let to_delete = select_backups_to_delete(&existing, versions);
+    let to_delete = select_backups_to_delete(&existing, versions, Some(keep));
     if to_delete.is_empty() {
         debug!("S3 backup cleanup had no backups to remove in {}", location);
     } else {

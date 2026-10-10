@@ -101,8 +101,10 @@ secret_access_key = "your-secret-key"
 `versions` applies independently to each location: the local directory keeps the newest `versions` backups, and the S3
 prefix keeps the newest `versions` backups. After every successful upload the server lists the objects under
 `path_prefix` and deletes the oldest automatically generated backups (`backup-<timestamp>.json[.gz][.enc]` together with
-their `.metadata.json` object) beyond that number. Plain and encrypted backups count alike. No other object under the
-prefix is ever deleted.
+their `.metadata.json` object) beyond that number. Plain and encrypted backups count alike, ordered by the time in their
+name. No other object under the prefix is ever deleted, and neither is the backup the run has just written. `versions`
+must be at least 1; the server and `kubidmd configtest` reject `versions = 0`, also when it is given as
+`--online-backup-versions`.
 
 #### Custom Endpoints
 
