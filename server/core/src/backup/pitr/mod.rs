@@ -10,6 +10,7 @@
 //!   watermark, so that recovery can pair a base with the segments that follow it;
 //! - recording the history a restore or a recovery abandons, so that a later recovery never
 //!   replays it;
+//! - recording the changes offline repair commands make outside the archive as gaps;
 //! - the `kubidmd database pitr-list` and `kubidmd database recover` commands.
 //!
 //! Recovery restores the newest base backup whose watermark is at or before the target,
@@ -31,9 +32,11 @@
 //!
 //! Layout: `settings` resolves the locations from the configuration, `store` reads and
 //! writes them, `archive` is the running server's task, `replicate` mirrors the archive to
-//! the replication regions and `recover` holds the recovery commands.
+//! the replication regions, `offline` records the changes of offline commands and `recover`
+//! holds the recovery commands.
 
 mod archive;
+mod offline;
 mod recover;
 mod replicate;
 mod settings;
@@ -42,6 +45,7 @@ mod store;
 mod test_util;
 
 pub use archive::*;
+pub use offline::*;
 pub use recover::*;
 pub use settings::*;
 

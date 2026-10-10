@@ -70,7 +70,7 @@ use kubidm_proto::{
     scim_v1::client::ScimAssertGeneric,
 };
 use kubidmd_lib::{
-    be::{Backend, BackendConfig},
+    be::{Backend, BackendConfig, BackendWriteTransaction},
     idm::ldap::LdapServer,
     prelude::*,
     schema::Schema,
@@ -355,7 +355,7 @@ pub fn dbscan_get_id2entry_core(config: &Configuration, id: u64) {
     };
 }
 
-pub fn dbscan_quarantine_id2entry_core(config: &Configuration, id: u64) {
+pub async fn dbscan_quarantine_id2entry_core(config: &Configuration, id: u64) {
     let be = dbscan_setup_be!(config);
     let mut be_wrtxn = match be.write() {
         Ok(txn) => txn,
@@ -368,6 +368,10 @@ pub fn dbscan_quarantine_id2entry_core(config: &Configuration, id: u64) {
         }
     };
 
+    if !note_dbscan_change(config, &mut be_wrtxn, "db-scan quarantine-id2entry").await {
+        return;
+    }
+
     match be_wrtxn
         .quarantine_entry(id)
         .and_then(|_| be_wrtxn.commit())
@@ -379,6 +383,36 @@ pub fn dbscan_quarantine_id2entry_core(config: &Configuration, id: u64) {
             error!("Failed to quarantine id2entry value: {:?}", e);
         }
     };
+}
+
+/// Before a `db-scan` command changes the database outside a transaction the WAL archive
+/// could record: record the change as a gap in the archive, when WAL archiving is
+/// configured, so that point-in-time recovery never replays across it. Returns false, after
+/// logging why, when the gap could not be recorded; the command must then not change the
+/// database.
+async fn note_dbscan_change(
+    config: &Configuration,
+    be_wrtxn: &mut BackendWriteTransaction<'_>,
+    command: &str,
+) -> bool {
+    let db_ts_max = match be_wrtxn.get_db_ts_max(Duration::ZERO) {
+        Ok(db_ts_max) => db_ts_max,
+        Err(err) => {
+            error!(?err, "Unable to read the last transaction of the database");
+            return false;
+        }
+    };
+    match pitr::note_offline_change(config, db_ts_max, command).await {
+        Ok(_) => true,
+        Err(err) => {
+            error!(
+                %err,
+                "The change could not be recorded in the WAL archive nor handed to the server, \
+                 so point-in-time recovery could replay across it; the database was not changed"
+            );
+            false
+        }
+    }
 }
 
 pub fn dbscan_list_quarantined_core(config: &Configuration) {
@@ -404,7 +438,7 @@ pub fn dbscan_list_quarantined_core(config: &Configuration) {
     };
 }
 
-pub fn dbscan_restore_quarantined_core(config: &Configuration, id: u64) {
+pub async fn dbscan_restore_quarantined_core(config: &Configuration, id: u64) {
     let be = dbscan_setup_be!(config);
     let mut be_wrtxn = match be.write() {
         Ok(txn) => txn,
@@ -416,6 +450,10 @@ pub fn dbscan_restore_quarantined_core(config: &Configuration, id: u64) {
             return;
         }
     };
+
+    if !note_dbscan_change(config, &mut be_wrtxn, "db-scan restore-quarantined").await {
+        return;
+    }
 
     match be_wrtxn
         .restore_quarantined(id)

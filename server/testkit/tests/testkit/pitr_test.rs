@@ -27,7 +27,10 @@ use kubidmd_core::backup::pitr::{
 };
 use kubidmd_core::backup::{is_encrypted_artifact, MIN_KDF_M_COST};
 use kubidmd_core::config::{Configuration, OnlineBackup};
-use kubidmd_core::{restore_s3_database, restore_server_core, RestoreStatus};
+use kubidmd_core::{
+    dbscan_quarantine_id2entry_core, dbscan_restore_quarantined_core, restore_s3_database,
+    restore_server_core, RestoreStatus,
+};
 use kubidmd_lib::be::SharedWalArchiver;
 use kubidmd_lib::repl::wal::{format_ts_rfc3339, list_segments, read_pending_events, WalArchiver};
 use kubidmd_testkit::{login_put_admin_idm_admins, setup_async_test, AsyncTestEnvironment};
@@ -342,6 +345,96 @@ fn test_pitr_unclean_stop_leaves_a_gap_recovery_does_not_cross() {
         assert!(!person_exists(&env.rsclient, PITR_USER_LOST).await);
         assert!(!person_exists(&env.rsclient, PITR_USER_AFTER).await);
         env.core_handle.shutdown().await;
+    });
+}
+
+/// The `db-scan` repair commands change the database outside any transaction the archive
+/// could record. Each records a gap: recovery stops right before the change, and an online
+/// backup taken after it makes later points recoverable again.
+#[test]
+fn test_pitr_dbscan_repairs_are_gaps_recovery_does_not_cross() {
+    run(async {
+        let workdir = tempfile::tempdir().expect("Failed to create workdir");
+        let backup_dir = workdir.path().join("backups");
+        let wal_dir = workdir.path().join("wal");
+        std::fs::create_dir(&backup_dir).expect("Failed to create backup directory");
+        let config = pitr_config(
+            &workdir.path().join("source.db"),
+            &backup_dir,
+            &wal_dir,
+            None,
+        );
+
+        let mut env = setup_async_test(config.clone()).await;
+        populate(&env).await;
+        env.core_handle
+            .trigger_online_backup(&backup_dir, 7, BackupCompression::Gzip, &Default::default())
+            .await
+            .expect("Online backup failed");
+        env.rsclient
+            .idm_person_account_create(PITR_USER_BEFORE, "Before")
+            .await
+            .expect("Failed to create the person before the repair");
+        env.core_handle.shutdown().await;
+        assert!(read_manifest(&wal_dir.join(PITR_MANIFEST_KEY)).gaps.is_empty());
+
+        // The server is stopped: quarantine an entry and put it back.
+        dbscan_quarantine_id2entry_core(&config, 1).await;
+        dbscan_restore_quarantined_core(&config, 1).await;
+        let manifest = read_manifest(&wal_dir.join(PITR_MANIFEST_KEY));
+        assert_eq!(manifest.gaps.len(), 2, "{:?}", manifest.gaps);
+        assert!(manifest
+            .gaps
+            .iter()
+            .all(|gap| gap.reason.contains("db-scan")));
+
+        // A target past the repairs is refused; the latest point stops before them and
+        // holds everything committed until then.
+        let refused_db = workdir.path().join("refused.db");
+        let refused = pitr_recover_server_core(
+            &pitr_config(&refused_db, &backup_dir, &wal_dir, None),
+            &RecoveryTargetSpec::Time(now_rfc3339()),
+            false,
+            None,
+        )
+        .await;
+        assert!(
+            matches!(&refused, Err(PitrError::NotRecoverable(msg)) if msg.contains("db-scan")),
+            "{refused:?}"
+        );
+        assert!(!refused_db.exists());
+        let before_db = workdir.path().join("before.db");
+        let before_config = pitr_config(&before_db, &backup_dir, &wal_dir, None);
+        pitr_recover_server_core(&before_config, &RecoveryTargetSpec::Latest, false, None)
+            .await
+            .expect("Recovery to the latest point before the repairs failed");
+        let mut recovered = setup_async_test(before_config).await;
+        login_put_admin_idm_admins(&recovered.rsclient).await;
+        assert!(person_exists(&recovered.rsclient, PITR_USER_BEFORE).await);
+        recovered.core_handle.shutdown().await;
+
+        // An online backup taken after the repairs is a base past them.
+        let mut env = setup_async_test(config.clone()).await;
+        login_put_admin_idm_admins(&env.rsclient).await;
+        env.core_handle
+            .trigger_online_backup(&backup_dir, 7, BackupCompression::Gzip, &Default::default())
+            .await
+            .expect("Online backup failed");
+        env.rsclient
+            .idm_person_account_create(PITR_USER_AFTER, "After")
+            .await
+            .expect("Failed to create the person after the repair");
+        env.core_handle.shutdown().await;
+        let after_db = workdir.path().join("after.db");
+        let after_config = pitr_config(&after_db, &backup_dir, &wal_dir, None);
+        pitr_recover_server_core(&after_config, &RecoveryTargetSpec::Latest, false, None)
+            .await
+            .expect("Recovery from the base taken after the repairs failed");
+        let mut recovered = setup_async_test(after_config).await;
+        login_put_admin_idm_admins(&recovered.rsclient).await;
+        assert!(person_exists(&recovered.rsclient, PITR_USER_BEFORE).await);
+        assert!(person_exists(&recovered.rsclient, PITR_USER_AFTER).await);
+        recovered.core_handle.shutdown().await;
     });
 }
 

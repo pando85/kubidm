@@ -541,7 +541,12 @@ S3, segments that were closed but not yet uploaded are lost with the host, which
 
 The offline `kubidmd domain rename` and `kubidmd database reindex` commands archive their writes like the running server
 does; the next server start uploads them. The `kubidmd db-scan quarantine-id2entry` and `restore-quarantined` repair
-commands bypass the archive: take an online backup after using them.
+commands move an entry in or out of the database without a transaction the archive could record, so each records a
+**gap** before it changes anything: from just after the last transaction the database committed up to the time of the
+command, with a reason naming the command. It goes into the manifest, or, when the archive has no manifest yet or can not
+be reached, into the WAL directory, from where the server records it at its next start and `recover` honours it
+meanwhile; when neither works the command refuses to change the database. Recovery then stops right before the repair,
+and an online backup taken after it makes later points recoverable again: take one after using these commands.
 
 #### Server Identity Changes
 

@@ -97,7 +97,9 @@ Recovery restores the newest base backup at or before the target, then applies l
       and only a new base backup makes later points recoverable
 - [ ] A restore whose abandoned history can be recorded neither in the archive nor handed over through the WAL directory
       exits 3; until a new online backup is taken after the start, a recovery past it could replay that history
-- [ ] `db-scan` quarantine commands bypass the WAL archive (documented)
+- [x] `db-scan` quarantine commands bypassed the WAL archive: `quarantine-id2entry` and `restore-quarantined` record a
+      gap from just after the last committed transaction up to now before they change anything (in the manifest, or
+      handed to the server through the WAL directory, else they refuse), so recovery never replays across them
 - [ ] Manual `database backup` files are not PITR bases
 - [x] The offline `restore` and `recover` ran their write transaction and reindex on the CLI's runtime: the restore,
       replay, reindex and boot verification now run on a dedicated database thread (`on_database_thread`), checked by

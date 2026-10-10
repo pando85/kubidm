@@ -186,6 +186,9 @@ pub enum WalGapReason {
     UnclosedSegment,
     /// A closed segment could not be written for too long and was dropped.
     UnwritableSegment,
+    /// An offline repair command (`db-scan quarantine-id2entry`, `restore-quarantined`)
+    /// changed the database without a transaction the archive could record.
+    OfflineChange,
 }
 
 impl std::fmt::Display for WalGapReason {
@@ -197,6 +200,9 @@ impl std::fmt::Display for WalGapReason {
             }
             WalGapReason::UnwritableSegment => {
                 write!(f, "a closed segment could not be written and was dropped")
+            }
+            WalGapReason::OfflineChange => {
+                write!(f, "an offline repair command changed the database")
             }
         }
     }
@@ -1133,6 +1139,16 @@ pub fn defer_restore(dir: &Path, restore: WalRestore) -> Result<(), WalError> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err.into()),
     }
+}
+
+/// Hand `gap` to the next archiver started on `dir`, for an offline command that changed the
+/// database while the archive could not record it. It is added to the events already
+/// pending there.
+pub fn defer_gap(dir: &Path, gap: WalGap) -> Result<(), WalError> {
+    fs::create_dir_all(dir)?;
+    let mut events = read_pending_events(dir);
+    events.gaps.push(gap);
+    write_pending_events(dir, &events)
 }
 
 /// The gap the open segment marker left in `dir` by a run that stopped without closing
