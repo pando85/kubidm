@@ -195,7 +195,7 @@ impl IntervalActor {
 
                 last_run = Some(next_time);
                 match run_until_shutdown(job.run(server), &mut rx).await {
-                    Some(Ok(_)) => {}
+                    Some(Ok(())) => {}
                     Some(Err(err)) => error!(?err, "An online backup error occurred."),
                     None => {
                         warn!(

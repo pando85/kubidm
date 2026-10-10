@@ -15,6 +15,8 @@ use kubidm_proto::backup::{BackupCompression, BACKUP_ENCRYPTED_SUFFIX};
 use regex::Regex;
 use time::{OffsetDateTime, UtcOffset};
 
+use super::{S3ClientWrapper, PARTIAL_BACKUP_SUFFIX};
+
 /// Pattern of the file name / object key of an automatically generated backup, as written
 /// by the online backup: `backup-<RFC3339 UTC timestamp>.json` with an optional compression
 /// suffix and an optional encryption suffix (see [`backup_artifact_name`]).
@@ -32,11 +34,16 @@ pub fn is_backup_artifact_name(name: &str) -> bool {
     BACKUP_ARTIFACT_NAME.is_match(name)
 }
 
+/// The timestamp in an automatically generated backup name, `backup-<timestamp>.json...`,
+/// or `None` for any other name.
+pub fn backup_name_timestamp(name: &str) -> Option<&str> {
+    Some(BACKUP_ARTIFACT_NAME.captures(name)?.get(1)?.as_str())
+}
+
 /// The time an automatically generated backup was taken, read from its name. None when
 /// `name` is not a backup artifact name.
 pub fn backup_artifact_time(name: &str) -> Option<DateTime<FixedOffset>> {
-    let timestamp = BACKUP_ARTIFACT_NAME.captures(name)?.get(1)?.as_str();
-    DateTime::parse_from_rfc3339(timestamp).ok()
+    DateTime::parse_from_rfc3339(backup_name_timestamp(name)?).ok()
 }
 
 /// Order two backup names oldest first by the time in their name, then by name.
@@ -139,10 +146,22 @@ pub fn select_incomplete_backups_to_delete(
     stale
 }
 
+/// The backup `name` is the partial file of, when it is the `.<backup>.partial` file of a
+/// backup being written, see [`super::partial_backup_path`].
+fn partial_backup_name(name: &str) -> Option<&str> {
+    name.strip_prefix('.')?
+        .strip_suffix(PARTIAL_BACKUP_SUFFIX)
+        .filter(|backup| is_backup_artifact_name(backup))
+}
+
 /// Apply the `versions` retention to the local online backup directory `dir` with
 /// [`select_backups_to_delete`], the rule the S3 locations use. Only regular files named
 /// like an automatically generated backup are considered; anything else in the directory,
 /// including names that are not valid UTF-8, is left alone.
+///
+/// The `.<backup>.partial` file of a backup whose writer was killed or lost power is
+/// removed by the rule S3 applies to incomplete uploads,
+/// [`select_incomplete_backups_to_delete`]: once a newer backup is complete.
 ///
 /// Never fails: the backup that triggered the cleanup has already succeeded, so an
 /// unreadable directory or entry, or a file that can not be removed, is logged and the
@@ -162,6 +181,7 @@ pub fn prune_local_backups(dir: &Path, versions: usize, keep: Option<&str>) {
     };
 
     let mut names = Vec::new();
+    let mut partials = Vec::new();
     for entry in entries {
         let entry = match entry {
             Ok(entry) => entry,
@@ -181,8 +201,28 @@ pub fn prune_local_backups(dir: &Path, versions: usize, keep: Option<&str>) {
             );
             continue;
         };
-        if is_backup_artifact_name(&name) && entry.path().is_file() {
+        if !entry.path().is_file() {
+            continue;
+        }
+        if is_backup_artifact_name(&name) {
             names.push(name);
+        } else if let Some(partial_of) = partial_backup_name(&name) {
+            partials.push(partial_of.to_string());
+        }
+    }
+
+    for stale in select_incomplete_backups_to_delete(&partials, &names, keep) {
+        let path = dir.join(format!(".{stale}{PARTIAL_BACKUP_SUFFIX}"));
+        match std::fs::remove_file(&path) {
+            Ok(()) => info!(
+                "Online backup cleanup removed {}, left by an interrupted backup",
+                path.display()
+            ),
+            Err(err) => error!(
+                "Online backup cleanup failed to remove {}: {}",
+                path.display(),
+                err
+            ),
         }
     }
 
@@ -206,6 +246,61 @@ pub fn prune_local_backups(dir: &Path, versions: usize, keep: Option<&str>) {
                 "Online backup cleanup failed to remove {}: {}",
                 path.display(),
                 err
+            ),
+        }
+    }
+}
+
+/// Apply the `versions` retention to the location `client` writes to: the primary prefix
+/// or the prefix of a replication region. Only automatically generated backup artifacts
+/// are ever deleted, together with their metadata sidecar; the PITR manifest and any other
+/// object under the prefix are kept. Only complete backups, with a sidecar, count towards
+/// `versions`; a backup object left without one by a failed upload is removed once a
+/// newer backup is complete. Failures are logged and never propagated, because the backup
+/// that triggered the cleanup has already succeeded. `keep`, that backup, is never
+/// deleted.
+pub(crate) async fn prune_s3_backups(client: &S3ClientWrapper, versions: usize, keep: &str) {
+    let location = client.location();
+
+    let listing = match client.list_backup_listing().await {
+        Ok(listing) => listing,
+        Err(e) => {
+            error!("S3 backup cleanup failed to list {}: {}", location, e);
+            return;
+        }
+    };
+
+    let to_delete = select_backups_to_delete(&listing.complete, versions, Some(keep));
+    if to_delete.is_empty() {
+        debug!("S3 backup cleanup had no backups to remove in {}", location);
+    } else {
+        info!(
+            "S3 backup cleanup found {} backups in {}, should keep {}, will remove {}",
+            listing.complete.len(),
+            location,
+            versions,
+            to_delete.len()
+        );
+    }
+
+    let incomplete =
+        select_incomplete_backups_to_delete(&listing.incomplete, &listing.complete, Some(keep));
+    if !incomplete.is_empty() {
+        info!(
+            "S3 backup cleanup removes {} backup object(s) without metadata from {}, left by \
+             failed uploads: {}",
+            incomplete.len(),
+            location,
+            incomplete.join(", ")
+        );
+    }
+
+    for key in to_delete.into_iter().chain(incomplete) {
+        match client.delete_backup(&key).await {
+            Ok(()) => info!("S3 backup cleanup removed {} from {}", key, location),
+            Err(e) => error!(
+                "S3 backup cleanup failed to remove {} from {}: {}",
+                key, location, e
             ),
         }
     }
@@ -515,7 +610,13 @@ mod tests {
             );
         }
         touch(dir.path(), "backup-2024-01-05T22:00:00Z.json.gz.invalid");
+        // A backup that may still be written, and one a crash left behind.
         touch(dir.path(), ".backup-2024-01-06T22:00:00Z.json.gz.partial");
+        touch(
+            dir.path(),
+            ".backup-2024-01-02T12:00:00Z.json.gz.enc.partial",
+        );
+        touch(dir.path(), ".manual.json.partial");
         touch(dir.path(), "manual.json");
         // A directory named like a backup is not a backup.
         std::fs::create_dir(dir.path().join("backup-2024-01-00T22:00:00Z.json.gz")).expect("mkdir");
@@ -526,6 +627,7 @@ mod tests {
             remaining(dir.path()),
             names(&[
                 ".backup-2024-01-06T22:00:00Z.json.gz.partial",
+                ".manual.json.partial",
                 "backup-2024-01-00T22:00:00Z.json.gz",
                 "backup-2024-01-03T22:00:00Z.json.gz",
                 "backup-2024-01-04T22:00:00Z.json.gz",

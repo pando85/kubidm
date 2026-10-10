@@ -406,8 +406,9 @@ fn check_file_ownership(opt: &KubidmdParser) -> Result<(), ExitCode> {
     Ok(())
 }
 
-/// The exit code of `database restore` and `restore-s3`: 1 when the database was not
-/// restored, otherwise [`RestoreStatus::exit_code`].
+/// The exit code of `database restore` and `restore-s3`: 1 when the restore failed, which
+/// includes a database that was restored but could not be reindexed (its error says so),
+/// otherwise [`RestoreStatus::exit_code`].
 fn restore_exit_code(restored: Result<RestoreStatus, OperationError>) -> ExitCode {
     match restored.ok() {
         Some(RestoreStatus::Complete) => {
@@ -436,8 +437,8 @@ async fn scripting_command(cmd: ScriptingCommand, config: Configuration) -> Exit
             .await;
         }
 
-        ScriptingCommand::Backup { path } => {
-            if !backup_server_core(&config, path.as_deref()).await {
+        ScriptingCommand::Backup { path, name } => {
+            if !backup_server_core(&config, path.as_deref(), name.as_deref()).await {
                 return ExitCode::FAILURE;
             }
         }
@@ -1005,7 +1006,7 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
         } => {
             info!("Running in backup mode ...");
 
-            if !backup_server_core(&config, Some(&bopt.path)).await {
+            if !backup_server_core(&config, Some(&bopt.path), None).await {
                 return ExitCode::FAILURE;
             }
         }
@@ -1274,6 +1275,13 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
                 .await
             {
                 Ok(_) if ropt.dry_run => {}
+                Ok(outcome) if !outcome.archive_updated => {
+                    warn!(
+                        "Recovery finished: the database was recovered, but the WAL archive was \
+                         not updated"
+                    );
+                    return ExitCode::from(2);
+                }
                 Ok(_) => info!("✅ Recovery Success!"),
                 Err(err) => {
                     error!(%err, "Point-in-time recovery failed");

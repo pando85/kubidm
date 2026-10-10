@@ -49,10 +49,6 @@ pub use crate::backup::{
     },
     restore::restore_database,
 };
-pub(crate) use crate::backup::{
-    cli::{fetch_s3_backup, FetchedS3Backup},
-    restore::{restore_and_replay_commit, CommittedRestore},
-};
 use crate::{
     actors::{QueryServerReadV1, QueryServerWriteV1},
     admin::AdminActor,
@@ -176,7 +172,7 @@ impl Drop for OfflineWalGuard {
                 );
             }
             // Gaps are recorded in the archive index by the running server.
-            if let Err(err) = archiver.defer_gaps_to_next_start() {
+            if let Err(err) = archiver.persist_pending_events() {
                 error!(%err, "Unable to hand the WAL archive gaps to the next server start");
             }
         }
@@ -1009,7 +1005,7 @@ impl CoreHandle {
                     archive.settings().local_dir.display()
                 ),
             }
-            archive.defer_gaps_to_next_start();
+            archive.persist_pending_events();
         }
 
         self.clean_shutdown = true;
@@ -1086,7 +1082,6 @@ impl CoreHandle {
         }
         .run(self.server_read_ref)
         .await
-        .map(|_| ())
     }
 }
 

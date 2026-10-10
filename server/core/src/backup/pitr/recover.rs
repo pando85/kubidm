@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::path::Path;
 use std::time::Duration;
 
 use kubidm_proto::backup::{
@@ -12,15 +13,15 @@ use kubidm_proto::internal::OperationError;
 use kubidmd_lib::be::WalApplyReport;
 use kubidmd_lib::prelude::duration_from_epoch_now;
 use kubidmd_lib::repl::wal::{
-    add_pending_server_uuid_change, clear_local_events, format_ts_rfc3339, list_segments,
-    parse_recovery_target_cid, parse_recovery_target_time, parse_segment, read_local_events,
-    select_records, WalEntryRecord, WalOperationRecord, WalPendingEvents, WalServerUuidChange,
+    clear_local_events, defer_restore, format_ts_rfc3339, list_segments, parse_recovery_target_cid,
+    parse_recovery_target_time, parse_segment, read_local_events, WalEntryRecord,
+    WalOperationRecord, WalPendingEvents, WalRestore,
 };
 use uuid::Uuid;
 
 use super::archive::{manifest_gap, manifest_uuid_change};
 use super::store::{PitrStore, SegmentKeys};
-use super::{blocking, PitrError, PitrSettings};
+use super::{blocking, PitrError, PitrLocation, PitrSettings};
 use crate::config::Configuration;
 
 /// What the operator asked `recover` to reach.
@@ -162,15 +163,12 @@ pub fn plan_recovery(
     })
 }
 
-/// The records of `file_entries` a recovery to `plan` replays: after the base watermark,
-/// at or before the target, and not part of history a restore or recovery abandoned.
-pub fn records_to_replay<'a>(
-    manifest: &'a PitrManifest,
-    plan: &'a RecoveryPlan,
-    file_entries: &'a [WalEntryRecord],
-) -> impl Iterator<Item = &'a WalEntryRecord> + 'a {
-    select_records(file_entries, plan.base.watermark_ts, plan.target.ts)
-        .filter(|record| !manifest.is_abandoned(record.ts()))
+/// Whether a recovery to `plan` replays `record`: it lies after the base watermark, at or
+/// before the target, and not in history a restore or recovery abandoned.
+pub fn is_replayed(manifest: &PitrManifest, plan: &RecoveryPlan, record: &WalEntryRecord) -> bool {
+    record.ts() > plan.base.watermark_ts
+        && record.ts() <= plan.target.ts
+        && !manifest.is_abandoned(record.ts())
 }
 
 /// The outcome of `recover`.
@@ -183,6 +181,10 @@ pub struct RecoveryOutcome {
     pub recovered_ts: Duration,
     pub dry_run: bool,
     pub apply: Option<WalApplyReport>,
+    /// Whether the WAL archive records the history the recovery abandoned. When it does
+    /// not, the database was still recovered, and the server records it once it reaches
+    /// the archive, when the recovery could hand it over.
+    pub archive_updated: bool,
 }
 
 /// The archive as recovery sees it: the manifest, plus the closed segments of the same
@@ -224,19 +226,28 @@ async fn open_archive(
         ))
     })?;
 
-    // A region prunes its base backups on its own; recovery from it can only start from
-    // the base backups it actually holds.
-    if primary.is_some() {
-        let held = settings.bases.list_keys().await?;
-        let indexed = manifest.base_backups.len();
-        manifest.retain_base_backups(&held);
-        if manifest.base_backups.len() != indexed {
-            warn!(
-                missing = indexed - manifest.base_backups.len(),
-                bases = %settings.bases,
-                "Base backups indexed by the archive are missing in the region and are not used"
-            );
+    // Recovery can only start from the base backups the location actually holds: a region
+    // prunes its copies on its own, and a base may have been deleted, or lost its sidecar,
+    // since it was indexed. When they can not be listed, the index is used as it is and
+    // fetching a missing base fails the recovery.
+    match settings.bases.list_keys().await {
+        Ok(held) => {
+            let indexed = manifest.base_backups.len();
+            manifest.retain_base_backups(&held);
+            if manifest.base_backups.len() != indexed {
+                warn!(
+                    missing = indexed - manifest.base_backups.len(),
+                    bases = %settings.bases,
+                    "Base backups indexed by the archive are missing or incomplete and are not \
+                     used"
+                );
+            }
         }
+        Err(err) => warn!(
+            %err,
+            bases = %settings.bases,
+            "Unable to list the base backups; using every base the archive indexes"
+        ),
     }
 
     // Gaps and changes of identity the server noticed and no manifest records yet still
@@ -270,10 +281,18 @@ async fn open_archive(
     })
 }
 
-/// Add the events a server left in its WAL directory to `manifest`. A gap whose end is
-/// unknown ends at `now`. A change of identity that does not follow from the manifest's
-/// is kept as a boundary only.
-fn fold_local_events(manifest: &mut PitrManifest, events: &WalPendingEvents, now: Duration) {
+/// Add the events a server left in its WAL directory to `manifest`: the restores the
+/// archive did not record yet first, since everything else happened after them. A gap
+/// whose end is unknown ends at `now`. A change of identity that does not follow from the
+/// manifest's is kept as a boundary only.
+pub(super) fn fold_local_events(
+    manifest: &mut PitrManifest,
+    events: &WalPendingEvents,
+    now: Duration,
+) {
+    for restore in &events.restores {
+        apply_restore(manifest, restore);
+    }
     for gap in &events.gaps {
         manifest.add_gap(manifest_gap(gap, now));
     }
@@ -286,6 +305,66 @@ fn fold_local_events(manifest: &mut PitrManifest, events: &WalPendingEvents, now
         ..PitrManifest::new(manifest.server_uuid)
     };
     manifest.merge_markers(&changes);
+}
+
+/// Record `restore` in `manifest`: what the stopped server left behind, the abandoned
+/// history, and the change of identity to the restored database's server uuid. Recording a
+/// restore the manifest already records changes nothing. Returns the change of identity
+/// recorded, if any.
+pub(super) fn apply_restore(
+    manifest: &mut PitrManifest,
+    restore: &WalRestore,
+) -> Option<PitrServerUuidChange> {
+    let at = format_ts_rfc3339(restore.at);
+    if manifest
+        .timeline_breaks
+        .iter()
+        .any(|known| known.after_ts == restore.after_ts && known.at == at)
+    {
+        return None;
+    }
+
+    // What the stopped server left in the WAL directory and no manifest records yet: the
+    // gaps (its unclosed segment included, which ends at the restore, inside the abandoned
+    // history) and its changes of identity. They belong to the history before the restore,
+    // and the server started on the restored database must not report them as its own.
+    fold_local_events(manifest, &restore.abandoned, restore.at);
+
+    // The abandoned history also covers any CID the archive holds, in case the clock of
+    // the old server was ahead.
+    let until_ts = manifest
+        .segments
+        .iter()
+        .map(|s| s.end_ts)
+        .chain(manifest.base_backups.iter().map(|b| b.watermark_ts))
+        .fold(restore.until_ts, Duration::max);
+    manifest.add_timeline_break(PitrTimelineBreak {
+        after_ts: restore.after_ts,
+        until_ts,
+        at,
+        reason: restore.reason.clone(),
+    });
+    if restore.server_uuid == manifest.server_uuid {
+        return None;
+    }
+    let change = PitrServerUuidChange {
+        from_server_uuid: manifest.server_uuid,
+        to_server_uuid: restore.server_uuid,
+        at_ts: until_ts + Duration::from_nanos(1),
+        reason: restore.reason.clone(),
+    };
+    // It starts from the manifest's identity, so it always applies.
+    if let Err(err) = manifest.apply_server_uuid_change(&change) {
+        error!(%err, "Unable to record the change of server uuid of the restore");
+        return None;
+    }
+    warn!(
+        from = %change.from_server_uuid,
+        to = %change.to_server_uuid,
+        "The database carries another server uuid than the archive; the archive continues \
+         under it"
+    );
+    Some(change)
 }
 
 /// `kubidmd database pitr-list`: print the base backups, segments and the recoverable
@@ -517,10 +596,7 @@ async fn load_records(opened: &OpenedArchive, plan: &RecoveryPlan) -> Result<Rep
             )));
         }
         for record in file.entries {
-            if record.ts() > plan.base.watermark_ts
-                && record.ts() <= plan.target.ts
-                && !opened.manifest.is_abandoned(record.ts())
-            {
+            if is_replayed(&opened.manifest, plan, &record) {
                 records.add(record)?;
             }
         }
@@ -613,6 +689,7 @@ pub async fn pitr_recover_server_core(
             recovered_ts,
             dry_run: true,
             apply: None,
+            archive_updated: false,
         });
     }
 
@@ -628,15 +705,19 @@ pub async fn pitr_recover_server_core(
         "Restoring base backup {} and replaying {} WAL records into {db_path}",
         plan.base.key, record_count
     );
-    let committed = crate::restore_and_replay_commit(config, base.path(), replay.into_records())
-        .await
-        .map_err(|err| {
-            error!(
-                ?err,
-                "Recovery failed; the database at {db_path} was not changed"
-            );
-            PitrError::Operation(err)
-        })?;
+    let committed = crate::backup::restore::restore_and_replay_commit(
+        config,
+        base.path(),
+        replay.into_records(),
+    )
+    .await
+    .map_err(|err| {
+        error!(
+            ?err,
+            "Recovery failed; the database at {db_path} was not changed"
+        );
+        PitrError::Operation(err)
+    })?;
     drop(base);
     let apply = committed.outcome.apply.clone();
     if let Some(report) = &apply {
@@ -657,20 +738,30 @@ pub async fn pitr_recover_server_core(
         reason: "recover",
         now: duration_from_epoch_now(),
     };
-    let recorded = record_abandoned_history(&opened, &restored, &db_path).await;
+    let archive_updated = match record_abandoned_history(&opened, &restored).await {
+        Ok(AbandonedHistory::Recorded) => true,
+        Ok(AbandonedHistory::Deferred(err)) => {
+            warn!(
+                %err,
+                "The database at {db_path} WAS recovered, but the WAL archive could not be \
+                 updated; do not recover it again. The server records the abandoned history in \
+                 the archive at its first synchronisation that reaches it."
+            );
+            false
+        }
+        Err(err) => {
+            error!(
+                %err,
+                "The database at {db_path} WAS recovered, but the abandoned history could not \
+                 be recorded in the WAL archive nor handed to the server; do not recover it \
+                 again. A later recovery past this point could replay it: take a new online \
+                 backup right after starting the server, and recover only to points after it."
+            );
+            false
+        }
+    };
 
-    let finished = finish_recovery(config, committed).await;
-    if let Err(err) = &finished {
-        error!(
-            %err,
-            "RECOVERY INCOMPLETE: the database at {db_path} WAS recovered to {}, but it could not \
-             be reindexed or failed its verification. Do not start the server on it; recover to \
-             another point or restore a backup.",
-            format_ts_rfc3339(recovered_ts)
-        );
-    }
-    finished?;
-    recorded?;
+    finish_recovery(config, committed, &db_path, recovered_ts).await?;
 
     eprintln!(
         "Recovered {db_path} to {} ({} records replayed on {})",
@@ -685,84 +776,78 @@ pub async fn pitr_recover_server_core(
         recovered_ts,
         dry_run: false,
         apply,
+        archive_updated,
     })
 }
 
-/// The steps of a recovery after its commit: reindex, boot and verify the database.
+/// The steps of a recovery after its commit: reindex, boot and verify the database
+/// recovered to `recovered_ts` at `db_path`.
 async fn finish_recovery(
     config: &Configuration,
-    committed: crate::CommittedRestore,
+    committed: crate::backup::restore::CommittedRestore,
+    db_path: &str,
+    recovered_ts: Duration,
 ) -> Result<(), PitrError> {
-    committed.reindex(config).await?;
+    let recovered_ts = format_ts_rfc3339(recovered_ts);
+    committed.reindex(config).await.inspect_err(|err| {
+        error!(
+            ?err,
+            "RECOVERY INCOMPLETE: the database at {db_path} WAS recovered to {recovered_ts}, but \
+             reindexing it failed; run `kubidmd database reindex` before starting the server."
+        );
+    })?;
     info!("Verifying the recovered database ...");
-    let consistency_errors = crate::verify_booted_database(config).await?;
+    let consistency_errors = crate::verify_booted_database(config)
+        .await
+        .inspect_err(|err| {
+            error!(
+                ?err,
+                "RECOVERY INCOMPLETE: the database at {db_path} WAS recovered to \
+                 {recovered_ts}, but it could not be verified. Do not start the server on it; \
+                 recover to another point or restore a backup."
+            );
+        })?;
     if consistency_errors.is_empty() {
         return Ok(());
     }
     for err in &consistency_errors {
         error!(?err, "Recovered database consistency error");
     }
+    error!(
+        "RECOVERY INCOMPLETE: the database at {db_path} WAS recovered to {recovered_ts}, but it \
+         failed its verification. Do not start the server on it; recover to another point or \
+         restore a backup."
+    );
     Err(PitrError::Operation(OperationError::ConsistencyError(
         consistency_errors,
     )))
 }
 
-/// Record the history a recovery abandoned in the archive it was read from and, when that
-/// is a replication region, in the primary archive the recovered server archives into.
+/// Record the history a recovery abandoned in the archive the recovered server archives
+/// into and, when the recovery read a replication region, in that region too.
 async fn record_abandoned_history(
     opened: &OpenedArchive,
     restored: &RestoredDatabase<'_>,
-    db_path: &str,
-) -> Result<(), PitrError> {
-    let identity_change = record_timeline_break(&opened.settings, restored)
-        .await
-        .inspect_err(|err| {
-            error!(
-                %err,
-                "The database at {db_path} WAS recovered, but the abandoned history could not \
-                 be recorded in the archive. A later recovery past this point could replay it: \
-                 take a new online backup right after starting the server, and recover only to \
-                 points after it."
-            );
-        })?;
+) -> Result<AbandonedHistory, PitrError> {
+    let archive = opened.primary.as_ref().unwrap_or(&opened.settings);
+    let restore = prepare_restore(&archive.local_dir, restored).await?;
 
-    // Recovered from a region: the primary archive, which the recovered server archives
-    // into, must learn about the abandoned history too. It is often unreachable when a
-    // region is used, so this is best effort; the server merges what the region recorded
-    // into the primary archive at its first synchronisation that reaches both.
-    let Some(primary) = &opened.primary else {
-        return Ok(());
-    };
-    if let Err(err) = record_timeline_break(primary, restored).await {
-        // A change of identity must reach the primary archive before the server archives
-        // into it under the new one: hand it to the server's first synchronisation.
-        if let Some(change) = &identity_change {
-            let change = WalServerUuidChange {
-                from: change.from_server_uuid,
-                to: change.to_server_uuid,
-                at_ts: change.at_ts,
-            };
-            let local_dir = primary.local_dir.clone();
-            blocking(move || Ok(add_pending_server_uuid_change(&local_dir, change)?))
-                .await
-                .unwrap_or_else(|err| {
-                    error!(
-                        %err,
-                        "Unable to hand the change of server uuid to the server; it will refuse \
-                         to archive into {} until the change is recorded there",
-                        primary.location
-                    )
-                });
+    // The region the recovery read from. The server mirrors the primary's record to it at
+    // its first synchronisation as well; recording it here keeps the region right while
+    // the primary is unreachable.
+    if opened.primary.is_some() {
+        if let Err(err) = record_restore(&opened.settings.location, &restore).await {
+            warn!(
+                %err,
+                region = %opened.settings.location,
+                "The abandoned history could not be recorded in the region; the server \
+                 mirrors it there once it reaches it"
+            );
         }
-        warn!(
-            %err,
-            "The abandoned history was recorded in the region, but not in the primary WAL \
-             archive at {}. The server merges it into the primary archive once it reaches \
-             both; until then take a new online backup right after starting the server.",
-            primary.location
-        );
     }
-    Ok(())
+
+    let recorded = record_restore(&archive.location, &restore).await;
+    settle_restore(&archive.local_dir, restore, recorded).await
 }
 
 /// What a restore or recovery did to the database, for the archive.
@@ -776,85 +861,106 @@ pub(super) struct RestoredDatabase<'a> {
     pub now: Duration,
 }
 
-/// Record in the archive that the database was restored or recovered to `after_ts`, so
-/// that everything archived after that point up to now is never replayed again. `until_ts`
-/// also covers any CID the archive holds, in case the clock of the old server was ahead.
+/// Where the history a restore or recovery abandoned was recorded.
+#[derive(Debug)]
+pub enum AbandonedHistory {
+    /// In the archive.
+    Recorded,
+    /// The archive could not be updated, for the reason given. The restore was handed to
+    /// the server through its WAL directory instead: its first synchronisation that
+    /// reaches the archive records it, before archiving anything else.
+    Deferred(PitrError),
+}
+
+/// The restore described by `restored`, with what the stopped server left in `local_dir`:
+/// the events no manifest records yet, and the end of its last unarchived segment.
+async fn prepare_restore(
+    local_dir: &Path,
+    restored: &RestoredDatabase<'_>,
+) -> Result<WalRestore, PitrError> {
+    let local_dir = local_dir.to_path_buf();
+    let (abandoned, local_segments) =
+        blocking(move || Ok((read_local_events(&local_dir), list_segments(&local_dir)?))).await?;
+    Ok(WalRestore {
+        after_ts: restored.after_ts,
+        until_ts: local_segments
+            .iter()
+            .map(|s| s.end_ts)
+            .fold(restored.now, Duration::max),
+        server_uuid: restored.server_uuid,
+        at: restored.now,
+        reason: restored.reason.to_string(),
+        abandoned,
+    })
+}
+
+/// Record `restore` in the archive at `location`. An archive with no manifest yet has no
+/// history to abandon, and nothing is recorded. Returns the change of identity recorded,
+/// if any.
+async fn record_restore(
+    location: &PitrLocation,
+    restore: &WalRestore,
+) -> Result<Option<PitrServerUuidChange>, PitrError> {
+    let store = PitrStore::open(location).await?;
+    let Some(mut manifest) = store.load_manifest().await? else {
+        return Ok(None);
+    };
+    let change = apply_restore(&mut manifest, restore);
+    store.save_manifest(&mut manifest, restore.at).await?;
+    info!(
+        after = %format_ts_rfc3339(restore.after_ts),
+        archive = %location,
+        "Abandoned history recorded in the PITR archive"
+    );
+    Ok(change)
+}
+
+/// After `restore` was `recorded` in the archive the server archives into (or not):
+/// forget the events of the stopped server it took over, or hand it to the server's first
+/// synchronisation through `local_dir`. Fails only when neither worked.
+async fn settle_restore(
+    local_dir: &Path,
+    restore: WalRestore,
+    recorded: Result<Option<PitrServerUuidChange>, PitrError>,
+) -> Result<AbandonedHistory, PitrError> {
+    let local_dir = local_dir.to_path_buf();
+    match recorded {
+        Ok(_) => {
+            if !restore.abandoned.is_empty() {
+                blocking(move || Ok(clear_local_events(&local_dir)?)).await?;
+            }
+            Ok(AbandonedHistory::Recorded)
+        }
+        Err(err) => match blocking(move || Ok(defer_restore(&local_dir, restore)?)).await {
+            Ok(()) => Ok(AbandonedHistory::Deferred(err)),
+            Err(defer_err) => {
+                error!(
+                    %defer_err,
+                    "Unable to hand the abandoned history to the server through its WAL \
+                     directory"
+                );
+                Err(err)
+            }
+        },
+    }
+}
+
+/// Record in the archive at `settings` that the database was restored or recovered to
+/// `restored.after_ts`, so that everything archived after that point up to now is never
+/// replayed again. When the database now carries another server uuid than the archive (a
+/// backup taken before a replication refresh, or one of another server), the archive
+/// continues under that identity from the end of the abandoned history on, and the change
+/// is a boundary no base backup of another identity replays across.
 ///
-/// When the database now carries another server uuid than the archive (a backup taken
-/// before a replication refresh, or one of another server), the archive continues under
-/// that identity from the end of the abandoned history on, and the change is a boundary
-/// no base backup of another identity replays across.
-///
-/// Returns the change of identity recorded, if any.
+/// When the archive can not be updated, the restore is handed to the server instead, see
+/// [`AbandonedHistory::Deferred`]. Fails only when that did not work either.
 pub(super) async fn record_timeline_break(
     settings: &PitrSettings,
     restored: &RestoredDatabase<'_>,
-) -> Result<Option<PitrServerUuidChange>, PitrError> {
-    let now = restored.now;
-    let store = PitrStore::open(&settings.location).await?;
-    let Some(mut manifest) = store.load_manifest().await? else {
-        // Nothing was ever archived, so there is no history to abandon.
-        return Ok(None);
-    };
-    let local_segments = {
-        let local_dir = settings.local_dir.clone();
-        blocking(move || Ok(list_segments(&local_dir)?)).await?
-    };
-    let until_ts = manifest
-        .segments
-        .iter()
-        .chain(local_segments.iter())
-        .map(|s| s.end_ts)
-        .chain(manifest.base_backups.iter().map(|b| b.watermark_ts))
-        .fold(now, Duration::max);
-
-    // What the stopped server left in the WAL directory and no manifest records yet: the
-    // gaps (its unclosed segment included, which ends at the latest now, inside the
-    // abandoned history) and its changes of identity. They belong to the history before
-    // this point, and the server started on the restored database must not report them
-    // again as its own.
-    let local_events = {
-        let local_dir = settings.local_dir.clone();
-        blocking(move || Ok(read_local_events(&local_dir))).await?
-    };
-    fold_local_events(&mut manifest, &local_events, now);
-
-    manifest.add_timeline_break(PitrTimelineBreak {
-        after_ts: restored.after_ts,
-        until_ts,
-        at: format_ts_rfc3339(now),
-        reason: restored.reason.to_string(),
-    });
-    let mut identity_change = None;
-    if restored.server_uuid != manifest.server_uuid {
-        let change = PitrServerUuidChange {
-            from_server_uuid: manifest.server_uuid,
-            to_server_uuid: restored.server_uuid,
-            at_ts: until_ts + Duration::from_nanos(1),
-            reason: restored.reason.to_string(),
-        };
-        manifest
-            .apply_server_uuid_change(&change)
-            .map_err(PitrError::Manifest)?;
-        warn!(
-            from = %change.from_server_uuid,
-            to = %change.to_server_uuid,
-            "The database carries another server uuid than the archive; the archive continues \
-             under it"
-        );
-        identity_change = Some(change);
-    }
-    store.save_manifest(&mut manifest, now).await?;
-    if !local_events.is_empty() {
-        let local_dir = settings.local_dir.clone();
-        blocking(move || Ok(clear_local_events(&local_dir)?)).await?;
-    }
-    info!(
-        after = %format_ts_rfc3339(restored.after_ts),
-        until = %format_ts_rfc3339(until_ts),
-        "Abandoned history recorded in the PITR archive"
-    );
-    Ok(identity_change)
+) -> Result<AbandonedHistory, PitrError> {
+    let restore = prepare_restore(&settings.local_dir, restored).await?;
+    let recorded = record_restore(&settings.location, &restore).await;
+    settle_restore(&settings.local_dir, restore, recorded).await
 }
 
 /// After `kubidmd database restore` or `restore-s3`: when WAL archiving is configured,
@@ -864,9 +970,9 @@ pub async fn note_restore(
     config: &Configuration,
     watermark: Duration,
     server_uuid: Uuid,
-) -> Result<(), PitrError> {
+) -> Result<AbandonedHistory, PitrError> {
     let Some(settings) = PitrSettings::from_config(config)? else {
-        return Ok(());
+        return Ok(AbandonedHistory::Recorded);
     };
     let restored = RestoredDatabase {
         after_ts: watermark,
@@ -874,9 +980,7 @@ pub async fn note_restore(
         reason: "restore",
         now: duration_from_epoch_now(),
     };
-    record_timeline_break(&settings, &restored)
-        .await
-        .map(|_| ())
+    record_timeline_break(&settings, &restored).await
 }
 
 #[cfg(test)]
@@ -969,7 +1073,7 @@ mod tests {
                 until_ts: None,
                 reason: WalGapReason::UnclosedSegment,
             }],
-            server_uuid_changes: Vec::new(),
+            ..WalPendingEvents::default()
         };
         fold_local_events(&mut m, &events, Duration::from_secs(350));
         assert!(plan_recovery(
@@ -1119,7 +1223,7 @@ mod tests {
     }
 
     #[test]
-    fn test_records_to_replay_skip_watermark_target_and_abandoned_history() {
+    fn test_replay_skips_watermark_target_and_abandoned_history() {
         let mut m = manifest();
         let record = |secs: u64| WalEntryRecord {
             cid_ts: Duration::from_secs(secs).as_nanos() as u64,
@@ -1138,7 +1242,9 @@ mod tests {
             &RecoveryTargetSpec::Time(format_ts_rfc3339(Duration::from_secs(350))),
         )
         .unwrap();
-        let ids: Vec<u64> = records_to_replay(&m, &plan, &entries)
+        let ids: Vec<u64> = entries
+            .iter()
+            .filter(|record| is_replayed(&m, &plan, record))
             .map(|r| r.entry_id)
             .collect();
         assert_eq!(ids, vec![150, 250, 350]);
@@ -1157,7 +1263,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(plan.base.key, "backup-1");
-        let ids: Vec<u64> = records_to_replay(&m, &plan, &entries)
+        let ids: Vec<u64> = entries
+            .iter()
+            .filter(|record| is_replayed(&m, &plan, record))
             .map(|r| r.entry_id)
             .collect();
         assert_eq!(ids, vec![150, 350]);
@@ -1218,7 +1326,13 @@ mod tests {
         let key = "backup-2024-01-01T00:00:00Z.json.gz.enc";
         fs::write(backup_dir.join(key), b"base").unwrap();
         plain_archive
-            .register_base_backup(&bases, key, "2024-01-01T00:00:00Z", &report(1000, server))
+            .register_base_backup_at(
+                Duration::from_secs(1000),
+                &bases,
+                key,
+                "2024-01-01T00:00:00Z",
+                &report(1000, server),
+            )
             .await
             .unwrap();
         append_create(&archiver, server, 1100, b"credential before encryption");

@@ -29,7 +29,7 @@ use kubidmd_core::backup::{is_encrypted_artifact, MIN_KDF_M_COST};
 use kubidmd_core::config::{Configuration, OnlineBackup};
 use kubidmd_core::{restore_s3_database, restore_server_core, RestoreStatus};
 use kubidmd_lib::be::SharedWalArchiver;
-use kubidmd_lib::repl::wal::{format_ts_rfc3339, list_segments, WalArchiver};
+use kubidmd_lib::repl::wal::{format_ts_rfc3339, list_segments, read_pending_events, WalArchiver};
 use kubidmd_testkit::{login_put_admin_idm_admins, setup_async_test, AsyncTestEnvironment};
 use uuid::Uuid;
 
@@ -400,8 +400,9 @@ fn test_pitr_s3_recover_on_a_new_host() {
         let target = write_history(env).await;
 
         // Everything was shipped: the local WAL directory holds no segment any more, and
-        // the prefix holds the base backup, the segments and the manifest, each with its
-        // metadata sidecar. Backup retention deleted the older backup only.
+        // the prefix holds the base backup and the segments, each with its metadata
+        // sidecar, and the manifest, a single object. Backup retention deleted the older
+        // backup only.
         assert!(
             list_segments(&source_wal)
                 .expect("Failed to list the local WAL directory")
@@ -425,8 +426,13 @@ fn test_pitr_s3_recover_on_a_new_host() {
         assert!(keys.iter().any(|key| key == FOREIGN_OBJECT), "{keys:?}");
         assert!(keys
             .iter()
-            .filter(|key| !key.ends_with(".metadata.json") && key.as_str() != FOREIGN_OBJECT)
+            .filter(|key| {
+                !key.ends_with(".metadata.json")
+                    && key.as_str() != FOREIGN_OBJECT
+                    && key.as_str() != PITR_MANIFEST_KEY
+            })
             .all(|key| keys.contains(&format!("{key}.metadata.json"))));
+        assert!(!keys.contains(&format!("{PITR_MANIFEST_KEY}.metadata.json")));
 
         // A new host: an empty WAL directory and no local backups. Everything comes from
         // S3.
@@ -947,7 +953,7 @@ fn test_pitr_restore_abandons_the_history_after_the_backup() {
 /// `restore-s3` records the abandoned history in the S3 archive like `restore`, and
 /// reports, without failing, a restore whose archive could not be reached.
 #[test]
-fn test_pitr_s3_restore_abandons_history_and_reports_an_unreachable_archive() {
+fn test_pitr_s3_restore_abandons_history_and_reports_an_archive_it_can_not_update() {
     let Some(s3_config) = test_s3_config("pitr-restore-test") else {
         return;
     };
@@ -987,22 +993,45 @@ fn test_pitr_s3_restore_abandons_history_and_reports_an_unreachable_archive() {
             .key
             .clone();
 
-        // The archive's endpoint is unreachable, as during an outage: the database is
-        // restored, and the status says the archive was not updated (exit code 2).
-        let mut unreachable = host_config("unreachable.db");
-        if let Some(s3) = unreachable
-            .online_backup
-            .as_mut()
-            .and_then(|backup| backup.s3.as_mut())
-        {
+        // The archive can not be updated: its endpoint is unreachable, as during an
+        // outage, or its bucket does not exist. The database is restored, the status says
+        // the archive was not updated (exit code 2), and the restore is handed to the
+        // server's first synchronisation through its WAL directory. Each of these hosts has
+        // its own WAL directory, so that what they hand over stays out of the restore below.
+        fn unreachable_endpoint(s3: &mut S3Config) {
             s3.endpoint = Some(UNREACHABLE_ENDPOINT.to_string());
         }
-        let status = restore_s3_database(&unreachable, s3_config.clone(), &base)
-            .await
-            .expect("The restore itself must succeed");
-        assert_eq!(status, RestoreStatus::WalArchiveNotUpdated);
-        assert_eq!(status.exit_code(), 2);
-        assert!(host.path().join("unreachable.db").exists());
+        fn missing_bucket(s3: &mut S3Config) {
+            s3.bucket = format!("kubidm-test-missing-{}", Uuid::new_v4());
+        }
+        let failures = [
+            ("unreachable", unreachable_endpoint as fn(&mut S3Config)),
+            ("missing-bucket", missing_bucket),
+        ];
+        for (name, break_archive) in failures {
+            let db = host.path().join(format!("{name}.db"));
+            let wal_dir = host.path().join(format!("{name}-wal"));
+            let mut failing = pitr_config(
+                &db,
+                &host.path().join("backups"),
+                &wal_dir,
+                Some(s3_config.clone()),
+            );
+            if let Some(s3) = failing
+                .online_backup
+                .as_mut()
+                .and_then(|backup| backup.s3.as_mut())
+            {
+                break_archive(s3);
+            }
+            let status = restore_s3_database(&failing, s3_config.clone(), &base)
+                .await
+                .expect("The restore itself must succeed");
+            assert_eq!(status, RestoreStatus::WalArchiveNotUpdated, "{name}");
+            assert_eq!(status.exit_code(), 2, "{name}");
+            assert!(db.exists(), "{name}");
+            assert_eq!(read_pending_events(&wal_dir).restores.len(), 1, "{name}");
+        }
         assert!(s3_manifest(&sdk, &s3_config)
             .await
             .timeline_breaks

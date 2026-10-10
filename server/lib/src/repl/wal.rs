@@ -212,11 +212,16 @@ pub struct WalPendingEvents {
     /// Changes of the server identity, in the order they happened.
     #[serde(default)]
     pub server_uuid_changes: Vec<WalServerUuidChange>,
+    /// Restores and recoveries the archive could not record when they happened, oldest
+    /// first. Each one precedes the gaps and changes of identity above, which the server
+    /// started on the restored database noticed.
+    #[serde(default)]
+    pub restores: Vec<WalRestore>,
 }
 
 impl WalPendingEvents {
     pub fn is_empty(&self) -> bool {
-        self.gaps.is_empty() && self.server_uuid_changes.is_empty()
+        self.gaps.is_empty() && self.server_uuid_changes.is_empty() && self.restores.is_empty()
     }
 
     /// Remove the events of `recorded`, each once.
@@ -235,7 +240,35 @@ impl WalPendingEvents {
                 self.server_uuid_changes.remove(index);
             }
         }
+        for restore in &recorded.restores {
+            if let Some(index) = self.restores.iter().position(|known| known == restore) {
+                self.restores.remove(index);
+            }
+        }
     }
+}
+
+/// An offline restore or recovery put a database in place while the archive could not
+/// record it: the history after `after_ts` is abandoned, and the archive continues under
+/// `server_uuid`. The next synchronisation that reaches the archive records it, before
+/// anything the new server archives.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WalRestore {
+    /// The CID timestamp the database was restored or recovered to.
+    pub after_ts: Duration,
+    /// The least end of the abandoned history: the time of the restore, or the end of a
+    /// segment the stopped server left in the WAL directory, whichever is later.
+    pub until_ts: Duration,
+    /// The server uuid the restored database carries.
+    pub server_uuid: Uuid,
+    /// When the restore happened.
+    pub at: Duration,
+    /// The command, for display.
+    pub reason: String,
+    /// What the stopped server left in the WAL directory and the archive did not record
+    /// yet. It belongs to the abandoned history.
+    #[serde(default)]
+    pub abandoned: WalPendingEvents,
 }
 
 /// The database took a new server uuid: from `at_ts` on, its transactions belong to
@@ -254,8 +287,8 @@ struct OpenSegmentMarker {
     start_ts: Duration,
 }
 
-/// What the archiver did since it started. Every failure counted here is also logged when
-/// it happens, with the running count.
+/// What the archiver did since it started, for tests. Every failure counted here is also
+/// logged when it happens, with the running count.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct WalArchiverStats {
     /// Records appended to a segment (closed or still open).
@@ -405,6 +438,20 @@ impl WalArchiver {
         server_uuid: Uuid,
         segments_path: PathBuf,
     ) -> Result<Self, WalError> {
+        Self::open(config, server_uuid, segments_path, None)
+    }
+
+    /// [`Self::new`] for a database whose last committed transaction has the CID timestamp
+    /// `db_ts_max`. The records an earlier run left unwritten all belong to transactions
+    /// up to it, so the gap they leave ends there rather than at the first
+    /// synchronisation, which may come long after the start when the archive is
+    /// unreachable.
+    pub fn open(
+        config: WalArchiveConfig,
+        server_uuid: Uuid,
+        segments_path: PathBuf,
+        db_ts_max: Option<Duration>,
+    ) -> Result<Self, WalError> {
         config.validate().map_err(WalError::ConfigError)?;
 
         fs::create_dir_all(&segments_path)?;
@@ -430,7 +477,8 @@ impl WalArchiver {
         // written to a segment. The gap is made durable before the marker goes, so that a
         // crash before the next synchronisation still reports it.
         let marker_path = segments_path.join(WAL_OPEN_SEGMENT_MARKER);
-        if let Some(gap) = read_marker_gap(&segments_path) {
+        if let Some(mut gap) = read_marker_gap(&segments_path) {
+            gap.until_ts = db_ts_max.map(|ts| ts.max(gap.from_ts));
             error!(
                 from = %format_ts_rfc3339(gap.from_ts),
                 "WAL ARCHIVE HOLE: the previous run stopped without archiving its open segment. \
@@ -480,6 +528,7 @@ impl WalArchiver {
         &self.segments_path
     }
 
+    #[cfg(test)]
     pub fn stats(&self) -> WalArchiverStats {
         self.stats
     }
@@ -491,6 +540,7 @@ impl WalArchiver {
     }
 
     /// Number of records that only live in memory.
+    #[cfg(test)]
     pub fn pending_record_count(&self) -> usize {
         self.current_segment
             .iter()
@@ -584,10 +634,11 @@ impl WalArchiver {
         write_pending_events(&self.segments_path, &self.pending)
     }
 
-    /// At the end of a run: make sure the events the archive index does not record yet
-    /// are on disk, so that the next [`WalArchiver::new`] reports them again. Call after the
-    /// last flush.
-    pub fn defer_gaps_to_next_start(&mut self) -> Result<(), WalError> {
+    /// At the end of a run: write the pending events (gaps, changes of identity, restores)
+    /// the archive index does not record yet to disk once more, in case an earlier write
+    /// of them failed, so that the next [`WalArchiver::new`] reports them again. Call after
+    /// the last flush.
+    pub fn persist_pending_events(&mut self) -> Result<(), WalError> {
         write_pending_events(&self.segments_path, &self.pending)
     }
 
@@ -780,7 +831,12 @@ impl WalArchiver {
         match self.current_segment.take() {
             Some(builder) if !builder.entries.is_empty() => {
                 self.sealed.push_back(builder.seal());
-                self.drop_unwritable_backlog();
+                // Beyond the limit the next write is tried at once instead of after the
+                // retry delay, and only a write that fails again drops segments: the
+                // directory may well have recovered since the last failure.
+                if self.sealed.len() > WAL_MAX_UNWRITTEN_SEGMENTS {
+                    self.retry_after = None;
+                }
                 true
             }
             _ => false,
@@ -877,9 +933,9 @@ impl WalArchiver {
         self.finish_writes(written, now)
     }
 
-    /// Drop the oldest closed segments beyond [`WAL_MAX_UNWRITTEN_SEGMENTS`] and record
-    /// each as a gap: writing keeps failing, and holding them would grow memory without
-    /// bound.
+    /// After a failed write: drop the oldest closed segments beyond
+    /// [`WAL_MAX_UNWRITTEN_SEGMENTS`] and record each as a gap, since writing keeps failing
+    /// and holding them would grow memory without bound.
     fn drop_unwritable_backlog(&mut self) {
         while self.sealed.len() > WAL_MAX_UNWRITTEN_SEGMENTS {
             let Some(dropped) = self.sealed.pop_front() else {
@@ -907,6 +963,7 @@ impl WalArchiver {
 
     /// Close the current segment when it is stale and write every closed segment, holding
     /// the caller's lock. Returns the last segment written.
+    #[cfg(test)]
     pub fn flush_if_stale(&mut self, now: Duration) -> Result<Option<WalSegment>, WalError> {
         self.seal_if_stale(now);
         self.write_due(now, true)
@@ -1026,7 +1083,7 @@ fn unreadable_pending_events() -> WalPendingEvents {
             until_ts: None,
             reason: WalGapReason::ArchiveFailure,
         }],
-        server_uuid_changes: Vec::new(),
+        ..WalPendingEvents::default()
     }
 }
 
@@ -1061,18 +1118,22 @@ pub fn clear_local_events(dir: &Path) -> Result<(), WalError> {
     }
 }
 
-/// Hand `change` to the next archiver started on `dir`, for an offline command that put a
-/// database with another server uuid in place.
-pub fn add_pending_server_uuid_change(
-    dir: &Path,
-    change: WalServerUuidChange,
-) -> Result<(), WalError> {
+/// Hand `restore` to the next archiver started on `dir`, for an offline restore or recovery
+/// the archive could not record. `restore.abandoned` must hold the events
+/// [`read_local_events`] returned: they are replaced by it, so that they are recorded as
+/// part of the abandoned history.
+pub fn defer_restore(dir: &Path, restore: WalRestore) -> Result<(), WalError> {
     fs::create_dir_all(dir)?;
-    let mut events = read_pending_events(dir);
-    if !events.server_uuid_changes.contains(&change) {
-        events.server_uuid_changes.push(change);
+    let events = WalPendingEvents {
+        restores: vec![restore],
+        ..WalPendingEvents::default()
+    };
+    write_pending_events(dir, &events)?;
+    match fs::remove_file(dir.join(WAL_OPEN_SEGMENT_MARKER)) {
+        Ok(()) => sync_dir(dir),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.into()),
     }
-    write_pending_events(dir, &events)
 }
 
 /// The gap the open segment marker left in `dir` by a run that stopped without closing
@@ -1682,12 +1743,19 @@ mod tests {
             .record_create(&cid(server, 20), 3, Uuid::new_v4(), vec![3])
             .unwrap();
         drop(archiver);
-        let mut restarted = WalArchiver::new(test_config(), server, wal_dir.clone()).unwrap();
+        // The database it left behind committed up to 25: the gap ends there.
+        let mut restarted = WalArchiver::open(
+            test_config(),
+            server,
+            wal_dir.clone(),
+            Some(Duration::from_secs(25)),
+        )
+        .unwrap();
         assert!(!marker.exists());
         assert!(wal_dir.join(WAL_PENDING_EVENTS_FILE).is_file());
         let unclosed = WalGap {
             from_ts: Duration::from_secs(20),
-            until_ts: None,
+            until_ts: Some(Duration::from_secs(25)),
             reason: WalGapReason::UnclosedSegment,
         };
         assert_eq!(restarted.pending_events().gaps, vec![unclosed]);
@@ -1891,10 +1959,45 @@ mod tests {
             list_segments(archiver.segments_path()).unwrap().len(),
             WAL_MAX_UNWRITTEN_SEGMENTS
         );
-        archiver.defer_gaps_to_next_start().unwrap();
+        archiver.persist_pending_events().unwrap();
         assert_eq!(
             read_pending_events(archiver.segments_path()).gaps.len(),
             extra as usize
+        );
+    }
+
+    #[test]
+    fn test_a_backlog_is_written_rather_than_dropped_once_the_directory_recovered() {
+        let server = Uuid::new_v4();
+        let (_dir, mut archiver) = archiver(
+            WalArchiveConfig {
+                segment_size_bytes: 1,
+                ..test_config()
+            },
+            server,
+        );
+
+        // One failed write makes commits wait a segment interval before writing again.
+        let repair = break_wal_dir(&archiver);
+        assert!(archiver
+            .record_create(&cid(server, 1), 1, Uuid::new_v4(), vec![1])
+            .is_err());
+        repair();
+
+        // Within that interval, more segments close than the backlog may hold: the write
+        // is tried again, succeeds, and nothing is lost.
+        let total = WAL_MAX_UNWRITTEN_SEGMENTS as u64 + 3;
+        for secs in 2..=total {
+            archiver
+                .record_create(&cid(server, secs), secs, Uuid::new_v4(), vec![1])
+                .unwrap();
+        }
+        assert_eq!(archiver.stats().dropped_segments, 0);
+        assert!(archiver.pending_events().gaps.is_empty());
+        assert!(!archiver.has_pending_records());
+        assert_eq!(
+            list_segments(archiver.segments_path()).unwrap().len(),
+            total as usize
         );
     }
 

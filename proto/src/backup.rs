@@ -102,6 +102,19 @@ impl FromStr for BackupCompression {
 }
 
 #[test]
+fn test_s3_credentials_debug_hides_the_secrets() {
+    let credentials = S3Credentials {
+        access_key_id: "AKIDEXAMPLE".to_string(),
+        secret_access_key: "very-secret".to_string(),
+        session_token: Some("session-secret".to_string()),
+    };
+    let printed = format!("{credentials:?}");
+    assert!(printed.contains("AKIDEXAMPLE"), "{printed}");
+    assert!(!printed.contains("very-secret"), "{printed}");
+    assert!(!printed.contains("session-secret"), "{printed}");
+}
+
+#[test]
 fn test_backup_compression_identify() {
     let gzip_path = Path::new("/var/lib/kubidm/backups/backup-2024-01-01.tar.gz");
     let no_comp_path = Path::new("/var/lib/kubidm/backups/backup-2024-01-01.tar");
@@ -632,12 +645,27 @@ impl Display for S3Config {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct S3Credentials {
     pub access_key_id: String,
     pub secret_access_key: String,
     #[serde(default)]
     pub session_token: Option<String>,
+}
+
+/// The secrets are never printed, so that a logged or printed configuration does not
+/// leak them.
+impl std::fmt::Debug for S3Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("S3Credentials")
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &"<redacted>")
+            .field(
+                "session_token",
+                &self.session_token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -813,6 +841,7 @@ impl Display for ReplicationStatus {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ReplicationRegionStatus {
+    /// The name of the replica: its `name`, or its signing region when it has none.
     pub region: String,
     pub bucket: String,
     pub status: ReplicationStatus,
@@ -871,10 +900,13 @@ impl Display for ReplicationHealthCheck {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ReplicationLagMetrics {
+    /// The name of the replica: its `name`, or its signing region when it has none.
     pub region: String,
     pub lag_seconds: u64,
     pub pending_backups: usize,
     pub last_backup_timestamp: Option<String>,
+    /// The configured `sync_interval_seconds`: how long a backup may wait for the next
+    /// replication sync, not a measured delay.
     pub replication_delay_seconds: u64,
 }
 

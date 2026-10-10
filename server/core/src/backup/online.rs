@@ -17,26 +17,14 @@ use kubidmd_lib::be::BackupStructuralReport;
 use tracing::instrument;
 
 use super::pitr::{BaseLocation, PitrArchive};
+use super::retention::prune_s3_backups;
 use super::{
     backup_artifact_name, backup_identity, backup_timestamp, prune_local_backups, run_blocking,
-    seal_backup_async, select_backups_to_delete, select_incomplete_backups_to_delete,
-    verify_backup_output_async, write_verified_local_backup_async, BackupEncryptor,
-    S3ClientWrapper,
+    seal_backup_async, verify_backup_output_async, write_verified_local_backup_async,
+    BackupEncryptor, S3ClientWrapper,
 };
 use crate::actors::QueryServerReadV1;
 use crate::config::OnlineBackup;
-
-/// A backup stored in one location: what it is called and what the structural
-/// verification read back from it, including the CID watermark point-in-time recovery
-/// indexes.
-#[derive(Debug, Clone)]
-pub struct OnlineBackupOutcome {
-    /// File name (local) or object key relative to the S3 prefix.
-    pub key: String,
-    /// RFC3339 time of the backup.
-    pub timestamp: String,
-    pub report: BackupStructuralReport,
-}
 
 /// What one online backup run does: where it stores the backup, how many backups every
 /// location keeps, how the artifact is compressed and encrypted, and the WAL archive that
@@ -70,14 +58,11 @@ impl OnlineBackupJob {
         }
     }
 
-    /// Run one online backup. Every target is attempted; the backups stored successfully
-    /// are returned in target order. Fails when the artifact can not be produced or when
-    /// any target failed, after every target has been attempted.
+    /// Run one online backup. Every target is attempted, and every backup stored is
+    /// indexed by the WAL archive. Fails when the artifact can not be produced or when any
+    /// target failed, after every target has been attempted.
     #[instrument(level = "info", name = "online_backup", skip_all)]
-    pub async fn run(
-        &self,
-        server: &'static QueryServerReadV1,
-    ) -> Result<Vec<OnlineBackupOutcome>, OperationError> {
+    pub async fn run(&self, server: &'static QueryServerReadV1) -> Result<(), OperationError> {
         #[allow(clippy::disallowed_methods)]
         // Allowed as this timestamp is only used for the backup name.
         let now = time::OffsetDateTime::now_utc();
@@ -109,7 +94,6 @@ impl OnlineBackupJob {
             OperationError::CryptographyError
         })?;
 
-        let mut outcomes = Vec::with_capacity(self.targets.len());
         let mut failure = None;
         for target in &self.targets {
             let stored = match target {
@@ -129,11 +113,6 @@ impl OnlineBackupJob {
                             .register_base_backup_logged(target, &key, &timestamp, &report)
                             .await;
                     }
-                    outcomes.push(OnlineBackupOutcome {
-                        key: key.clone(),
-                        timestamp: timestamp.clone(),
-                        report,
-                    });
                 }
                 Err(err) => {
                     error!(?err, "Online backup to {} failed", target);
@@ -144,7 +123,7 @@ impl OnlineBackupJob {
 
         match failure {
             Some(err) => Err(err),
-            None => Ok(outcomes),
+            None => Ok(()),
         }
     }
 
@@ -309,60 +288,5 @@ impl OnlineBackupJob {
         }
 
         Ok(report)
-    }
-}
-
-/// Apply the `versions` retention to the location `client` writes to: the primary prefix
-/// or the prefix of a replication region. Only automatically generated backup artifacts
-/// are ever deleted, together with their metadata sidecar; the PITR manifest and any other
-/// object under the prefix are kept. Only complete backups, with a sidecar, count towards
-/// `versions`; a backup object left without one by a failed upload is removed once a
-/// newer backup is complete. Failures are logged and never propagated, because the backup
-/// that triggered the cleanup has already succeeded. `keep`, that backup, is never
-/// deleted.
-async fn prune_s3_backups(client: &S3ClientWrapper, versions: usize, keep: &str) {
-    let location = client.location();
-
-    let listing = match client.list_backup_listing().await {
-        Ok(listing) => listing,
-        Err(e) => {
-            error!("S3 backup cleanup failed to list {}: {}", location, e);
-            return;
-        }
-    };
-
-    let to_delete = select_backups_to_delete(&listing.complete, versions, Some(keep));
-    if to_delete.is_empty() {
-        debug!("S3 backup cleanup had no backups to remove in {}", location);
-    } else {
-        info!(
-            "S3 backup cleanup found {} backups in {}, should keep {}, will remove {}",
-            listing.complete.len(),
-            location,
-            versions,
-            to_delete.len()
-        );
-    }
-
-    let incomplete =
-        select_incomplete_backups_to_delete(&listing.incomplete, &listing.complete, Some(keep));
-    if !incomplete.is_empty() {
-        info!(
-            "S3 backup cleanup removes {} backup object(s) without metadata from {}, left by \
-             failed uploads: {}",
-            incomplete.len(),
-            location,
-            incomplete.join(", ")
-        );
-    }
-
-    for key in to_delete.into_iter().chain(incomplete) {
-        match client.delete_backup(&key).await {
-            Ok(()) => info!("S3 backup cleanup removed {} from {}", key, location),
-            Err(e) => error!(
-                "S3 backup cleanup failed to remove {} from {}: {}",
-                key, location, e
-            ),
-        }
     }
 }

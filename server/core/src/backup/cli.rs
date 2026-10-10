@@ -25,9 +25,12 @@ use time::format_description::well_known::Rfc3339;
 
 use super::{
     backup_identity, backup_name_timestamp, compare_backup_names, is_backup_artifact_name,
-    lag_metrics_from_health, open_backup_file_with_config, pitr, region_is_healthy,
+    lag_metrics_from_health, open_backup_file_with_config,
+    pitr::{self, AbandonedHistory},
+    region_is_healthy,
     restore::{
-        backup_encryption_config, restore_and_replay_commit, restore_database, RestoreOutcome,
+        backup_encryption_config, restore_and_replay_commit, restore_database, CommittedRestore,
+        RestoreOutcome,
     },
     run_blocking, s3_location, seal_backup_async, verify_backup_output_async,
     write_verified_local_backup_async, BackupEncryptor, BackupVerifyError, S3BackupError,
@@ -39,10 +42,18 @@ use crate::{config::Configuration, setup_backend, verify_booted_database};
 /// stdout without a path. The backup uses the compression and the client-side encryption
 /// of the `[online_backup]` section, so it is interchangeable with an online backup.
 ///
+/// `stdout_name` is the name a backup written to stdout will be stored under. It is checked
+/// like a destination path, and an encrypted backup records its timestamp, so that it
+/// opens under a `backup-<timestamp>` name; it is ignored with a `dst_path`.
+///
 /// Returns true when the backup was written and verified. Every failure, including a
 /// database that can not be opened and a destination that already exists, returns false,
 /// which the command turns into a non-zero exit code.
-pub async fn backup_server_core(config: &Configuration, dst_path: Option<&Path>) -> bool {
+pub async fn backup_server_core(
+    config: &Configuration,
+    dst_path: Option<&Path>,
+    stdout_name: Option<&str>,
+) -> bool {
     let schema = match Schema::new() {
         Ok(s) => s,
         Err(e) => {
@@ -69,13 +80,22 @@ pub async fn backup_server_core(config: &Configuration, dst_path: Option<&Path>)
         None => None,
     };
 
-    if let Some(dst_path) = dst_path {
-        if let Err(reason) =
-            check_backup_destination_name(dst_path, compression, encryptor.is_some())
-        {
+    // The name the backup is stored under, when it is known.
+    let name = dst_path.or(stdout_name.map(Path::new));
+    if let Some(name) = name {
+        if let Err(reason) = check_backup_destination_name(name, compression, encryptor.is_some()) {
             error!("Backup failed: {reason}");
             return false;
         }
+    } else if encryptor.is_some() {
+        warn!(
+            "The encrypted backup written to stdout records no timestamp, so it only opens \
+             under a name that claims none: stored as backup-<timestamp>{}{BACKUP_ENCRYPTED_SUFFIX}, \
+             restore refuses it. Pass --name with the name it will be stored under.",
+            compression.suffix()
+        );
+    }
+    if let Some(dst_path) = dst_path {
         if dst_path.exists() {
             error!(
                 "Backup failed: backup file {} already exists, will not overwrite it.",
@@ -118,8 +138,8 @@ pub async fn backup_server_core(config: &Configuration, dst_path: Option<&Path>)
         }
     };
 
-    // Written to stdout, the backup has no name and so claims no timestamp.
-    let identity = backup_identity(dst_path.unwrap_or(Path::new("")));
+    // Written to stdout without a name, the backup claims no timestamp.
+    let identity = backup_identity(name.unwrap_or(Path::new("")));
     let artifact =
         match seal_backup_async(backup_data, compression, encryptor.as_ref(), identity).await {
             Ok(artifact) => artifact,
@@ -143,7 +163,7 @@ pub async fn backup_server_core(config: &Configuration, dst_path: Option<&Path>)
         info!("Backup written to {}", dst_path.display());
     } else {
         if !report_backup_verification(
-            verify_backup_output_async(artifact.clone(), None, compression, encryptor.as_ref())
+            verify_backup_output_async(artifact.clone(), name, compression, encryptor.as_ref())
                 .await,
         ) {
             return false;
@@ -247,8 +267,10 @@ pub enum RestoreStatus {
     /// The database was restored and committed, but the WAL archive could not record the
     /// abandoned history, typically because the archive's location is unavailable, as when
     /// restoring from a replication region while the primary bucket is down. The restore
-    /// must not be repeated or rolled back; a new online backup after the server start
-    /// makes point-in-time recovery safe again.
+    /// must not be repeated or rolled back. The restore is handed to the server, which
+    /// records it at its first synchronisation that reaches the archive; should even that
+    /// fail, a new online backup after the server start makes point-in-time recovery safe
+    /// again.
     WalArchiveNotUpdated,
 }
 
@@ -272,10 +294,20 @@ pub async fn restore_server_core(
     dst_path: &Path,
 ) -> Result<RestoreStatus, OperationError> {
     let committed = restore_and_replay_commit(config, dst_path, Vec::new()).await?;
-    // The database holds the backup from here on, so the history after it is abandoned
-    // whatever happens next.
+    finish_restore(config, committed).await
+}
+
+/// The steps of a restore after its commit. The database holds the backup from here on,
+/// so the history after it is abandoned whatever happens next: that is recorded first,
+/// then the database is reindexed.
+async fn finish_restore(
+    config: &Configuration,
+    committed: CommittedRestore,
+) -> Result<RestoreStatus, OperationError> {
     let status = note_restore_in_wal_archive(config, &committed.outcome).await;
-    committed.reindex(config).await?;
+    committed.reindex(config).await.inspect_err(|_| {
+        error!("Run `kubidmd database reindex` before starting the server");
+    })?;
     Ok(status)
 }
 
@@ -287,15 +319,24 @@ async fn note_restore_in_wal_archive(
     outcome: &RestoreOutcome,
 ) -> RestoreStatus {
     match pitr::note_restore(config, outcome.watermark, outcome.server_uuid).await {
-        Ok(()) => RestoreStatus::Complete,
+        Ok(AbandonedHistory::Recorded) => RestoreStatus::Complete,
+        Ok(AbandonedHistory::Deferred(err)) => {
+            warn!(
+                %err,
+                "The database WAS restored; do not restore it again. The WAL archive could not \
+                 be updated, as when restoring from a replication region while the primary is \
+                 down: the server records the abandoned history in the archive at its first \
+                 synchronisation that reaches it."
+            );
+            RestoreStatus::WalArchiveNotUpdated
+        }
         Err(err) => {
             error!(
                 %err,
                 "The database WAS restored; do not restore it again. The abandoned history \
-                 could not be recorded in the WAL archive, whose location may be unavailable \
-                 (as when restoring from a replication region while the primary is down). A \
-                 later point-in-time recovery past this point could replay it: take a new \
-                 online backup right after starting the server."
+                 could not be recorded in the WAL archive nor handed to the server. A later \
+                 point-in-time recovery past this point could replay it: take a new online \
+                 backup right after starting the server."
             );
             RestoreStatus::WalArchiveNotUpdated
         }
@@ -605,12 +646,7 @@ pub async fn restore_s3_database(
     let committed = restore_and_replay_commit(config, &fetched.path, Vec::new()).await?;
     // Remove the downloaded artifact.
     drop(fetched);
-
-    // The database holds the backup from here on, so the history after it is abandoned
-    // whatever happens next.
-    let status = note_restore_in_wal_archive(config, &committed.outcome).await;
-    committed.reindex(config).await?;
-    Ok(status)
+    finish_restore(config, committed).await
 }
 
 /// Verify the backup stored under `key` in S3. The SHA-256 of the stored object is checked
@@ -1145,7 +1181,7 @@ mod tests {
         let existing = dir.path().join("kubidm.json.gz");
         std::fs::write(&existing, b"an older backup").expect("write");
         let config = Configuration::new_for_test();
-        assert!(!backup_server_core(&config, Some(&existing)).await);
+        assert!(!backup_server_core(&config, Some(&existing), None).await);
         assert_eq!(std::fs::read(&existing).expect("read"), b"an older backup");
 
         // The database can not be opened.
@@ -1154,8 +1190,13 @@ mod tests {
             ..Configuration::new_for_test()
         };
         let dest = dir.path().join("new.json.gz");
-        assert!(!backup_server_core(&config, Some(&dest)).await);
+        assert!(!backup_server_core(&config, Some(&dest), None).await);
         assert!(!dest.exists());
+
+        // The name a backup to stdout will be stored under is checked like a path, before
+        // anything is written: a gzip backup can not be stored as plain JSON.
+        let config = Configuration::new_for_test();
+        assert!(!backup_server_core(&config, None, Some("backup-2024-01-01T22:00:00Z.json")).await);
     }
 
     #[test]

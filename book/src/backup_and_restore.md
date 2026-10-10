@@ -48,7 +48,8 @@ verified there, and only then renamed to its final name, so a backup name never 
 after a full disk or a crash, and an existing file is never overwritten. An artifact that fails the verification is
 renamed with an `.invalid` suffix so that it is kept for inspection but is neither counted nor deleted by retention, and
 the backup is reported as an error without pruning any older backup. A `.partial` file left behind by a crash is never
-counted either and can be removed. An S3 artifact that fails this check is never uploaded.
+counted either; retention removes it once a newer backup is complete, and a manual backup to the same destination names
+it in its error. An S3 artifact that fails this check is never uploaded.
 
 ## Method 1 - Automatic Backup
 
@@ -379,9 +380,13 @@ An encrypted backup also records the timestamp of the name it was written under,
 Under a name of that form it only opens when the name carries the same timestamp, so an older backup copied over the
 name or the S3 key of a newer one is refused instead of silently restoring the older state. Under any other name, such
 as a copy to removable media or a manual `database backup` to a path of your choice, it opens and restores normally;
-such a name does not claim when the backup was taken. Copies under the same name, in another directory, bucket, prefix
-or [replication region](#encrypted-backups-and-replication), are the same artifact and open everywhere. A WAL segment is
-bound to its segment id the same way, and a segment is never accepted as a backup or the other way round.
+such a name does not claim when the backup was taken. `kubidmd scripting backup` writing to stdout does not know the
+name the backup ends up under, so an encrypted one records no timestamp and is refused under a
+`backup-<timestamp>.json[.gz].enc` name: pass the name with `--name`
+(`kubidmd scripting backup --name backup-2024-01-01T22:00:00.000000000Z.json.gz.enc > ...`), which also checks it
+against the compression and encryption like a destination path. Copies under the same name, in another directory,
+bucket, prefix or [replication region](#encrypted-backups-and-replication), are the same artifact and open everywhere. A
+WAL segment is bound to its segment id the same way, and a segment is never accepted as a backup or the other way round.
 
 What is and is not encrypted:
 
@@ -499,7 +504,9 @@ WAL archiving requires `online_backup.enabled = true`, since recovery always sta
   last transaction they contain), the segments, and the gaps and abandoned history described below. It records the
   server it belongs to, and a server refuses to archive into another server's manifest: give every server its own
   location. A server that changes its own identity keeps its archive, see
-  [Server Identity Changes](#server-identity-changes).
+  [Server Identity Changes](#server-identity-changes). In S3 the manifest is a single object that carries its SHA-256 in
+  its own metadata, without a `.metadata.json` object, so a save that fails or is interrupted leaves the previous
+  version whole. A base backup whose object or metadata object is gone drops out of the index.
 - **Base backups.** Every successful scheduled online backup is indexed as a base: the S3 backup when
   `[online_backup.s3]` is configured, otherwise the local one. Manual `kubidmd database backup` artifacts are not
   indexed. Recovery becomes possible with the first online backup taken after WAL archiving was enabled. When only
@@ -521,15 +528,16 @@ backup still present, so the archive always reaches back to the oldest base back
 
 Records live in memory until their segment is closed. If the server stops without shutting down (a crash, a kill, a
 power loss) the open segment is lost from the archive, although the transactions themselves are safely committed in the
-database. The next start notices this, logs `WAL ARCHIVE HOLE`, and records a **gap** in the manifest. A committed
-transaction whose changes could not be recorded is logged and recorded as a gap the same way, while a closed segment
-that could not be written (for example on a full disk) is kept in memory and retried at least every
-`segment_interval_seconds`; beyond four such segments the oldest is dropped and recorded as a gap. A local segment that
-is found damaged is moved aside as `<segment>.corrupt` and its range recorded as a gap. Gaps are kept in the WAL
-directory until the manifest records them, so repeated crashes never lose one. Replaying across a gap would silently
-skip changes, so `recover` refuses any target whose replay would cross one, and `--latest` stops right before it. A base
-backup taken after the gap makes later points recoverable again; take one after any `WAL ARCHIVE HOLE`. With S3,
-segments that were closed but not yet uploaded are lost with the host, which only shortens the recoverable window.
+database. The next start notices this, logs `WAL ARCHIVE HOLE`, and records a **gap** in the manifest, from the first
+record that was lost up to the last transaction the database committed. A committed transaction whose changes could not
+be recorded is logged and recorded as a gap the same way, while a closed segment that could not be written (for example
+on a full disk) is kept in memory and retried at least every `segment_interval_seconds`; once more than four such
+segments wait, the write is tried at once, and when it fails again the oldest are dropped and recorded as gaps. A local
+segment that is found damaged is moved aside as `<segment>.corrupt` and its range recorded as a gap. Gaps are kept in
+the WAL directory until the manifest records them, so repeated crashes never lose one. Replaying across a gap would
+silently skip changes, so `recover` refuses any target whose replay would cross one, and `--latest` stops right before
+it. A base backup taken after the gap makes later points recoverable again; take one after any `WAL ARCHIVE HOLE`. With
+S3, segments that were closed but not yet uploaded are lost with the host, which only shortens the recoverable window.
 
 The offline `kubidmd domain rename` and `kubidmd database reindex` commands archive their writes like the running server
 does; the next server start uploads them. The `kubidmd db-scan quarantine-id2entry` and `restore-quarantined` repair
@@ -600,13 +608,17 @@ that were never archived. It then:
 Abandoned history is never replayed again: after recovering to 10:30, the server started on the recovered database
 writes new history, and a later recovery to any point after it replays the recovered state plus the new history, never
 the transactions that were discarded. `kubidmd database restore` and `restore-s3` record abandoned history the same way
-when WAL archiving is configured. They record it in the primary archive only: when that archive can not be reached (for
-example while restoring with `restore-s3 --region` during an outage of the primary), they restore the database and exit
-with code 2 and an error saying the history could not be recorded: the restore succeeded and must not be repeated or
-rolled back, but a later point-in-time recovery past it could replay the abandoned history until a new online backup is
-taken. Prefer `recover --region` in that situation. A restore that failed exits with code 1, including one whose reindex
-failed after the commit: its error then says that the database WAS restored, and `kubidmd database reindex` must run
-before the server starts.
+when WAL archiving is configured. They record it in the primary archive, the one the server archives into. When that
+archive can not be updated (for example while restoring with `restore-s3 --region` during an outage of the primary, or
+when its bucket does not exist), they restore the database, hand the abandoned history to the server through its WAL
+directory, and exit with code 2 and a warning: the restore succeeded and must not be repeated or rolled back. The server
+records the abandoned history, and the change of server uuid when the restored backup carries another one, at its first
+archive synchronisation that reaches the archive, before it archives anything else. Should even the WAL directory not be
+writable, the error says so: a later point-in-time recovery past the restore could then replay the abandoned history
+until a new online backup is taken. `recover` behaves the same way, and also records the abandoned history in the region
+it recovered from. A restore or recovery that failed exits with code 1, including one whose reindex or verification
+failed after the commit: its error then says that the database WAS restored, and whether to run
+`kubidmd database reindex` before the server starts or to recover to another point.
 
 #### The Encrypted WAL Archive
 
@@ -685,7 +697,7 @@ topology, treat a recovered node like a restored one: the other nodes must be re
 | Manual backup (`kubidmd database backup`) | the path given                                      | yes                                         | no                                           | `restore`                          |
 | WAL segment                               | `wal/` of the archive's S3 location, or the WAL dir | yes (`.enc`)                                | when the archive's S3 location replicates    | `recover [--region]`               |
 | `pitr-manifest.json`                      | next to the segments                                | no (holds no directory content)             | with the segments                            | read by `pitr-list` and `recover`  |
-| `.metadata.json` sidecars                 | next to every S3 object                             | no (checksum, size, key identifier)         | with their object                            | checked by every download          |
+| `.metadata.json` sidecars                 | next to every S3 object but the manifest            | no (checksum, size, key identifier)         | with their object                            | checked by every download          |
 
 Every combination is supported. Things to keep in mind when combining them:
 
@@ -771,15 +783,17 @@ To take the backup (assuming our docker environment) you first need to stop the 
 docker stop <container name>
 docker run --rm -i -t -v kubidmd:/data -v kubidmd_backups:/backup \
     kubidm/server:latest /sbin/kubidmd database backup -c /data/server.toml \
-    /backup/kubidm.backup.json
+    /backup/kubidm.backup.json.gz
 docker start <container name>
 ```
 
-You can then restart your instance. DO NOT modify the backup.json as it may introduce data errors into your instance.
+You can then restart your instance. DO NOT modify the backup file as it may introduce data errors into your instance.
 
-The manual backup uses the `compression` and the `[online_backup.encryption]` settings of the configuration. With
-encryption enabled, the file written is an encrypted container whatever its name; name it with the `.enc` suffix
-(`/backup/kubidm.backup.json.enc`) to keep it recognisable, and keep the key, see
+The manual backup uses the `compression` and the `[online_backup.encryption]` settings of the configuration. Name the
+file after the compression: `.json.gz` with the default gzip, `.json` with `compression = "NoCompression"`. Restore
+takes the compression of a plain backup from its name, so a name with another suffix is refused before anything is
+written. With encryption enabled, the file written is an encrypted container whatever its name; name it with the `.enc`
+suffix (`/backup/kubidm.backup.json.gz.enc`) to keep it recognisable, and keep the key, see
 [Client-Side Backup Encryption](#client-side-backup-encryption).
 
 To restore from the backup:
@@ -788,7 +802,7 @@ To restore from the backup:
 docker stop <container name>
 docker run --rm -i -t -v kubidmd:/data -v kubidmd_backups:/backup \
     kubidm/server:latest /sbin/kubidmd database restore -c /data/server.toml \
-    /backup/kubidm.backup.json
+    /backup/kubidm.backup.json.gz
 docker start <container name>
 ```
 
