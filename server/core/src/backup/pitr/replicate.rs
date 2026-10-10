@@ -1,7 +1,7 @@
 //! Mirroring the archive to the replication regions of its S3 location, repairing the
 //! region copies, and reporting how far every region's copy is from the primary's.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::time::Duration;
 
@@ -627,6 +627,10 @@ pub struct WalReplicationHealth {
     /// Segments the primary's manifest names that the primary itself lacks or can not
     /// read, with why. No region can be given them; they are a problem of the primary.
     pub unavailable_on_primary: Vec<(String, String)>,
+    /// Segments the primary's manifest names that retention deletes, or is due to delete
+    /// within the [`replication_tolerance`]: they are not checked, since the archive run
+    /// deletes their objects before it saves the manifest that stops naming them.
+    pub expiring: usize,
     /// Whether the sidecars were compared too (`--deep`).
     pub deep: bool,
     /// The lag a region may have and still be healthy, see [`replication_tolerance`].
@@ -670,6 +674,7 @@ pub async fn check_wal_replication(
         updated_at: String::new(),
         segments: 0,
         unavailable_on_primary: Vec::new(),
+        expiring: 0,
         deep,
         tolerance,
         regions: Vec::new(),
@@ -680,6 +685,24 @@ pub async fn check_wal_replication(
     health.archived = true;
     health.updated_at.clone_from(&manifest.updated_at);
     health.segments = manifest.segments.len();
+    // The segments retention deletes are left out: an archive run deletes their objects
+    // first and saves the manifest that stops naming them after, so a listing taken in
+    // between lacks segments this manifest still names. A segment that expires within the
+    // tolerance counts too, for an archive run whose clock or schedule is a little ahead.
+    let expiring: BTreeSet<String> = select_segments_to_delete(
+        &manifest,
+        now.saturating_add(tolerance),
+        settings.wal.retention(),
+    )
+    .into_iter()
+    .collect();
+    health.expiring = expiring.len();
+    let checked: Vec<WalSegment> = manifest
+        .segments
+        .iter()
+        .filter(|segment| !expiring.contains(&segment.segment_id))
+        .cloned()
+        .collect();
     let primary_objects = primary.list_object_sizes().await?;
 
     let mut unavailable = BTreeMap::new();
@@ -696,6 +719,7 @@ pub async fn check_wal_replication(
             primary,
             primary_objects: &primary_objects,
             manifest: &manifest,
+            segments: &checked,
             deep,
             now,
             tolerance,
@@ -721,6 +745,8 @@ struct RegionCheck<'a> {
     primary: &'a S3ClientWrapper,
     primary_objects: &'a ObjectSizes,
     manifest: &'a PitrManifest,
+    /// The segments of `manifest` to compare: those retention is not deleting.
+    segments: &'a [WalSegment],
     deep: bool,
     now: Duration,
     tolerance: Duration,
@@ -755,7 +781,7 @@ async fn check_region(
         target.primary_objects,
         &client,
         &region_objects,
-        &manifest.segments,
+        target.segments,
         target.deep,
     )
     .await;
@@ -786,7 +812,7 @@ async fn check_region(
                 (Some(primary), None) => primary,
                 (None, _) => Duration::ZERO,
             });
-            let unrecorded: Vec<&WalSegment> = manifest
+            let unrecorded: Vec<&WalSegment> = target
                 .segments
                 .iter()
                 .filter(|segment| !region_manifest.has_segment(&segment.segment_id))
@@ -878,6 +904,13 @@ pub fn format_wal_replication_report(health: &WalReplicationHealth, detailed: bo
             }
         }
     }
+    if health.expiring > 0 {
+        let _ = writeln!(
+            out,
+            "  {} segments expire under the retention period and are not checked",
+            health.expiring
+        );
+    }
     let _ = writeln!(
         out,
         "  Compared: {}; lag tolerated: {}s",
@@ -913,9 +946,9 @@ pub fn format_wal_replication_report(health: &WalReplicationHealth, detailed: bo
             .map(|lag| format!("{}s", lag.as_secs()))
             .unwrap_or_else(|| "-".to_string())
     };
-    let intact = |region: &WalRegionHealth| -> String {
-        format!("{}/{}", region.segments.intact, health.segments)
-    };
+    let checked = health.segments.saturating_sub(health.expiring);
+    let intact =
+        |region: &WalRegionHealth| -> String { format!("{}/{checked}", region.segments.intact) };
     let width = |header: &str, values: &mut dyn Iterator<Item = usize>| -> usize {
         values.max().unwrap_or(0).max(header.len())
     };
@@ -992,9 +1025,8 @@ pub fn format_wal_replication_report(health: &WalReplicationHealth, detailed: bo
         if !region.segments.missing.is_empty() || !region.segments.damaged.is_empty() {
             let _ = writeln!(
                 out,
-                "    {} of {} segments not replicated intact",
+                "    {} of {checked} segments not replicated intact",
                 region.segments.missing.len() + region.segments.damaged.len(),
-                health.segments
             );
         }
         if detailed {
@@ -1352,5 +1384,121 @@ mod tests {
             health.regions[0].manifest,
             RegionManifestState::Current { .. }
         ));
+    }
+    /// Retention deletes the objects of an expired segment first and saves the manifest
+    /// that stops naming it after: a status check in between sees a manifest naming a
+    /// segment neither the primary nor the region holds. That is retention at work, not a
+    /// segment the primary lost, and it neither fails the check nor counts as missing.
+    #[tokio::test]
+    async fn test_segments_retention_is_deleting_are_not_reported_missing() {
+        let objects: Objects = Arc::new(Mutex::new(BTreeMap::new()));
+        let fake = fake_s3::FakeS3::start(fake_s3::store(Arc::clone(&objects))).await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let server = Uuid::new_v4();
+
+        let mut primary_s3 = fake.config("primary");
+        primary_s3.replication = Some(ReplicationConfig {
+            enabled: true,
+            regions: vec![region_of(&fake, "replica")],
+            sync_interval_seconds: 300,
+        });
+        let wal = WalArchiveConfig {
+            enabled: true,
+            local_path: Some(dir.path().join("wal")),
+            retention_days: 1,
+            ..WalArchiveConfig::default()
+        };
+        let settings = PitrSettings {
+            wal: wal.clone(),
+            local_dir: dir.path().join("wal"),
+            location: PitrLocation::S3(primary_s3.clone()),
+            bases: BaseLocation::Local(dir.path().join("backups")),
+            encryption: BackupEncryptionConfig::default(),
+        };
+        let archiver: SharedWalArchiver = Arc::new(std::sync::Mutex::new(
+            WalArchiver::open(wal, server, dir.path().join("wal"), None).expect("archiver"),
+        ));
+        let archive = PitrArchive::new(settings.clone(), archiver);
+
+        let store = PitrStore::open(&settings.location).await.expect("store");
+        let PitrStore::S3 { client: primary } = &store else {
+            panic!("S3 store expected");
+        };
+        let day = 86_400;
+        let mut manifest = PitrManifest::new(server);
+        for start in [100, 2 * day] {
+            let mut archived = segment(
+                &segment_file_name(server, Duration::from_secs(start)),
+                start,
+                start + 50,
+            );
+            archived.server_uuid = server;
+            primary
+                .upload_backup(
+                    b"segment",
+                    &archived.object_key(),
+                    "t",
+                    BackupCompression::Gzip,
+                    None,
+                )
+                .await
+                .expect("upload");
+            manifest.add_segment(archived);
+        }
+        store
+            .save_manifest(&mut manifest, Duration::from_secs(2 * day + 60))
+            .await
+            .expect("save");
+        let mut report = PitrSyncReport::default();
+        archive
+            .replicate(
+                &store,
+                &mut manifest,
+                Duration::from_secs(2 * day + 60),
+                &mut report,
+            )
+            .await;
+        assert_eq!((report.replicated, report.region_errors), (2, 0));
+        let ids: Vec<String> = manifest
+            .segments
+            .iter()
+            .map(|s| s.segment_id.clone())
+            .collect();
+        let keys: Vec<String> = manifest
+            .segments
+            .iter()
+            .map(WalSegment::object_key)
+            .collect();
+
+        // Two days in, the first segment is past the one day of retention: an archive run
+        // deletes its objects on the primary and in the region, then saves the manifest.
+        // The status runs in between.
+        for location in ["primary", "replica"] {
+            let mut objects = objects.lock().expect("objects");
+            objects.remove(&format!("/{location}/{}", keys[0]));
+            objects.remove(&format!("/{location}/{}{METADATA_SUFFIX}", keys[0]));
+        }
+        let now = Duration::from_secs(2 * day + 600);
+        for deep in [false, true] {
+            let health = check(&settings, deep, now).await;
+            assert_eq!(health.expiring, 1, "{health:#?}");
+            assert!(health.unavailable_on_primary.is_empty(), "{health:#?}");
+            assert!(health.regions[0].segments.missing.is_empty(), "{health:#?}");
+            assert_eq!(health.regions[0].segments.intact, 1, "{health:#?}");
+            assert!(health.is_healthy(), "{health:#?}");
+            let text = format_wal_replication_report(&health, true);
+            assert!(text.contains("1 segments expire"), "{text}");
+            assert!(text.contains("1/1"), "{text}");
+        }
+
+        // A segment within the retention period that the primary lost is still reported.
+        objects
+            .lock()
+            .expect("objects")
+            .remove(&format!("/primary/{}", keys[1]));
+        let health = check(&settings, false, now).await;
+        assert_eq!(health.unavailable_on_primary.len(), 1, "{health:#?}");
+        assert_eq!(health.unavailable_on_primary[0].0, ids[1]);
+        assert!(!health.is_healthy());
     }
 }

@@ -267,11 +267,13 @@ size, as for backups), two reads per segment and region, which catches a copy re
 copy is still healthy when it only lacks what the primary archived within the replication's `sync_interval_seconds` plus
 two `segment_interval_seconds`, since the next archive run is due to copy it: its manifest is then `pending`, and
 `--detailed` lists such segments as not copied yet. A segment the primary itself lacks is reported on its own, as a
-problem of the primary that no region can be given, never as a damaged region copy. Before the first archive run there
-is no manifest yet, which is reported as not yet archived and is healthy. `--detailed` names every missing or differing
-segment. The command exits non-zero when neither backups nor the WAL archive are replicated, when a primary location can
-not be read or misses segments its manifest names, or when any region of either is not healthy, which makes it suitable
-for monitoring.
+problem of the primary that no region can be given, never as a damaged region copy. Segments that retention deletes
+(older than `retention_days` and not needed by the oldest base backup, give or take the same tolerance) are left out of
+the check and counted on their own: an archive run deletes their objects before it saves the manifest that stops naming
+them, so a check in between would otherwise report them missing. Before the first archive run there is no manifest yet,
+which is reported as not yet archived and is healthy. `--detailed` names every missing or differing segment. The command
+exits non-zero when neither backups nor the WAL archive are replicated, when a primary location can not be read or
+misses segments its manifest names, or when any region of either is not healthy, which makes it suitable for monitoring.
 
 #### Recovering from a Region
 
