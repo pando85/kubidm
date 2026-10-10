@@ -76,7 +76,7 @@ async fn test_status_endpoint_legacy(rsclient: &kubidm_client::KubidmClient) {
     assert_eq!(res.status(), 200);
 
     let body: bool = res.json().await.expect("Failed to parse JSON");
-    assert_eq!(body, true);
+    assert!(body);
 }
 
 #[test]
