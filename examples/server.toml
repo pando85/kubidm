@@ -194,8 +194,9 @@ compression = "gzip"
 #   Optional: Cross-region replication of the S3 backups.
 #   After every successful upload, the backup object and its .metadata.json sidecar are
 #   copied to every region listed here, and each region keeps its newest `versions`
-#   backups (the same retention as the primary bucket). A region that can not be
-#   written to is logged as an error and skipped; the primary backup still succeeds.
+#   backups (the same retention as the primary bucket). The backup makes one attempt
+#   per region and never retries: a region that can not be written to is logged and
+#   skipped, and the primary backup still succeeds.
 #   Every `sync_interval_seconds`, the server copies to each region the primary
 #   backups it misses (or holds a differing copy of), then checks that each region
 #   holds all the primary's backups and logs a warning per region that does not.
@@ -216,10 +217,6 @@ compression = "gzip"
 # enabled = true
 #   Seconds between two replication sync and health check runs (default 300)
 # sync_interval_seconds = 300
-#   Further attempts when copying a backup to a region fails (default 3) ...
-# max_retries = 3
-#   ... and the seconds to wait between attempts (default 30)
-# retry_delay_seconds = 30
 #
 #   One entry per region. `region` names the entry (for replicate-status and --region)
 #   and is the signing region of its requests; `bucket` is required.

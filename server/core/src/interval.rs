@@ -149,8 +149,9 @@ impl IntervalActor {
 
         let mut handles = Vec::with_capacity(2);
 
-        // The health monitor is a separate task with its own shutdown receiver, so a slow
-        // or unreachable region can never delay the backup schedule.
+        // The replication monitor is a separate task with its own shutdown receiver. It is
+        // the only place that retries the copies to a region: the backup run makes a single
+        // attempt per region and never waits for one.
         if let Some(replication) = s3_config
             .as_ref()
             .and_then(|s3| s3.replication.clone())

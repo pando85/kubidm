@@ -129,10 +129,6 @@ Add a `replication` section with one entry per region to `[online_backup.s3]`:
 enabled = true
 # Seconds between two replication sync and health check runs (default 300)
 sync_interval_seconds = 300
-# Further attempts when copying a backup to a region fails (default 3) ...
-max_retries = 3
-# ... and the seconds to wait between attempts (default 30)
-retry_delay_seconds = 30
 
 [[online_backup.s3.replication.regions]]
 region = "eu-west-1"
@@ -181,9 +177,10 @@ see [Encrypted Backups and Replication](#encrypted-backups-and-replication). The
 when it is uploaded to the same S3 location, is mirrored to the same regions by the archive itself, see
 [The WAL Archive and Replication](#the-wal-archive-and-replication).
 
-A region that can not be written to is retried `max_retries` times, `retry_delay_seconds` apart, then logged at error
-level and skipped. A failing region never fails the primary backup. Backups a region missed this way, and all the
-existing backups of a region added to the configuration, are copied by the replication sync described below.
+Each backup run makes a single attempt per region and never retries or waits: a region that can not be written to is
+logged as a warning and skipped, so a slow or unreachable region can neither fail the primary backup nor delay the
+schedule or a shutdown. The replication sync described below is the only place that retries: backups a region missed
+this way, and all the existing backups of a region added to the configuration, are copied by it.
 
 #### Retention per Region
 

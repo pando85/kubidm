@@ -372,8 +372,6 @@ fn test_replication_config_default() {
     assert!(!config.enabled);
     assert_eq!(config.regions.len(), 0);
     assert_eq!(config.sync_interval_seconds, 300);
-    assert_eq!(config.max_retries, 3);
-    assert_eq!(config.retry_delay_seconds, 30);
 }
 
 #[test]
@@ -684,10 +682,6 @@ pub struct ReplicationConfig {
     pub regions: Vec<ReplicationRegionConfig>,
     #[serde(default = "default_replication_sync_interval")]
     pub sync_interval_seconds: u64,
-    #[serde(default = "default_replication_max_retries")]
-    pub max_retries: u32,
-    #[serde(default = "default_replication_retry_delay")]
-    pub retry_delay_seconds: u64,
 }
 
 fn default_replication_enabled() -> bool {
@@ -698,22 +692,12 @@ fn default_replication_sync_interval() -> u64 {
     300
 }
 
-fn default_replication_max_retries() -> u32 {
-    3
-}
-
-fn default_replication_retry_delay() -> u64 {
-    30
-}
-
 impl Default for ReplicationConfig {
     fn default() -> Self {
         Self {
             enabled: default_replication_enabled(),
             regions: Vec::new(),
             sync_interval_seconds: default_replication_sync_interval(),
-            max_retries: default_replication_max_retries(),
-            retry_delay_seconds: default_replication_retry_delay(),
         }
     }
 }

@@ -18,7 +18,6 @@ use kubidm_proto::backup::{
     S3Config, S3EncryptionAlgorithm,
 };
 use sha2::{Digest, Sha256};
-use tokio::time::{sleep, Duration};
 
 use super::retention::is_backup_artifact_name;
 
@@ -219,7 +218,7 @@ impl S3ClientWrapper {
     /// Upload `data` under `key` (relative to the configured prefix) with the given,
     /// already computed, metadata sidecar. Shared by the primary upload and by
     /// replication, so a replica carries the very same sidecar as the primary.
-    async fn upload_with_metadata(
+    pub(crate) async fn upload_with_metadata(
         &self,
         data: &[u8],
         key: &str,
@@ -754,38 +753,6 @@ impl S3ClientWrapper {
             region.location()
         );
         Ok(())
-    }
-
-    /// `replicate_backup` with the retry policy of `replication_config`: up to
-    /// `max_retries` further attempts, `retry_delay_seconds` apart. Every failed attempt
-    /// is logged; the error of the last attempt is returned.
-    pub async fn replicate_backup_with_retries(
-        &self,
-        backup_key: &str,
-        backup_data: &[u8],
-        metadata: &S3BackupMetadata,
-        region_config: &ReplicationRegionConfig,
-        replication_config: &ReplicationConfig,
-    ) -> Result<(), S3BackupError> {
-        let attempts = replication_config.max_retries.saturating_add(1);
-        let mut attempt = 1;
-        loop {
-            match self
-                .replicate_backup(backup_key, backup_data, metadata, region_config)
-                .await
-            {
-                Ok(()) => return Ok(()),
-                Err(err) if attempt < attempts => {
-                    warn!(
-                        "Replication of {} to region {} failed (attempt {} of {}): {}",
-                        backup_key, region_config.region, attempt, attempts, err
-                    );
-                    sleep(Duration::from_secs(replication_config.retry_delay_seconds)).await;
-                    attempt += 1;
-                }
-                Err(err) => return Err(err),
-            }
-        }
     }
 
     /// Compare the primary's copy of `backup_key` with the one in `region`, without
@@ -1414,8 +1381,6 @@ mod tests {
             enabled: true,
             regions: vec![],
             sync_interval_seconds: 600,
-            max_retries: 5,
-            retry_delay_seconds: 60,
         };
         assert!(config.to_string().contains("enabled: true"));
         assert!(config.to_string().contains("600s"));
@@ -1737,8 +1702,6 @@ mod tests {
                 kms_key_id: None,
             }],
             sync_interval_seconds: 300,
-            max_retries: 3,
-            retry_delay_seconds: 30,
         };
 
         let config = S3Config {
@@ -1762,8 +1725,6 @@ mod tests {
         assert!(!config.enabled);
         assert_eq!(config.regions.len(), 0);
         assert_eq!(config.sync_interval_seconds, 300);
-        assert_eq!(config.max_retries, 3);
-        assert_eq!(config.retry_delay_seconds, 30);
     }
 
     #[test]
@@ -2303,8 +2264,6 @@ mod tests {
                 },
             ],
             sync_interval_seconds: 600,
-            max_retries: 5,
-            retry_delay_seconds: 60,
         };
 
         let json = serde_json::to_string(&config).unwrap();

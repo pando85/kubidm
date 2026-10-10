@@ -119,9 +119,6 @@ fn test_setup() -> Option<TestSetup> {
         enabled: true,
         regions,
         sync_interval_seconds: 300,
-        // No retries: the broken region must fail fast, and nothing here is flaky.
-        max_retries: 0,
-        retry_delay_seconds: 0,
     };
 
     let primary = S3Config {

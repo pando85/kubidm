@@ -255,38 +255,42 @@ impl OnlineBackupJob {
         // The backup itself has succeeded at this point: neither replication nor retention
         // may turn it into a failure. Both only log.
         //
-        // Replication copies the object and its sidecar, as uploaded, to every configured
-        // region. A region that fails is reported and skipped; the replication monitor
+        // The replication monitor is the single source of truth for the region copies: it
         // copies whatever a region misses every `sync_interval_seconds`, and
-        // `replicate-status` shows what is missing in the meantime. Retention
-        // then runs in the primary and in every region that could be reached, so each
-        // location keeps its newest `versions` backups independently.
+        // `replicate-status` shows what is missing in the meantime. The run makes one
+        // attempt per region so that a reachable region holds the backup right away, and
+        // never retries or waits, so that a slow or unreachable region can not hold up the
+        // schedule or the shutdown. Retention then runs in the primary and in every region
+        // the copy reached, so each location keeps its newest `versions` backups
+        // independently.
         let mut region_clients = Vec::new();
-        if let Some(replication) = s3_client.replication_config() {
-            for region_config in &replication.regions {
-                if let Err(e) = s3_client
-                    .replicate_backup_with_retries(
-                        key,
-                        artifact,
-                        &metadata,
-                        region_config,
-                        replication,
-                    )
+        for region_config in s3_client
+            .replication_config()
+            .map(|replication| replication.regions.as_slice())
+            .unwrap_or_default()
+        {
+            let copied = match S3ClientWrapper::for_region(region_config).await {
+                Ok(region) => region
+                    .upload_with_metadata(artifact, key, &metadata)
                     .await
-                {
-                    error!(
-                        "S3 backup replication of {} to region {} (bucket {}) failed: {}",
-                        key, region_config.region, region_config.bucket, e
+                    .map(|()| region),
+                Err(err) => Err(err),
+            };
+            match copied {
+                Ok(region) => {
+                    info!(
+                        "Replicated backup {} to region {} ({})",
+                        key,
+                        region_config.region,
+                        region.location()
                     );
-                    continue;
+                    region_clients.push(region);
                 }
-                match S3ClientWrapper::for_region(region_config).await {
-                    Ok(client) => region_clients.push(client),
-                    Err(e) => error!(
-                        "S3 backup cleanup skipped region {}: unable to create its client: {}",
-                        region_config.region, e
-                    ),
-                }
+                Err(err) => warn!(
+                    "S3 backup replication of {} to region {} (bucket {}) failed, the \
+                     replication monitor copies it later: {}",
+                    key, region_config.region, region_config.bucket, err
+                ),
             }
         }
 

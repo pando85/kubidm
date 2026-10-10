@@ -80,8 +80,6 @@ fn create_test_replication_config() -> ReplicationConfig {
             },
         ],
         sync_interval_seconds: 300,
-        max_retries: 3,
-        retry_delay_seconds: 30,
     }
 }
 
@@ -491,8 +489,6 @@ fn test_replication_config_defaults() {
     assert!(!config.enabled);
     assert_eq!(config.regions.len(), 0);
     assert_eq!(config.sync_interval_seconds, 300);
-    assert_eq!(config.max_retries, 3);
-    assert_eq!(config.retry_delay_seconds, 30);
 }
 
 #[test]

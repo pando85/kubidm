@@ -740,8 +740,6 @@ fn test_pitr_s3_encrypted_replicated_recover_from_region() {
         enabled: true,
         regions: vec![region.clone()],
         sync_interval_seconds: 3600,
-        max_retries: 0,
-        retry_delay_seconds: 0,
     });
     let region_s3 = region.to_s3_config();
 
