@@ -123,8 +123,9 @@ When it is enabled, every backup made from this configuration is encrypted: the 
 S3, `kubidmd database backup` and `kubidmd scripting backup` (also when it writes to stdout). The backup is serialised
 and compressed as usual and the result is then sealed with AES-256-GCM under a key derived from the configured secret
 with Argon2id and a fresh random salt. The artifact is a self-describing container: a header with the salt, the key
-derivation parameters, the nonce, the key identifier and the compression, followed by the ciphertext. Nothing but the
-secret is needed to open it.
+derivation parameters, the nonce, the key identifier and the compression, followed by the ciphertext. The header is
+authenticated together with the ciphertext, so any change to either, a truncation or a header taken from another
+artifact makes the artifact fail to open. Nothing but the secret is needed to open it.
 
 #### Key Sources
 
@@ -138,21 +139,26 @@ derivation and never as the cipher key itself.
 - `{ File = { path = "/etc/kubidm/backup.key" } }`: the content of the file is the secret, byte for byte. Generate it
   with for example `head -c 32 /dev/urandom > /etc/kubidm/backup.key` and keep it readable only by the server user.
 - `{ HttpEndpoint = { url = "https://vault.example.com/v1/kubidm-backup-key" } }`: the response body of a GET request to
-  the URL is the secret. The endpoint is called every time a backup is made or restored, so it has to be reachable from
-  the server and from the host that restores.
+  the URL is the secret (at most 64 KiB, within 30 seconds). The endpoint is called every time a backup is made or
+  restored, so it has to be reachable from the server and from the host that restores. The URL must use `https`; plain
+  `http` is only accepted for a loopback address such as a local secrets agent, because it would send the secret in the
+  clear.
 
 At startup, and in `kubidmd configtest`, the key source is checked to be usable: the passphrase file or environment
-variable is present and not empty, the key file exists and is readable, the URL is a well formed `http` or `https` URL
-(it is not fetched at that point). The key derivation parameters (`key_derivation.m_cost` in KiB, `t_cost`, `p_cost`)
-must lie within sane bounds; the defaults are 19 MiB, 2 iterations and no parallelism.
+variable is present and not empty, the key file exists and is readable, the URL is a well formed `https` URL, or `http`
+on loopback (it is not fetched at that point). A passphrase file or key file that everyone on the host can read is
+reported with a warning, as for the TLS key. The key derivation parameters (`key_derivation.m_cost` in KiB, `t_cost`,
+`p_cost`) must lie within sane bounds; the defaults are 19 MiB, 2 iterations and no parallelism.
 
 #### Key Identifier
 
 Every artifact records the `key_identifier` of the key it was encrypted with, and so does the `.metadata.json` object in
-S3. When no identifier is configured, a fingerprint of the key material is used, so artifacts made with the same secret
-always carry the same identifier. The identifier is public information: it tells an operator which key a backup needs,
-it is shown by `list-backups`, `verify-backup` and `verify-s3`, and it is named in every error about a key that could
-not be obtained or does not fit.
+S3. When no identifier is configured, a key file or key endpoint is identified by a fingerprint of its content, so
+artifacts made with the same key always carry the same identifier. A passphrase is never fingerprinted, because a public
+fingerprint of a passphrase would let an attacker test guesses against a precomputed dictionary; without a configured
+identifier its artifacts record the identifier `passphrase`. Configure a `key_identifier` to tell passphrases apart. The
+identifier is public information: it tells an operator which key a backup needs, it is shown by `list-backups`,
+`verify-backup` and `verify-s3`, and it is named in every error about a key that could not be obtained or does not fit.
 
 When a `key_identifier` is configured, a restore refuses an artifact whose header names a different one before trying to
 decrypt it. Without a configured identifier the key is simply tried.
@@ -162,7 +168,10 @@ decrypt it. Without a configured identifier the key is simply tried.
 Encrypted artifacts get the extra suffix `.enc` after the compression suffix: `backup-<timestamp>.json.enc` and
 `backup-<timestamp>.json.gz.enc`. Retention, `list-backups` and the post-write verification treat them as first class
 backups, and a rejected encrypted artifact is quarantined as `...json.gz.enc.invalid` like a plain one. The suffix is
-informational: an encrypted container is recognised by its content, so a renamed artifact still restores.
+mostly informational: an encrypted container is recognised by its content, so a renamed artifact still restores. The
+reverse is refused: an artifact named `.enc`, or an S3 object whose name or metadata says it is encrypted, must be an
+encrypted container, so that whoever can write to the backup location can not swap an encrypted backup for an
+unauthenticated plain one.
 
 What is and is not encrypted:
 
@@ -193,7 +202,8 @@ The commands fail with a clear message, and leave the target database untouched,
 encryption is not enabled in the configuration, when the secret can not be obtained, when the configured
 `key_identifier` differs from the one in the artifact, or when the secret does not decrypt it. Each message names the
 key identifier recorded in the artifact. Plain backups made before encryption was enabled keep restoring with an
-encrypting configuration.
+encrypting configuration, with a warning: the encryption key does not protect their integrity, so only restore a plain
+backup whose origin you trust.
 
 A deployment that has turned encryption on keeps its secret outside of the backups it protects. Store the passphrase or
 key file in a password manager or secret store that survives the loss of the server, and test a restore from it.
