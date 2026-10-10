@@ -6,6 +6,17 @@ be that physical damage or a mistake. Kubidm supports backup and restore of the 
 It is important that you only attempt to restore data with the same version of the server that the backup originated
 from.
 
+The automatic backup is built from parts that can be combined freely:
+
+- **Online backups** to a local directory and/or an [S3-compatible bucket](#s3-compatible-storage-backup), each verified
+  after it is written ([verification](#verifying-that-a-backup-can-be-restored) can also be run on demand).
+- **[Cross-region replication](#cross-region-backup-replication)** of the S3 backups to further buckets.
+- **[Client-side encryption](#client-side-backup-encryption)** of everything that leaves the server.
+- **[Point-in-time recovery](#point-in-time-recovery)** (PITR), which archives every committed write so that the
+  database can be rebuilt as of any moment between backups.
+
+[How the Features Combine](#how-the-features-combine) summarises what each combination does and how to recover from it.
+
 ## Backup Integrity Guarantees
 
 When Kubidm reports that an online or manual backup completed successfully, that backup is guaranteed to be semantically
@@ -164,9 +175,11 @@ still be targeted with `--region`, so a replica remains a recovery source after 
 After every scheduled S3 backup has been uploaded and its `<key>.metadata.json` sidecar written, the server copies both
 objects, unchanged, to every configured region under that region's `path_prefix`. The copy keeps the primary's key,
 checksum, size and timestamp, so a replica is indistinguishable from the primary object for `verify-s3` and
-`restore-s3`. Only automatically generated backups are replicated; nothing else under the primary prefix is copied.
-Local backups are never replicated. Client-side encrypted backups are replicated like any other backup, see
-[Encrypted Backups and Replication](#encrypted-backups-and-replication).
+`restore-s3`. The backup replication copies only automatically generated backups; nothing else under the primary prefix
+is copied by it. Local backups are never replicated. Client-side encrypted backups are replicated like any other backup,
+see [Encrypted Backups and Replication](#encrypted-backups-and-replication). The WAL archive of point-in-time recovery,
+when it is uploaded to the same S3 location, is mirrored to the same regions by the archive itself, see
+[The WAL Archive and Replication](#the-wal-archive-and-replication).
 
 A region that can not be written to is retried `max_retries` times, `retry_delay_seconds` apart, then logged at error
 level and skipped. A failing region never fails the primary backup. Backups a region missed this way, and all the
@@ -232,6 +245,9 @@ kubidmd database verify-s3 -c /data/server.toml --region eu-west-1 --key backup-
 kubidmd database restore-s3 -c /data/server.toml --region eu-west-1 --key backup-2024-01-01T22:00:00Z.json.gz
 ```
 
+`pitr-list` and `recover` take `--region <name>` as well, to recover to a point in time from a region's copy of the WAL
+archive and of the base backups, see [The WAL Archive and Replication](#the-wal-archive-and-replication).
+
 To restore on a host whose `server.toml` has no replication section, pass the region's bucket and endpoint directly:
 `restore-s3 --bucket kubidm-backups-eu --endpoint https://... --key ...` (credentials then come from the AWS environment
 variables or the instance role, and the key is relative to the region's `path_prefix`, which has to be reproduced in
@@ -275,7 +291,8 @@ derivation and never as the cipher key itself.
   with for example `head -c 32 /dev/urandom > /etc/kubidm/backup.key` and keep it readable only by the server user.
 - `{ HttpEndpoint = { url = "https://vault.example.com/v1/kubidm-backup-key" } }`: the response body of a GET request to
   the URL is the secret (at most 64 KiB, within 30 seconds). The endpoint is called every time a backup is made or
-  restored, so it has to be reachable from the server and from the host that restores. The URL must use `https`; plain
+  restored, and with point-in-time recovery also at every WAL archive run that has segments to archive and at every
+  `recover`, so it has to be reachable from the server and from the host that restores. The URL must use `https`; plain
   `http` is only accepted for a loopback address such as a local secrets agent, because it would send the secret in the
   clear.
 
@@ -311,14 +328,19 @@ unauthenticated plain one.
 What is and is not encrypted:
 
 - The backup itself, meaning every entry, is encrypted.
+- With point-in-time recovery, every archived WAL segment is encrypted the same way, see
+  [The Encrypted WAL Archive](#the-encrypted-wal-archive).
 - The `.metadata.json` sidecar in S3 stays in plaintext. It contains only the SHA-256 checksum and size of the encrypted
   object, the upload timestamp, the compression, `encrypted = true` and the key identifier. It never contains directory
   content or the key.
-- The file names and object keys embed only the timestamp.
+- The PITR manifest `pitr-manifest.json` stays in plaintext. It contains the server UUID, CID ranges, record counts,
+  checksums, object keys and key identifiers, never directory content.
+- The file names and object keys embed only the timestamp (and, for WAL segments, the server UUID and the CID timestamp
+  of their first record).
 
 #### Restoring an Encrypted Backup
 
-`restore`, `verify-backup`, `restore-s3` and `verify-s3` decrypt transparently: they read the
+`restore`, `verify-backup`, `restore-s3`, `verify-s3` and `recover` decrypt transparently: they read the
 `[online_backup.encryption]` section of the configuration they are given, obtain the secret from its key source and open
 the artifact with it. A cold restore on a fresh host therefore needs the server configuration file and the secret it
 names: the passphrase (in `KUBIDM_BACKUP_PASSPHRASE` or in the `passphrase_file`), the key file, or access to the key
@@ -396,6 +418,12 @@ enabled = true
 # [online_backup.wal_archive.s3]
 # bucket = "kubidm-wal"
 # region = "us-east-1"
+# That location can replicate the archive to regions of its own:
+# [online_backup.wal_archive.s3.replication]
+# enabled = true
+# [[online_backup.wal_archive.s3.replication.regions]]
+# region = "eu-west-1"
+# bucket = "kubidm-wal-eu"
 ```
 
 WAL archiving requires `online_backup.enabled = true`, since recovery always starts from an online backup.
@@ -407,7 +435,8 @@ WAL archiving requires `online_backup.enabled = true`, since recovery always sta
   JSON file with a `.meta.json` sidecar that records its CID range and SHA-256.
 - **Archive location.** When `[online_backup.wal_archive.s3]` or `[online_backup.s3]` is configured, closed segments are
   uploaded under `<path_prefix>/wal/` (each with a `.metadata.json` object) and removed locally once the upload
-  succeeded. Otherwise they stay in the local WAL directory.
+  succeeded. Otherwise they stay in the local WAL directory. With [client-side encryption](#the-encrypted-wal-archive)
+  enabled, every archived segment is encrypted and named `<segment>.enc`, in S3 and in the local directory alike.
 - **Manifest.** `pitr-manifest.json`, in the archive location, indexes the base backups with their CID watermark (the
   last transaction they contain), the segments, and the gaps and abandoned history described below. It records the
   server it belongs to, and a server refuses to archive into another server's manifest: give every server its own
@@ -418,9 +447,10 @@ WAL archiving requires `online_backup.enabled = true`, since recovery always sta
   `[online_backup.wal_archive.s3]` is set, segments go to S3 but base backups stay in the local directory, so recovery
   needs that directory too.
 
-The archive task runs every `segment_interval_seconds`: it closes a segment older than that, uploads closed segments,
-updates the manifest and applies retention. A clean shutdown closes and archives the open segment, so nothing committed
-is left behind.
+The archive task runs every `segment_interval_seconds`: it closes a segment older than that, archives (encrypts,
+uploads) closed segments, updates the manifest, applies retention and
+[mirrors the archive to the replication regions](#the-wal-archive-and-replication). A clean shutdown closes and archives
+the open segment, so nothing committed is left behind.
 
 #### Retention
 
@@ -450,8 +480,10 @@ kubidmd database pitr-list -c /data/server.toml
 ```
 
 prints the base backups with their watermarks, the segments with their CID ranges and record counts (marking the
-segments still only in the local WAL directory), any gaps and abandoned history, and the recoverable window. It does not
-open the database, so it can run while the server is running. It exits non-zero when nothing is recoverable yet.
+segments still only in the local WAL directory, and the key identifier of encrypted segments), any gaps and abandoned
+history, and the recoverable window. It does not open the database, so it can run while the server is running, and it
+needs no encryption key, since the manifest is not encrypted. It exits non-zero when nothing is recoverable yet.
+`--region <name>` lists a replication region's copy instead.
 
 #### Recovering
 
@@ -470,25 +502,121 @@ docker start <container name>
 - `--target-cid <CID>` recovers up to and including the transaction with that change identifier
   (`<nanoseconds>-<server uuid>`, as the server logs it).
 - `--latest` recovers everything the archive holds.
-- `--dry-run` prints the plan (base backup, segments, number of records, resulting point) and changes nothing.
+- `--dry-run` prints the plan (base backup, segments, number of records, resulting point) and changes nothing. It reads,
+  decrypts and checks every segment the recovery would replay, so it also proves that the archive up to the target is
+  intact and that the configured key opens it.
+- `--region <name>` recovers from a replication region's copy, see
+  [The WAL Archive and Replication](#the-wal-archive-and-replication).
 
 The command reads the `[online_backup]` section of the configuration to find the archive and the base backups, so the
 same `server.toml` works on a replacement host. It uses the segments of the same server still in the local WAL directory
 that were never archived. It then:
 
-1. downloads (from S3) or opens the base backup and checks every segment against the SHA-256 the manifest recorded;
-2. restores the base backup into the configured database and replays the records after its watermark, in CID order, in
-   the same database transaction, so that a failure leaves the database untouched;
+1. reads every segment it replays, decrypts it when it is encrypted, and checks it against the SHA-256 the manifest
+   recorded;
+2. downloads (from S3) or opens the base backup, decrypts it when it is encrypted, restores it into the configured
+   database and replays the records after its watermark, in CID order, in the same database transaction, so that a
+   failure leaves the database untouched;
 3. reindexes, boots and verifies the recovered database like `verify-backup --level full`;
 4. records in the manifest that the history after the recovered point was **abandoned**.
 
 Abandoned history is never replayed again: after recovering to 10:30, the server started on the recovered database
 writes new history, and a later recovery to any point after it replays the recovered state plus the new history, never
 the transactions that were discarded. `kubidmd database restore` and `restore-s3` record abandoned history the same way
-when WAL archiving is configured.
+when WAL archiving is configured. They record it in the primary archive only: when that archive can not be reached (for
+example while restoring with `restore-s3 --region` during an outage of the primary), they restore the database but exit
+non-zero with an error saying the history could not be recorded. Prefer `recover --region` in that situation.
+
+#### The Encrypted WAL Archive
+
+A segment holds the full state of every entry the archived transactions changed, password hashes and other credentials
+included, so it needs the same protection as a backup. When `[online_backup.encryption]` is enabled, the archive task
+encrypts every closed segment with the backup encryption scheme (AES-256-GCM, a key derived with Argon2id and a fresh
+salt per segment, the configured `key_identifier` in its header) before it leaves the server's WAL bookkeeping:
+
+- With S3, the encrypted segment is uploaded as `wal/<segment>.enc`, with `encrypted = true` and the key identifier in
+  its `.metadata.json`.
+- With the local archive, it is written next to the plaintext as `<segment>.enc`, and the plaintext segment is removed
+  as soon as the manifest records the encrypted copy.
+- In the local archive, plaintext segments archived before encryption was enabled are encrypted by the next archive run.
+  Segments already uploaded to S3 stay as they were uploaded; recovery reads plain and encrypted segments alike.
+- When the key can not be obtained, nothing is archived: the closed segments stay in the WAL directory, the run is
+  logged as failed, and the next run retries. A segment is never archived in plaintext while encryption is enabled.
+
+The only plaintext copies of archived changes are the open segment, held in memory, and closed segments waiting for
+their archive run (at most `segment_interval_seconds`), both in the WAL directory next to the database, which holds the
+same data. The manifest records for every segment the key identifier it was encrypted with, and keeps the SHA-256 of the
+plaintext segment, which recovery checks after decrypting.
+
+`recover` decrypts with the `[online_backup.encryption]` section of the configuration it is given, exactly like
+`restore`; the key is only obtained when an encrypted segment or base backup is actually read. It fails, and changes
+nothing, when a segment is encrypted and encryption is not enabled, when the key can not be obtained, or when it does
+not open the segment, naming the key identifier the segment needs. A segment the manifest records as encrypted must be
+an encrypted container, so a plain object can not be swapped in for it. Base backups are encrypted by the same setting,
+so one secret recovers both. Key rotation works as for backups: keep every previous secret for as long as segments or
+base backups written with it are retained, which is at least `retention_days` and the age of the oldest base backup.
+
+#### The WAL Archive and Replication
+
+When the S3 location the archive is uploaded to has an enabled replication section (`[online_backup.s3.replication]`
+when the archive shares `[online_backup.s3]`, or `[online_backup.wal_archive.s3.replication]` for a separate location),
+every archive run mirrors the archive to every region of that section, after its own work is done:
+
+1. the segments a region misses are copied from the primary (checked against the primary's checksum; bytes and sidecar
+   unchanged, so encrypted segments stay encrypted and a region never needs the key);
+2. the region's `pitr-manifest.json` is written: the primary's manifest, plus whatever only the region still records (so
+   that a region keeps the history a primary that lost its archive no longer has);
+3. the region applies the archive retention rules to its own copy: base backups it no longer holds drop out of its
+   index, and segments older than `retention_days` that its oldest remaining base backup does not need, and that the
+   primary no longer lists, are deleted.
+
+A region that fails is logged and retried by the next run; it never fails the archiving. A new base backup is mirrored
+right after it is indexed. The base backups themselves reach the regions through the
+[backup replication](#cross-region-backup-replication), and only when they are in `[online_backup.s3]`; a region of a
+separate WAL location only has base backups when `[online_backup.s3]` replicates to a region of the same name, which
+`recover --region` requires. When the base backups are local, recovering from a region needs the local backup directory.
+Without an S3 archive location there is nothing to replicate: a local archive is never replicated. `replicate-status`
+reports the backups only, not the WAL archive; `pitr-list --region <name>` shows what a region's archive holds.
+
+`pitr-list --region <name>` and `recover --region <name>` read the copy of the archive held by the configured region of
+that name (looked up whether or not replication is still enabled), and the base backups from the same region when they
+are in S3. Only the base backups the region actually holds are used. A recovery from a region records the abandoned
+history in the region's manifest and, if it can be reached, in the primary's. When it could not be, the recovered server
+takes the abandoned history from the region into the primary archive at its first archive run that reaches both, so a
+later recovery from either location never replays it.
+
+```bash
+# The primary bucket is unavailable: recover from the eu-west-1 copy (server stopped)
+kubidmd database pitr-list -c /data/server.toml --region eu-west-1
+kubidmd database recover -c /data/server.toml --region eu-west-1 --latest
+```
 
 Base backups and segments can only be used by the server version that wrote them, like backups. In a replicated
 topology, treat a recovered node like a restored one: the other nodes must be refreshed from it.
+
+### How the Features Combine
+
+| Artifact                                  | Where                                               | Encrypted with `[online_backup.encryption]` | Replicated to regions                        | Recovered with                     |
+| ----------------------------------------- | --------------------------------------------------- | ------------------------------------------- | -------------------------------------------- | ---------------------------------- |
+| Online backup                             | `online_backup.path` and/or `[online_backup.s3]`    | yes (`.enc`)                                | S3 copy, by `[online_backup.s3.replication]` | `restore`, `restore-s3 [--region]` |
+| Manual backup (`kubidmd database backup`) | the path given                                      | yes                                         | no                                           | `restore`                          |
+| WAL segment                               | `wal/` of the archive's S3 location, or the WAL dir | yes (`.enc`)                                | when the archive's S3 location replicates    | `recover [--region]`               |
+| `pitr-manifest.json`                      | next to the segments                                | no (holds no directory content)             | with the segments                            | read by `pitr-list` and `recover`  |
+| `.metadata.json` sidecars                 | next to every S3 object                             | no (checksum, size, key identifier)         | with their object                            | checked by every download          |
+
+Every combination is supported. Things to keep in mind when combining them:
+
+- **One secret for everything.** Backups, base backups and WAL segments are encrypted with the same configured key. A
+  cold recovery on a new host needs the `server.toml` and that secret, nothing from the old host. Replicas need the same
+  secret: keep it available independently of the primary region.
+- **Verification.** `verify-backup` and `verify-s3 [--region]` prove that a (base) backup restores, decrypting it with
+  the configured key; `recover --dry-run [--region]` proves that the WAL segments up to a target are intact and decrypt.
+  Together they verify a point-in-time recovery without touching the database.
+- **Disaster recovery from a region.** With S3 backups, replication and PITR, a region holds the encrypted base backups,
+  the encrypted segments and the manifest. `recover --region <name> --target-time ...` alone rebuilds the database as of
+  any recoverable point; `restore-s3 --region <name>` restores a single backup.
+- **Retention.** `versions` applies to the backups in every location, `retention_days` to the WAL archive in every
+  location, and in every location the archive keeps the segments its oldest base backup needs.
 
 ## Verifying That a Backup Can Be Restored
 

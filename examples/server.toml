@@ -205,6 +205,9 @@ compression = "gzip"
 #   Client-side encrypted backups (see [online_backup.encryption] below) are copied as
 #   they are: a region holds the same `.enc` objects and sidecars as the primary, and
 #   restoring or verifying from a region needs the same encryption key.
+#   The WAL archive of point-in-time recovery (see [online_backup.wal_archive] below),
+#   when it is uploaded here, is mirrored to the same regions after every archive run;
+#   `pitr-list` and `recover` take `--region <name>` as well.
 #   Requires at least one region, unique region names, a bucket per region, a
 #   location (endpoint, bucket, path_prefix) per region distinct from the primary and
 #   from every other region, and a positive sync_interval_seconds when enabled.
@@ -249,7 +252,9 @@ compression = "gzip"
 #   `restore-s3` and `verify-s3` decrypt with the same settings. Keep the key outside of
 #   the server: a backup can only be restored by whoever holds it. This is independent
 #   of S3 server_side_encryption / kms_key_id, which the bucket applies at rest; replicated
-#   copies stay encrypted with this key in every region.
+#   copies stay encrypted with this key in every region. With point-in-time recovery, the
+#   archived WAL segments (which hold credentials too) are encrypted the same way
+#   ("<segment>.enc", in S3 and in local_path) and `recover` decrypts them.
 #
 # [online_backup.encryption]
 # enabled = true
@@ -278,7 +283,9 @@ compression = "gzip"
 #   database as of any moment since the oldest base backup. Requires the online backup
 #   above, whose backups are the bases (the S3 ones when [online_backup.s3] is set).
 #   Segments are uploaded to [online_backup.s3] (or [online_backup.wal_archive.s3]) or,
-#   without S3, kept in local_path. See the Backup and Restore chapter of the book.
+#   without S3, kept in local_path. They are encrypted when [online_backup.encryption] is
+#   enabled, and mirrored to the regions of the replication section of their S3 location.
+#   See the Backup and Restore chapter of the book.
 #
 # [online_backup.wal_archive]
 # enabled = true
@@ -291,3 +298,9 @@ compression = "gzip"
 # retention_days = 7
 #   Where segments are written before upload (default: "wal" next to db_path)
 # local_path = "/var/lib/private/kubidm/wal"
+#   Optional: archive to another S3 location than [online_backup.s3]. Its own
+#   [online_backup.wal_archive.s3.replication] section, if any, replicates the archive;
+#   base backups then stay in [online_backup.s3] (or online_backup.path).
+# [online_backup.wal_archive.s3]
+# bucket = "kubidm-wal"
+# region = "us-east-1"
