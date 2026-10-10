@@ -389,10 +389,10 @@ pub async fn dbscan_quarantine_id2entry_core(config: &Configuration, id: u64) ->
 
 /// Commit the change a `db-scan` command made in `be_wrtxn` outside any transaction the
 /// WAL archive could record. When WAL archiving is configured, the change is first
-/// recorded as a gap in the archive, so that point-in-time recovery never replays across
-/// it, and the gap is taken back when the commit fails. Returns false, after logging why,
-/// when the gap could not be recorded, in which case nothing is committed, or when the
-/// commit failed.
+/// handed over as a pending gap of the archive, so that point-in-time recovery never
+/// replays across it; the gap is confirmed once the commit succeeded, and taken back when
+/// it failed. Returns false, after logging why, when the gap could not be handed over, in
+/// which case nothing is committed, or when the commit failed.
 async fn commit_dbscan_change(
     config: &Configuration,
     mut be_wrtxn: BackendWriteTransaction<'_>,
@@ -417,17 +417,27 @@ async fn commit_dbscan_change(
         }
     };
     match be_wrtxn.commit() {
-        Ok(()) => true,
+        Ok(()) => {
+            if let Err(err) = pitr::confirm_offline_change(record).await {
+                // Still pending: the server records it once this process exits.
+                warn!(
+                    %err,
+                    "Unable to confirm the WAL archive gap of the change; the server records it \
+                     as an unconfirmed gap"
+                );
+            }
+            true
+        }
         Err(err) => {
             error!(
                 ?err,
                 "Failed to commit the change; the database was not changed"
             );
             if let Err(err) = pitr::withdraw_offline_change(record).await {
-                warn!(
+                error!(
                     %err,
                     "Unable to take back the WAL archive gap of the change that did not happen; \
-                     recovery stops before it until a new base backup is taken"
+                     point-in-time recovery stops before it until a new online backup is taken"
                 );
             }
             false

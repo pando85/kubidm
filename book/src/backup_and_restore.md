@@ -595,13 +595,16 @@ commands move an entry in or out of the database without a transaction the archi
 **gap**: from just after the last transaction the database committed up to the time of the command, with a reason naming
 `db-scan`. The command first makes the change in its write transaction, so that a wrong id or an entry that is not
 quarantined fails before anything is recorded; then it hands the gap over through the WAL directory (a file in
-`.handed-over-gaps/`) and commits. A commit that fails takes the gap back. A server owns the manifest, and the command
-may run next to it, so the command never writes the manifest itself: the server records the gap at its next start or
-archive run, and `recover` and `pitr-list` honour it from the WAL directory meanwhile. When the gap can not be handed
-over, the command refuses to change the database and exits non-zero, as it does when the change fails. Recovery then
-stops right before the repair, and an online backup taken after it makes later points recoverable again: take one after
-using these commands. Start the server after a repair before recovering on another host, which only sees the gaps the
-manifest records.
+`.handed-over-gaps/`, pending and locked by the command) and commits. A commit that succeeds confirms the gap; a commit
+that fails takes it back, which always works, since nobody takes a pending gap over while its command runs. A server
+owns the manifest, and the command may run next to it, so the command never writes the manifest itself: the server
+records the confirmed gap at its next start or archive run, and `recover` and `pitr-list` honour it from the WAL
+directory meanwhile. A pending gap whose command stopped without confirming or taking it back (it was killed, perhaps
+right after its commit) is recorded as well, with a warning, since the change may have happened. When the gap can not be
+handed over, the command refuses to change the database and exits non-zero, as it does when the change fails. Recovery
+then stops right before the repair, and an online backup taken after it makes later points recoverable again: take one
+after using these commands. Start the server after a repair before recovering on another host, which only sees the gaps
+the manifest records.
 
 #### Manual Backups as Recovery Bases
 

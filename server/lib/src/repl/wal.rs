@@ -64,6 +64,9 @@ pub const WAL_JOURNAL_SUFFIX: &str = ".journal";
 /// The directory, inside the WAL directory, where offline commands hand gaps over to the
 /// server, one file per gap: see [`hand_over_gap`].
 pub const WAL_HANDED_OVER_GAPS_DIR: &str = ".handed-over-gaps";
+/// Suffix of a gap handed over in [`WAL_HANDED_OVER_GAPS_DIR`] whose change is not
+/// confirmed yet: see [`HandedOverGap`].
+pub const WAL_HANDED_OVER_PENDING_SUFFIX: &str = ".pending";
 /// Fixed per record overhead assumed when measuring a segment against `segment_size_bytes`.
 const RECORD_OVERHEAD_BYTES: u64 = 96;
 /// How many closed segments that could not be written yet are kept in memory. When the
@@ -1804,27 +1807,94 @@ pub fn defer_restore(dir: &Path, restore: WalRestore) -> Result<(), WalError> {
     }
 }
 
-/// Hand `gap` to the server that archives from `dir`, for an offline command that changed
-/// the database outside the archive: one file in [`WAL_HANDED_OVER_GAPS_DIR`], which the
-/// server takes into its pending events when it starts and at every archive run, and
-/// recovery reads meanwhile. A running server rewrites its own files from memory, so the
-/// gap never goes into them. Returns the file, for [`withdraw_handed_over_gap`].
-pub fn hand_over_gap(dir: &Path, gap: &WalGap) -> Result<PathBuf, WalError> {
+/// Hand `gap` to the server that archives from `dir`, for an offline command about to
+/// change the database outside the archive: one file in [`WAL_HANDED_OVER_GAPS_DIR`],
+/// which the server takes into its pending events when it starts and at every archive run,
+/// and recovery reads meanwhile. A running server rewrites its own files from memory, so
+/// the gap never goes into them.
+///
+/// The gap is pending until the command says whether the change happened, with
+/// [`HandedOverGap::confirm`] or [`HandedOverGap::withdraw`]: the command holds a lock on
+/// it meanwhile, and the server never takes over a gap that is still locked, so a change
+/// that fails can always take its gap back. A pending gap whose command stopped without
+/// either (it was killed or crashed, perhaps after its change) is taken over as it is:
+/// recording a gap for a change that did not happen only stops recovery early, while
+/// losing the gap of a change that did happen would replay across it.
+pub fn hand_over_gap(dir: &Path, gap: &WalGap) -> Result<HandedOverGap, WalError> {
     let gaps_dir = dir.join(WAL_HANDED_OVER_GAPS_DIR);
     fs::create_dir_all(&gaps_dir)?;
+    sync_dir(dir)?;
     let name = format!(
         "gap-{}-{}.json",
         gap.from_ts.as_nanos(),
         Uuid::new_v4().simple()
     );
-    write_file_durably(&gaps_dir, &name, &serde_json::to_vec(gap)?)?;
-    sync_dir(dir)?;
-    Ok(gaps_dir.join(name))
+    let pending = gaps_dir.join(format!("{name}{WAL_HANDED_OVER_PENDING_SUFFIX}"));
+    let tmp = gaps_dir.join(format!("{name}{WAL_TMP_SUFFIX}"));
+    let written = (|| -> Result<fs::File, WalError> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        // Locked before it can be seen under its pending name, and for as long as this
+        // command runs: the lock goes with the process.
+        file.lock()?;
+        file.write_all(&serde_json::to_vec(gap)?)?;
+        file.sync_all()?;
+        fs::rename(&tmp, &pending)?;
+        sync_dir(&gaps_dir)?;
+        Ok(file)
+    })();
+    match written {
+        Ok(lock) => Ok(HandedOverGap {
+            pending,
+            confirmed: gaps_dir.join(name),
+            _lock: lock,
+        }),
+        Err(err) => {
+            let _ = fs::remove_file(&tmp);
+            Err(err)
+        }
+    }
 }
 
-/// Take back the gap [`hand_over_gap`] wrote to `path`: the change it announced did not
-/// happen.
-pub fn withdraw_handed_over_gap(path: &Path) -> Result<(), WalError> {
+/// A gap [`hand_over_gap`] handed over for a change that is about to happen, locked and
+/// pending until the change is confirmed or withdrawn.
+#[derive(Debug)]
+pub struct HandedOverGap {
+    /// The file of the gap while it is pending.
+    pending: PathBuf,
+    /// Its file once confirmed.
+    confirmed: PathBuf,
+    /// Keeps the lock on the pending file: the server leaves the gap alone while it is held.
+    _lock: fs::File,
+}
+
+impl HandedOverGap {
+    /// The file of the gap while it is pending.
+    pub fn path(&self) -> &Path {
+        &self.pending
+    }
+
+    /// The change happened: the gap is handed over for good, under its confirmed name, and
+    /// the server records it at its next start or archive run. When this fails the gap
+    /// stays pending, and is taken over as such once this process exits.
+    pub fn confirm(self) -> Result<(), WalError> {
+        fs::rename(&self.pending, &self.confirmed)?;
+        self.confirmed.parent().map_or(Ok(()), sync_dir)
+    }
+
+    /// The change did not happen: take the gap back. It is still locked, so no server took
+    /// it over; when it is gone all the same (a restore or recovery cleared the handed over
+    /// gaps meanwhile), this fails, so that the caller can say so.
+    pub fn withdraw(self) -> Result<(), WalError> {
+        fs::remove_file(&self.pending)?;
+        self.pending.parent().map_or(Ok(()), sync_dir)
+    }
+}
+
+/// Remove the handed over gap file `path`, once its gap is recorded elsewhere.
+fn remove_handed_over_gap(path: &Path) -> Result<(), WalError> {
     match fs::remove_file(path) {
         Ok(()) => path.parent().map_or(Ok(()), sync_dir),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -1832,7 +1902,30 @@ pub fn withdraw_handed_over_gap(path: &Path) -> Result<(), WalError> {
     }
 }
 
-/// The gaps handed over in `dir` (see [`hand_over_gap`]) with their files. A file that can
+/// Whether the handed over gap at `path`, pending, is abandoned: the command that handed it
+/// over no longer holds its lock, so it stopped without confirming or withdrawing it. A
+/// file that can not be opened or locked counts as abandoned, so that its gap is recorded.
+fn pending_gap_is_abandoned(path: &Path) -> bool {
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(err) => {
+            warn!(%err, path = %path.display(), "Unable to open a pending handed over WAL archive gap");
+            return true;
+        }
+    };
+    match file.try_lock() {
+        Ok(()) => true,
+        Err(fs::TryLockError::WouldBlock) => false,
+        Err(fs::TryLockError::Error(err)) => {
+            warn!(%err, path = %path.display(), "Unable to lock a pending handed over WAL archive gap");
+            true
+        }
+    }
+}
+
+/// The gaps handed over in `dir` (see [`hand_over_gap`]) with their files: the confirmed
+/// ones, and the pending ones whose command stopped without confirming or withdrawing them,
+/// which are logged. A pending gap whose command still runs is left out. A file that can
 /// not be read is a gap over all of history, since what it held is unknown.
 fn read_handed_over_gaps(dir: &Path) -> Vec<(PathBuf, WalGap)> {
     let gaps_dir = dir.join(WAL_HANDED_OVER_GAPS_DIR);
@@ -1863,7 +1956,21 @@ fn read_handed_over_gaps(dir: &Path) -> Vec<(PathBuf, WalGap)> {
                 continue;
             }
         };
-        if path.extension().is_none_or(|extension| extension != "json") {
+        let pending = path
+            .to_str()
+            .is_some_and(|path| path.ends_with(&format!(".json{WAL_HANDED_OVER_PENDING_SUFFIX}")));
+        if pending {
+            if !pending_gap_is_abandoned(&path) {
+                // Its command still runs, and may yet take it back.
+                continue;
+            }
+            warn!(
+                path = %path.display(),
+                "An offline command handed over a WAL archive gap and stopped before it said \
+                 whether its change happened; the gap is recorded, since the change may have \
+                 happened. Point-in-time recovery stops before it until a new online backup"
+            );
+        } else if path.extension().is_none_or(|extension| extension != "json") {
             // A file still being written.
             continue;
         }
@@ -1915,7 +2022,7 @@ fn adopt_handed_over_gaps(dir: &Path, pending: &mut WalPendingEvents) {
             reason = %gap.reason,
             "WAL archive gap handed over by an offline command"
         );
-        if let Err(err) = withdraw_handed_over_gap(&path) {
+        if let Err(err) = remove_handed_over_gap(&path) {
             // Taken over again by the next run: recorded twice, which changes nothing.
             warn!(%err, path = %path.display(), "Unable to remove a handed over WAL archive gap");
         }

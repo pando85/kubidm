@@ -23,8 +23,7 @@ use kubidm_proto::backup::{PitrBaseBackup, PitrManifest};
 use kubidmd_lib::be::BackupStructuralReport;
 use kubidmd_lib::prelude::duration_from_epoch_now;
 use kubidmd_lib::repl::wal::{
-    format_ts_rfc3339, hand_over_gap, withdraw_handed_over_gap, write_file_durably, WalGap,
-    WalGapReason,
+    format_ts_rfc3339, hand_over_gap, write_file_durably, HandedOverGap, WalGap, WalGapReason,
 };
 
 use super::{blocking, BaseLocation, PitrError, PitrSettings};
@@ -36,11 +35,12 @@ use crate::config::Configuration;
 pub const HANDED_OVER_BASES_DIR: &str = ".handed-over-bases";
 
 /// Where [`note_offline_change`] recorded the gap of an offline change.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum OfflineChangeRecord {
-    /// In this file of the WAL directory, for the server to record at its next start or
-    /// archive run. Recovery honours it from there meanwhile.
-    HandedOver(PathBuf),
+    /// In the WAL directory, pending until [`confirm_offline_change`] or
+    /// [`withdraw_offline_change`], for the server to record at its next start or archive
+    /// run once confirmed. Recovery honours it from there meanwhile.
+    HandedOver(HandedOverGap),
     /// Nowhere: WAL archiving is not configured.
     NotConfigured,
 }
@@ -68,8 +68,8 @@ fn offline_change_gap(db_ts_max: Duration, now: Duration) -> WalGap {
 /// manifest: a server running next to the command owns the manifest, and a read, modify
 /// and write of it here could undo a save of the server's. The server records it at its
 /// next start or archive run, and `recover` honours it meanwhile. Fails when the gap could
-/// not be handed over; the caller must then leave the database alone. When the change
-/// then does not happen after all, take the gap back with [`withdraw_offline_change`].
+/// not be handed over; the caller must then leave the database alone. Once the change happened, confirm it with [`confirm_offline_change`];
+/// when it does not happen after all, take the gap back with [`withdraw_offline_change`].
 pub async fn note_offline_change(
     config: &Configuration,
     db_ts_max: Duration,
@@ -93,7 +93,7 @@ pub(super) async fn record_offline_change(
     command: &str,
 ) -> Result<OfflineChangeRecord, PitrError> {
     let local_dir = settings.local_dir.clone();
-    let path = blocking(move || Ok(hand_over_gap(&local_dir, &gap)?)).await?;
+    let handed_over = blocking(move || Ok(hand_over_gap(&local_dir, &gap)?)).await?;
     warn!(
         command,
         from = %format_ts_rfc3339(gap.from_ts),
@@ -102,15 +102,25 @@ pub(super) async fn record_offline_change(
         "Gap handed to the server: point-in-time recovery does not replay across this change; \
          take an online backup after starting the server"
     );
-    Ok(OfflineChangeRecord::HandedOver(path))
+    Ok(OfflineChangeRecord::HandedOver(handed_over))
 }
 
-/// The change [`note_offline_change`] recorded did not happen: take its gap back.
+/// The change [`note_offline_change`] recorded happened: hand its gap over for good. When
+/// this fails, the gap stays pending and the server records it all the same once this
+/// process exits, since a pending gap nobody holds may be one of a change that happened.
+pub async fn confirm_offline_change(record: OfflineChangeRecord) -> Result<(), PitrError> {
+    match record {
+        OfflineChangeRecord::HandedOver(gap) => blocking(move || Ok(gap.confirm()?)).await,
+        OfflineChangeRecord::NotConfigured => Ok(()),
+    }
+}
+
+/// The change [`note_offline_change`] recorded did not happen: take its gap back. No
+/// server took it over meanwhile, since it was pending; this fails when it is gone all the
+/// same.
 pub async fn withdraw_offline_change(record: OfflineChangeRecord) -> Result<(), PitrError> {
     match record {
-        OfflineChangeRecord::HandedOver(path) => {
-            blocking(move || Ok(withdraw_handed_over_gap(&path)?)).await
-        }
+        OfflineChangeRecord::HandedOver(gap) => blocking(move || Ok(gap.withdraw()?)).await,
         OfflineChangeRecord::NotConfigured => Ok(()),
     }
 }
@@ -319,6 +329,7 @@ mod tests {
     };
     use kubidmd_lib::repl::wal::{
         read_local_events, read_pending_events, segment_file_name, WalArchiver,
+        WAL_HANDED_OVER_GAPS_DIR,
     };
     use uuid::Uuid;
 
@@ -401,6 +412,9 @@ mod tests {
             saved,
             "the manifest is the server's"
         );
+        // Pending while the command runs: nobody takes it over yet.
+        assert!(read_local_events(&settings.local_dir).gaps.is_empty());
+        confirm_offline_change(record).await.unwrap();
         let events = read_local_events(&settings.local_dir);
         assert_eq!(events.gaps, vec![gap]);
         assert_eq!(
@@ -414,20 +428,9 @@ mod tests {
         fold_local_events(&mut manifest, &events, Duration::from_secs(400));
         assert_change_blocks_recovery(&manifest);
 
-        // A change that did not happen takes its gap back.
-        let withdrawn = record_offline_change(
-            &settings,
-            offline_change_gap(Duration::from_secs(300), Duration::from_secs(350)),
-            "db-scan restore-quarantined",
-        )
-        .await
-        .unwrap();
-        assert_eq!(read_local_events(&settings.local_dir).gaps.len(), 2);
-        withdraw_offline_change(withdrawn).await.unwrap();
-        assert_eq!(read_local_events(&settings.local_dir).gaps, vec![gap]);
-
-        // The server takes it over into its own pending events when it starts.
-        let archiver = WalArchiver::open(
+        // The server takes the confirmed gap over into its own pending events when it
+        // starts, and at every archive run.
+        let mut archiver = WalArchiver::open(
             settings.wal.clone(),
             Uuid::nil(),
             settings.local_dir.clone(),
@@ -437,6 +440,56 @@ mod tests {
         assert_eq!(archiver.pending_events().gaps, vec![gap]);
         assert_eq!(read_pending_events(&settings.local_dir).gaps, vec![gap]);
         assert_eq!(read_local_events(&settings.local_dir).gaps, vec![gap]);
+
+        // A change that fails next to the running server: its archive run does not take
+        // the pending gap over, so the change takes it back, and nothing records it.
+        let withdrawn = record_offline_change(
+            &settings,
+            offline_change_gap(Duration::from_secs(300), Duration::from_secs(350)),
+            "db-scan restore-quarantined",
+        )
+        .await
+        .unwrap();
+        archiver.adopt_handed_over_gaps();
+        assert_eq!(archiver.pending_events().gaps, vec![gap]);
+        withdraw_offline_change(withdrawn).await.unwrap();
+        archiver.adopt_handed_over_gaps();
+        assert_eq!(archiver.pending_events().gaps, vec![gap]);
+        assert_eq!(read_local_events(&settings.local_dir).gaps, vec![gap]);
+    }
+
+    /// A command that stopped after it handed its gap over, without saying whether its
+    /// change happened (it was killed, perhaps right after its commit): the gap is
+    /// recorded, since losing the gap of a change that happened would let recovery replay
+    /// across it.
+    #[tokio::test]
+    async fn test_offline_change_whose_command_stopped_keeps_its_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = settings(dir.path());
+        fs::create_dir_all(&settings.local_dir).unwrap();
+        let gap = offline_change_gap(Duration::from_secs(200), Duration::from_secs(300));
+        let record = record_offline_change(&settings, gap, "db-scan quarantine-id2entry")
+            .await
+            .unwrap();
+        assert!(read_local_events(&settings.local_dir).gaps.is_empty());
+        // What the exit of the process does: the lock goes, the pending file stays.
+        drop(record);
+        assert_eq!(read_local_events(&settings.local_dir).gaps, vec![gap]);
+        let archiver = WalArchiver::open(
+            settings.wal.clone(),
+            Uuid::nil(),
+            settings.local_dir.clone(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(archiver.pending_events().gaps, vec![gap]);
+        assert!(
+            fs::read_dir(settings.local_dir.join(WAL_HANDED_OVER_GAPS_DIR))
+                .unwrap()
+                .next()
+                .is_none(),
+            "the server took the gap over"
+        );
     }
 
     #[tokio::test]
@@ -444,12 +497,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let settings = settings(dir.path());
         let gap = offline_change_gap(Duration::from_secs(200), Duration::from_secs(300));
-        assert!(matches!(
-            record_offline_change(&settings, gap, "db-scan quarantine-id2entry")
-                .await
-                .unwrap(),
-            OfflineChangeRecord::HandedOver(_)
-        ));
+        let record = record_offline_change(&settings, gap, "db-scan quarantine-id2entry")
+            .await
+            .unwrap();
+        assert!(matches!(record, OfflineChangeRecord::HandedOver(_)));
+        confirm_offline_change(record).await.unwrap();
         assert_eq!(read_local_events(&settings.local_dir).gaps.len(), 1);
     }
 
