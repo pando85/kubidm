@@ -1935,7 +1935,8 @@ impl Entry<EntrySealed, EntryCommitted> {
 
     /// Load a stored entry. On failure the returned error carries the row id and the
     /// uuid and name recovered from the raw attributes, and names the attribute that
-    /// could not be loaded, so that the entry can be identified by an operator.
+    /// could not be loaded, so that the entry can be identified by an operator. The caller
+    /// logs it, with what it was doing.
     pub fn from_dbentry(db_e: DbEntry, id: u64) -> Result<Self, Box<DbEntryLoadError>> {
         // Recover the identity of the entry up front so that any failure below can be
         // reported against it. Only identifiers are taken, never attribute values.
@@ -1958,14 +1959,6 @@ impl Entry<EntrySealed, EntryCommitted> {
                             r_attrs.insert(k, vs);
                         }
                         Err(error) => {
-                            error!(
-                                entry_id = id,
-                                ?entry_uuid,
-                                ?entry_name,
-                                attribute = %k,
-                                ?error,
-                                "from_dbentry failed: stored value set could not be loaded"
-                            );
                             return Err(Box::new(DbEntryLoadError {
                                 entry_id: id,
                                 entry_uuid,
@@ -1987,12 +1980,6 @@ impl Entry<EntrySealed, EntryCommitted> {
             .get(&Attribute::Uuid)
             .and_then(|vs| vs.to_uuid_single())
         else {
-            error!(
-                entry_id = id,
-                ?entry_uuid,
-                ?entry_name,
-                "from_dbentry failed: entry has no valid uuid"
-            );
             return Err(Box::new(DbEntryLoadError {
                 entry_id: id,
                 entry_uuid,

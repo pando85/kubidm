@@ -19,7 +19,10 @@ use crate::{
             ReplicationUpdateVector, ReplicationUpdateVectorReadTransaction,
             ReplicationUpdateVectorTransaction, ReplicationUpdateVectorWriteTransaction,
         },
-        wal::{WalArchiver, WalEntryRecord, WalOperationRecord, WalPendingOp},
+        wal::{
+            lock_archiver, write_closed_segments, WalArchiver, WalEntryRecord, WalOperationRecord,
+            WalPendingOp,
+        },
     },
     utils::trigraph_iter,
     value::{IndexType, Value},
@@ -36,7 +39,7 @@ use std::{
     io::prelude::*,
     ops::DerefMut,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, MutexGuard},
     time::Duration,
 };
 use tracing::{trace, trace_span};
@@ -285,7 +288,7 @@ impl BackendConfig {
     }
 
     /// Enable WAL archiving with `wal_archive`. Segments are written to its `local_path`,
-    /// or to `wal` next to the database file when that is unset.
+    /// which must be set.
     pub fn with_wal_archive(mut self, wal_archive: Option<WalArchiveConfig>) -> Self {
         self.wal_archive = wal_archive;
         self
@@ -302,26 +305,17 @@ impl BackendConfig {
         }
     }
 
-    /// The directory WAL segments are written to when archiving is enabled.
+    /// The directory WAL segments are written to when archiving is enabled. The caller
+    /// resolves it (the server core derives the default from the database path), so that
+    /// there is one place that does.
     fn wal_segments_path(&self) -> Result<Option<PathBuf>, OperationError> {
         let Some(wal_archive) = self.wal_archive.as_ref().filter(|w| w.enabled) else {
             return Ok(None);
         };
-        if let Some(local_path) = &wal_archive.local_path {
-            return Ok(Some(local_path.clone()));
-        }
-        if self.path.as_os_str().is_empty() {
-            error!(
-                "WAL archiving is enabled on an in-memory database without wal_archive.local_path"
-            );
-            return Err(OperationError::InvalidState);
-        }
-        match self.path.parent() {
-            Some(parent) => Ok(Some(parent.join("wal"))),
+        match &wal_archive.local_path {
+            Some(local_path) => Ok(Some(local_path.clone())),
             None => {
-                error!(
-                    "WAL archiving is enabled but the database path has no parent directory and wal_archive.local_path is unset"
-                );
+                error!("WAL archiving is enabled without a WAL directory (wal_archive.local_path)");
                 Err(OperationError::InvalidState)
             }
         }
@@ -331,16 +325,19 @@ impl BackendConfig {
 /// The archiver shared by the backend and the server core's upload task.
 pub type SharedWalArchiver = Arc<Mutex<WalArchiver>>;
 
+/// Lock `archiver`, see [`lock_archiver`].
+pub fn lock_wal(archiver: &SharedWalArchiver) -> MutexGuard<'_, WalArchiver> {
+    lock_archiver(archiver)
+}
+
 /// What [`BackendWriteTransaction::wal_apply`] did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WalApplyReport {
-    /// Records applied, including truncations.
+    /// Records applied.
     pub applied: usize,
     pub created: usize,
     pub modified: usize,
     pub deleted: usize,
-    /// Whether a truncation record removed every entry of the base backup.
-    pub truncated: bool,
     /// The CID of the last record applied: the point the database now represents.
     pub last_cid: Option<Cid>,
 }
@@ -385,6 +382,8 @@ pub struct BackendWriteTransaction<'a> {
     wal_pending: BTreeMap<u64, WalPendingOp>,
     /// Whether this transaction removed every entry before writing `wal_pending`.
     wal_truncate: bool,
+    /// The server uuid this transaction gave the database, when it changed it.
+    wal_server_uuid: Option<Uuid>,
     /// The CID the archived records are tagged with. Set by the operations that carry a
     /// CID and, authoritatively, by the query server at commit.
     wal_cid: Option<Cid>,
@@ -2324,6 +2323,7 @@ impl<'a> BackendWriteTransaction<'a> {
             wal,
             wal_pending,
             wal_truncate,
+            wal_server_uuid,
             wal_cid,
             wal_stage_failed,
         } = self;
@@ -2342,7 +2342,14 @@ impl<'a> BackendWriteTransaction<'a> {
         // what is lost is the ability to recover this transaction from the archive until
         // the next base backup covers it.
         if let Some(wal) = wal {
-            Self::wal_archive_committed(&wal, wal_cid, wal_truncate, wal_pending, wal_stage_failed);
+            Self::wal_archive_committed(
+                &wal,
+                wal_cid.as_ref(),
+                wal_truncate,
+                wal_server_uuid,
+                wal_pending,
+                wal_stage_failed,
+            );
         }
 
         Ok(())
@@ -2350,49 +2357,54 @@ impl<'a> BackendWriteTransaction<'a> {
 
     fn wal_archive_committed(
         wal: &SharedWalArchiver,
-        wal_cid: Option<Cid>,
+        wal_cid: Option<&Cid>,
         wal_truncate: bool,
+        wal_server_uuid: Option<Uuid>,
         wal_pending: BTreeMap<u64, WalPendingOp>,
         wal_stage_failed: bool,
     ) {
-        if wal_pending.is_empty() && !wal_truncate && !wal_stage_failed {
+        if wal_pending.is_empty() && !wal_truncate && !wal_stage_failed && wal_server_uuid.is_none()
+        {
             return;
         }
 
-        let mut archiver = wal.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        {
+            let mut archiver = lock_wal(wal);
 
-        if wal_stage_failed {
-            archiver.note_failure(wal_cid.as_ref().map(|cid| cid.ts));
-            error!(
-                "WAL ARCHIVE HOLE: a committed transaction could not be fully recorded; \
-                 point-in-time recovery can not reproduce it. Take a new base backup."
-            );
-        }
+            // The records of this transaction already belong to the new identity.
+            if let Some(server_uuid) = wal_server_uuid {
+                archiver.change_server_uuid(server_uuid, wal_cid.map(|cid| cid.ts));
+            }
 
-        let Some(cid) = wal_cid else {
-            archiver.note_failure(None);
-            error!(
-                records = wal_pending.len(),
-                "WAL ARCHIVE HOLE: a committed transaction carried no CID and its records were \
-                 dropped; point-in-time recovery can not reproduce it. Take a new base backup."
-            );
-            return;
-        };
-
-        let record_count = wal_pending.len();
-        match archiver.append_transaction(&cid, wal_truncate, wal_pending) {
-            Ok(_) => trace!(%cid, records = record_count, "WAL records archived"),
-            Err(err) => {
-                archiver.note_failure(Some(cid.ts));
+            if wal_stage_failed {
+                archiver.note_failure(wal_cid.map(|cid| cid.ts));
                 error!(
-                    ?err,
-                    %cid,
-                    records = record_count,
-                    failures = archiver.stats().failures,
-                    "WAL ARCHIVE HOLE: unable to archive a committed transaction; point-in-time \
-                     recovery can not reproduce it. Take a new base backup."
+                    "WAL ARCHIVE HOLE: a committed transaction could not be fully recorded; \
+                     point-in-time recovery can not reproduce it. Take a new base backup."
                 );
             }
+
+            let Some(cid) = wal_cid else {
+                archiver.note_failure(None);
+                error!(
+                    records = wal_pending.len(),
+                    "WAL ARCHIVE HOLE: a committed transaction carried no CID and its records \
+                     were dropped; point-in-time recovery can not reproduce it. Take a new base \
+                     backup."
+                );
+                return;
+            };
+
+            let record_count = wal_pending.len();
+            archiver.stage_transaction(cid, wal_truncate, wal_pending);
+            trace!(%cid, records = record_count, "WAL records archived");
+        }
+
+        // A segment this transaction closed is compressed and written without the archiver
+        // lock, so that the archive task is never held up by it. A failure is logged and
+        // retried; the records stay in memory meanwhile.
+        if let Some(cid) = wal_cid {
+            let _ = write_closed_segments(wal, cid.ts, false);
         }
     }
 
@@ -2478,44 +2490,52 @@ impl<'a> BackendWriteTransaction<'a> {
     /// start, exactly as after a restore.
     pub fn wal_apply(
         &mut self,
-        records: &[WalEntryRecord],
+        mut records: Vec<WalEntryRecord>,
     ) -> Result<WalApplyReport, OperationError> {
-        let mut ordered: Vec<&WalEntryRecord> = records.iter().collect();
-        ordered.sort_by_key(|record| (record.cid_ts, record.entry_id));
+        records.sort_by_key(|record| (record.cid_ts, record.entry_id));
 
-        // The ids the restored database assigned to each entry.
-        let existing = self
-            .get_idlayer()
-            .get_identry(&IdList::AllIds)
-            .map_err(|e| {
-                admin_error!(?e, "get_identry failed");
-                e
-            })?;
-        let mut uuid_to_id: BTreeMap<Uuid, u64> = existing
-            .iter()
-            .map(|e| (e.get_uuid(), e.get_id()))
-            .collect();
+        // The ids the restored database assigned to each entry, read from the raw rows
+        // without loading every entry.
+        let mut uuid_to_id: BTreeMap<Uuid, u64> = BTreeMap::new();
+        let mut id_max_in_use = 0;
+        for raw in self.get_idlayer().get_identry_raw(&IdList::AllIds)? {
+            let entry_uuid = serde_json::from_slice::<DbEntry>(&raw.data)
+                .ok()
+                .and_then(|entry| entry.stored_uuid())
+                .ok_or_else(|| {
+                    admin_error!(entry_id = raw.id, "Restored entry has no readable uuid");
+                    OperationError::CorruptedEntry(raw.id)
+                })?;
+            uuid_to_id.insert(entry_uuid, raw.id);
+            id_max_in_use = id_max_in_use.max(raw.id);
+        }
 
         let mut report = WalApplyReport::default();
         // The final state of every entry the records touch: Some(bytes) to write, None to
-        // remove. A truncation drops everything staged before it.
+        // remove.
         let mut final_state: BTreeMap<Uuid, Option<Vec<u8>>> = BTreeMap::new();
 
-        for record in ordered {
-            match &record.operation {
+        for record in records {
+            report.last_cid = Some(record.cid());
+            match record.operation {
                 WalOperationRecord::Truncate => {
-                    self.get_ruv().clear();
-                    self.get_idlayer().danger_purge_id2entry()?;
-                    uuid_to_id.clear();
-                    final_state.clear();
-                    report.truncated = true;
+                    // A replication refresh: it also replaced the domain and server uuids
+                    // and the key material, which the archive does not hold. Replaying the
+                    // entries alone would mix the refreshed directory with the identity of
+                    // the base, so recovery needs a base taken after the refresh.
+                    admin_error!(
+                        cid = ?report.last_cid,
+                        "The WAL records include a replication refresh; recovery can not \
+                         replay across it. Recover from a base backup taken after it."
+                    );
+                    return Err(OperationError::InvalidState);
                 }
                 WalOperationRecord::Create { entry_data } => {
-                    final_state.insert(record.entry_uuid, Some(entry_data.clone()));
+                    final_state.insert(record.entry_uuid, Some(entry_data));
                     report.created += 1;
                 }
                 WalOperationRecord::Modify { entry_data } => {
-                    final_state.insert(record.entry_uuid, Some(entry_data.clone()));
+                    final_state.insert(record.entry_uuid, Some(entry_data));
                     report.modified += 1;
                 }
                 WalOperationRecord::Delete => {
@@ -2524,18 +2544,12 @@ impl<'a> BackendWriteTransaction<'a> {
                 }
             }
             report.applied += 1;
-            report.last_cid = Some(record.cid());
         }
 
         // The cached maximum id is not refreshed by a raw restore in the same transaction,
         // so take the highest id actually in use as well.
         let id_max_cached = self.get_idlayer().get_id2entry_max_id()?;
-        let mut id_max = existing
-            .iter()
-            .map(|e| e.get_id())
-            .max()
-            .unwrap_or(0)
-            .max(id_max_cached);
+        let mut id_max = id_max_in_use.max(id_max_cached);
         let mut writes: Vec<IdRawEntry> = Vec::new();
         let mut deletes: Vec<u64> = Vec::new();
 
@@ -2614,6 +2628,10 @@ impl<'a> BackendWriteTransaction<'a> {
             error!(?err, "Unable to persist server uuid");
             err
         })?;
+        // The archive learns about the new identity when this transaction commits.
+        if self.wal.is_some() {
+            self.wal_server_uuid = Some(nsid);
+        }
         Ok(nsid)
     }
     pub fn get_db_s_uuid(&mut self) -> Result<Uuid, OperationError> {
@@ -2815,6 +2833,7 @@ impl Backend {
             wal: self.wal.clone(),
             wal_pending: BTreeMap::new(),
             wal_truncate: false,
+            wal_server_uuid: None,
             wal_cid: None,
             wal_stage_failed: false,
         })
@@ -4710,6 +4729,53 @@ mod tests {
     }
 
     #[test]
+    fn test_be_wal_server_uuid_change_starts_a_new_identity_in_the_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let be = wal_backend(dir.path(), 1024 * 1024);
+        let archiver = be.wal_archiver().expect("WAL archiving must be enabled");
+        let old_uuid = archiver.lock().unwrap().server_uuid();
+
+        // A write under the old identity, still in the open segment.
+        let mut be_txn = be.write().unwrap();
+        be_txn
+            .create(
+                &CID_ZERO,
+                vec![
+                    wal_test_entry("william", "db237e8a-0079-4b8c-8a56-593b22aa44d1")
+                        .into_sealed_new(),
+                ],
+            )
+            .unwrap();
+        be_txn.commit().unwrap();
+
+        // A refresh resets the server uuid. Until the commit the archive knows nothing.
+        let mut be_txn = be.write().unwrap();
+        let new_uuid = be_txn.reset_db_s_uuid().unwrap();
+        be_txn.set_wal_cid(&CID_TWO);
+        assert_eq!(archiver.lock().unwrap().server_uuid(), old_uuid);
+        be_txn.commit().unwrap();
+
+        // The segment of the old identity is closed under it, the archiver goes on under
+        // the new one, and the change waits on disk for the archive index.
+        let archiver = archiver.lock().unwrap();
+        assert_eq!(archiver.server_uuid(), new_uuid);
+        assert!(!archiver.has_pending_records());
+        let segments = crate::repl::wal::list_segments(&dir.path().join("wal")).unwrap();
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].server_uuid, old_uuid);
+        let changes =
+            crate::repl::wal::read_pending_events(&dir.path().join("wal")).server_uuid_changes;
+        assert_eq!(
+            changes,
+            vec![crate::repl::wal::WalServerUuidChange {
+                from: old_uuid,
+                to: new_uuid,
+                at_ts: CID_TWO.ts,
+            }]
+        );
+    }
+
+    #[test]
     fn test_be_wal_records_committed_writes_and_deletes() {
         let dir = tempfile::tempdir().unwrap();
         let be = wal_backend(dir.path(), 1024 * 1024);
@@ -5000,9 +5066,19 @@ mod tests {
         .cloned()
         .collect();
         assert_eq!(to_apply.len(), 4);
+        // A restore numbers the entries afresh, here exactly as the source did. Make the
+        // ids the records carry differ from the restored ones, so that only a replay that
+        // resolves entries by uuid passes.
+        let to_apply: Vec<WalEntryRecord> = to_apply
+            .into_iter()
+            .map(|mut record| {
+                record.entry_id += 100;
+                record
+            })
+            .collect();
 
-        // Recover: restore the base into a fresh backend (which renumbers the ids), apply
-        // the records, reindex, and compare with the live state.
+        // Recover: restore the base into a fresh backend, apply the records, reindex, and
+        // compare with the live state.
         sketching::test_init();
         let recovered =
             Backend::new(BackendConfig::new_test("main"), wal_test_idxmeta(), false).unwrap();
@@ -5011,12 +5087,11 @@ mod tests {
         rec_txn
             .restore(&mut backup, BackupCompression::NoCompression)
             .unwrap();
-        let report = rec_txn.wal_apply(&to_apply).unwrap();
+        let report = rec_txn.wal_apply(to_apply.clone()).unwrap();
         assert_eq!(report.applied, 4);
         assert_eq!(report.created, 1);
         assert_eq!(report.modified, 2);
         assert_eq!(report.deleted, 1);
-        assert!(!report.truncated);
         assert_eq!(report.last_cid, Some(CID_ADV.clone()));
         assert_eq!(
             rec_txn.get_db_ts_max(Duration::ZERO).unwrap(),
@@ -5054,14 +5129,15 @@ mod tests {
         assert!(rec_txn.verify().is_empty());
 
         // Applying the same records again is a no-op in state terms.
-        let report = rec_txn.wal_apply(&to_apply).unwrap();
+        let report = rec_txn.wal_apply(to_apply.clone()).unwrap();
         assert_eq!(report.applied, 4);
         rec_txn.reindex(false).unwrap();
         assert!(entry_exists!(rec_txn, e3));
         assert!(!entry_exists!(rec_txn, e1));
         rec_txn.commit().unwrap();
 
-        // A truncate record wipes the base before the records that follow it.
+        // A truncate record is a replication refresh, which also replaced the identity of
+        // the database: it is refused, and nothing is applied.
         let mut rec_txn = recovered.write().unwrap();
         let truncate_then_create = vec![
             WalEntryRecord {
@@ -5081,12 +5157,15 @@ mod tests {
                 },
             },
         ];
-        let report = rec_txn.wal_apply(&truncate_then_create).unwrap();
-        assert!(report.truncated);
+        assert_eq!(
+            rec_txn.wal_apply(truncate_then_create),
+            Err(OperationError::InvalidState)
+        );
+        drop(rec_txn);
+        let mut rec_txn = recovered.write().unwrap();
         rec_txn.reindex(false).unwrap();
-        assert!(entry_exists!(rec_txn, e1));
-        assert!(!entry_exists!(rec_txn, e2));
-        assert!(!entry_exists!(rec_txn, e3));
+        assert!(entry_exists!(rec_txn, e2));
+        assert!(entry_exists!(rec_txn, e3));
         rec_txn.commit().unwrap();
 
         // Bytes that are not an entry are rejected before anything is written.
@@ -5100,6 +5179,6 @@ mod tests {
                 entry_data: b"garbage".to_vec(),
             },
         }];
-        assert!(rec_txn.wal_apply(&garbage).is_err());
+        assert!(rec_txn.wal_apply(garbage).is_err());
     }
 }

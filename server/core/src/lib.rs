@@ -51,7 +51,7 @@ pub use crate::backup::{
 };
 pub(crate) use crate::backup::{
     cli::{fetch_s3_backup, FetchedS3Backup},
-    restore::restore_and_replay,
+    restore::{restore_and_replay_commit, CommittedRestore},
 };
 use crate::{
     actors::{QueryServerReadV1, QueryServerWriteV1},

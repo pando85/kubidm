@@ -19,7 +19,6 @@ use kubidm_proto::{
 };
 use kubidmd_lib::{
     be::{verify_backup_structure, BackendTransaction, BackupStructuralReport},
-    prelude::*,
     schema::Schema,
 };
 use time::format_description::well_known::Rfc3339;
@@ -27,7 +26,9 @@ use time::format_description::well_known::Rfc3339;
 use super::{
     backup_identity, backup_name_timestamp, compare_backup_names, is_backup_artifact_name,
     lag_metrics_from_health, open_backup_file_with_config, pitr, region_is_healthy,
-    restore::{backup_encryption_config, restore_and_replay, restore_database},
+    restore::{
+        backup_encryption_config, restore_and_replay_commit, restore_database, RestoreOutcome,
+    },
     run_blocking, s3_location, seal_backup_async, verify_backup_output_async,
     write_verified_local_backup_async, BackupEncryptor, BackupVerifyError, S3BackupError,
     S3ClientWrapper,
@@ -264,20 +265,28 @@ impl RestoreStatus {
 }
 
 /// Restore the backup at `dst_path` into the database described by `config`, the
-/// `database restore` command. Fails when the database was not restored.
+/// `database restore` command. Fails when the database was not restored, or when it was
+/// restored but could not be reindexed, which the error log reports as a changed database.
 pub async fn restore_server_core(
     config: &Configuration,
     dst_path: &Path,
 ) -> Result<RestoreStatus, OperationError> {
-    let outcome = restore_and_replay(config, dst_path, &[]).await?;
-    Ok(note_restore_in_wal_archive(config, outcome.watermark).await)
+    let committed = restore_and_replay_commit(config, dst_path, Vec::new()).await?;
+    // The database holds the backup from here on, so the history after it is abandoned
+    // whatever happens next.
+    let status = note_restore_in_wal_archive(config, &committed.outcome).await;
+    committed.reindex(config).await?;
+    Ok(status)
 }
 
 /// After a restore of the configured database, record in the WAL archive (when one is
 /// configured) that the history after the restored backup was abandoned, so that a later
 /// point-in-time recovery never replays it.
-async fn note_restore_in_wal_archive(config: &Configuration, watermark: Duration) -> RestoreStatus {
-    match pitr::note_restore(config, watermark).await {
+async fn note_restore_in_wal_archive(
+    config: &Configuration,
+    outcome: &RestoreOutcome,
+) -> RestoreStatus {
+    match pitr::note_restore(config, outcome.watermark, outcome.server_uuid).await {
         Ok(()) => RestoreStatus::Complete,
         Err(err) => {
             error!(
@@ -593,11 +602,15 @@ pub async fn restore_s3_database(
         fetched.metadata.size_bytes, fetched.metadata.checksum_sha256
     );
 
-    let outcome = restore_and_replay(config, &fetched.path, &[]).await?;
+    let committed = restore_and_replay_commit(config, &fetched.path, Vec::new()).await?;
     // Remove the downloaded artifact.
     drop(fetched);
 
-    Ok(note_restore_in_wal_archive(config, outcome.watermark).await)
+    // The database holds the backup from here on, so the history after it is abandoned
+    // whatever happens next.
+    let status = note_restore_in_wal_archive(config, &committed.outcome).await;
+    committed.reindex(config).await?;
+    Ok(status)
 }
 
 /// Verify the backup stored under `key` in S3. The SHA-256 of the stored object is checked

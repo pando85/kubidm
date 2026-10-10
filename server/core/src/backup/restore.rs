@@ -4,7 +4,12 @@
 use std::path::Path;
 
 use kubidm_proto::{backup::BackupEncryptionConfig, internal::OperationError};
-use kubidmd_lib::{be::WalApplyReport, prelude::*, repl::wal::WalEntryRecord, schema::Schema};
+use kubidmd_lib::{
+    be::{Backend, WalApplyReport},
+    prelude::*,
+    repl::wal::WalEntryRecord,
+    schema::Schema,
+};
 
 use super::open_backup_file_with_config;
 use crate::{config::Configuration, reindex_inner, setup_backend, utils::touch_file_or_quit};
@@ -26,13 +31,17 @@ pub async fn restore_database(
     config: &Configuration,
     src_path: &Path,
 ) -> Result<(), OperationError> {
-    restore_and_replay(config, src_path, &[]).await.map(|_| ())
+    restore_and_replay(config, src_path, Vec::new())
+        .await
+        .map(|_| ())
 }
 
 /// What [`restore_and_replay`] did.
 pub(crate) struct RestoreOutcome {
     /// The CID watermark of the restored backup.
     pub watermark: Duration,
+    /// The server uuid the restored database carries.
+    pub server_uuid: Uuid,
     /// The WAL records applied on top of it, if any were given.
     pub apply: Option<WalApplyReport>,
 }
@@ -43,8 +52,49 @@ pub(crate) struct RestoreOutcome {
 pub(crate) async fn restore_and_replay(
     config: &Configuration,
     src_path: &Path,
-    records: &[WalEntryRecord],
+    records: Vec<WalEntryRecord>,
 ) -> Result<RestoreOutcome, OperationError> {
+    restore_and_replay_commit(config, src_path, records)
+        .await?
+        .reindex(config)
+        .await
+}
+
+/// A database [`restore_and_replay_commit`] restored and committed, not reindexed yet.
+pub(crate) struct CommittedRestore {
+    pub outcome: RestoreOutcome,
+    be: Backend,
+    schema: Schema,
+}
+
+impl CommittedRestore {
+    /// Reindex the restored database, the last step of a restore. A failure leaves the
+    /// restored content in place: the database is no longer what it was before.
+    pub(crate) async fn reindex(
+        self,
+        config: &Configuration,
+    ) -> Result<RestoreOutcome, OperationError> {
+        reindex_inner(self.be, self.schema, config)
+            .await
+            .inspect_err(|err| {
+                error!(
+                    ?err,
+                    "The database WAS restored, but reindexing it failed; run \
+                     `kubidmd database reindex` before starting the server"
+                );
+            })?;
+        Ok(self.outcome)
+    }
+}
+
+/// [`restore_and_replay`] up to the commit: the caller learns whether the database was
+/// changed, and reindexes it with [`CommittedRestore::reindex`]. A failure leaves the
+/// database as it was.
+pub(crate) async fn restore_and_replay_commit(
+    config: &Configuration,
+    src_path: &Path,
+    records: Vec<WalEntryRecord>,
+) -> Result<CommittedRestore, OperationError> {
     // The artifact is opened before the database is touched, so that a backup that can
     // not be read (missing, or encrypted with a key this configuration does not have)
     // leaves the target database as it was. An encrypted artifact is decrypted with the
@@ -87,6 +137,7 @@ pub(crate) async fn restore_and_replay(
             error!(?err, "Failed to restore database");
         })?;
     let watermark = be_wr_txn.get_db_ts_max(Duration::ZERO)?;
+    let server_uuid = be_wr_txn.get_db_s_uuid()?;
 
     let apply = if records.is_empty() {
         None
@@ -105,6 +156,13 @@ pub(crate) async fn restore_and_replay(
     })?;
     info!("Database loaded successfully");
 
-    reindex_inner(be, schema, config).await?;
-    Ok(RestoreOutcome { watermark, apply })
+    Ok(CommittedRestore {
+        outcome: RestoreOutcome {
+            watermark,
+            server_uuid,
+            apply,
+        },
+        be,
+        schema,
+    })
 }
