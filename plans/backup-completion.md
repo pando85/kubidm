@@ -106,11 +106,11 @@ Recovery restores the newest base backup at or before the target, then applies l
 Every shell: `unset CARGO_TARGET_DIR`. Run the S3 tests against Silo:
 
 ```sh
-docker run -d --name silo -p 9000:9000 \
+docker run -d --rm --name silo -p 9000:9000 \
   -e MINIO_ROOT_USER=kubidm-test -e MINIO_ROOT_PASSWORD=kubidm-test-secret \
   pgsty/silo:RELEASE.2026-09-16T00-00-00Z server /data
-KUBIDM_TEST_S3_ENDPOINT=http://127.0.0.1:9000 \
-  cargo test -p kubidmd_testkit --test integration_test backup
+KUBIDM_TEST_S3_REQUIRED=1 KUBIDM_TEST_S3_ENDPOINT=http://127.0.0.1:9000 \
+  cargo test -p kubidmd_testkit --test integration_test -- backup s3_ replication encryption pitr database_verify
 ```
 
 ## Known caveats

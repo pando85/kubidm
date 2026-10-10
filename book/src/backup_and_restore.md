@@ -273,10 +273,28 @@ kubidmd database restore-s3 -c /data/server.toml --region eu-west-1 --key backup
 `pitr-list` and `recover` take `--region <name>` as well, to recover to a point in time from a region's copy of the WAL
 archive and of the base backups, see [The WAL Archive and Replication](#the-wal-archive-and-replication).
 
-To restore on a host whose `server.toml` has no replication section, pass the region's bucket and endpoint directly:
-`restore-s3 --bucket kubidm-backups-eu --endpoint https://... --key ...` (credentials then come from the AWS environment
-variables or the instance role, and the key is relative to the region's `path_prefix`, which has to be reproduced in
-`[online_backup.s3]` as `path_prefix` in that case).
+To restore on a host whose `server.toml` has no replication section, add the replica to it as a region, with replication
+disabled, and select it with `--region`. Only the region entry is used, so `[online_backup.s3]` can keep the primary's
+settings, or name any bucket on a host that does not take backups:
+
+```toml
+[online_backup.s3]
+bucket = "kubidm-backups"
+region = "us-east-1"
+
+[online_backup.s3.replication]
+# Never replicate from this host; the region is only a recovery source.
+enabled = false
+
+[[online_backup.s3.replication.regions]]
+region = "eu-west-1"
+bucket = "kubidm-backups-eu"
+# path_prefix, endpoint and credentials as on the server that replicates to it
+```
+
+`--bucket` and `--endpoint` are no substitute for this: they replace only the bucket and the endpoint of
+`[online_backup.s3]`, whose `region`, `path_prefix` and credentials still apply, so against AWS the requests would be
+signed for the primary's region and fail for a replica in another one.
 
 ### Client-Side Backup Encryption
 
@@ -790,9 +808,10 @@ docker start <container name>
 
 The key is relative to the configured `path_prefix`; `kubidmd database list-backups` shows the available keys. The
 database is left untouched when the download or the checksum check fails. `--bucket` and `--endpoint` override the
-configuration, which allows restoring on a host whose `server.toml` has no `[online_backup.s3]` section (credentials
-then come from the AWS environment variables or the instance role). `--region <name>` restores from the copy held by a
-replication region, see [Recovering from a Region](#recovering-from-a-region).
+configuration, which allows restoring on a host whose `server.toml` has no `[online_backup.s3]` section. The key is then
+the full object key, since there is no `path_prefix`, and the signing region and the credentials come from the AWS
+environment (`AWS_REGION`, `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`) or the instance role. `--region <name>`
+restores from the copy held by a replication region, see [Recovering from a Region](#recovering-from-a-region).
 
 ## Method 3 - Manual Database Copy
 
