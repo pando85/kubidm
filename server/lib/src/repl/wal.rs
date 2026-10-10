@@ -15,9 +15,11 @@
 //! This module is synchronous and knows nothing about S3. Uploading closed segments,
 //! retention and the recovery commands live in the server core.
 
+use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 use flate2::write::GzEncoder;
@@ -52,6 +54,10 @@ pub const WAL_OPEN_SEGMENT_MARKER: &str = ".open-segment.json";
 pub const WAL_PENDING_EVENTS_FILE: &str = ".pending-events.json";
 /// Fixed per record overhead assumed when measuring a segment against `segment_size_bytes`.
 const RECORD_OVERHEAD_BYTES: u64 = 96;
+/// How many closed segments that could not be written yet are kept in memory. When the
+/// WAL directory stays unwritable, the oldest one beyond this is dropped and recorded as a
+/// gap, so that memory stays bounded at a few `segment_size_bytes`.
+pub const WAL_MAX_UNWRITTEN_SEGMENTS: usize = 4;
 
 /// One archived change: the state of entry `entry_uuid` after the transaction `cid`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -175,6 +181,8 @@ pub enum WalGapReason {
     ArchiveFailure,
     /// The previous run stopped without closing its open segment.
     UnclosedSegment,
+    /// A closed segment could not be written for too long and was dropped.
+    UnwritableSegment,
 }
 
 impl std::fmt::Display for WalGapReason {
@@ -183,6 +191,9 @@ impl std::fmt::Display for WalGapReason {
             WalGapReason::ArchiveFailure => write!(f, "a committed transaction was not archived"),
             WalGapReason::UnclosedSegment => {
                 write!(f, "the server stopped without archiving its open segment")
+            }
+            WalGapReason::UnwritableSegment => {
+                write!(f, "a closed segment could not be written and was dropped")
             }
         }
     }
@@ -218,7 +229,8 @@ struct OpenSegmentMarker {
     start_ts: Duration,
 }
 
-/// Counters an operator can use to notice that archiving is not keeping up.
+/// What the archiver did since it started. Every failure counted here is also logged when
+/// it happens, with the running count.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct WalArchiverStats {
     /// Records appended to a segment (closed or still open).
@@ -231,6 +243,9 @@ pub struct WalArchiverStats {
     /// Attempts to write a closed segment that failed. The records stay in memory and the
     /// write is retried, so nothing is lost unless the server stops first.
     pub flush_failures: u64,
+    /// Closed segments dropped because they could not be written for too long. Each one
+    /// is a hole in the WAL.
+    pub dropped_segments: u64,
 }
 
 /// Collects the records of committed transactions into segments and writes closed
@@ -239,7 +254,18 @@ pub struct WalArchiver {
     config: WalArchiveConfig,
     server_uuid: Uuid,
     segments_path: PathBuf,
+    /// The segment that takes the records of the next transactions.
     current_segment: Option<WalSegmentBuilder>,
+    /// Closed segments not written yet, oldest first.
+    sealed: VecDeque<SealedSegment>,
+    /// The start of every segment taken out by [`Self::take_writes`] and not handed back
+    /// to [`Self::finish_writes`] yet, by segment id.
+    in_flight: BTreeMap<String, Duration>,
+    /// After a failed write, commits do not try again before this CID time; the archive
+    /// synchronisation always does.
+    retry_after: Option<Duration>,
+    /// The start the open segment marker on disk records, when there is one.
+    marker_start: Option<Duration>,
     stats: WalArchiverStats,
     /// Events not yet recorded by the archive index, mirrored in
     /// [`WAL_PENDING_EVENTS_FILE`].
@@ -250,9 +276,99 @@ pub struct WalArchiver {
 }
 
 struct WalSegmentBuilder {
+    /// The server whose transactions the segment holds.
+    server_uuid: Uuid,
     entries: Vec<WalEntryRecord>,
     start_ts: Duration,
     current_size: u64,
+}
+
+impl WalSegmentBuilder {
+    fn seal(self) -> SealedSegment {
+        let start_ts = self
+            .entries
+            .first()
+            .map(WalEntryRecord::ts)
+            .unwrap_or(self.start_ts);
+        let end_ts = self
+            .entries
+            .last()
+            .map(WalEntryRecord::ts)
+            .unwrap_or(start_ts);
+        SealedSegment {
+            file: WalSegmentFile {
+                format_version: WAL_SEGMENT_FORMAT_VERSION,
+                segment_id: segment_file_name(self.server_uuid, start_ts),
+                server_uuid: self.server_uuid,
+                server_version: env!("KUBIDM_PKG_SERIES").to_string(),
+                start_ts,
+                end_ts,
+                entries: self.entries,
+            },
+        }
+    }
+}
+
+/// A closed segment that is not written yet.
+pub struct SealedSegment {
+    file: WalSegmentFile,
+}
+
+/// Closed segments taken out of the archiver by [`WalArchiver::take_writes`], so that they
+/// are serialised, compressed and written without holding the archiver lock.
+pub struct WalSegmentWrites {
+    dir: PathBuf,
+    segments: Vec<SealedSegment>,
+}
+
+impl WalSegmentWrites {
+    pub fn is_empty(&self) -> bool {
+        self.segments.is_empty()
+    }
+
+    /// Write every segment. Hand the outcome back to [`WalArchiver::finish_writes`].
+    pub fn write(self) -> WalSegmentWritten {
+        let results = self
+            .segments
+            .into_iter()
+            .map(|sealed| match write_segment_file(&self.dir, &sealed.file) {
+                Ok(segment) => Ok(segment),
+                Err(err) => Err((Box::new(sealed), err)),
+            })
+            .collect();
+        WalSegmentWritten { results }
+    }
+}
+
+/// The outcome of [`WalSegmentWrites::write`].
+pub struct WalSegmentWritten {
+    results: Vec<Result<WalSegment, (Box<SealedSegment>, WalError)>>,
+}
+
+/// Lock `archiver`. A thread that panicked while holding the lock does not stop the
+/// archiving: every archiver method leaves it consistent before it can fail, so the
+/// poisoned lock is taken over.
+pub fn lock_archiver(archiver: &Mutex<WalArchiver>) -> MutexGuard<'_, WalArchiver> {
+    archiver
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Write the closed segments of `archiver` without holding its lock while they are
+/// serialised, compressed and written, so that commits and the archive task never wait
+/// on that work. Unless `force`, nothing is tried before the retry delay of an earlier
+/// failure ran out (`now` is the clock). Returns the last segment written.
+pub fn write_closed_segments(
+    archiver: &Mutex<WalArchiver>,
+    now: Duration,
+    force: bool,
+) -> Result<Option<WalSegment>, WalError> {
+    let writes = lock_archiver(archiver).take_writes(now, force);
+    if writes.is_empty() {
+        return Ok(None);
+    }
+    let written = writes.write();
+    lock_archiver(archiver).finish_writes(written, now)
 }
 
 impl WalArchiver {
@@ -313,6 +429,10 @@ impl WalArchiver {
             server_uuid,
             segments_path,
             current_segment: None,
+            sealed: VecDeque::new(),
+            in_flight: BTreeMap::new(),
+            retry_after: None,
+            marker_start: None,
             stats: WalArchiverStats::default(),
             pending,
             last_ts: None,
@@ -339,19 +459,31 @@ impl WalArchiver {
         self.stats
     }
 
-    /// Whether records are waiting in a segment that has not been closed yet.
+    /// Whether records only live in memory: in the open segment, or in a closed one that
+    /// is not written yet.
     pub fn has_pending_records(&self) -> bool {
-        self.current_segment
-            .as_ref()
-            .is_some_and(|segment| !segment.entries.is_empty())
+        self.in_memory_start().is_some()
     }
 
-    /// Number of records in the segment that is still open.
+    /// Number of records that only live in memory.
     pub fn pending_record_count(&self) -> usize {
         self.current_segment
-            .as_ref()
+            .iter()
             .map(|segment| segment.entries.len())
-            .unwrap_or(0)
+            .chain(self.sealed.iter().map(|sealed| sealed.file.entries.len()))
+            .sum()
+    }
+
+    /// The CID time of the oldest record that only lives in memory, including the
+    /// segments being written right now.
+    fn in_memory_start(&self) -> Option<Duration> {
+        self.current_segment
+            .iter()
+            .filter(|segment| !segment.entries.is_empty())
+            .map(|segment| segment.start_ts)
+            .chain(self.sealed.iter().map(|sealed| sealed.file.start_ts))
+            .chain(self.in_flight.values().copied())
+            .min()
     }
 
     /// Count a transaction whose records were lost and remember the gap it leaves. Called
@@ -407,10 +539,37 @@ impl WalArchiver {
         write_pending_events(&self.segments_path, &self.pending)
     }
 
-    fn marker_path(&self) -> PathBuf {
-        self.segments_path.join(WAL_OPEN_SEGMENT_MARKER)
+    /// Make the open segment marker match the records that only live in memory: present
+    /// with the start of the oldest of them, absent when there are none. A failure is
+    /// logged and retried with the next change.
+    fn sync_marker(&mut self) {
+        let wanted = self.in_memory_start();
+        if wanted == self.marker_start {
+            return;
+        }
+        let result = match wanted {
+            Some(start_ts) => serde_json::to_vec(&OpenSegmentMarker { start_ts })
+                .map_err(WalError::from)
+                .and_then(|data| {
+                    write_file_durably(&self.segments_path, WAL_OPEN_SEGMENT_MARKER, &data)
+                }),
+            None => match fs::remove_file(self.segments_path.join(WAL_OPEN_SEGMENT_MARKER)) {
+                Ok(()) => sync_dir(&self.segments_path),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(err) => Err(err.into()),
+            },
+        };
+        match result {
+            Ok(()) => self.marker_start = wanted,
+            Err(err) => warn!(
+                %err,
+                "Unable to update the WAL open segment marker; a crash before the records in \
+                 memory are written may go unnoticed"
+            ),
+        }
     }
 
+    #[cfg(test)]
     pub fn record_create(
         &mut self,
         cid: &Cid,
@@ -431,6 +590,7 @@ impl WalArchiver {
         )
     }
 
+    #[cfg(test)]
     pub fn record_modify(
         &mut self,
         cid: &Cid,
@@ -451,6 +611,7 @@ impl WalArchiver {
         )
     }
 
+    #[cfg(test)]
     pub fn record_delete(
         &mut self,
         cid: &Cid,
@@ -464,11 +625,10 @@ impl WalArchiver {
         )
     }
 
-    /// Append the changes of one committed transaction. All records share `cid` and land
-    /// in the same segment. The current segment is closed first when it is older than the
-    /// segment interval (the transaction CID is the clock), and closed afterwards when the
-    /// appended records took it over the size limit. Returns the segment that was closed
-    /// by this call, if any.
+    /// Append the changes of one committed transaction and write the segments that it
+    /// closed, holding the caller's lock throughout. See [`Self::stage_transaction`];
+    /// [`write_closed_segments`] does the writing without the lock. Returns the last
+    /// segment written by this call, if any.
     pub fn append_transaction<I>(
         &mut self,
         cid: &Cid,
@@ -478,15 +638,23 @@ impl WalArchiver {
     where
         I: IntoIterator<Item = (u64, WalPendingOp)>,
     {
-        if !self.is_enabled() {
-            return Ok(None);
-        }
+        self.stage_transaction(cid, truncate, ops);
+        self.write_due(cid.ts, false)
+    }
 
-        // A segment that can not be written stays in memory and is retried, so a failed
-        // flush loses nothing; it is logged and counted.
-        let mut rolled = self
-            .flush_if_stale(cid.ts)
-            .unwrap_or_else(|err| self.note_flush_failure(&err));
+    /// Append the changes of one committed transaction. All records share `cid` and land
+    /// in the same segment. The current segment is closed first when it is older than the
+    /// segment interval (the transaction CID is the clock), and closed afterwards when the
+    /// appended records took it over the size limit. Closed segments wait in memory until
+    /// they are written ([`Self::take_writes`]).
+    pub fn stage_transaction<I>(&mut self, cid: &Cid, truncate: bool, ops: I)
+    where
+        I: IntoIterator<Item = (u64, WalPendingOp)>,
+    {
+        if !self.is_enabled() {
+            return;
+        }
+        self.seal_if_stale(cid.ts);
 
         let mut records: Vec<WalEntryRecord> = Vec::new();
         if truncate {
@@ -518,34 +686,19 @@ impl WalArchiver {
                 operation,
             });
         }
-
         if records.is_empty() {
-            return Ok(rolled);
+            return;
         }
 
-        if !self.has_pending_records() {
-            // The first records of a segment only live in memory until it is closed.
-            let marker = OpenSegmentMarker { start_ts: cid.ts };
-            if let Err(err) = serde_json::to_vec(&marker)
-                .map_err(WalError::from)
-                .and_then(|data| fs::write(self.marker_path(), data).map_err(WalError::from))
-            {
-                warn!(
-                    %err,
-                    "Unable to write the WAL open segment marker; a crash before the segment \
-                     is closed would go unnoticed"
-                );
-            }
-        }
-
+        let server_uuid = self.server_uuid;
         let segment = self
             .current_segment
             .get_or_insert_with(|| WalSegmentBuilder {
+                server_uuid,
                 entries: Vec::new(),
                 start_ts: cid.ts,
                 current_size: 0,
             });
-
         for record in records {
             segment.current_size += estimate_record_size(&record);
             segment.entries.push(record);
@@ -554,99 +707,167 @@ impl WalArchiver {
         self.last_ts = Some(cid.ts);
 
         if segment.current_size >= self.config.segment_size_bytes {
-            match self.flush_current_segment() {
-                Ok(Some(closed)) => rolled = Some(closed),
-                Ok(None) => {}
-                Err(err) => {
-                    self.note_flush_failure(&err);
-                }
-            }
+            self.seal_current();
         }
-
-        Ok(rolled)
-    }
-
-    fn note_flush_failure(&mut self, err: &WalError) -> Option<WalSegment> {
-        self.stats.flush_failures += 1;
-        error!(
-            %err,
-            flush_failures = self.stats.flush_failures,
-            "Unable to write a closed WAL segment to {}; its records are kept in memory and \
-             the write is retried",
-            self.segments_path.display()
-        );
-        None
+        // The records only live in memory until their segment is written.
+        self.sync_marker();
     }
 
     /// Close the current segment when it was opened at least one segment interval before
-    /// `now`. Returns the closed segment.
-    pub fn flush_if_stale(&mut self, now: Duration) -> Result<Option<WalSegment>, WalError> {
+    /// `now`. Returns whether it was closed.
+    pub fn seal_if_stale(&mut self, now: Duration) -> bool {
         let stale = self.current_segment.as_ref().is_some_and(|segment| {
             !segment.entries.is_empty() && now >= segment.start_ts + self.config.segment_interval()
         });
-        if stale {
-            self.flush_current_segment()
-        } else {
-            Ok(None)
+        stale && self.seal_current()
+    }
+
+    /// Close the current segment; it is written by the next [`Self::take_writes`]. Returns
+    /// whether there was a segment with records to close.
+    pub fn seal_current(&mut self) -> bool {
+        match self.current_segment.take() {
+            Some(builder) if !builder.entries.is_empty() => {
+                self.sealed.push_back(builder.seal());
+                self.drop_unwritable_backlog();
+                true
+            }
+            _ => false,
         }
     }
 
-    /// Close the current segment and write it to the WAL directory. Returns the closed
-    /// segment, or None when no record was pending. When the write fails the segment stays
-    /// open, so that a later call retries it.
+    /// Take the closed segments out to be written, unless a failed write asked commits to
+    /// wait (`now` is the clock) and `force` is false. Every segment taken must be handed
+    /// back to [`Self::finish_writes`].
+    pub fn take_writes(&mut self, now: Duration, force: bool) -> WalSegmentWrites {
+        let waiting = self
+            .retry_after
+            .is_some_and(|retry_after| now < retry_after);
+        let segments: Vec<SealedSegment> = if force || !waiting {
+            self.sealed.drain(..).collect()
+        } else {
+            Vec::new()
+        };
+        for sealed in &segments {
+            self.in_flight
+                .insert(sealed.file.segment_id.clone(), sealed.file.start_ts);
+        }
+        WalSegmentWrites {
+            dir: self.segments_path.clone(),
+            segments,
+        }
+    }
+
+    /// Account for segments written outside the lock. A segment that could not be written
+    /// goes back in line, and commits wait one segment interval before trying again.
+    /// Returns the last segment written, or the first error.
+    pub fn finish_writes(
+        &mut self,
+        written: WalSegmentWritten,
+        now: Duration,
+    ) -> Result<Option<WalSegment>, WalError> {
+        let mut last = None;
+        let mut first_err = None;
+        for result in written.results {
+            match result {
+                Ok(segment) => {
+                    self.in_flight.remove(&segment.segment_id);
+                    self.stats.segments_closed += 1;
+                    info!(
+                        segment = %segment.segment_id,
+                        entries = segment.entry_count,
+                        size_bytes = segment.size_bytes,
+                        "WAL segment closed"
+                    );
+                    last = Some(segment);
+                }
+                Err((sealed, err)) => {
+                    self.in_flight.remove(&sealed.file.segment_id);
+                    self.stats.flush_failures += 1;
+                    error!(
+                        %err,
+                        segment = %sealed.file.segment_id,
+                        flush_failures = self.stats.flush_failures,
+                        "Unable to write a closed WAL segment to {}; its records are kept in \
+                         memory and the write is retried",
+                        self.segments_path.display()
+                    );
+                    let index = self
+                        .sealed
+                        .iter()
+                        .position(|queued| queued.file.start_ts > sealed.file.start_ts)
+                        .unwrap_or(self.sealed.len());
+                    self.sealed.insert(index, *sealed);
+                    first_err.get_or_insert(err);
+                }
+            }
+        }
+        if first_err.is_some() {
+            self.retry_after = Some(now + self.config.segment_interval());
+            self.drop_unwritable_backlog();
+        } else {
+            self.retry_after = None;
+        }
+        self.sync_marker();
+        match first_err {
+            Some(err) => Err(err),
+            None => Ok(last),
+        }
+    }
+
+    /// Write the closed segments while holding the caller's lock. See
+    /// [`write_closed_segments`].
+    fn write_due(&mut self, now: Duration, force: bool) -> Result<Option<WalSegment>, WalError> {
+        let writes = self.take_writes(now, force);
+        if writes.is_empty() {
+            return Ok(None);
+        }
+        let written = writes.write();
+        self.finish_writes(written, now)
+    }
+
+    /// Drop the oldest closed segments beyond [`WAL_MAX_UNWRITTEN_SEGMENTS`] and record
+    /// each as a gap: writing keeps failing, and holding them would grow memory without
+    /// bound.
+    fn drop_unwritable_backlog(&mut self) {
+        while self.sealed.len() > WAL_MAX_UNWRITTEN_SEGMENTS {
+            let Some(dropped) = self.sealed.pop_front() else {
+                break;
+            };
+            self.stats.dropped_segments += 1;
+            error!(
+                segment = %dropped.file.segment_id,
+                records = dropped.file.entries.len(),
+                from = %format_ts_rfc3339(dropped.file.start_ts),
+                until = %format_ts_rfc3339(dropped.file.end_ts),
+                "WAL ARCHIVE HOLE: a closed segment could not be written to {} for too long and \
+                 was dropped; point-in-time recovery can not replay its transactions until a \
+                 new base backup is taken",
+                self.segments_path.display()
+            );
+            self.add_gap(WalGap {
+                from_ts: dropped.file.start_ts,
+                until_ts: Some(dropped.file.end_ts),
+                reason: WalGapReason::UnwritableSegment,
+            });
+        }
+        self.sync_marker();
+    }
+
+    /// Close the current segment when it is stale and write every closed segment, holding
+    /// the caller's lock. Returns the last segment written.
+    pub fn flush_if_stale(&mut self, now: Duration) -> Result<Option<WalSegment>, WalError> {
+        self.seal_if_stale(now);
+        self.write_due(now, true)
+    }
+
+    /// Close the current segment and write every closed segment to the WAL directory,
+    /// holding the caller's lock. Returns the last segment written, or None when no
+    /// record was pending. A segment that can not be written stays in memory, so that a
+    /// later call retries it.
     pub fn flush_current_segment(&mut self) -> Result<Option<WalSegment>, WalError> {
-        let Some(builder) = self.current_segment.take() else {
-            return Ok(None);
-        };
-        if builder.entries.is_empty() {
-            return Ok(None);
-        }
-
-        let start_ts = builder
-            .entries
-            .first()
-            .map(WalEntryRecord::ts)
-            .unwrap_or(builder.start_ts);
-        let end_ts = builder
-            .entries
-            .last()
-            .map(WalEntryRecord::ts)
-            .unwrap_or(start_ts);
-
-        let file = WalSegmentFile {
-            format_version: WAL_SEGMENT_FORMAT_VERSION,
-            segment_id: segment_file_name(self.server_uuid, start_ts),
-            server_uuid: self.server_uuid,
-            server_version: env!("KUBIDM_PKG_SERIES").to_string(),
-            start_ts,
-            end_ts,
-            entries: builder.entries,
-        };
-
-        let segment = match write_segment_file(&self.segments_path, &file) {
-            Ok(segment) => segment,
-            Err(err) => {
-                self.current_segment = Some(WalSegmentBuilder {
-                    entries: file.entries,
-                    start_ts: builder.start_ts,
-                    current_size: builder.current_size,
-                });
-                return Err(err);
-            }
-        };
-        if let Err(err) = fs::remove_file(self.marker_path()) {
-            if err.kind() != std::io::ErrorKind::NotFound {
-                warn!(%err, "Unable to remove the WAL open segment marker");
-            }
-        }
-        self.stats.segments_closed += 1;
-        info!(
-            segment = %segment.segment_id,
-            entries = segment.entry_count,
-            size_bytes = segment.size_bytes,
-            "WAL segment closed"
-        );
-        Ok(Some(segment))
+        self.seal_current();
+        let now = self.last_ts.unwrap_or_default();
+        self.write_due(now, true)
     }
 }
 
@@ -1362,8 +1583,76 @@ mod tests {
         assert_eq!(gaps[1].until_ts, None);
     }
 
+    /// Make every write to the WAL directory of `archiver` fail: the directory is replaced
+    /// by a file. Returns the function that puts the directory back.
+    fn break_wal_dir(archiver: &WalArchiver) -> impl FnOnce() {
+        let dir = archiver.segments_path().to_path_buf();
+        let aside = dir.with_extension("aside");
+        fs::rename(&dir, &aside).unwrap();
+        fs::write(&dir, b"not a directory").unwrap();
+        move || {
+            fs::remove_file(&dir).unwrap();
+            fs::rename(&aside, &dir).unwrap();
+        }
+    }
+
     #[test]
     fn test_failed_flush_keeps_the_records_and_retries() {
+        let server = Uuid::new_v4();
+        let (_dir, mut archiver) = archiver(
+            WalArchiveConfig {
+                segment_size_bytes: 1,
+                segment_interval_seconds: 60,
+                ..test_config()
+            },
+            server,
+        );
+        let repair = break_wal_dir(&archiver);
+
+        // The size limit is reached, the write fails, nothing is lost or reported as lost.
+        let rolled = archiver
+            .record_create(&cid(server, 5), 1, Uuid::new_v4(), vec![1])
+            .unwrap_err();
+        assert!(matches!(rolled, WalError::IoError(_)));
+        assert_eq!(archiver.pending_record_count(), 1);
+        assert_eq!(archiver.stats().flush_failures, 1);
+        assert_eq!(archiver.stats().failures, 0);
+        assert!(archiver.pending_events().is_empty());
+
+        // Commits within the retry delay do not try again: each one costs no compression of
+        // the backlog. They are kept as separate closed segments.
+        for secs in 6..8 {
+            assert!(archiver
+                .record_create(&cid(server, secs), secs, Uuid::new_v4(), vec![1])
+                .unwrap()
+                .is_none());
+        }
+        assert_eq!(archiver.stats().flush_failures, 1);
+        assert_eq!(archiver.pending_record_count(), 3);
+
+        // A forced write (the archive synchronisation) always tries, each segment once.
+        assert!(archiver.flush_current_segment().is_err());
+        assert_eq!(archiver.stats().flush_failures, 4);
+        assert_eq!(archiver.pending_record_count(), 3);
+
+        // Once the obstacle is gone, the next commit after the delay writes every segment.
+        repair();
+        let rolled = archiver
+            .record_create(&cid(server, 70), 70, Uuid::new_v4(), vec![2])
+            .unwrap()
+            .expect("the retried segments must be written");
+        assert_eq!(rolled.start_ts, Duration::from_secs(70));
+        assert!(!archiver.has_pending_records());
+        let listed = list_segments(archiver.segments_path()).unwrap();
+        assert_eq!(listed.len(), 4);
+        assert!(!archiver
+            .segments_path()
+            .join(WAL_OPEN_SEGMENT_MARKER)
+            .exists());
+    }
+
+    #[test]
+    fn test_unwritable_backlog_is_bounded_and_recorded_as_gaps() {
         let server = Uuid::new_v4();
         let (_dir, mut archiver) = archiver(
             WalArchiveConfig {
@@ -1372,37 +1661,97 @@ mod tests {
             },
             server,
         );
-        // A non-empty directory where the segment file goes makes the write fail.
-        let blocker = archiver
-            .segments_path()
-            .join(segment_file_name(server, Duration::from_secs(5)));
-        std::fs::create_dir(&blocker).unwrap();
-        std::fs::write(blocker.join("x"), b"x").unwrap();
+        let repair = break_wal_dir(&archiver);
 
-        // The size limit is reached, the flush fails, nothing is lost or reported as lost.
-        let rolled = archiver
-            .record_create(&cid(server, 5), 1, Uuid::new_v4(), vec![1])
-            .unwrap();
-        assert!(rolled.is_none());
-        assert_eq!(archiver.pending_record_count(), 1);
-        assert_eq!(archiver.stats().flush_failures, 1);
-        assert_eq!(archiver.stats().failures, 0);
-        assert!(archiver.pending_events().is_empty());
-        assert!(archiver.flush_current_segment().is_err());
-        assert_eq!(archiver.pending_record_count(), 1);
+        // Every transaction closes a segment that can not be written. Beyond the limit,
+        // the oldest is dropped and its range becomes a gap.
+        let extra = 3;
+        let total = WAL_MAX_UNWRITTEN_SEGMENTS as u64 + extra;
+        for secs in 1..=total {
+            let _ = archiver.record_create(&cid(server, secs), secs, Uuid::new_v4(), vec![1]);
+        }
+        assert_eq!(archiver.pending_record_count(), WAL_MAX_UNWRITTEN_SEGMENTS);
+        assert_eq!(archiver.stats().dropped_segments, extra);
+        let gaps = archiver.pending_events().gaps;
+        assert_eq!(
+            gaps,
+            (1..=extra)
+                .map(|secs| WalGap {
+                    from_ts: Duration::from_secs(secs),
+                    until_ts: Some(Duration::from_secs(secs)),
+                    reason: WalGapReason::UnwritableSegment,
+                })
+                .collect::<Vec<_>>()
+        );
 
-        // Once the obstacle is gone the retry writes every record.
-        std::fs::remove_dir_all(&blocker).unwrap();
-        let rolled = archiver
-            .record_create(&cid(server, 6), 2, Uuid::new_v4(), vec![2])
+        // The kept segments are written once the directory is back; the gaps are on disk.
+        repair();
+        archiver.flush_current_segment().unwrap();
+        assert!(!archiver.has_pending_records());
+        assert_eq!(
+            list_segments(archiver.segments_path()).unwrap().len(),
+            WAL_MAX_UNWRITTEN_SEGMENTS
+        );
+        archiver.defer_gaps_to_next_start().unwrap();
+        assert_eq!(
+            read_pending_events(archiver.segments_path()).gaps.len(),
+            extra as usize
+        );
+    }
+
+    #[test]
+    fn test_segments_are_written_outside_the_archiver_lock() {
+        let server = Uuid::new_v4();
+        let (_dir, mut archiver) = archiver(
+            WalArchiveConfig {
+                segment_size_bytes: 1,
+                ..test_config()
+            },
+            server,
+        );
+        archiver.stage_transaction(
+            &cid(server, 1),
+            false,
+            [(
+                1,
+                WalPendingOp::Create {
+                    entry_uuid: Uuid::new_v4(),
+                    entry_data: vec![1],
+                },
+            )],
+        );
+        let shared = Mutex::new(archiver);
+        // While the closed segment is out being written, the lock is free and the records
+        // are still covered by the open segment marker.
+        let writes = lock_archiver(&shared).take_writes(Duration::from_secs(1), false);
+        assert!(!writes.is_empty());
+        {
+            let archiver = lock_archiver(&shared);
+            assert!(archiver.has_pending_records());
+            assert!(archiver
+                .segments_path()
+                .join(WAL_OPEN_SEGMENT_MARKER)
+                .exists());
+        }
+        let written = writes.write();
+        let segment = lock_archiver(&shared)
+            .finish_writes(written, Duration::from_secs(1))
             .unwrap()
-            .expect("the retried segment must be written");
-        assert_eq!(rolled.entry_count, 2);
+            .unwrap();
+        let archiver = lock_archiver(&shared);
+        assert_eq!(segment.entry_count, 1);
         assert!(!archiver.has_pending_records());
         assert!(!archiver
             .segments_path()
             .join(WAL_OPEN_SEGMENT_MARKER)
             .exists());
+        // Nothing left: the helper has nothing to do.
+        drop(archiver);
+        assert!(
+            write_closed_segments(&shared, Duration::from_secs(2), false)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

@@ -19,7 +19,10 @@ use crate::{
             ReplicationUpdateVector, ReplicationUpdateVectorReadTransaction,
             ReplicationUpdateVectorTransaction, ReplicationUpdateVectorWriteTransaction,
         },
-        wal::{WalArchiver, WalEntryRecord, WalOperationRecord, WalPendingOp},
+        wal::{
+            lock_archiver, write_closed_segments, WalArchiver, WalEntryRecord, WalOperationRecord,
+            WalPendingOp,
+        },
     },
     utils::trigraph_iter,
     value::{IndexType, Value},
@@ -331,13 +334,9 @@ impl BackendConfig {
 /// The archiver shared by the backend and the server core's upload task.
 pub type SharedWalArchiver = Arc<Mutex<WalArchiver>>;
 
-/// Lock `archiver`. A thread that panicked while holding the lock does not stop the
-/// archiving: every archiver method leaves it consistent before it can fail, so the
-/// poisoned lock is taken over.
+/// Lock `archiver`, see [`lock_archiver`].
 pub fn lock_wal(archiver: &SharedWalArchiver) -> MutexGuard<'_, WalArchiver> {
-    archiver
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    lock_archiver(archiver)
 }
 
 /// What [`BackendWriteTransaction::wal_apply`] did.
@@ -2351,7 +2350,13 @@ impl<'a> BackendWriteTransaction<'a> {
         // what is lost is the ability to recover this transaction from the archive until
         // the next base backup covers it.
         if let Some(wal) = wal {
-            Self::wal_archive_committed(&wal, wal_cid, wal_truncate, wal_pending, wal_stage_failed);
+            Self::wal_archive_committed(
+                &wal,
+                wal_cid.as_ref(),
+                wal_truncate,
+                wal_pending,
+                wal_stage_failed,
+            );
         }
 
         Ok(())
@@ -2359,7 +2364,7 @@ impl<'a> BackendWriteTransaction<'a> {
 
     fn wal_archive_committed(
         wal: &SharedWalArchiver,
-        wal_cid: Option<Cid>,
+        wal_cid: Option<&Cid>,
         wal_truncate: bool,
         wal_pending: BTreeMap<u64, WalPendingOp>,
         wal_stage_failed: bool,
@@ -2368,40 +2373,38 @@ impl<'a> BackendWriteTransaction<'a> {
             return;
         }
 
-        let mut archiver = lock_wal(wal);
+        {
+            let mut archiver = lock_wal(wal);
 
-        if wal_stage_failed {
-            archiver.note_failure(wal_cid.as_ref().map(|cid| cid.ts));
-            error!(
-                "WAL ARCHIVE HOLE: a committed transaction could not be fully recorded; \
-                 point-in-time recovery can not reproduce it. Take a new base backup."
-            );
-        }
-
-        let Some(cid) = wal_cid else {
-            archiver.note_failure(None);
-            error!(
-                records = wal_pending.len(),
-                "WAL ARCHIVE HOLE: a committed transaction carried no CID and its records were \
-                 dropped; point-in-time recovery can not reproduce it. Take a new base backup."
-            );
-            return;
-        };
-
-        let record_count = wal_pending.len();
-        match archiver.append_transaction(&cid, wal_truncate, wal_pending) {
-            Ok(_) => trace!(%cid, records = record_count, "WAL records archived"),
-            Err(err) => {
-                archiver.note_failure(Some(cid.ts));
+            if wal_stage_failed {
+                archiver.note_failure(wal_cid.map(|cid| cid.ts));
                 error!(
-                    ?err,
-                    %cid,
-                    records = record_count,
-                    failures = archiver.stats().failures,
-                    "WAL ARCHIVE HOLE: unable to archive a committed transaction; point-in-time \
-                     recovery can not reproduce it. Take a new base backup."
+                    "WAL ARCHIVE HOLE: a committed transaction could not be fully recorded; \
+                     point-in-time recovery can not reproduce it. Take a new base backup."
                 );
             }
+
+            let Some(cid) = wal_cid else {
+                archiver.note_failure(None);
+                error!(
+                    records = wal_pending.len(),
+                    "WAL ARCHIVE HOLE: a committed transaction carried no CID and its records \
+                     were dropped; point-in-time recovery can not reproduce it. Take a new base \
+                     backup."
+                );
+                return;
+            };
+
+            let record_count = wal_pending.len();
+            archiver.stage_transaction(cid, wal_truncate, wal_pending);
+            trace!(%cid, records = record_count, "WAL records archived");
+        }
+
+        // A segment this transaction closed is compressed and written without the archiver
+        // lock, so that the archive task is never held up by it. A failure is logged and
+        // retried; the records stay in memory meanwhile.
+        if let Some(cid) = wal_cid {
+            let _ = write_closed_segments(wal, cid.ts, false);
         }
     }
 
