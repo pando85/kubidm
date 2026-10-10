@@ -1341,7 +1341,7 @@ mod tests {
             local_path: Some(wal_dir.clone()),
         };
         let archiver: SharedWalArchiver = Arc::new(Mutex::new(
-            WalArchiver::new(wal_cfg.clone(), server, wal_dir.clone()).unwrap(),
+            WalArchiver::open(wal_cfg.clone(), server, wal_dir.clone(), None).unwrap(),
         ));
         let bases = BaseLocation::Local(backup_dir.clone());
         let plain_settings = PitrSettings {

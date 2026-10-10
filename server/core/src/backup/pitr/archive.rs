@@ -868,7 +868,7 @@ mod tests {
             local_path: Some(wal_dir.clone()),
         };
         let archiver: SharedWalArchiver = Arc::new(Mutex::new(
-            WalArchiver::new(wal_cfg.clone(), server, wal_dir.clone()).unwrap(),
+            WalArchiver::open(wal_cfg.clone(), server, wal_dir.clone(), None).unwrap(),
         ));
         let bases = BaseLocation::Local(backup_dir.clone());
         let settings = PitrSettings {
@@ -1047,7 +1047,7 @@ mod tests {
             ..WalArchiveConfig::default()
         };
         let archiver: SharedWalArchiver = Arc::new(Mutex::new(
-            WalArchiver::new(wal_cfg.clone(), server, wal_dir.clone()).unwrap(),
+            WalArchiver::open(wal_cfg.clone(), server, wal_dir.clone(), None).unwrap(),
         ));
         let archive = PitrArchive::new(
             PitrSettings {
@@ -1108,7 +1108,7 @@ mod tests {
             ..WalArchiveConfig::default()
         };
         let archiver: SharedWalArchiver = Arc::new(Mutex::new(
-            WalArchiver::new(wal_cfg.clone(), server, wal_dir.clone()).unwrap(),
+            WalArchiver::open(wal_cfg.clone(), server, wal_dir.clone(), None).unwrap(),
         ));
         let archive = PitrArchive::new(
             PitrSettings {
@@ -1229,7 +1229,7 @@ mod tests {
         };
         let bases = settings.bases.clone();
         let archiver: SharedWalArchiver = Arc::new(Mutex::new(
-            WalArchiver::new(wal_cfg.clone(), old_uuid, wal_dir.clone()).unwrap(),
+            WalArchiver::open(wal_cfg.clone(), old_uuid, wal_dir.clone(), None).unwrap(),
         ));
         let archive = PitrArchive::new(settings.clone(), archiver.clone());
         let key1 = "backup-2024-01-01T00:00:00Z.json";
@@ -1258,7 +1258,7 @@ mod tests {
         drop(archive);
         drop(archiver);
         let archiver: SharedWalArchiver = Arc::new(Mutex::new(
-            WalArchiver::new(wal_cfg, new_uuid, wal_dir.clone()).unwrap(),
+            WalArchiver::open(wal_cfg, new_uuid, wal_dir.clone(), None).unwrap(),
         ));
         let archive = PitrArchive::new(settings, archiver.clone());
 
@@ -1374,7 +1374,7 @@ mod tests {
             encryption: BackupEncryptionConfig::default(),
         };
         let archiver: SharedWalArchiver = Arc::new(Mutex::new(
-            WalArchiver::new(wal_cfg.clone(), u1, wal_dir.clone()).unwrap(),
+            WalArchiver::open(wal_cfg.clone(), u1, wal_dir.clone(), None).unwrap(),
         ));
         let archive = PitrArchive::new(settings.clone(), archiver.clone());
         let key = "backup-2024-01-01T00:00:00Z.json";
@@ -1416,7 +1416,7 @@ mod tests {
 
         // The server starts on the restored database, under U1, and archives again.
         let archiver: SharedWalArchiver = Arc::new(Mutex::new(
-            WalArchiver::new(wal_cfg, u1, wal_dir.clone()).unwrap(),
+            WalArchiver::open(wal_cfg, u1, wal_dir.clone(), None).unwrap(),
         ));
         let archive = PitrArchive::new(settings.clone(), archiver.clone());
         append_create(&archiver, u1, 1500, b"new history");
@@ -1467,7 +1467,7 @@ mod tests {
         // A server that never reached its archive: refreshed from X to A, and stopped with
         // records in memory.
         let archiver: SharedWalArchiver = Arc::new(Mutex::new(
-            WalArchiver::new(wal_cfg.clone(), x, wal_dir.clone()).unwrap(),
+            WalArchiver::open(wal_cfg.clone(), x, wal_dir.clone(), None).unwrap(),
         ));
         archiver
             .lock()
@@ -1490,7 +1490,7 @@ mod tests {
 
         // The server started on it reports nothing of the old server, and archives.
         let archiver: SharedWalArchiver = Arc::new(Mutex::new(
-            WalArchiver::new(wal_cfg, b, wal_dir.clone()).unwrap(),
+            WalArchiver::open(wal_cfg, b, wal_dir.clone(), None).unwrap(),
         ));
         assert!(archiver.lock().unwrap().pending_events().is_empty());
         let archive = PitrArchive::new(settings.clone(), archiver.clone());
@@ -1549,7 +1549,7 @@ mod tests {
 
         // The server never reaches its archive: its segments stay in the WAL directory.
         let archiver: SharedWalArchiver = Arc::new(Mutex::new(
-            WalArchiver::new(wal_cfg.clone(), x, wal_dir.clone()).unwrap(),
+            WalArchiver::open(wal_cfg.clone(), x, wal_dir.clone(), None).unwrap(),
         ));
         let archive = PitrArchive::new(settings.clone(), archiver.clone());
         append_create(&archiver, x, 1100, b"abandoned");
@@ -1578,7 +1578,7 @@ mod tests {
         // The server starts on it, archives the old segments, and the restored backup is
         // indexed before anything new is committed.
         let archiver: SharedWalArchiver = Arc::new(Mutex::new(
-            WalArchiver::new(wal_cfg, restored_uuid, wal_dir.clone()).unwrap(),
+            WalArchiver::open(wal_cfg, restored_uuid, wal_dir.clone(), None).unwrap(),
         ));
         let archive = PitrArchive::new(settings.clone(), archiver.clone());
         archive.sync(Duration::from_secs(1500), true).await.unwrap();
@@ -1637,7 +1637,7 @@ mod tests {
             encryption: BackupEncryptionConfig::default(),
         };
         let archiver: SharedWalArchiver = Arc::new(Mutex::new(
-            WalArchiver::new(wal_cfg.clone(), u2, wal_dir.clone()).unwrap(),
+            WalArchiver::open(wal_cfg.clone(), u2, wal_dir.clone(), None).unwrap(),
         ));
         let archive = PitrArchive::new(settings.clone(), archiver.clone());
         archive
@@ -1675,7 +1675,7 @@ mod tests {
 
         // The server started on it archives, its sidecar repaired or the segment set aside.
         let archiver: SharedWalArchiver = Arc::new(Mutex::new(
-            WalArchiver::new(wal_cfg, u1, wal_dir.clone()).unwrap(),
+            WalArchiver::open(wal_cfg, u1, wal_dir.clone(), None).unwrap(),
         ));
         let archive = PitrArchive::new(settings, archiver.clone());
         append_create(&archiver, u1, 1300, b"new history");
@@ -1708,7 +1708,7 @@ mod tests {
             encryption: BackupEncryptionConfig::default(),
         };
         let archiver: SharedWalArchiver = Arc::new(Mutex::new(
-            WalArchiver::new(wal_cfg.clone(), server, wal_dir.clone()).unwrap(),
+            WalArchiver::open(wal_cfg.clone(), server, wal_dir.clone(), None).unwrap(),
         ));
         let archive = PitrArchive::new(settings.clone(), archiver.clone());
         let key = "backup-2024-01-01T00:00:00Z.json";
@@ -1757,7 +1757,7 @@ mod tests {
 
         // The server started on the recovered database reports nothing of it.
         let archiver: SharedWalArchiver = Arc::new(Mutex::new(
-            WalArchiver::new(wal_cfg, server, wal_dir.clone()).unwrap(),
+            WalArchiver::open(wal_cfg, server, wal_dir.clone(), None).unwrap(),
         ));
         assert!(archiver.lock().unwrap().pending_events().is_empty());
 
@@ -1785,7 +1785,7 @@ mod tests {
             ..WalArchiveConfig::default()
         };
         let archiver: SharedWalArchiver = Arc::new(Mutex::new(
-            WalArchiver::new(wal_cfg.clone(), server, wal_dir.clone()).unwrap(),
+            WalArchiver::open(wal_cfg.clone(), server, wal_dir.clone(), None).unwrap(),
         ));
         let bases = BaseLocation::Local(backup_dir.clone());
         let archive = PitrArchive::new(

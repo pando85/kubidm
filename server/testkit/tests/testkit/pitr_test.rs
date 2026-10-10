@@ -812,10 +812,11 @@ fn test_pitr_s3_encrypted_replicated_recover_from_region() {
             .expect("PITR is enabled");
         let wal_dir = last_host.path().join("retention-wal");
         let archiver: SharedWalArchiver = Arc::new(Mutex::new(
-            WalArchiver::new(
+            WalArchiver::open(
                 settings.backend_wal_config(),
                 region_manifest.server_uuid,
                 wal_dir.clone(),
+                None,
             )
             .expect("Failed to open a WAL archiver"),
         ));

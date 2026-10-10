@@ -439,19 +439,12 @@ impl WalArchiver {
     /// Create an archiver writing to `segments_path`, which is created when it does not
     /// exist and probed for writability so that a misconfiguration fails at startup
     /// rather than at the first commit.
-    pub fn new(
-        config: WalArchiveConfig,
-        server_uuid: Uuid,
-        segments_path: PathBuf,
-    ) -> Result<Self, WalError> {
-        Self::open(config, server_uuid, segments_path, None)
-    }
-
-    /// [`Self::new`] for a database whose last committed transaction has the CID timestamp
-    /// `db_ts_max`. The records an earlier run left unwritten all belong to transactions
-    /// up to it, so the gap they leave ends there rather than at the first
-    /// synchronisation, which may come long after the start when the archive is
-    /// unreachable.
+    ///
+    /// `db_ts_max` is the CID timestamp of the database's last committed transaction. The
+    /// records an earlier run left unwritten all belong to transactions up to it, so the
+    /// gap they leave ends there rather than at the first synchronisation, which may come
+    /// long after the start when the archive is unreachable. Without it (None, for an
+    /// archiver that belongs to no database), that gap ends at the first synchronisation.
     pub fn open(
         config: WalArchiveConfig,
         server_uuid: Uuid,
@@ -642,7 +635,7 @@ impl WalArchiver {
 
     /// At the end of a run: write the pending events (gaps, changes of identity, restores)
     /// the archive index does not record yet to disk once more, in case an earlier write
-    /// of them failed, so that the next [`WalArchiver::new`] reports them again. Call after
+    /// of them failed, so that the next [`WalArchiver::open`] reports them again. Call after
     /// the last flush.
     pub fn persist_pending_events(&mut self) -> Result<(), WalError> {
         write_pending_events(&self.segments_path, &self.pending)
@@ -1459,7 +1452,7 @@ mod tests {
 
     fn archiver(config: WalArchiveConfig, server: Uuid) -> (tempfile::TempDir, WalArchiver) {
         let dir = tempfile::tempdir().unwrap();
-        let archiver = WalArchiver::new(config, server, dir.path().join("wal")).unwrap();
+        let archiver = WalArchiver::open(config, server, dir.path().join("wal"), None).unwrap();
         (dir, archiver)
     }
 
@@ -1480,13 +1473,13 @@ mod tests {
             ..test_config()
         };
         assert!(matches!(
-            WalArchiver::new(invalid, server, dir.path().join("wal2")),
+            WalArchiver::open(invalid, server, dir.path().join("wal2"), None),
             Err(WalError::ConfigError(_))
         ));
 
         // A file where the directory should be is rejected.
         std::fs::write(dir.path().join("file"), b"x").unwrap();
-        assert!(WalArchiver::new(test_config(), server, dir.path().join("file")).is_err());
+        assert!(WalArchiver::open(test_config(), server, dir.path().join("file"), None).is_err());
     }
 
     #[test]
@@ -1727,7 +1720,7 @@ mod tests {
         let wal_dir = dir.path().join("wal");
         let marker = wal_dir.join(WAL_OPEN_SEGMENT_MARKER);
 
-        let mut archiver = WalArchiver::new(test_config(), server, wal_dir.clone()).unwrap();
+        let mut archiver = WalArchiver::open(test_config(), server, wal_dir.clone(), None).unwrap();
         assert!(archiver.pending_events().is_empty());
         assert!(!marker.exists());
 
@@ -1792,7 +1785,7 @@ mod tests {
         let wal_dir = dir.path().join("wal");
 
         // Crash with records of 100 in memory.
-        let mut archiver = WalArchiver::new(test_config(), server, wal_dir.clone()).unwrap();
+        let mut archiver = WalArchiver::open(test_config(), server, wal_dir.clone(), None).unwrap();
         archiver
             .record_create(&cid(server, 100), 1, Uuid::new_v4(), vec![1])
             .unwrap();
@@ -1800,7 +1793,7 @@ mod tests {
 
         // The next run reports [100, ...) but never records it (the archive is
         // unreachable), commits at 200, and crashes again before closing that segment.
-        let mut second = WalArchiver::new(test_config(), server, wal_dir.clone()).unwrap();
+        let mut second = WalArchiver::open(test_config(), server, wal_dir.clone(), None).unwrap();
         assert_eq!(second.pending_events().gaps.len(), 1);
         second
             .record_create(&cid(server, 200), 2, Uuid::new_v4(), vec![2])
@@ -1809,7 +1802,7 @@ mod tests {
         drop(second);
 
         // Every hole is still reported: the first one was not replaced by the later marker.
-        let third = WalArchiver::new(test_config(), server, wal_dir).unwrap();
+        let third = WalArchiver::open(test_config(), server, wal_dir, None).unwrap();
         let starts: Vec<(Duration, WalGapReason)> = third
             .pending_events()
             .gaps
@@ -1833,7 +1826,7 @@ mod tests {
         let wal_dir = dir.path().join("wal");
         fs::create_dir_all(&wal_dir).unwrap();
         fs::write(wal_dir.join(WAL_PENDING_EVENTS_FILE), b"{ torn").unwrap();
-        let archiver = WalArchiver::new(test_config(), server, wal_dir).unwrap();
+        let archiver = WalArchiver::open(test_config(), server, wal_dir, None).unwrap();
         let gaps = archiver.pending_events().gaps;
         assert_eq!(gaps.len(), 1);
         assert_eq!(gaps[0].from_ts, Duration::ZERO);
