@@ -15,9 +15,9 @@
 //! The records of the open segment live in memory until it is closed. Unless the journal
 //! is off ([`WalJournalMode::Off`]), every commit also appends them to the journal of the
 //! segment (`<segment>.journal`), synced to disk by the commit or within a bounded
-//! interval, so that the next start after an unclean stop closes the segment from its
-//! journal instead of reporting its records as a gap. The journal goes once the closed
-//! segment is written.
+//! interval, so that the next start after an unclean stop, or `recover`, closes the segment
+//! from its journal instead of reporting its records as a gap. The journal goes only once
+//! a written segment holds its records.
 //!
 //! This module is synchronous and knows nothing about S3. Uploading closed segments,
 //! retention and the recovery commands live in the server core.
@@ -361,6 +361,11 @@ pub struct WalArchiver {
     /// Whether segments are journaled: not with [`WalJournalMode::Off`], nor after a
     /// journal failed, for the rest of the run.
     journaling: bool,
+    /// The CID time of the transaction the database is committing right now, between
+    /// [`Self::prepare_commit`] and the call that archives it. The open segment marker
+    /// covers it, so that an unclean stop between the database commit and its archiving is
+    /// noticed.
+    committing: Option<Duration>,
 }
 
 struct WalSegmentBuilder {
@@ -596,6 +601,9 @@ impl LeftJournal {
 /// The segment journals left in `dir`, oldest first.
 fn left_journals(dir: &Path) -> Result<Vec<LeftJournal>, WalError> {
     let mut journals = Vec::new();
+    if !dir.exists() {
+        return Ok(journals);
+    }
     for entry in fs::read_dir(dir)? {
         let path = entry?.path();
         let Some(segment_id) = path
@@ -619,102 +627,242 @@ fn left_journals(dir: &Path) -> Result<Vec<LeftJournal>, WalError> {
     Ok(journals)
 }
 
-/// After an unclean stop: close the segments the journals left in `dir` hold, and return
-/// where the history the archive misses starts, if it misses any.
+/// What a run that stopped without writing every record left in a WAL directory: the
+/// open segment marker and the segment journals, see [`plan_left_history`].
+struct LeftHistory {
+    /// The segments the journals hold that are not written yet, in order.
+    segments: Vec<WalSegmentFile>,
+    /// Every journal found. Once the segments are written they are leftovers.
+    journals: Vec<PathBuf>,
+    /// Where the history the WAL directory misses starts, if it misses any.
+    missing_from: Option<Duration>,
+}
+
+impl LeftHistory {
+    /// The gap of the history the WAL directory misses, up to `db_ts_max` when it is
+    /// known.
+    fn gap(&self, db_ts_max: Option<Duration>) -> Option<WalGap> {
+        self.missing_from.map(|from_ts| WalGap {
+            from_ts,
+            until_ts: db_ts_max.map(|ts| ts.max(from_ts)),
+            reason: WalGapReason::UnclosedSegment,
+        })
+    }
+}
+
+/// After an unclean stop: what the journals and the open segment marker left in `dir`
+/// hold, and where the history they miss starts. Changes nothing.
 ///
-/// `marker_start` is the start of the oldest records that lived only in memory when the
-/// run stopped, as the open segment marker recorded it; `db_ts_max` the last transaction
-/// the database committed. The journals and the segments already written must hold every
-/// transaction from `marker_start` up to `db_ts_max`, in segments that follow each other:
-/// the history is complete up to the end of the newest of them as long as every journal
-/// but the newest was closed. A journal of a segment already written is a leftover and only
-/// removed. Journals older than `marker_start` belong to written segments as well.
-fn recover_journals(
-    dir: &Path,
-    marker_start: Duration,
-    db_ts_max: Option<Duration>,
-) -> Result<Option<Duration>, WalError> {
+/// The marker records the start of the oldest records that lived only in memory when the
+/// run stopped. Without a marker, a journal that holds records no written segment holds
+/// still counts: its records were committed, the marker merely did not reach the disk.
+/// `db_ts_max` is the last transaction the database committed, when it is known. The
+/// journals and the segments already written must hold every transaction from that start
+/// up to `db_ts_max`, in segments that follow each other: the history is complete up to
+/// the end of the newest of them as long as every journal but the newest was closed. A
+/// journal of a segment already written is a leftover. Journals older than the start
+/// belong to written segments as well. Each journal is read up to its first torn frame.
+fn plan_left_history(dir: &Path, db_ts_max: Option<Duration>) -> Result<LeftHistory, WalError> {
     let journals = left_journals(dir)?;
     let written = scan_segments(dir)?.segments;
+    let is_written = |journal: &LeftJournal| {
+        written
+            .iter()
+            .any(|segment| segment.segment_id == journal.segment_id)
+    };
+    let mut history = LeftHistory {
+        segments: Vec::new(),
+        journals: journals
+            .iter()
+            .map(|journal| journal.path.clone())
+            .collect(),
+        missing_from: None,
+    };
+    let start = read_marker_gap(dir).map(|gap| gap.from_ts).or_else(|| {
+        journals
+            .iter()
+            .filter(|journal| !journal.records.is_empty() && !is_written(journal))
+            .map(|journal| journal.start_ts)
+            .min()
+    });
+    let Some(start) = start else {
+        return Ok(history);
+    };
 
-    // What holds the history from `marker_start` on, oldest first: the segments written
-    // before the first journal, then the journals. Each item: start, end, complete.
+    // What holds the history from `start` on, oldest first: the segments written before
+    // the first journal, then the journals. Each item: start, end, complete.
     let first_journal = journals
         .iter()
         .map(|journal| journal.start_ts)
-        .find(|start| *start >= marker_start);
+        .find(|journal_start| *journal_start >= start);
     let mut items: Vec<(Duration, Option<Duration>, bool)> = written
         .iter()
-        .filter(|segment| segment.start_ts >= marker_start)
+        .filter(|segment| segment.start_ts >= start)
         .filter(|segment| first_journal.is_none_or(|first| segment.start_ts < first))
         .map(|segment| (segment.start_ts, Some(segment.end_ts), true))
         .collect();
-
-    let mut recovered = 0;
     for journal in journals {
-        let already_written = written
-            .iter()
-            .any(|segment| segment.segment_id == journal.segment_id);
-        if journal.start_ts >= marker_start {
-            items.push((journal.start_ts, journal.last_ts, journal.sealed));
-            if !already_written && !journal.records.is_empty() {
-                let mut entries = journal.records;
-                entries.sort_by_key(WalEntryRecord::ts);
-                let start_ts = entries
-                    .first()
-                    .map(WalEntryRecord::ts)
-                    .unwrap_or(journal.start_ts);
-                let end_ts = entries.last().map(WalEntryRecord::ts).unwrap_or(start_ts);
-                let file = WalSegmentFile {
-                    format_version: WAL_SEGMENT_FORMAT_VERSION,
-                    segment_id: segment_file_name(journal.server_uuid, start_ts),
-                    server_uuid: journal.server_uuid,
-                    server_version: journal
-                        .server_version
-                        .unwrap_or_else(|| env!("KUBIDM_PKG_SERIES").to_string()),
-                    start_ts,
-                    end_ts,
-                    entries,
-                };
-                recovered += file.entries.len();
-                write_segment_file(dir, &file)?;
-                info!(
-                    segment = %file.segment_id,
-                    records = file.entries.len(),
-                    closed = journal.sealed,
-                    "WAL segment closed from the journal the previous run left"
-                );
-            }
+        if journal.start_ts < start {
+            continue;
         }
-        remove_journal(&journal.path);
-    }
-    if recovered > 0 {
-        sync_dir(dir)?;
+        items.push((journal.start_ts, journal.last_ts, journal.sealed));
+        if is_written(&journal) || journal.records.is_empty() {
+            continue;
+        }
+        // The records stay in journal order, which is the commit order, as in the
+        // segment the run would have written.
+        let entries = journal.records;
+        let start_ts = entries
+            .first()
+            .map(WalEntryRecord::ts)
+            .unwrap_or(journal.start_ts);
+        let end_ts = entries.last().map(WalEntryRecord::ts).unwrap_or(start_ts);
+        history.segments.push(WalSegmentFile {
+            format_version: WAL_SEGMENT_FORMAT_VERSION,
+            segment_id: segment_file_name(journal.server_uuid, start_ts),
+            server_uuid: journal.server_uuid,
+            server_version: journal
+                .server_version
+                .unwrap_or_else(|| env!("KUBIDM_PKG_SERIES").to_string()),
+            start_ts,
+            end_ts,
+            entries,
+        });
     }
 
-    // Walk the history from the marker on.
+    history.missing_from = missing_from(start, items, db_ts_max)
+        // The database committed nothing since: nothing can be missing.
+        .filter(|from| db_ts_max.is_none_or(|db_ts_max| db_ts_max >= *from));
+    Ok(history)
+}
+
+/// Walk the history from `start` on (`items`: start, end, complete) and return where it
+/// stops being complete, see [`plan_left_history`].
+fn missing_from(
+    start: Duration,
+    mut items: Vec<(Duration, Option<Duration>, bool)>,
+    db_ts_max: Option<Duration>,
+) -> Option<Duration> {
     items.sort_by_key(|(start, _, _)| *start);
     let Some(first) = items.first() else {
-        return Ok(Some(marker_start));
+        return Some(start);
     };
-    if first.0 != marker_start {
-        return Ok(Some(marker_start));
+    if first.0 != start {
+        return Some(start);
     }
     let last_index = items.len() - 1;
     for (index, (start, end, complete)) in items.iter().enumerate() {
         let after =
             |end: &Option<Duration>| end.map_or(*start, |end| end + Duration::from_nanos(1));
         if index < last_index && !complete {
-            return Ok(Some(after(end)));
+            return Some(after(end));
         }
         if index == last_index {
-            return Ok(match (db_ts_max, end) {
+            return match (db_ts_max, end) {
                 (Some(db_ts_max), Some(end)) if db_ts_max <= *end => None,
                 _ => Some(after(end)),
-            });
+            };
         }
     }
-    Ok(Some(marker_start))
+    Some(start)
+}
+
+/// After an unclean stop, when the server starts: close the segments the journals left in
+/// `dir` hold (see [`plan_left_history`]), and record the history they miss, if any, as a
+/// gap up to `db_ts_max`, the last transaction the database committed, in the pending
+/// events of `dir`. The journals and the open segment marker go only once that is on
+/// disk, so that a crash half way through starts over. Returns the gap.
+pub fn close_left_segments(
+    dir: &Path,
+    db_ts_max: Option<Duration>,
+) -> Result<Option<WalGap>, WalError> {
+    close_left_history(dir, db_ts_max, false)
+}
+
+/// [`close_left_segments`] for an offline command that takes over the WAL directory of a
+/// stopped server (`recover`, `restore`), so that what the journals hold is never lost nor
+/// mistaken for history of the database it puts in place. Where the history the journals
+/// miss ends is unknown without the database: the open segment marker stays, moved to
+/// where the gap starts, so that the next start settles it against the database, and
+/// [`read_local_events`] reports the gap meanwhile.
+pub fn close_left_segments_offline(dir: &Path) -> Result<Option<WalGap>, WalError> {
+    close_left_history(dir, None, true)
+}
+
+fn close_left_history(
+    dir: &Path,
+    db_ts_max: Option<Duration>,
+    offline: bool,
+) -> Result<Option<WalGap>, WalError> {
+    let history = plan_left_history(dir, db_ts_max)?;
+    for file in &history.segments {
+        write_segment_file(dir, file)?;
+        info!(
+            segment = %file.segment_id,
+            records = file.entries.len(),
+            "WAL segment closed from the journal the previous run left"
+        );
+    }
+    if !history.segments.is_empty() {
+        sync_dir(dir)?;
+    }
+    let gap = history.gap(db_ts_max);
+    let keep_marker = match gap {
+        Some(gap) if offline => {
+            let marker = serde_json::to_vec(&OpenSegmentMarker {
+                start_ts: gap.from_ts,
+            })?;
+            write_file_durably(dir, WAL_OPEN_SEGMENT_MARKER, &marker)?;
+            true
+        }
+        Some(gap) => {
+            let mut pending = read_pending_events(dir);
+            pending.gaps.push(gap);
+            write_pending_events(dir, &pending)?;
+            false
+        }
+        None => false,
+    };
+    for journal in &history.journals {
+        remove_journal(journal);
+    }
+    if !keep_marker {
+        match fs::remove_file(dir.join(WAL_OPEN_SEGMENT_MARKER)) {
+            Ok(()) => sync_dir(dir)?,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Ok(gap)
+}
+
+/// What a stopped run left in `dir` that no written segment holds, read without changing
+/// anything: the segments its journals hold, compressed as they would be written and
+/// described by their sidecars, and the events of `dir` (see [`read_local_events`]) with
+/// the gap of what the journals miss, whose end is unknown, in place of the gap of the
+/// open segment marker. [`close_left_segments_offline`] followed by [`read_local_events`]
+/// gives the same, done.
+pub fn read_left_segments(dir: &Path) -> Result<LeftSegments, WalError> {
+    let history = plan_left_history(dir, None)?;
+    let segments = history
+        .segments
+        .iter()
+        .map(encode_segment)
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut events = read_pending_events(dir);
+    events
+        .gaps
+        .extend(read_handed_over_gaps(dir).into_iter().map(|(_, gap)| gap));
+    events.gaps.extend(history.gap(None));
+    Ok(LeftSegments { segments, events })
+}
+
+/// See [`read_left_segments`].
+#[derive(Debug, Default)]
+pub struct LeftSegments {
+    /// Each segment with its compressed content, in order.
+    pub segments: Vec<(WalSegment, Vec<u8>)>,
+    pub events: WalPendingEvents,
 }
 
 /// Closed segments taken out of the archiver by [`WalArchiver::take_writes`], so that they
@@ -812,44 +960,30 @@ impl WalArchiver {
         })?;
         let _ = fs::remove_file(&probe);
 
+        // A marker or a journal left behind means the previous run stopped with records
+        // that were never written to a segment. The journals close its segments, and only
+        // what they miss, if anything, is a gap. The gap is made durable before the
+        // marker and the journals go, so that a crash before the next synchronisation
+        // still reports it.
+        let left_marker = segments_path.join(WAL_OPEN_SEGMENT_MARKER).exists();
+        match close_left_segments(&segments_path, db_ts_max)? {
+            Some(gap) => error!(
+                from = %format_ts_rfc3339(gap.from_ts),
+                "WAL ARCHIVE HOLE: the previous run stopped without archiving its open \
+                 segment. Point-in-time recovery can not replay the transactions committed \
+                 since then until a new base backup is taken."
+            ),
+            None if left_marker => info!(
+                "The previous run stopped without closing its open segment; it was closed \
+                 from its journal and nothing is missing from the archive"
+            ),
+            None => {}
+        }
+
         // Events an earlier run, or an offline command, noticed and no synchronisation
         // recorded yet.
         let mut pending = read_pending_events(&segments_path);
         adopt_handed_over_gaps(&segments_path, &mut pending);
-
-        // A marker left behind means the previous run stopped with records that were never
-        // written to a segment. The gap is made durable before the marker goes, so that a
-        // crash before the next synchronisation still reports it.
-        // The journals of its open segments close them, and only what they miss, if
-        // anything, is a gap.
-        let marker_path = segments_path.join(WAL_OPEN_SEGMENT_MARKER);
-        if let Some(mut gap) = read_marker_gap(&segments_path) {
-            match recover_journals(&segments_path, gap.from_ts, db_ts_max)? {
-                Some(from_ts) => {
-                    gap.from_ts = from_ts;
-                    gap.until_ts = db_ts_max.map(|ts| ts.max(gap.from_ts));
-                    error!(
-                        from = %format_ts_rfc3339(gap.from_ts),
-                        "WAL ARCHIVE HOLE: the previous run stopped without archiving its open \
-                         segment. Point-in-time recovery can not replay the transactions \
-                         committed since then until a new base backup is taken."
-                    );
-                    pending.gaps.push(gap);
-                    write_pending_events(&segments_path, &pending)?;
-                }
-                None => info!(
-                    "The previous run stopped without closing its open segment; it was closed \
-                     from its journal and nothing is missing from the archive"
-                ),
-            }
-            fs::remove_file(&marker_path)?;
-            sync_dir(&segments_path)?;
-        } else {
-            // Without the marker every record was written: the journals are leftovers.
-            for journal in left_journals(&segments_path)? {
-                remove_journal(&journal.path);
-            }
-        }
 
         info!(
             path = %segments_path.display(),
@@ -870,6 +1004,7 @@ impl WalArchiver {
             pending,
             last_ts: None,
             journaling: config.open_segment_journal != WalJournalMode::Off,
+            committing: None,
             config,
         })
     }
@@ -912,7 +1047,7 @@ impl WalArchiver {
     }
 
     /// The CID time of the oldest record that only lives in memory, including the
-    /// segments being written right now.
+    /// segments being written right now and the transaction being committed.
     fn in_memory_start(&self) -> Option<Duration> {
         self.current_segment
             .iter()
@@ -920,7 +1055,29 @@ impl WalArchiver {
             .map(|segment| segment.start_ts)
             .chain(self.sealed.iter().map(|sealed| sealed.file.start_ts))
             .chain(self.in_flight.values().copied())
+            .chain(self.committing)
             .min()
+    }
+
+    /// Before the database commits a transaction with changes to archive, at `cid_ts`:
+    /// make sure the open segment marker is on disk and covers it. A transaction is only
+    /// archived once the database committed it, so without this an unclean stop between
+    /// the two would leave no trace of it when nothing else was in memory. Hand the
+    /// transaction to [`Self::stage_transaction`] or [`Self::note_failure`] once it is
+    /// committed, or to [`Self::abandon_commit`] when the commit failed.
+    pub fn prepare_commit(&mut self, cid_ts: Duration) {
+        if !self.is_enabled() {
+            return;
+        }
+        self.committing = Some(cid_ts);
+        self.sync_marker();
+    }
+
+    /// The commit [`Self::prepare_commit`] announced failed: nothing was committed.
+    pub fn abandon_commit(&mut self) {
+        if self.committing.take().is_some() {
+            self.sync_marker();
+        }
     }
 
     /// Count a transaction whose records were lost and remember the gap it leaves. Called
@@ -933,6 +1090,8 @@ impl WalArchiver {
             until_ts: cid_ts,
             reason: WalGapReason::ArchiveFailure,
         });
+        // The gap is on disk: the marker no longer needs to cover the transaction.
+        self.abandon_commit();
     }
 
     /// The database took the server uuid `to` in the transaction at `cid_ts` (a
@@ -1158,8 +1317,11 @@ impl WalArchiver {
             });
         }
         if records.is_empty() {
+            self.abandon_commit();
             return;
         }
+        // The records join the segment in memory below, which the marker covers from then.
+        self.committing = None;
 
         if self.current_segment.is_none() {
             let mut builder = WalSegmentBuilder {
@@ -1180,7 +1342,7 @@ impl WalArchiver {
 
         // The records are journaled before they join the segment in memory, synced to disk
         // as the journal mode asks.
-        self.journal_frame(cid.ts, &JournalFrameRef::Records(&records), true);
+        self.journal_frame(cid.ts, &JournalFrameRef::Records(&records));
         let Some(segment) = self.current_segment.as_mut() else {
             return;
         };
@@ -1199,20 +1361,54 @@ impl WalArchiver {
     }
 
     /// A committed transaction that archived no record, at `cid_ts`. The database records
-    /// it as its last transaction, so the journal of the open segment does too: an unclean
-    /// stop right after it is then known to have lost nothing. The frame is not synced on
-    /// its own; the next sync covers it.
+    /// it as its last transaction, so the journal of the open segment does too, synced like
+    /// the records of a commit: an unclean stop right after it is then known to have lost
+    /// nothing, rather than reported as a gap up to it.
     pub fn note_commit(&mut self, cid_ts: Duration) {
         if !self.is_enabled() {
             return;
         }
-        self.journal_frame(cid_ts, &JournalFrameRef::Commit(cid_ts), false);
+        self.journal_frame(cid_ts, &JournalFrameRef::Commit(cid_ts));
     }
 
-    /// Append `frame` to the journal of the open segment, if it has one. With `records`,
-    /// the journal is then synced to disk as the journal mode asks. A journal that fails
-    /// stops journaling for the rest of the run.
-    fn journal_frame(&mut self, now: Duration, frame: &JournalFrameRef<'_>, records: bool) {
+    /// With [`WalJournalMode::Interval`]: sync the journal of the open segment when frames
+    /// were written to it since its last sync, at `now`. The archive task calls this every
+    /// `journal_sync_interval`, so that no commit waits longer than that for its journal
+    /// to reach the disk, whether or not other commits follow it.
+    pub fn sync_journal(&mut self, now: Duration) {
+        let Some(journal) = self
+            .current_segment
+            .as_mut()
+            .and_then(|segment| segment.journal.as_mut())
+            .filter(|journal| journal.unsynced)
+        else {
+            return;
+        };
+        if let Err(err) = journal.sync() {
+            let path = journal.path.clone();
+            if let Some(segment) = self.current_segment.as_mut() {
+                segment.journal = None;
+            }
+            self.stop_journaling(&err, Some(&path));
+            return;
+        }
+        journal.synced_at = now;
+    }
+
+    /// Whether the journal of the open segment holds frames not synced to disk yet.
+    pub fn has_unsynced_journal(&self) -> bool {
+        self.current_segment
+            .as_ref()
+            .and_then(|segment| segment.journal.as_ref())
+            .is_some_and(|journal| journal.unsynced)
+    }
+
+    /// Append `frame` to the journal of the open segment, if it has one, and sync the
+    /// journal to disk as the journal mode asks: with every frame in
+    /// [`WalJournalMode::Commit`], once the interval since the last sync ran out in
+    /// [`WalJournalMode::Interval`]. A journal that fails stops journaling for the rest of
+    /// the run.
+    fn journal_frame(&mut self, now: Duration, frame: &JournalFrameRef<'_>) {
         let mode = self.config.open_segment_journal;
         let interval = self.config.journal_sync_interval();
         let Some(journal) = self
@@ -1224,7 +1420,7 @@ impl WalArchiver {
         };
         let result = journal.append(frame).and_then(|()| {
             let due = match mode {
-                WalJournalMode::Commit => records,
+                WalJournalMode::Commit => true,
                 WalJournalMode::Interval => now >= journal.synced_at + interval,
                 WalJournalMode::Off => false,
             };
@@ -1568,14 +1764,13 @@ pub fn write_pending_events(dir: &Path, events: &WalPendingEvents) -> Result<(),
 
 /// The events left in `dir` by a server that is not running: those it never had recorded,
 /// the gaps offline commands handed over, and the gap of the open segment it stopped
-/// without closing.
+/// without closing (from the start of the segment: [`close_left_segments_offline`] first,
+/// to close it from its journal, or [`read_left_segments`] to see what the journal holds).
 pub fn read_local_events(dir: &Path) -> WalPendingEvents {
     let mut events = read_pending_events(dir);
-    events.gaps.extend(
-        read_handed_over_gaps(dir)
-            .into_iter()
-            .map(|(_, gap)| gap),
-    );
+    events
+        .gaps
+        .extend(read_handed_over_gaps(dir).into_iter().map(|(_, gap)| gap));
     events.gaps.extend(read_marker_gap(dir));
     events
 }
@@ -1751,12 +1946,7 @@ pub fn read_marker_gap(dir: &Path) -> Option<WalGap> {
 /// Both are synced to disk before the sidecar exists, so that a sidecar never describes a
 /// segment file a crash tore.
 pub fn write_segment_file(dir: &Path, file: &WalSegmentFile) -> Result<WalSegment, WalError> {
-    check_segment_id(&file.segment_id)?;
-    let serialized = serde_json::to_vec(file)?;
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-    encoder.write_all(&serialized)?;
-    let compressed = encoder.finish()?;
-    let segment = describe_segment(file, &compressed);
+    let (segment, compressed) = encode_segment(file)?;
 
     write_file_durably(dir, &file.segment_id, &compressed)?;
     write_file_durably(
@@ -1767,6 +1957,17 @@ pub fn write_segment_file(dir: &Path, file: &WalSegmentFile) -> Result<WalSegmen
 
     debug!(segment = %file.segment_id, "WAL segment written");
     Ok(segment)
+}
+
+/// Serialise and compress `file`: its content as [`write_segment_file`] writes it, and its
+/// sidecar.
+fn encode_segment(file: &WalSegmentFile) -> Result<(WalSegment, Vec<u8>), WalError> {
+    check_segment_id(&file.segment_id)?;
+    let serialized = serde_json::to_vec(file)?;
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&serialized)?;
+    let compressed = encoder.finish()?;
+    Ok((describe_segment(file, &compressed), compressed))
 }
 
 /// The sidecar of the segment `file` whose compressed content is `compressed`.
@@ -2882,6 +3083,229 @@ mod tests {
             }]
         );
         assert!(list_segments(&wal_dir).unwrap().is_empty());
+    }
+
+    /// The marker of a new segment may not reach the disk before a crash, while its
+    /// journal holds a committed transaction: the journal is the source of truth, so the
+    /// segment is closed from it rather than the journal removed as a leftover.
+    #[test]
+    fn test_a_journal_without_the_marker_is_closed_rather_than_removed() {
+        let server = Uuid::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("wal");
+        let config = journal_config(WalJournalMode::Commit);
+        let mut archiver =
+            WalArchiver::open(config.clone(), server, wal_dir.clone(), None).unwrap();
+        archiver.stage_transaction(&cid(server, 10), false, [create(10, 1)]);
+        drop(archiver);
+        // The crash came after the journal and before the marker.
+        fs::remove_file(wal_dir.join(WAL_OPEN_SEGMENT_MARKER)).unwrap();
+
+        let restarted = WalArchiver::open(
+            config.clone(),
+            server,
+            wal_dir.clone(),
+            Some(Duration::from_secs(10)),
+        )
+        .unwrap();
+        assert!(restarted.pending_events().is_empty());
+        let segments = list_segments(&wal_dir).unwrap();
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].entry_count, 1);
+        assert!(journals(&wal_dir).is_empty());
+        drop(restarted);
+
+        // What the journal misses up to the database's last transaction is a gap, as
+        // with the marker.
+        let mut archiver =
+            WalArchiver::open(config.clone(), server, wal_dir.clone(), None).unwrap();
+        archiver.stage_transaction(&cid(server, 20), false, [create(20, 1)]);
+        drop(archiver);
+        fs::remove_file(wal_dir.join(WAL_OPEN_SEGMENT_MARKER)).unwrap();
+        let restarted = WalArchiver::open(
+            config,
+            server,
+            wal_dir.clone(),
+            Some(Duration::from_secs(25)),
+        )
+        .unwrap();
+        assert_eq!(
+            restarted.pending_events().gaps,
+            vec![WalGap {
+                from_ts: Duration::from_secs(20) + Duration::from_nanos(1),
+                until_ts: Some(Duration::from_secs(25)),
+                reason: WalGapReason::UnclosedSegment,
+            }]
+        );
+        assert_eq!(list_segments(&wal_dir).unwrap().len(), 2);
+    }
+
+    /// The marker covers a transaction from before the database commits it: a crash
+    /// between the commit and its archiving is a gap, whatever the journal mode, and a
+    /// crash before the commit, or a commit that failed, is none.
+    #[test]
+    fn test_a_crash_between_the_database_commit_and_its_archiving_is_a_gap() {
+        for mode in [WalJournalMode::Commit, WalJournalMode::Off] {
+            let server = Uuid::new_v4();
+            let dir = tempfile::tempdir().unwrap();
+            let wal_dir = dir.path().join("wal");
+            let config = journal_config(mode);
+            let mut archiver =
+                WalArchiver::open(config.clone(), server, wal_dir.clone(), None).unwrap();
+            archiver.prepare_commit(Duration::from_secs(10));
+            assert!(wal_dir.join(WAL_OPEN_SEGMENT_MARKER).exists(), "{mode}");
+            drop(archiver);
+
+            // The database did not commit it.
+            let mut restarted = WalArchiver::open(
+                config.clone(),
+                server,
+                wal_dir.clone(),
+                Some(Duration::from_secs(5)),
+            )
+            .unwrap();
+            assert!(restarted.pending_events().is_empty(), "{mode}");
+            assert!(!wal_dir.join(WAL_OPEN_SEGMENT_MARKER).exists(), "{mode}");
+
+            // A failed commit takes the marker back.
+            restarted.prepare_commit(Duration::from_secs(10));
+            restarted.abandon_commit();
+            assert!(!wal_dir.join(WAL_OPEN_SEGMENT_MARKER).exists(), "{mode}");
+
+            // The database committed it, and the server stopped before archiving it.
+            restarted.prepare_commit(Duration::from_secs(10));
+            drop(restarted);
+            let restarted = WalArchiver::open(
+                config,
+                server,
+                wal_dir.clone(),
+                Some(Duration::from_secs(10)),
+            )
+            .unwrap();
+            assert_eq!(
+                restarted.pending_events().gaps,
+                vec![WalGap {
+                    from_ts: Duration::from_secs(10),
+                    until_ts: Some(Duration::from_secs(10)),
+                    reason: WalGapReason::UnclosedSegment,
+                }],
+                "{mode}"
+            );
+        }
+    }
+
+    /// In Commit mode every frame is synced before the commit returns, the frame of a
+    /// commit that archived no record included: otherwise a power loss would lose it while
+    /// the database keeps the commit, which the next start reports as a gap although
+    /// nothing is missing. In Interval mode the archive task syncs what waits.
+    #[test]
+    fn test_journal_frames_are_synced_as_the_mode_asks() {
+        let server = Uuid::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("wal");
+        let mut archiver = WalArchiver::open(
+            journal_config(WalJournalMode::Commit),
+            server,
+            wal_dir.clone(),
+            None,
+        )
+        .unwrap();
+        archiver.stage_transaction(&cid(server, 10), false, [create(10, 1)]);
+        assert!(!archiver.has_unsynced_journal());
+        archiver.note_commit(Duration::from_secs(12));
+        assert!(!archiver.has_unsynced_journal());
+        drop(archiver);
+
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("wal");
+        let mut archiver = WalArchiver::open(
+            journal_config(WalJournalMode::Interval),
+            server,
+            wal_dir,
+            None,
+        )
+        .unwrap();
+        archiver.stage_transaction(&cid(server, 10), false, [create(10, 1)]);
+        archiver.note_commit(Duration::from_millis(10_100));
+        assert!(archiver.has_unsynced_journal());
+        archiver.sync_journal(Duration::from_millis(10_200));
+        assert!(!archiver.has_unsynced_journal());
+        // The interval runs from that sync.
+        archiver.note_commit(Duration::from_millis(11_100));
+        assert!(archiver.has_unsynced_journal());
+        archiver.stage_transaction(&cid(server, 12), false, [create(12, 1)]);
+        assert!(!archiver.has_unsynced_journal());
+    }
+
+    /// An offline command closes the journals of a stopped server, or reads them without
+    /// changing anything, to the same result. Where the history they miss ends is settled
+    /// against the database at the next start: the marker stays, moved to the gap.
+    #[test]
+    fn test_offline_commands_read_or_close_the_journals_of_a_stopped_server() {
+        let server = Uuid::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("wal");
+        let config = journal_config(WalJournalMode::Commit);
+        let mut archiver =
+            WalArchiver::open(config.clone(), server, wal_dir.clone(), None).unwrap();
+        archiver.stage_transaction(&cid(server, 10), false, [create(10, 1)]);
+        archiver.stage_transaction(&cid(server, 11), false, [create(11, 2)]);
+        drop(archiver);
+        let gap = WalGap {
+            from_ts: Duration::from_secs(11) + Duration::from_nanos(1),
+            until_ts: None,
+            reason: WalGapReason::UnclosedSegment,
+        };
+
+        let read = read_left_segments(&wal_dir).unwrap();
+        assert_eq!(read.segments.len(), 1);
+        assert_eq!(read.segments[0].0.entry_count, 2);
+        assert_eq!(read.events.gaps, vec![gap]);
+        assert_eq!(journals(&wal_dir).len(), 1, "reading changes nothing");
+        assert!(list_segments(&wal_dir).unwrap().is_empty());
+
+        assert_eq!(close_left_segments_offline(&wal_dir).unwrap(), Some(gap));
+        assert!(journals(&wal_dir).is_empty());
+        let segments = list_segments(&wal_dir).unwrap();
+        assert_eq!(segments, vec![read.segments[0].0.clone()]);
+        assert_eq!(read_local_events(&wal_dir).gaps, vec![gap]);
+        // Closing again changes nothing.
+        assert_eq!(close_left_segments_offline(&wal_dir).unwrap(), Some(gap));
+        assert_eq!(list_segments(&wal_dir).unwrap(), segments);
+
+        // The database committed nothing after the journal: no gap at the next start.
+        let restarted = WalArchiver::open(
+            config.clone(),
+            server,
+            wal_dir.clone(),
+            Some(Duration::from_secs(11)),
+        )
+        .unwrap();
+        assert!(restarted.pending_events().is_empty());
+        assert!(!wal_dir.join(WAL_OPEN_SEGMENT_MARKER).exists());
+    }
+
+    /// The records of a journal keep their order, which is the commit order, even when
+    /// the clock went backwards between two commits.
+    #[test]
+    fn test_journal_records_keep_the_commit_order() {
+        let server = Uuid::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("wal");
+        let config = journal_config(WalJournalMode::Commit);
+        let mut archiver =
+            WalArchiver::open(config.clone(), server, wal_dir.clone(), None).unwrap();
+        archiver.stage_transaction(&cid(server, 20), false, [create(20, 1)]);
+        archiver.stage_transaction(&cid(server, 15), false, [create(15, 2)]);
+        drop(archiver);
+        close_left_segments(&wal_dir, Some(Duration::from_secs(20))).unwrap();
+        let segments = list_segments(&wal_dir).unwrap();
+        let file = read_segment_file(&wal_dir.join(&segments[0].segment_id)).unwrap();
+        let order: Vec<Duration> = file.entries.iter().map(WalEntryRecord::ts).collect();
+        assert_eq!(
+            order,
+            vec![Duration::from_secs(20), Duration::from_secs(15)]
+        );
     }
 
     #[test]

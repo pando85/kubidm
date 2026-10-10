@@ -13,9 +13,10 @@ use kubidm_proto::internal::OperationError;
 use kubidmd_lib::be::WalApplyReport;
 use kubidmd_lib::prelude::duration_from_epoch_now;
 use kubidmd_lib::repl::wal::{
-    clear_local_events, defer_restore, format_ts_rfc3339, list_segments, parse_recovery_target_cid,
-    parse_recovery_target_time, parse_segment, read_local_events, scan_segments, WalEntryRecord,
-    WalOperationRecord, WalPendingEvents, WalRestore,
+    clear_local_events, close_left_segments_offline, defer_restore, format_ts_rfc3339,
+    list_segments, parse_recovery_target_cid, parse_recovery_target_time, parse_segment,
+    read_left_segments, read_local_events, scan_segments, WalEntryRecord, WalOperationRecord,
+    WalPendingEvents, WalRestore,
 };
 use uuid::Uuid;
 
@@ -203,13 +204,32 @@ struct OpenedArchive {
     manifest: PitrManifest,
     /// Ids of the segments that are only in the local WAL directory.
     local_only: BTreeSet<String>,
+    /// The compressed content of the segments only the journals in the local WAL
+    /// directory hold, by id, when they were read without being closed.
+    journaled: BTreeMap<String, Vec<u8>>,
+}
+
+/// What [`open_archive`] does with the journals and the open segment marker a stopped
+/// server left in its WAL directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeftHistory {
+    /// Read what they hold, changing nothing: the server may still be running.
+    Read,
+    /// Close the segments they hold, as the next start of the server would, so that the
+    /// commands that follow find them in the directory.
+    Close,
 }
 
 /// Open the archive described by `config`, or its copy in the replication region `region`,
 /// and load its manifest.
+///
+/// What the local WAL directory holds and the archive does not is added: segments not
+/// archived yet, the segments the journals of a server that stopped uncleanly hold (see
+/// [`LeftHistory`]), and the gaps no manifest records yet.
 async fn open_archive(
     config: &Configuration,
     region: Option<&str>,
+    left: LeftHistory,
 ) -> Result<OpenedArchive, PitrError> {
     let configured = PitrSettings::from_config(config)?.ok_or_else(|| {
         PitrError::Config(
@@ -260,25 +280,54 @@ async fn open_archive(
         ),
     }
 
-    // Gaps and changes of identity the server noticed and no manifest records yet still
-    // bound what can be recovered.
-    let local_events = {
+    // What an unclean stop left in the journals is part of the history: without it,
+    // recovery would stop where the open segment of the stopped server started. Gaps and
+    // changes of identity the server noticed and no manifest records yet still bound what
+    // can be recovered.
+    let (local_events, journaled, local_segments) = {
         let local_dir = settings.local_dir.clone();
-        blocking(move || Ok(read_local_events(&local_dir))).await?
+        blocking(move || {
+            let (events, journaled) = match left {
+                LeftHistory::Close => {
+                    if let Some(gap) = close_left_segments_offline(&local_dir)? {
+                        warn!(
+                            from = %format_ts_rfc3339(gap.from_ts),
+                            "The server stopped uncleanly and its journal does not show that \
+                             it holds every transaction the database committed after this \
+                             point; recovery stops before it"
+                        );
+                    }
+                    (read_local_events(&local_dir), Vec::new())
+                }
+                LeftHistory::Read => {
+                    let left = read_left_segments(&local_dir)?;
+                    (left.events, left.segments)
+                }
+            };
+            Ok((events, journaled, list_segments(&local_dir)?))
+        })
+        .await?
     };
     fold_local_events(&mut manifest, &local_events, duration_from_epoch_now());
 
     let mut local_only = BTreeSet::new();
-    let local_segments = {
-        let local_dir = settings.local_dir.clone();
-        blocking(move || Ok(list_segments(&local_dir)?)).await?
-    };
-    for segment in local_segments {
+    let mut journaled_data = BTreeMap::new();
+    let journaled = journaled
+        .into_iter()
+        .map(|(segment, data)| (segment, Some(data)));
+    for (segment, data) in local_segments
+        .into_iter()
+        .map(|segment| (segment, None))
+        .chain(journaled)
+    {
         if !manifest.knows_server(segment.server_uuid) || manifest.has_segment(&segment.segment_id)
         {
             continue;
         }
         local_only.insert(segment.segment_id.clone());
+        if let Some(data) = data {
+            journaled_data.insert(segment.segment_id.clone(), data);
+        }
         manifest.add_segment(segment);
     }
 
@@ -288,6 +337,7 @@ async fn open_archive(
         store,
         manifest,
         local_only,
+        journaled: journaled_data,
     })
 }
 
@@ -389,8 +439,9 @@ pub async fn pitr_list_server_core(config: &Configuration, region: Option<&str>)
         settings,
         manifest,
         local_only,
+        journaled,
         ..
-    } = match open_archive(config, region).await {
+    } = match open_archive(config, region, LeftHistory::Read).await {
         Ok(opened) => opened,
         Err(err) => {
             error!(%err, "Unable to read the PITR archive");
@@ -458,7 +509,9 @@ pub async fn pitr_list_server_core(config: &Configuration, region: Option<&str>)
             "SEGMENT", "FROM", "TO", "RECORDS", "SIZE_BYTES"
         );
         for segment in &manifest.segments {
-            let note = if local_only.contains(&segment.segment_id) {
+            let note = if journaled.contains_key(&segment.segment_id) {
+                "  (in the journal of a stopped server, not archived yet)".to_string()
+            } else if local_only.contains(&segment.segment_id) {
                 "  (local, not archived yet)".to_string()
             } else if let Some(key) = &segment.encryption_key {
                 format!("  (encrypted, key '{key}')")
@@ -593,15 +646,20 @@ async fn load_records(opened: &OpenedArchive, plan: &RecoveryPlan) -> Result<Rep
                 env!("KUBIDM_PKG_SERIES")
             )));
         }
-        let data = opened
-            .store
-            .fetch_segment(
-                &opened.settings.local_dir,
-                segment,
-                opened.local_only.contains(&segment.segment_id),
-                &mut keys,
-            )
-            .await?;
+        let data = match opened.journaled.get(&segment.segment_id) {
+            Some(data) => data.clone(),
+            None => {
+                opened
+                    .store
+                    .fetch_segment(
+                        &opened.settings.local_dir,
+                        segment,
+                        opened.local_only.contains(&segment.segment_id),
+                        &mut keys,
+                    )
+                    .await?
+            }
+        };
         let compression = segment.compression;
         let file = blocking(move || Ok(parse_segment(&data, compression)?)).await?;
         if !opened.manifest.knows_server(file.server_uuid) {
@@ -650,7 +708,9 @@ fn print_plan(opened: &OpenedArchive, plan: &RecoveryPlan, records: usize, recov
                 format_ts_rfc3339(segment.start_ts),
                 format_ts_rfc3339(segment.end_ts),
                 segment.entry_count,
-                if opened.local_only.contains(&segment.segment_id) {
+                if opened.journaled.contains_key(&segment.segment_id) {
+                    ", in a journal"
+                } else if opened.local_only.contains(&segment.segment_id) {
                     ", local"
                 } else if segment.encryption_key.is_some() {
                     ", encrypted"
@@ -678,7 +738,13 @@ pub async fn pitr_recover_server_core(
     dry_run: bool,
     region: Option<&str>,
 ) -> Result<RecoveryOutcome, PitrError> {
-    let opened = open_archive(config, region).await?;
+    // A dry run changes nothing, and may run next to the server.
+    let left = if dry_run {
+        LeftHistory::Read
+    } else {
+        LeftHistory::Close
+    };
+    let opened = open_archive(config, region, left).await?;
     let plan = plan_recovery(&opened.manifest, target)?;
 
     if plan.base.server_version != env!("KUBIDM_PKG_SERIES") {
@@ -901,8 +967,14 @@ async fn prepare_restore(
     restored: &RestoredDatabase<'_>,
 ) -> Result<WalRestore, PitrError> {
     let local_dir = local_dir.to_path_buf();
-    let (abandoned, scan) =
-        blocking(move || Ok((read_local_events(&local_dir), scan_segments(&local_dir)?))).await?;
+    // The segments the journals of the stopped server hold belong to the history before
+    // the restore: they are closed first, so that the restore accounts for them and the
+    // next start does not take them for history of the restored database.
+    let (abandoned, scan) = blocking(move || {
+        close_left_segments_offline(&local_dir)?;
+        Ok((read_local_events(&local_dir), scan_segments(&local_dir)?))
+    })
+    .await?;
     if !scan.unreadable.is_empty() {
         warn!(
             segments = %scan.unreadable.join(", "),
@@ -1332,6 +1404,7 @@ mod tests {
             store: PitrStore::Local { dir: dir.clone() },
             manifest,
             local_only: BTreeSet::new(),
+            journaled: BTreeMap::new(),
         }
     }
 

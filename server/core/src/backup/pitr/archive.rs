@@ -6,7 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kubidm_proto::backup::{
-    PitrBaseBackup, PitrManifest, PitrServerUuidChange, PitrWalGap, WalSegment, PITR_MANIFEST_KEY,
+    PitrBaseBackup, PitrManifest, PitrServerUuidChange, PitrWalGap, WalJournalMode, WalSegment,
+    PITR_MANIFEST_KEY,
 };
 use kubidmd_lib::be::{lock_wal, BackupStructuralReport, SharedWalArchiver};
 use kubidmd_lib::prelude::duration_from_epoch_now;
@@ -844,6 +845,7 @@ pub(crate) fn start_wal_archive_task(
     mut rx: broadcast::Receiver<CoreAction>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let journal_sync = start_journal_sync_task(&archive);
         let mut inter = interval(archive.interval());
         inter.set_missed_tick_behavior(MissedTickBehavior::Skip);
         // The first tick completes immediately: archive what a previous run left behind.
@@ -862,8 +864,41 @@ pub(crate) fn start_wal_archive_task(
                 }
             }
         }
+        if let Some(journal_sync) = journal_sync {
+            journal_sync.abort();
+        }
         info!("Stopped {}", crate::TaskName::WalArchive);
     })
+}
+
+/// With `open_segment_journal = "Interval"`, start the task that syncs the journal of the
+/// open segment every `journal_sync_interval_ms`, on its own so that a long archive run
+/// never delays it: a commit waits at most that long for its journal to reach the disk,
+/// whether or not other commits follow it. The archive task aborts it when it stops.
+fn start_journal_sync_task(archive: &Arc<PitrArchive>) -> Option<tokio::task::JoinHandle<()>> {
+    let wal = &archive.settings.wal;
+    if wal.open_segment_journal != WalJournalMode::Interval {
+        return None;
+    }
+    let period = wal.journal_sync_interval().max(Duration::from_millis(10));
+    let archive = archive.clone();
+    Some(tokio::spawn(async move {
+        let mut inter = interval(period);
+        inter.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        loop {
+            inter.tick().await;
+            let now = duration_from_epoch_now();
+            if let Err(err) = archive
+                .with_archiver(move |archiver| {
+                    archiver.sync_journal(now);
+                    Ok(())
+                })
+                .await
+            {
+                warn!(%err, "Unable to sync the WAL segment journal");
+            }
+        }
+    }))
 }
 
 #[cfg(test)]
@@ -1513,6 +1548,58 @@ mod tests {
         assert_eq!(again.server_uuid_changes, manifest.server_uuid_changes);
     }
 
+    /// With the Interval journal mode, the archive task syncs the journal of the open
+    /// segment every `journal_sync_interval_ms`, whether or not another commit follows.
+    #[tokio::test]
+    async fn test_the_archive_task_syncs_an_interval_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("wal");
+        let server = Uuid::new_v4();
+        let wal_cfg = WalArchiveConfig {
+            enabled: true,
+            local_path: Some(wal_dir.clone()),
+            open_segment_journal: WalJournalMode::Interval,
+            journal_sync_interval_ms: 20,
+            ..WalArchiveConfig::default()
+        };
+        let settings = PitrSettings {
+            wal: wal_cfg.clone(),
+            local_dir: wal_dir.clone(),
+            location: PitrLocation::Local(wal_dir.clone()),
+            bases: BaseLocation::Local(dir.path().join("backups")),
+            encryption: BackupEncryptionConfig::default(),
+        };
+        let archiver: SharedWalArchiver = Arc::new(Mutex::new(
+            WalArchiver::open(wal_cfg, server, wal_dir, None).unwrap(),
+        ));
+        // A commit now, well inside the segment interval, which the next commit would sync
+        // only once the interval ran out: there is none.
+        append_create(
+            &archiver,
+            server,
+            duration_from_epoch_now().as_secs(),
+            b"waits for its sync",
+        );
+        assert!(lock_wal(&archiver).has_unsynced_journal());
+
+        let (tx, rx) = broadcast::channel(1);
+        let task =
+            start_wal_archive_task(Arc::new(PitrArchive::new(settings, archiver.clone())), rx);
+        let mut synced = false;
+        for _ in 0..250 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let archiver = lock_wal(&archiver);
+            assert!(archiver.has_pending_records(), "the segment stays open");
+            if !archiver.has_unsynced_journal() {
+                synced = true;
+                break;
+            }
+        }
+        tx.send(CoreAction::Shutdown).unwrap();
+        task.await.unwrap();
+        assert!(synced, "the journal was not synced by the archive task");
+    }
+
     #[tokio::test]
     async fn test_a_restore_before_anything_was_archived_discards_the_old_events() {
         let dir = tempfile::tempdir().unwrap();
@@ -1568,7 +1655,19 @@ mod tests {
         let store = PitrStore::open(&settings.location).await.unwrap();
         let manifest = store.load_manifest().await.unwrap().unwrap();
         assert_eq!(manifest.server_uuid, b);
-        assert!(manifest.gaps.is_empty(), "{:?}", manifest.gaps);
+        // The records the old server journaled are archived as the abandoned history they
+        // are; what its journal could not show it holds is a gap inside that history.
+        assert!(
+            manifest.gaps.iter().all(
+                |gap| manifest.is_abandoned(gap.from_ts) && manifest.is_abandoned(gap.until_ts)
+            ),
+            "{manifest:#?}"
+        );
+        assert!(manifest
+            .segments
+            .iter()
+            .filter(|segment| segment.server_uuid != b)
+            .all(|segment| manifest.is_abandoned(segment.start_ts)));
     }
 
     /// A server whose archive was never reachable keeps its closed segments in its WAL

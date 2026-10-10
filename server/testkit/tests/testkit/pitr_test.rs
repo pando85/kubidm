@@ -340,6 +340,79 @@ fn test_pitr_unclean_stop_loses_nothing_with_the_journal() {
     });
 }
 
+/// A server that stopped uncleanly may not start again: its database is damaged, which is
+/// when `recover` is needed. Recovery then takes the open segment from the journal itself,
+/// read as it is by a dry run, closed by the recovery, and the latest point is the last
+/// write before the stop.
+#[test]
+fn test_pitr_recover_after_an_unclean_stop_includes_the_journal_without_a_start() {
+    let workdir = tempfile::tempdir().expect("Failed to create workdir");
+    let backup_dir = workdir.path().join("backups");
+    let wal_dir = workdir.path().join("wal");
+    std::fs::create_dir(&backup_dir).expect("Failed to create backup directory");
+    let config = pitr_config(
+        &workdir.path().join("source.db"),
+        &backup_dir,
+        &wal_dir,
+        None,
+    );
+
+    run(async {
+        let env = setup_async_test(config.clone()).await;
+        populate(&env).await;
+        env.core_handle
+            .trigger_online_backup(&backup_dir, 7, BackupCompression::Gzip, &Default::default())
+            .await
+            .expect("Online backup failed");
+        env.rsclient
+            .idm_person_account_create(PITR_USER_BEFORE, "Before")
+            .await
+            .expect("Failed to create the archived person");
+        archive_now(&env).await;
+        env.rsclient
+            .idm_person_account_create(PITR_USER_LOST, "Journaled")
+            .await
+            .expect("Failed to create the journaled person");
+        // No shutdown: the runtime goes away under the server, as in a crash.
+        std::mem::forget(env);
+    });
+
+    let journals = || {
+        std::fs::read_dir(&wal_dir)
+            .expect("Failed to list the WAL directory")
+            .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+            .filter(|name| name.ends_with(".journal"))
+            .count()
+    };
+    assert_eq!(journals(), 1);
+
+    run(async {
+        let latest_db = workdir.path().join("latest.db");
+        let latest_config = pitr_config(&latest_db, &backup_dir, &wal_dir, None);
+        let dry_run =
+            pitr_recover_server_core(&latest_config, &RecoveryTargetSpec::Latest, true, None)
+                .await
+                .expect("Dry run of the recovery failed");
+        assert_eq!(journals(), 1, "a dry run changes nothing");
+        let recovered =
+            pitr_recover_server_core(&latest_config, &RecoveryTargetSpec::Latest, false, None)
+                .await
+                .expect("Recovery to the latest point failed");
+        assert_eq!(recovered.recovered_ts, dry_run.recovered_ts);
+        assert_eq!(recovered.records, dry_run.records);
+        assert_eq!(journals(), 0);
+
+        let mut env = setup_async_test(latest_config).await;
+        login_put_admin_idm_admins(&env.rsclient).await;
+        assert!(person_exists(&env.rsclient, PITR_USER_BEFORE).await);
+        assert!(
+            person_exists(&env.rsclient, PITR_USER_LOST).await,
+            "The journaled write must be recovered without a start of the stopped server"
+        );
+        env.core_handle.shutdown().await;
+    });
+}
+
 #[test]
 fn test_pitr_unclean_stop_leaves_a_gap_recovery_does_not_cross() {
     let workdir = tempfile::tempdir().expect("Failed to create workdir");
