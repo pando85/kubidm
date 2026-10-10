@@ -300,7 +300,10 @@ At startup, and in `kubidmd configtest`, the key source is checked to be usable:
 variable is present and not empty, the key file exists and is readable, the URL is a well formed `https` URL, or `http`
 on loopback (it is not fetched at that point). A passphrase file or key file that everyone on the host can read is
 reported with a warning, as for the TLS key. The key derivation parameters (`key_derivation.m_cost` in KiB, `t_cost`,
-`p_cost`) must lie within sane bounds; the defaults are 19 MiB, 2 iterations and no parallelism.
+`p_cost`) must lie within sane bounds; the defaults are 19 MiB, 2 iterations and no parallelism. `m_cost` must be
+between 8 MiB (8192) and 1 GiB (1048576), `t_cost` and `p_cost` between 1 and 16, and `m_cost` times `t_cost` at most 4
+GiB (4194304). The same bounds are checked on the parameters recorded in an artifact before anything is derived from
+them, so a modified artifact can not make a restore allocate more memory or spend more time than that.
 
 #### Key Identifier
 

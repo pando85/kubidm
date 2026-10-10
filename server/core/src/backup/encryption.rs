@@ -48,14 +48,24 @@ use url::Url;
 /// `passphrase_file` is configured.
 pub const PASSPHRASE_ENV: &str = "KUBIDM_BACKUP_PASSPHRASE";
 
+// Bounds of the Argon2id parameters. They apply to the configuration and, more
+// importantly, to the header of every artifact before it is decrypted: the header is only
+// authenticated once the key has been derived with the parameters it names, so whoever can
+// write to the backup store chooses them. The maxima keep the worst case of one artifact
+// to about a gigabyte of memory and a few seconds of CPU on the host that restores, and
+// still leave ample room above the defaults (19 MiB, 2 passes, 1 lane).
+
 /// Lowest accepted Argon2id memory cost, in KiB (8 MiB).
 pub const MIN_KDF_M_COST: u32 = 8 * 1024;
-/// Highest accepted Argon2id memory cost, in KiB (4 GiB).
-pub const MAX_KDF_M_COST: u32 = 4 * 1024 * 1024;
+/// Highest accepted Argon2id memory cost, in KiB (1 GiB).
+pub const MAX_KDF_M_COST: u32 = 1024 * 1024;
 /// Highest accepted Argon2id iteration count.
-pub const MAX_KDF_T_COST: u32 = 64;
+pub const MAX_KDF_T_COST: u32 = 16;
 /// Highest accepted Argon2id parallelism.
-pub const MAX_KDF_P_COST: u32 = 64;
+pub const MAX_KDF_P_COST: u32 = 16;
+/// Highest accepted product of the memory cost (KiB) and the iteration count, the memory
+/// Argon2id fills in total (4 GiB): 1 GiB with 4 passes, or 256 MiB with 16.
+pub const MAX_KDF_WORK: u64 = 4 * 1024 * 1024;
 
 /// Fixed salt of the key fingerprint that identifies the material of a key file or key
 /// endpoint when no `key_identifier` is configured. A fixed salt would let an attacker
@@ -216,8 +226,9 @@ pub fn read_encryption_header(
 }
 
 /// Check that Argon2id parameters are within the bounds this server accepts, both for the
-/// configuration and for the header of an artifact about to be decrypted (so that a crafted
-/// header can not make a restore allocate gigabytes).
+/// configuration and for the header of an artifact about to be decrypted, before anything
+/// is allocated: a crafted header can not make a restore allocate more than
+/// [`MAX_KDF_M_COST`] or fill more than [`MAX_KDF_WORK`] KiB in total.
 pub fn validate_key_derivation_params(params: &KeyDerivationParams) -> Result<(), String> {
     if params.m_cost < MIN_KDF_M_COST || params.m_cost > MAX_KDF_M_COST {
         return Err(format!(
@@ -235,6 +246,14 @@ pub fn validate_key_derivation_params(params: &KeyDerivationParams) -> Result<()
         return Err(format!(
             "key_derivation.p_cost must be between 1 and {MAX_KDF_P_COST}, got {}",
             params.p_cost
+        ));
+    }
+    let work = u64::from(params.m_cost) * u64::from(params.t_cost);
+    if work > MAX_KDF_WORK {
+        return Err(format!(
+            "key_derivation.m_cost * key_derivation.t_cost must be at most {MAX_KDF_WORK} \
+             (KiB times passes), got {} * {} = {work}",
+            params.m_cost, params.t_cost
         ));
     }
     Params::new(params.m_cost, params.t_cost, params.p_cost, None)
@@ -991,19 +1010,52 @@ mod tests {
     fn test_decrypt_rejects_header_with_excessive_kdf_cost() {
         let enc = encryptor(b"pw", None);
         let sealed = enc.encrypt(b"secret", BackupCompression::Gzip).unwrap();
-        let (mut header, ciphertext_start) = read_encryption_header(&sealed).unwrap();
-        header.key_derivation.m_cost = u32::MAX;
+        let (header, ciphertext_start) = read_encryption_header(&sealed).unwrap();
+        let ciphertext = &sealed[ciphertext_start..];
 
-        let header_json = serde_json::to_vec(&header).unwrap();
-        let mut rebuilt = BACKUP_ENCRYPTION_MAGIC.to_vec();
-        rebuilt.extend_from_slice(&(header_json.len() as u32).to_le_bytes());
-        rebuilt.extend_from_slice(&header_json);
-        rebuilt.extend_from_slice(&sealed[ciphertext_start..]);
-
-        assert!(matches!(
-            enc.decrypt(&rebuilt),
-            Err(BackupEncryptionError::KeyDerivationFailed(_))
-        ));
+        // Every one of these used to pass the bounds: the last one asks for 4 GiB filled 64
+        // times, minutes of work and an allocation that can take down the restore host.
+        // They are refused from the header alone, before any key derivation.
+        for params in [
+            KeyDerivationParams {
+                m_cost: u32::MAX,
+                ..fast_kdf()
+            },
+            KeyDerivationParams {
+                m_cost: 4 * 1024 * 1024,
+                ..fast_kdf()
+            },
+            KeyDerivationParams {
+                t_cost: 64,
+                ..fast_kdf()
+            },
+            KeyDerivationParams {
+                p_cost: 64,
+                ..fast_kdf()
+            },
+            KeyDerivationParams {
+                m_cost: MAX_KDF_M_COST,
+                t_cost: MAX_KDF_T_COST,
+                p_cost: 1,
+            },
+            KeyDerivationParams {
+                m_cost: 4 * 1024 * 1024,
+                t_cost: 64,
+                p_cost: 64,
+            },
+        ] {
+            let mut crafted = header.clone();
+            crafted.key_derivation = params.clone();
+            let started = std::time::Instant::now();
+            assert!(
+                matches!(
+                    enc.decrypt(&rebuild(&crafted, ciphertext)),
+                    Err(BackupEncryptionError::KeyDerivationFailed(_))
+                ),
+                "{params}"
+            );
+            assert!(started.elapsed() < Duration::from_secs(1), "{params}");
+        }
     }
 
     #[test]
@@ -1156,10 +1208,24 @@ mod tests {
         assert!(validate_key_derivation_params(&fast_kdf()).is_ok());
         assert!(validate_key_derivation_params(&KeyDerivationParams {
             m_cost: MAX_KDF_M_COST,
-            t_cost: MAX_KDF_T_COST,
+            t_cost: 4,
             p_cost: MAX_KDF_P_COST,
         })
         .is_ok());
+        assert!(validate_key_derivation_params(&KeyDerivationParams {
+            m_cost: 256 * 1024,
+            t_cost: MAX_KDF_T_COST,
+            p_cost: 1,
+        })
+        .is_ok());
+        // Each bound holds alone, but together they exceed the total work.
+        let err = validate_key_derivation_params(&KeyDerivationParams {
+            m_cost: MAX_KDF_M_COST,
+            t_cost: MAX_KDF_T_COST,
+            p_cost: 1,
+        })
+        .unwrap_err();
+        assert!(err.contains("m_cost * key_derivation.t_cost"), "{err}");
 
         let err = validate_key_derivation_params(&KeyDerivationParams {
             m_cost: MIN_KDF_M_COST - 1,
