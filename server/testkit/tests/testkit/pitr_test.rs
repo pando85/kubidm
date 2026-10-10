@@ -468,8 +468,9 @@ fn test_pitr_s3_recover_on_a_new_host() {
         let target = write_history(env).await;
 
         // Everything was shipped: the local WAL directory holds no segment any more, and
-        // the prefix holds the base backup, the segments and the manifest, each with its
-        // metadata sidecar. Backup retention left the archive alone.
+        // the prefix holds the base backup and the segments, each with its metadata
+        // sidecar, and the manifest, a single object. Backup retention left the archive
+        // alone.
         assert!(
             list_segments(&source_wal)
                 .expect("Failed to list the local WAL directory")
@@ -492,8 +493,9 @@ fn test_pitr_s3_recover_on_a_new_host() {
         assert!(segment_count >= 2, "{keys:?}");
         assert!(keys
             .iter()
-            .filter(|key| !key.ends_with(".metadata.json"))
+            .filter(|key| !key.ends_with(".metadata.json") && *key != PITR_MANIFEST_KEY)
             .all(|key| keys.contains(&format!("{key}.metadata.json"))));
+        assert!(!keys.contains(&format!("{PITR_MANIFEST_KEY}.metadata.json")));
 
         // A new host: an empty WAL directory and no local backups. Everything comes from
         // S3.

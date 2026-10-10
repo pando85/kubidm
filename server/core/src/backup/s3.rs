@@ -278,17 +278,59 @@ impl S3ClientWrapper {
 
         // A backup is only complete with its sidecar, and listings ignore an object without
         // one. Removing the object right away keeps the prefix clean; should that fail too,
-        // the retention removes it once a newer backup is complete.
+        // the retention removes it once a newer backup is complete. A key that already
+        // had a sidecar (a replica copied again) is left alone: removing the object would
+        // leave its old sidecar without it, and the next comparison sees the mismatch.
         if let Err(err) = self.upload_metadata(&object_key, metadata).await {
-            if let Err(delete_err) = self.delete_object(&object_key).await {
-                warn!(
-                    "Unable to remove {} after its metadata could not be written: {}",
-                    object_key, delete_err
-                );
+            match self.sidecar_exists(&object_key).await {
+                Ok(false) => {
+                    if let Err(delete_err) = self.delete_object(&object_key).await {
+                        warn!(
+                            "Unable to remove {} after its metadata could not be written: {}",
+                            object_key, delete_err
+                        );
+                    }
+                }
+                Ok(true) => warn!(
+                    "{} was overwritten, but its metadata could not be updated; it no longer \
+                     matches its sidecar",
+                    object_key
+                ),
+                Err(head_err) => warn!(
+                    "{} is left in place: its metadata could not be written, and whether it \
+                     existed before could not be checked: {}",
+                    object_key, head_err
+                ),
             }
             return Err(err);
         }
         Ok(())
+    }
+
+    /// Whether the metadata sidecar of `object_key` (a full key, prefix included) exists.
+    async fn sidecar_exists(&self, object_key: &str) -> Result<bool, S3BackupError> {
+        let metadata_key = format!("{object_key}{METADATA_SUFFIX}");
+        match self
+            .client
+            .head_object()
+            .bucket(&self.config.bucket)
+            .key(&metadata_key)
+            .send()
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(err)
+                if err
+                    .as_service_error()
+                    .is_some_and(|service_err| service_err.is_not_found()) =>
+            {
+                Ok(false)
+            }
+            Err(err) => Err(S3BackupError::SdkError(format!(
+                "Failed to look up {metadata_key}: {}",
+                DisplayErrorContext(&err)
+            ))),
+        }
     }
 
     async fn upload_single(
@@ -564,37 +606,76 @@ impl S3ClientWrapper {
         Ok((data, metadata))
     }
 
-    /// Download `key` exactly like [`Self::download_backup`], or return None when the
-    /// object has no metadata sidecar, which is the case when it was never written. Any
-    /// other failure, including a missing object behind an existing sidecar, is an error.
-    pub async fn download_backup_if_exists(
+    /// Write `data` under `key` (relative to the configured prefix) as a single object
+    /// whose SHA-256 is stored in its own metadata, with no sidecar. One PUT replaces the
+    /// object atomically, so a write that fails or is abandoned half way leaves the
+    /// previous version whole. This is how an index overwritten in place, the PITR
+    /// manifest, is stored: a backup and its sidecar are two objects that can disagree.
+    pub async fn upload_document(
+        &self,
+        data: Bytes,
+        key: &str,
+        timestamp: &str,
+    ) -> Result<(), S3BackupError> {
+        let size = data.len() as u64;
+        let checksum = sha256_hex(data.clone()).await?;
+        let metadata = S3BackupMetadata::new(
+            checksum,
+            timestamp.to_string(),
+            BackupCompression::NoCompression,
+            size,
+        );
+        self.upload_single(data, &self.build_object_key(key), &metadata)
+            .await
+    }
+
+    /// Read the object `key` written by [`Self::upload_document`], checked against the
+    /// checksum stored with it, or None when the bucket holds no such object. Only a
+    /// missing key counts as absent: a missing bucket, or any other failure, is an error.
+    ///
+    /// An object written as a backup, with a sidecar, carries the same checksum in its own
+    /// metadata, so a manifest written by an earlier version is read the same way, and
+    /// its sidecar is ignored.
+    pub async fn download_document_if_exists(
         &self,
         key: &str,
-    ) -> Result<Option<(Vec<u8>, S3BackupMetadata)>, S3BackupError> {
-        let metadata_key = format!("{}.metadata.json", self.build_object_key(key));
-        match self
+    ) -> Result<Option<Vec<u8>>, S3BackupError> {
+        let object_key = self.build_object_key(key);
+        let output = match self
             .client
-            .head_object()
+            .get_object()
             .bucket(&self.config.bucket)
-            .key(&metadata_key)
+            .key(&object_key)
             .send()
             .await
         {
-            Ok(_) => {}
+            Ok(output) => output,
             Err(err)
                 if err
                     .as_service_error()
-                    .is_some_and(|service_err| service_err.is_not_found()) =>
+                    .is_some_and(|service_err| service_err.is_no_such_key()) =>
             {
                 return Ok(None)
             }
             Err(err) => {
-                return Err(S3BackupError::SdkError(format!(
-                    "Failed to look up {metadata_key}: {err}"
+                return Err(S3BackupError::DownloadError(format!(
+                    "Failed to download {object_key}: {}",
+                    DisplayErrorContext(&err)
                 )))
             }
+        };
+        let expected = output
+            .metadata()
+            .and_then(|metadata| metadata.get("checksum-sha256"))
+            .cloned();
+        let data = self.collect_stream(output).await?;
+        if let Some(expected) = expected {
+            let actual = sha256_hex(data.clone()).await?;
+            if actual != expected {
+                return Err(S3BackupError::InvalidChecksum { expected, actual });
+            }
         }
-        self.download_backup(key).await.map(Some)
+        Ok(Some(Vec::from(data)))
     }
 
     /// Download the whole object at `object_key` (a full key, prefix included).
@@ -1574,6 +1655,9 @@ pub(crate) mod fake_s3 {
         }
     }
 
+    /// The header of the `checksum-sha256` user metadata.
+    pub const CHECKSUM_HEADER: &str = "x-amz-meta-checksum-sha256";
+
     /// The status, headers and body to answer a request with.
     pub type Reply = (u16, Vec<(&'static str, String)>, String);
     pub type Responder = Arc<dyn Fn(&Recorded) -> Reply + Send + Sync>;
@@ -1606,17 +1690,28 @@ pub(crate) mod fake_s3 {
 
     /// A responder that behaves like a small object store holding every bucket in
     /// `objects` (keyed by `/<bucket>/<key>`): PUT, GET, HEAD, DELETE and ListObjectsV2.
+    ///
+    /// The `checksum-sha256` user metadata of an object is kept and returned with it.
     pub fn store(objects: Arc<Mutex<BTreeMap<String, Vec<u8>>>>) -> Responder {
+        let checksums: Arc<Mutex<BTreeMap<String, String>>> = Arc::default();
         Arc::new(move |request: &Recorded| {
             let mut objects = objects.lock().expect("objects");
+            let mut checksums = checksums.lock().expect("checksums");
             let not_found = || error(404, "NoSuchKey");
             match request.method.as_str() {
                 "PUT" => {
                     objects.insert(request.path.clone(), request.body.clone());
+                    match request.header(CHECKSUM_HEADER) {
+                        Some(checksum) => {
+                            checksums.insert(request.path.clone(), checksum.to_string())
+                        }
+                        None => checksums.remove(&request.path),
+                    };
                     ok(request)
                 }
                 "DELETE" => {
                     objects.remove(&request.path);
+                    checksums.remove(&request.path);
                     ok(request)
                 }
                 "HEAD" => match objects.get(&request.path) {
@@ -1655,7 +1750,14 @@ pub(crate) mod fake_s3 {
                 "GET" => match objects.get(&request.path) {
                     Some(body) => (
                         200,
-                        vec![("content-length", body.len().to_string())],
+                        [("content-length", body.len().to_string())]
+                            .into_iter()
+                            .chain(
+                                checksums
+                                    .get(&request.path)
+                                    .map(|checksum| (CHECKSUM_HEADER, checksum.clone())),
+                            )
+                            .collect(),
                         String::from_utf8_lossy(body).into_owned(),
                     ),
                     None => not_found(),
@@ -1752,10 +1854,13 @@ mod tests {
         // A bucket policy, throttling or a network error rejects the sidecar after the
         // object went through.
         let fake = fake_s3::FakeS3::start(Arc::new(|request: &fake_s3::Recorded| {
-            if request.method == "PUT" && request.path.ends_with(".metadata.json") {
-                fake_s3::error(403, "AccessDenied")
-            } else {
-                fake_s3::ok(request)
+            match request.method.as_str() {
+                "PUT" if request.path.ends_with(".metadata.json") => {
+                    fake_s3::error(403, "AccessDenied")
+                }
+                // A new backup: no sidecar existed before.
+                "HEAD" => (404, vec![], String::new()),
+                _ => fake_s3::ok(request),
             }
         }))
         .await;
@@ -1788,6 +1893,103 @@ mod tests {
             )),
             "the object left without a sidecar must be removed: {requests:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_an_existing_object_whose_new_sidecar_fails_is_kept() {
+        // A replica copied again over an existing pair: the object goes through, the new
+        // sidecar does not, and the old one is still there.
+        let fake = fake_s3::FakeS3::start(Arc::new(|request: &fake_s3::Recorded| {
+            if request.method == "PUT" && request.path.ends_with(".metadata.json") {
+                fake_s3::error(403, "AccessDenied")
+            } else {
+                fake_s3::ok(request)
+            }
+        }))
+        .await;
+        let client = S3ClientWrapper::new(fake.config("bucket"))
+            .await
+            .expect("client");
+
+        client
+            .upload_with_metadata(
+                Bytes::from_static(b"artifact"),
+                "backup-2024-01-01T22:00:00Z.json.gz",
+                &metadata("checksum", "2024-01-01T22:00:00Z", 8),
+            )
+            .await
+            .expect_err("an object without its sidecar must fail");
+        let requests = fake.requests();
+        assert!(
+            requests.iter().all(|request| request.method != "DELETE"),
+            "an object that existed before must not be removed: {requests:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_document_is_one_object_and_only_a_missing_key_is_absent() {
+        let objects = Arc::new(std::sync::Mutex::new(BTreeMap::new()));
+        let fake = fake_s3::FakeS3::start(fake_s3::store(Arc::clone(&objects))).await;
+        let client = S3ClientWrapper::new(fake.config("bucket"))
+            .await
+            .expect("client");
+
+        assert_eq!(
+            client
+                .download_document_if_exists("doc.json")
+                .await
+                .expect("absent"),
+            None
+        );
+        client
+            .upload_document(
+                Bytes::from_static(b"{}"),
+                "doc.json",
+                "2024-01-01T22:00:00Z",
+            )
+            .await
+            .expect("upload");
+        assert_eq!(
+            objects.lock().expect("objects").keys().collect::<Vec<_>>(),
+            vec!["/bucket/doc.json"],
+            "a document has no sidecar"
+        );
+        // A sidecar left by an earlier version, whatever it says, is not read.
+        objects.lock().expect("objects").insert(
+            "/bucket/doc.json.metadata.json".to_string(),
+            b"not a sidecar".to_vec(),
+        );
+        assert_eq!(
+            client
+                .download_document_if_exists("doc.json")
+                .await
+                .expect("present"),
+            Some(b"{}".to_vec())
+        );
+
+        // Damaged behind the checksum stored with it.
+        objects
+            .lock()
+            .expect("objects")
+            .insert("/bucket/doc.json".to_string(), b"{\"x\":1}".to_vec());
+        assert!(matches!(
+            client.download_document_if_exists("doc.json").await,
+            Err(S3BackupError::InvalidChecksum { .. })
+        ));
+
+        // A bucket that does not exist is not an absent document.
+        let missing_bucket = fake_s3::FakeS3::start(Arc::new(|_: &fake_s3::Recorded| {
+            fake_s3::error(404, "NoSuchBucket")
+        }))
+        .await;
+        let client = S3ClientWrapper::new(missing_bucket.config("bucket"))
+            .await
+            .expect("client");
+        let err = client
+            .download_document_if_exists("doc.json")
+            .await
+            .expect_err("a missing bucket must fail");
+        assert!(err.to_string().contains("NoSuchBucket"), "{err}");
     }
 
     #[tokio::test]

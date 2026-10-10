@@ -35,7 +35,9 @@ impl FetchedBase {
 }
 
 impl BaseLocation {
-    /// The keys of the base backups that currently exist at this location.
+    /// The keys of the base backups that currently exist at this location. In S3 only a
+    /// complete backup counts: one whose object and metadata sidecar both exist, since
+    /// recovery can not fetch any other.
     pub(super) async fn list_keys(&self) -> Result<Vec<String>, PitrError> {
         let mut keys = match self {
             BaseLocation::Local(dir) => {
@@ -57,13 +59,12 @@ impl BaseLocation {
                 })
                 .await?
             }
-            BaseLocation::S3(config) => S3ClientWrapper::new(config.clone())
-                .await?
-                .list_backups()
-                .await?
-                .into_iter()
-                .filter(|key| is_backup_artifact_name(key))
-                .collect(),
+            BaseLocation::S3(config) => {
+                S3ClientWrapper::new(config.clone())
+                    .await?
+                    .list_backup_artifacts()
+                    .await?
+            }
         };
         keys.sort();
         Ok(keys)
@@ -127,8 +128,11 @@ impl PitrStore {
                 }
             }
             PitrStore::S3 { client } => {
-                match client.download_backup_if_exists(PITR_MANIFEST_KEY).await? {
-                    Some((data, _)) => data,
+                match client
+                    .download_document_if_exists(PITR_MANIFEST_KEY)
+                    .await?
+                {
+                    Some(data) => data,
                     None => return Ok(None),
                 }
             }
@@ -160,14 +164,9 @@ impl PitrStore {
                 .await?;
             }
             PitrStore::S3 { client } => {
+                // One object, so that the manifest is never torn from a sidecar.
                 client
-                    .upload_backup(
-                        &data,
-                        PITR_MANIFEST_KEY,
-                        &now,
-                        kubidm_proto::backup::BackupCompression::NoCompression,
-                        None,
-                    )
+                    .upload_document(data.into(), PITR_MANIFEST_KEY, &now)
                     .await?;
             }
         }
@@ -436,8 +435,77 @@ pub(super) fn verify_segment_checksum(segment: &WalSegment, data: &[u8]) -> Resu
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+
+    use uuid::Uuid;
+
     use super::super::test_util::segment;
     use super::*;
+    use crate::backup::s3::fake_s3;
+
+    #[tokio::test]
+    async fn test_s3_manifest_is_one_object_that_a_stale_sidecar_never_breaks() {
+        let objects = Arc::new(Mutex::new(BTreeMap::new()));
+        let fake = fake_s3::FakeS3::start(fake_s3::store(Arc::clone(&objects))).await;
+        let store = PitrStore::open(&PitrLocation::S3(fake.config("bucket")))
+            .await
+            .expect("store");
+        assert_eq!(store.load_manifest().await.expect("load"), None);
+
+        let mut manifest = PitrManifest::new(Uuid::new_v4());
+        store
+            .save_manifest(&mut manifest, Duration::from_secs(10))
+            .await
+            .expect("save");
+        let manifest_path = format!("/bucket/{PITR_MANIFEST_KEY}");
+        assert_eq!(
+            objects.lock().expect("objects").keys().collect::<Vec<_>>(),
+            vec![&manifest_path]
+        );
+
+        // The sidecar an earlier version wrote next to it, out of step with the manifest
+        // after an interrupted save.
+        objects.lock().expect("objects").insert(
+            format!("{manifest_path}.metadata.json"),
+            br#"{"checksum_sha256":"0","timestamp":"t","compression":"NoCompression","size_bytes":1}"#
+                .to_vec(),
+        );
+        manifest.add_base_backup(PitrBaseBackup {
+            key: "backup-2024-01-01T00:00:00.000000000Z.json.gz".to_string(),
+            timestamp: "t".to_string(),
+            watermark_ts: Duration::from_secs(5),
+            server_version: "v".to_string(),
+            server_uuid: None,
+        });
+        store
+            .save_manifest(&mut manifest, Duration::from_secs(20))
+            .await
+            .expect("save");
+        assert_eq!(store.load_manifest().await.expect("load"), Some(manifest));
+    }
+
+    #[tokio::test]
+    async fn test_s3_bases_without_a_sidecar_or_an_object_are_not_listed() {
+        let objects = Arc::new(Mutex::new(BTreeMap::new()));
+        let fake = fake_s3::FakeS3::start(fake_s3::store(Arc::clone(&objects))).await;
+        let complete = "backup-2024-01-01T00:00:00.000000000Z.json.gz";
+        let no_sidecar = "backup-2024-01-02T00:00:00.000000000Z.json.gz";
+        let no_object = "backup-2024-01-03T00:00:00.000000000Z.json.gz";
+        for path in [
+            complete.to_string(),
+            format!("{complete}.metadata.json"),
+            no_sidecar.to_string(),
+            format!("{no_object}.metadata.json"),
+        ] {
+            objects
+                .lock()
+                .expect("objects")
+                .insert(format!("/bucket/{path}"), b"x".to_vec());
+        }
+        let bases = BaseLocation::S3(fake.config("bucket"));
+        assert_eq!(bases.list_keys().await.expect("list"), vec![complete]);
+    }
 
     #[test]
     fn test_verify_segment_checksum() {

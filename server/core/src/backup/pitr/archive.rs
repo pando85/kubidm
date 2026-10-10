@@ -575,9 +575,17 @@ impl PitrArchive {
         now: Duration,
         report: &mut PitrSyncReport,
     ) -> Result<bool, PitrError> {
-        let existing_bases = self.settings.bases.list_keys().await?;
+        // Base backups that can not be listed are kept for now: that only keeps more
+        // segments, and must not stop the archiving.
         let bases_before = manifest.base_backups.len();
-        manifest.retain_base_backups(&existing_bases);
+        match self.settings.bases.list_keys().await {
+            Ok(existing_bases) => manifest.retain_base_backups(&existing_bases),
+            Err(err) => warn!(
+                %err,
+                bases = %self.settings.bases,
+                "Unable to list the base backups; the index keeps them until the next run"
+            ),
+        }
         let mut changed = manifest.base_backups.len() != bases_before;
 
         for segment_id in select_segments_to_delete(manifest, now, self.settings.wal.retention()) {

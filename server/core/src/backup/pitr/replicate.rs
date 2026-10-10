@@ -166,7 +166,14 @@ async fn replicate_to_region(
         mirrored.merge_from(region_manifest);
     }
     if let Some(bases) = target.bases {
-        mirrored.retain_base_backups(&bases.list_keys().await?);
+        match bases.list_keys().await {
+            Ok(held) => mirrored.retain_base_backups(&held),
+            Err(err) => warn!(
+                %err,
+                region = %region_name,
+                "Unable to list the base backups of the region; its index keeps them for now"
+            ),
+        }
     }
     // A segment the primary still lists stays, or the next run would copy it again.
     let expired: Vec<WalSegment> =

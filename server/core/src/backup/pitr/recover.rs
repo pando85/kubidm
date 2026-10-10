@@ -224,19 +224,28 @@ async fn open_archive(
         ))
     })?;
 
-    // A region prunes its base backups on its own; recovery from it can only start from
-    // the base backups it actually holds.
-    if primary.is_some() {
-        let held = settings.bases.list_keys().await?;
-        let indexed = manifest.base_backups.len();
-        manifest.retain_base_backups(&held);
-        if manifest.base_backups.len() != indexed {
-            warn!(
-                missing = indexed - manifest.base_backups.len(),
-                bases = %settings.bases,
-                "Base backups indexed by the archive are missing in the region and are not used"
-            );
+    // Recovery can only start from the base backups the location actually holds: a region
+    // prunes its copies on its own, and a base may have been deleted, or lost its sidecar,
+    // since it was indexed. When they can not be listed, the index is used as it is and
+    // fetching a missing base fails the recovery.
+    match settings.bases.list_keys().await {
+        Ok(held) => {
+            let indexed = manifest.base_backups.len();
+            manifest.retain_base_backups(&held);
+            if manifest.base_backups.len() != indexed {
+                warn!(
+                    missing = indexed - manifest.base_backups.len(),
+                    bases = %settings.bases,
+                    "Base backups indexed by the archive are missing or incomplete and are not \
+                     used"
+                );
+            }
         }
+        Err(err) => warn!(
+            %err,
+            bases = %settings.bases,
+            "Unable to list the base backups; using every base the archive indexes"
+        ),
     }
 
     // Gaps and changes of identity the server noticed and no manifest records yet still
