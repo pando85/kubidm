@@ -19,7 +19,7 @@ use tokio::sync::broadcast;
 use tokio::time::{interval, MissedTickBehavior};
 use uuid::Uuid;
 
-use super::recover::apply_restore;
+use super::recover::{apply_restore, RestoreRecord};
 use super::store::{read_local_segment, PitrStore};
 use super::{blocking, BaseLocation, PitrError, PitrLocation, PitrSettings};
 use crate::backup::BackupEncryptor;
@@ -52,11 +52,10 @@ async fn load_or_new_manifest(
     let (mut manifest, mut changed) = match store.load_manifest().await? {
         Some(mut manifest) => {
             // A restore abandons the history of an archive, and of the WAL directory.
-            let breaks = manifest.timeline_breaks.len();
+            let mut changed = false;
             for restore in &events.restores {
-                apply_restore(&mut manifest, restore);
+                changed |= apply_restore(&mut manifest, restore) != RestoreRecord::AlreadyRecorded;
             }
-            let changed = manifest.timeline_breaks.len() != breaks;
             (manifest, changed)
         }
         None => match events

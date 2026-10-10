@@ -307,21 +307,26 @@ pub(super) fn fold_local_events(
     manifest.merge_markers(&changes);
 }
 
+/// What [`apply_restore`] did to a manifest.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum RestoreRecord {
+    /// The manifest already recorded the restore, and is unchanged.
+    AlreadyRecorded,
+    /// The restore was recorded, with the change of identity it brought.
+    Applied,
+}
+
 /// Record `restore` in `manifest`: what the stopped server left behind, the abandoned
 /// history, and the change of identity to the restored database's server uuid. Recording a
-/// restore the manifest already records changes nothing. Returns the change of identity
-/// recorded, if any.
-pub(super) fn apply_restore(
-    manifest: &mut PitrManifest,
-    restore: &WalRestore,
-) -> Option<PitrServerUuidChange> {
+/// restore the manifest already records changes nothing.
+pub(super) fn apply_restore(manifest: &mut PitrManifest, restore: &WalRestore) -> RestoreRecord {
     let at = format_ts_rfc3339(restore.at);
     if manifest
         .timeline_breaks
         .iter()
         .any(|known| known.after_ts == restore.after_ts && known.at == at)
     {
-        return None;
+        return RestoreRecord::AlreadyRecorded;
     }
 
     // What the stopped server left in the WAL directory and no manifest records yet: the
@@ -345,7 +350,7 @@ pub(super) fn apply_restore(
         reason: restore.reason.clone(),
     });
     if restore.server_uuid == manifest.server_uuid {
-        return None;
+        return RestoreRecord::Applied;
     }
     let change = PitrServerUuidChange {
         from_server_uuid: manifest.server_uuid,
@@ -356,7 +361,7 @@ pub(super) fn apply_restore(
     // It starts from the manifest's identity, so it always applies.
     if let Err(err) = manifest.apply_server_uuid_change(&change) {
         error!(%err, "Unable to record the change of server uuid of the restore");
-        return None;
+        return RestoreRecord::Applied;
     }
     warn!(
         from = %change.from_server_uuid,
@@ -364,7 +369,7 @@ pub(super) fn apply_restore(
         "The database carries another server uuid than the archive; the archive continues \
          under it"
     );
-    Some(change)
+    RestoreRecord::Applied
 }
 
 /// `kubidmd database pitr-list`: print the base backups, segments and the recoverable
@@ -927,28 +932,26 @@ async fn prepare_restore(
 /// Record `restore` in the archive at `location`. An archive with no manifest yet archived
 /// no history, but the stopped server may have left some in its WAL directory: the
 /// archive then starts with the restore, under the identity of that history, so that it
-/// is archived as abandoned. When it left none, nothing is recorded. Returns the change of
-/// identity recorded, if any.
-async fn record_restore(
-    location: &PitrLocation,
-    restore: &WalRestore,
-) -> Result<Option<PitrServerUuidChange>, PitrError> {
+/// is archived as abandoned. When it left none, nothing is recorded.
+async fn record_restore(location: &PitrLocation, restore: &WalRestore) -> Result<(), PitrError> {
     let store = PitrStore::open(location).await?;
     let mut manifest = match store.load_manifest().await? {
         Some(manifest) => manifest,
         None => match restore.local_server_uuid {
             Some(server_uuid) => PitrManifest::new(server_uuid),
-            None => return Ok(None),
+            None => return Ok(()),
         },
     };
-    let change = apply_restore(&mut manifest, restore);
+    if apply_restore(&mut manifest, restore) == RestoreRecord::AlreadyRecorded {
+        return Ok(());
+    }
     store.save_manifest(&mut manifest, restore.at).await?;
     info!(
         after = %format_ts_rfc3339(restore.after_ts),
         archive = %location,
         "Abandoned history recorded in the PITR archive"
     );
-    Ok(change)
+    Ok(())
 }
 
 /// After `restore` was `recorded` in the archive the server archives into (or not):
@@ -957,11 +960,11 @@ async fn record_restore(
 async fn settle_restore(
     local_dir: &Path,
     restore: WalRestore,
-    recorded: Result<Option<PitrServerUuidChange>, PitrError>,
+    recorded: Result<(), PitrError>,
 ) -> Result<AbandonedHistory, PitrError> {
     let local_dir = local_dir.to_path_buf();
     match recorded {
-        Ok(_) => {
+        Ok(()) => {
             if !restore.abandoned.is_empty() {
                 blocking(move || Ok(clear_local_events(&local_dir)?)).await?;
             }
