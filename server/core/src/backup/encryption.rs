@@ -31,6 +31,7 @@
 //! two backups made with the same material never share a key or a nonce. Key material and
 //! derived keys are held in [`Zeroizing`] buffers and wiped when dropped.
 
+use std::ffi::OsString;
 use std::fmt;
 use std::fs;
 use std::net::IpAddr;
@@ -405,6 +406,16 @@ fn normalise_passphrase(mut passphrase: Zeroizing<Vec<u8>>) -> Zeroizing<Vec<u8>
 /// The passphrase: the content of `passphrase_file` when a file is configured, otherwise
 /// the [`PASSPHRASE_ENV`] environment variable, with trailing whitespace removed either way.
 fn resolve_passphrase(passphrase_file: Option<&Path>) -> Result<Zeroizing<Vec<u8>>, String> {
+    // The variable is only read when no file is configured.
+    resolve_passphrase_from(passphrase_file, || std::env::var_os(PASSPHRASE_ENV))
+}
+
+/// [`resolve_passphrase`] with the value of the [`PASSPHRASE_ENV`] environment variable
+/// supplied by `env_value`, so that the tests need not change the process environment.
+fn resolve_passphrase_from(
+    passphrase_file: Option<&Path>,
+    env_value: impl FnOnce() -> Option<OsString>,
+) -> Result<Zeroizing<Vec<u8>>, String> {
     match passphrase_file {
         Some(path) => {
             let passphrase =
@@ -417,7 +428,7 @@ fn resolve_passphrase(passphrase_file: Option<&Path>) -> Result<Zeroizing<Vec<u8
             Ok(passphrase)
         }
         None => {
-            let passphrase = std::env::var_os(PASSPHRASE_ENV)
+            let passphrase = env_value()
                 .map(|value| normalise_passphrase(Zeroizing::new(value.into_encoded_bytes())))
                 .filter(|passphrase| !passphrase.is_empty());
             passphrase.ok_or_else(|| {
@@ -1495,6 +1506,31 @@ mod tests {
 
         let err = resolve_passphrase(Some(&dir.path().join("missing"))).unwrap_err();
         assert!(err.contains("unable to read passphrase_file"), "{err}");
+    }
+
+    #[test]
+    fn test_resolve_passphrase_from_the_environment() {
+        let from_env = |value: Option<&str>| {
+            resolve_passphrase_from(None, || value.map(OsString::from)).map(|p| p.to_vec())
+        };
+        assert_eq!(
+            from_env(Some("env passphrase \n")).unwrap(),
+            b"env passphrase".to_vec()
+        );
+        for missing in [None, Some(""), Some(" \n")] {
+            let err = from_env(missing).unwrap_err();
+            assert!(err.contains(PASSPHRASE_ENV), "{err}");
+        }
+
+        // A configured file takes precedence; the variable is then not even read.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("passphrase");
+        std::fs::write(&path, "file passphrase\n").unwrap();
+        let passphrase = resolve_passphrase_from(Some(&path), || {
+            panic!("The environment must not be read when a passphrase_file is configured")
+        })
+        .unwrap();
+        assert_eq!(*passphrase, b"file passphrase".to_vec());
     }
 
     #[test]
