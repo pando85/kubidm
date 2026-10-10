@@ -1232,7 +1232,9 @@ pub struct WalArchiveConfig {
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub enum WalJournalMode {
     /// The journal is synced to disk by every write commit, before the commit returns, so
-    /// whatever stops the server the journal holds every commit the database holds. This
+    /// whatever stops the server the journal holds every commit the database holds, except
+    /// one in flight when the server stopped (committed by the database, not yet synced to
+    /// the journal), which is then recorded as a gap. This
     /// costs one more disk sync per write transaction; since write transactions are
     /// serialised, and every authentication writes its session, it bounds write throughput
     /// and adds to login latency on slow storage.
