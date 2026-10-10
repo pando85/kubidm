@@ -87,7 +87,11 @@ Recovery restores the newest base backup at or before the target, then applies l
 ### Known limitations, follow-ups
 
 - [ ] `replicate-status` reports backups only, not the WAL archive (`pitr-list --region` shows a region's archive)
-- [ ] Per-segment key derivation (Argon2id with a fresh salt per segment) makes decrypting large WAL archives slower
+- [x] Per-segment key derivation (Argon2id with a fresh salt per segment) made decrypting large WAL archives slow:
+      segments are sealed in an encryption session (one salt and derived key per server run, up to 2^20 segments, a
+      random nonce and the segment id per segment) and decryption keeps derived keys by salt and parameters, zeroized
+      on drop. The container format is unchanged, so segments sealed one by one still open; no release tag contains
+      the WAL format (checked with `git tag --contains`)
 - [ ] An unclean stop loses the open segment (up to `segment_interval_seconds` of WAL) from the archive, and more than
       four closed segments that can not be written are dropped; both are recorded as gaps that recovery does not cross,
       and only a new base backup makes later points recoverable

@@ -186,6 +186,9 @@ pub struct PitrArchive {
     store: tokio::sync::OnceCell<PitrStore>,
     /// The stores of the replication regions, by region name, built once.
     pub(super) region_stores: tokio::sync::Mutex<BTreeMap<String, PitrStore>>,
+    /// The encryptor segments were last sealed with. It is kept while the configured key
+    /// stays the same, so that the segments of a server run share one encryption session.
+    encryptor: tokio::sync::Mutex<Option<BackupEncryptor>>,
 }
 
 impl PitrArchive {
@@ -196,6 +199,28 @@ impl PitrArchive {
             manifest_lock: tokio::sync::Mutex::new(()),
             store: tokio::sync::OnceCell::new(),
             region_stores: tokio::sync::Mutex::new(BTreeMap::new()),
+            encryptor: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    /// The encryptor segments are sealed with: the configured key, obtained again for every
+    /// run so that a rotated key is picked up, and the encryptor of the earlier runs as long
+    /// as it holds the same key, which keeps its encryption session. None when encryption
+    /// is not enabled.
+    async fn segment_encryptor(&self) -> Result<Option<BackupEncryptor>, PitrError> {
+        let Some(configured) = BackupEncryptor::from_config(&self.settings.encryption)
+            .await
+            .map_err(|err| PitrError::Encryption(err.to_string()))?
+        else {
+            return Ok(None);
+        };
+        let mut kept = self.encryptor.lock().await;
+        match kept.as_ref() {
+            Some(kept) if kept.same_key(&configured) => Ok(Some(kept.clone())),
+            _ => {
+                *kept = Some(configured.clone());
+                Ok(Some(configured))
+            }
         }
     }
 
@@ -442,7 +467,7 @@ impl PitrArchive {
         let local_dir = &self.settings.local_dir;
         // The key is obtained once per run, and only when there is something to encrypt.
         let encryptor = if self.settings.encryption.enabled {
-            match BackupEncryptor::from_config(&self.settings.encryption).await {
+            match self.segment_encryptor().await {
                 Ok(encryptor) => encryptor,
                 Err(err) => {
                     let err = PitrError::Encryption(format!(

@@ -625,8 +625,8 @@ recover to another point.
 
 A segment holds the full state of every entry the archived transactions changed, password hashes and other credentials
 included, so it needs the same protection as a backup. When `[online_backup.encryption]` is enabled, the archive task
-encrypts every closed segment with the backup encryption scheme (AES-256-GCM, a key derived with Argon2id and a fresh
-salt per segment, the configured `key_identifier` in its header) before it leaves the server's WAL bookkeeping:
+encrypts every closed segment with the backup encryption scheme (AES-256-GCM, a key derived with Argon2id, the configured
+`key_identifier` in its header) before it leaves the server's WAL bookkeeping:
 
 - With S3, the encrypted segment is uploaded as `wal/<segment>.enc`, with `encrypted = true` and the key identifier in
   its `.metadata.json`.
@@ -641,6 +641,13 @@ The only plaintext copies of archived changes are the open segment, held in memo
 their archive run (at most `segment_interval_seconds`), both in the WAL directory next to the database, which holds the
 same data. The manifest records for every segment the key identifier it was encrypted with, and keeps the SHA-256 of the
 plaintext segment, which recovery checks after decrypting.
+
+Argon2id is deliberately slow, and segments are small and many, so one derivation per segment would make reading a large
+archive slow. The segments a server archives are therefore sealed in an encryption session: they share one random salt,
+and so one derived key, from the server start (or the last change of the key) for up to 2^20 segments, while every
+segment keeps a random nonce of its own and its id in the authenticated header. A recovery derives the key once per
+session and keeps the derived keys in memory, wiped when the command ends. Sharing the key does not make segments
+interchangeable: a segment stored under the id of another one is still refused. Backups keep a fresh salt each.
 
 `recover` decrypts with the `[online_backup.encryption]` section of the configuration it is given, exactly like
 `restore`; the key is only obtained when an encrypted segment or base backup is actually read. It fails, and changes

@@ -1040,7 +1040,7 @@ mod tests {
 
     use super::super::test_util::*;
     use super::super::{BaseLocation, PitrArchive, PitrLocation};
-    use crate::backup::is_encrypted_artifact;
+    use crate::backup::{is_encrypted_artifact, read_encryption_header};
 
     #[test]
     fn test_resolve_target() {
@@ -1432,6 +1432,25 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(report_sync.archived, 0);
+
+        // A later run seals in the same encryption session: every segment the server
+        // archived since it started shares one salt, so one key derivation opens them all.
+        append_create(&archiver, server, 1500, b"credential of a later run");
+        let report_sync = archive.sync(Duration::from_secs(1500), true).await.unwrap();
+        assert_eq!(report_sync.archived, 1);
+        let salts: BTreeSet<Vec<u8>> = store
+            .load_manifest()
+            .await
+            .unwrap()
+            .unwrap()
+            .segments
+            .iter()
+            .map(|segment| {
+                let stored = fs::read(wal_dir.join(segment.stored_name())).unwrap();
+                read_encryption_header(&stored).unwrap().0.salt
+            })
+            .collect();
+        assert_eq!(salts.len(), 1, "{salts:?}");
 
         // Recovery decrypts the segments and checks them against the plaintext checksums.
         let plan = plan_recovery(&manifest, &RecoveryTargetSpec::Latest).unwrap();

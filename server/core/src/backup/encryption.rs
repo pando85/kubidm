@@ -27,15 +27,28 @@
 //!
 //! Every key source yields *key material* (a passphrase, the bytes of a key file or the body
 //! of an HTTP response). The material is never used as the cipher key directly: the cipher
-//! key is derived from it with Argon2id and the per-artifact salt stored in the header, so
-//! two backups made with the same material never share a key or a nonce. Key material and
-//! derived keys are held in [`Zeroizing`] buffers and wiped when dropped.
+//! key is derived from it with Argon2id and the salt stored in the header. Every backup gets
+//! a fresh salt, so two backups made with the same material never share a key. Key material
+//! and derived keys are held in [`Zeroizing`] buffers and wiped when dropped.
+//!
+//! WAL segments are small and many, and one Argon2id derivation per segment made reading a
+//! large archive slow. An encryptor therefore seals segments in a *session*
+//! ([`BackupEncryptor::encrypt_in_session`]): one random salt, and so one derived key, for
+//! up to [`SESSION_MAX_ARTIFACTS`] artifacts, each with its own random nonce and its own
+//! identity in the authenticated header. The container format is the same, the salt is
+//! simply shared, so every reader opens session and per-artifact containers alike, and an
+//! encryptor keeps the keys it derived for decryption by salt and parameters, so that the
+//! segments of one session cost one derivation to open. The binding of a segment to its id
+//! does not depend on the key: a segment of the same session stored under another id is
+//! still refused.
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use argon2::{Algorithm, Argon2, Params, Version};
@@ -73,6 +86,16 @@ pub const MAX_KDF_P_COST: u32 = 16;
 /// Highest accepted product of the memory cost (KiB) and the iteration count, the memory
 /// Argon2id fills in total (4 GiB): 1 GiB with 4 passes, or 256 MiB with 16.
 pub const MAX_KDF_WORK: u64 = 4 * 1024 * 1024;
+
+/// How many artifacts one encryption session seals under one salt, and so one key, before
+/// it draws a new salt. Every artifact has a random 96-bit nonce; with this many messages per
+/// AES-256-GCM key the chance that two nonces collide stays below 2^-57.
+pub const SESSION_MAX_ARTIFACTS: u64 = 1 << 20;
+/// How many derived keys an encryptor keeps for decryption. Opening the segments of a few
+/// sessions needs a few keys; artifacts that each carry their own salt (backups, segments
+/// sealed before sessions existed) gain nothing from the cache, which is bounded so that
+/// reading many of them does not grow it.
+const MAX_CACHED_KEYS: usize = 64;
 
 /// Fixed salt of the key fingerprint that identifies the material of a key file or key
 /// endpoint when no `key_identifier` is configured. A fixed salt would let an attacker
@@ -551,6 +574,41 @@ pub struct BackupEncryptor {
     config: BackupEncryptionConfig,
     key_material: Zeroizing<Vec<u8>>,
     key_identifier: String,
+    /// The keys derived from `key_material`, shared by every clone.
+    derived: Arc<Mutex<DerivedKeys>>,
+}
+
+/// The salt and parameters a key was derived with.
+type DerivationInput = (Vec<u8>, u32, u32, u32);
+
+fn derivation_input(salt: &[u8], params: &KeyDerivationParams) -> DerivationInput {
+    (salt.to_vec(), params.m_cost, params.t_cost, params.p_cost)
+}
+
+/// The keys an encryptor derived. The keys are wiped when they are dropped, with the last
+/// clone of the encryptor.
+#[derive(Default)]
+struct DerivedKeys {
+    /// Keys that opened an artifact, or seal the session, by salt and parameters.
+    keys: BTreeMap<DerivationInput, Zeroizing<Vec<u8>>>,
+    /// The session [`BackupEncryptor::encrypt_in_session`] seals with.
+    session: Option<EncryptionSession>,
+}
+
+struct EncryptionSession {
+    salt: Vec<u8>,
+    key: Zeroizing<Vec<u8>>,
+    /// Artifacts sealed with it so far.
+    sealed: u64,
+}
+
+impl DerivedKeys {
+    fn remember(&mut self, input: DerivationInput, key: &Zeroizing<Vec<u8>>) {
+        if self.keys.len() >= MAX_CACHED_KEYS && !self.keys.contains_key(&input) {
+            self.keys.clear();
+        }
+        self.keys.insert(input, key.clone());
+    }
 }
 
 impl fmt::Debug for BackupEncryptor {
@@ -614,6 +672,7 @@ impl BackupEncryptor {
             config,
             key_material,
             key_identifier,
+            derived: Arc::default(),
         })
     }
 
@@ -622,21 +681,96 @@ impl BackupEncryptor {
         &self.key_identifier
     }
 
+    /// Whether `other` encrypts with the same key: the same material, identifier and key
+    /// derivation parameters. A caller that resolves the key again for every run keeps its
+    /// earlier encryptor, and with it the session and the derived keys, while this holds.
+    pub fn same_key(&self, other: &BackupEncryptor) -> bool {
+        *self.key_material == *other.key_material
+            && self.key_identifier == other.key_identifier
+            && self.config.key_derivation == other.config.key_derivation
+    }
+
+    fn derived(&self) -> MutexGuard<'_, DerivedKeys> {
+        // The keys are only ever replaced whole, so a panic while the lock was held leaves
+        // them consistent.
+        self.derived
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The number of keys kept for decryption.
+    #[cfg(test)]
+    pub(crate) fn cached_keys(&self) -> usize {
+        self.derived().keys.len()
+    }
+
     /// Seal a serialised (and possibly compressed) backup or WAL segment into an encrypted
-    /// container that records, authenticated, that it is `artifact`.
+    /// container that records, authenticated, that it is `artifact`, under a fresh salt
+    /// and so a key of its own.
     pub fn encrypt(
         &self,
         plaintext: &[u8],
         compression: BackupCompression,
         artifact: &BackupArtifactIdentity,
     ) -> Result<Vec<u8>, BackupEncryptionError> {
-        let mut rng = rand::rng();
         let mut salt = vec![0u8; BACKUP_ENCRYPTION_SALT_LEN];
-        rng.fill_bytes(&mut salt);
-        let mut nonce_bytes = [0u8; BACKUP_ENCRYPTION_NONCE_LEN];
-        rng.fill_bytes(&mut nonce_bytes);
-
+        rand::rng().fill_bytes(&mut salt);
         let key = derive_key(&self.key_material, &salt, &self.config.key_derivation)?;
+        self.seal(plaintext, compression, artifact, salt, &key)
+    }
+
+    /// [`Self::encrypt`] in the session of this encryptor and its clones: the salt, and so
+    /// the key, is shared with the other artifacts of the session, which costs a single
+    /// Argon2id derivation to seal and to open them all. A new session starts after
+    /// [`SESSION_MAX_ARTIFACTS`] artifacts. Each artifact still has its own random nonce,
+    /// and records its own identity in the authenticated header.
+    pub fn encrypt_in_session(
+        &self,
+        plaintext: &[u8],
+        compression: BackupCompression,
+        artifact: &BackupArtifactIdentity,
+    ) -> Result<Vec<u8>, BackupEncryptionError> {
+        let current = {
+            let mut derived = self.derived();
+            match derived.session.as_mut() {
+                Some(session) if session.sealed < SESSION_MAX_ARTIFACTS => {
+                    session.sealed += 1;
+                    Some((session.salt.clone(), session.key.clone()))
+                }
+                _ => None,
+            }
+        };
+        let (salt, key) = match current {
+            Some(current) => current,
+            None => {
+                // Derived without the lock held: it takes as long as Argon2id takes.
+                let mut salt = vec![0u8; BACKUP_ENCRYPTION_SALT_LEN];
+                rand::rng().fill_bytes(&mut salt);
+                let key = derive_key(&self.key_material, &salt, &self.config.key_derivation)?;
+                let mut derived = self.derived();
+                derived.remember(derivation_input(&salt, &self.config.key_derivation), &key);
+                derived.session = Some(EncryptionSession {
+                    salt: salt.clone(),
+                    key: key.clone(),
+                    sealed: 1,
+                });
+                (salt, key)
+            }
+        };
+        self.seal(plaintext, compression, artifact, salt, &key)
+    }
+
+    /// Seal `plaintext` as `artifact` with `key`, derived from `salt`, and a fresh nonce.
+    fn seal(
+        &self,
+        plaintext: &[u8],
+        compression: BackupCompression,
+        artifact: &BackupArtifactIdentity,
+        salt: Vec<u8>,
+        key: &[u8],
+    ) -> Result<Vec<u8>, BackupEncryptionError> {
+        let mut nonce_bytes = [0u8; BACKUP_ENCRYPTION_NONCE_LEN];
+        rand::rng().fill_bytes(&mut nonce_bytes);
 
         let header = BackupEncryptionHeader::new(
             self.key_identifier.clone(),
@@ -666,7 +800,7 @@ impl BackupEncryptor {
         let prefix_len = output.len();
         output.extend_from_slice(plaintext);
 
-        let key = key_from_slice(&key).ok_or(BackupEncryptionError::InvalidKeyLength)?;
+        let key = key_from_slice(key).ok_or(BackupEncryptionError::InvalidKeyLength)?;
         let cipher = Aes256Gcm::new(&*key);
         let nonce = <&Aes256GcmNonce>::try_from(nonce_bytes.as_slice())
             .map_err(|_| BackupEncryptionError::InvalidNonceLength)?;
@@ -719,12 +853,19 @@ impl BackupEncryptor {
             return Err(BackupEncryptionError::InvalidNonceLength);
         }
 
-        let key = derive_key(&self.key_material, &header.salt, &header.key_derivation)?;
+        // A key derived for an earlier artifact with the same salt and parameters (one of
+        // the same session) is used again rather than derived anew.
+        let input = derivation_input(&header.salt, &header.key_derivation);
+        let cached = self.derived().keys.get(&input).cloned();
+        let derived = match cached {
+            Some(key) => key,
+            None => derive_key(&self.key_material, &header.salt, &header.key_derivation)?,
+        };
         let (associated_data, ciphertext) = data
             .split_at_checked(ciphertext_start)
             .ok_or(BackupEncryptionError::InvalidHeader)?;
 
-        let key = key_from_slice(&key).ok_or(BackupEncryptionError::InvalidKeyLength)?;
+        let key = key_from_slice(&derived).ok_or(BackupEncryptionError::InvalidKeyLength)?;
         let cipher = Aes256Gcm::new(&*key);
         let nonce = <&Aes256GcmNonce>::try_from(header.nonce.as_slice())
             .map_err(|_| BackupEncryptionError::InvalidNonceLength)?;
@@ -739,6 +880,8 @@ impl BackupEncryptor {
                 configured_key: self.key_identifier.clone(),
             }
         })?;
+        // Only a key that opened an artifact is kept.
+        self.derived().remember(input, &derived);
 
         Ok((plaintext, header))
     }
@@ -851,6 +994,96 @@ mod tests {
         rebuilt.extend_from_slice(&header_json);
         rebuilt.extend_from_slice(ciphertext);
         rebuilt
+    }
+
+    /// The segments of one session share one salt, and so one derived key: opening them
+    /// all derives it once, where a container with a salt of its own needs a derivation
+    /// each. Every segment keeps its own nonce and stays bound to its own id.
+    #[test]
+    fn test_session_segments_share_one_key_and_stay_bound_to_their_id() {
+        let writer = encryptor(b"pw", None);
+        let segment_ids: Vec<String> = (0..8).map(|n| format!("wal-segment-{n}")).collect();
+        let sealed: Vec<Vec<u8>> = segment_ids
+            .iter()
+            .map(|id| {
+                writer
+                    .encrypt_in_session(
+                        id.as_bytes(),
+                        BackupCompression::Gzip,
+                        &BackupArtifactIdentity::wal_segment(id),
+                    )
+                    .expect("encrypt")
+            })
+            .collect();
+        let headers: Vec<BackupEncryptionHeader> = sealed
+            .iter()
+            .map(|data| read_encryption_header(data).expect("header").0)
+            .collect();
+        assert!(headers.iter().all(|header| header.salt == headers[0].salt));
+        let nonces: std::collections::BTreeSet<&Vec<u8>> =
+            headers.iter().map(|header| &header.nonce).collect();
+        assert_eq!(nonces.len(), sealed.len(), "every segment has its own nonce");
+
+        // A reader that never saw the session derives its key once, for the first segment.
+        let reader = encryptor(b"pw", None);
+        assert_eq!(reader.cached_keys(), 0);
+        for (id, data) in segment_ids.iter().zip(&sealed) {
+            let (plaintext, _) = reader
+                .decrypt(data, &BackupArtifactIdentity::wal_segment(id))
+                .expect("decrypt");
+            assert_eq!(plaintext, id.as_bytes());
+            assert_eq!(reader.cached_keys(), 1);
+        }
+        // Its clones share the derived key.
+        assert_eq!(reader.clone().cached_keys(), 1);
+
+        // The shared key does not make segments interchangeable.
+        assert!(matches!(
+            reader.decrypt(
+                &sealed[0],
+                &BackupArtifactIdentity::wal_segment(&segment_ids[1])
+            ),
+            Err(BackupEncryptionError::ArtifactMismatch { .. })
+        ));
+
+        // Containers with a salt of their own (backups, segments sealed one by one) still
+        // open, each with its own key.
+        let single = writer
+            .encrypt(b"one", BackupCompression::Gzip, &backup_id())
+            .expect("encrypt");
+        assert_ne!(
+            read_encryption_header(&single).expect("header").0.salt,
+            headers[0].salt
+        );
+        assert_eq!(reader.decrypt(&single, &backup_id()).expect("decrypt").0, b"one");
+        assert_eq!(reader.cached_keys(), 2);
+
+        // A key that opens nothing is not kept.
+        let stranger = encryptor(b"other", None);
+        assert!(stranger
+            .decrypt(&sealed[0], &BackupArtifactIdentity::wal_segment(&segment_ids[0]))
+            .is_err());
+        assert_eq!(stranger.cached_keys(), 0);
+    }
+
+    #[test]
+    fn test_same_key_compares_material_identifier_and_parameters() {
+        let a = encryptor(b"pw", Some("k1"));
+        assert!(a.same_key(&encryptor(b"pw", Some("k1"))));
+        assert!(!a.same_key(&encryptor(b"other", Some("k1"))));
+        assert!(!a.same_key(&encryptor(b"pw", Some("k2"))));
+        let stronger = BackupEncryptor::with_key_material(
+            BackupEncryptionConfig {
+                key_derivation: KeyDerivationParams {
+                    t_cost: 2,
+                    ..test_kdf()
+                },
+                ..config(Some("k1"))
+            },
+            b"pw".to_vec(),
+        )
+        .expect("encryptor");
+        assert!(!a.same_key(&stronger));
     }
 
     #[test]

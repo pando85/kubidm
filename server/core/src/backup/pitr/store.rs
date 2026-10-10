@@ -15,8 +15,8 @@ use sha2::{Digest, Sha256};
 
 use super::{blocking, BaseLocation, PitrError, PitrLocation};
 use crate::backup::{
-    is_backup_artifact_name, is_encrypted_artifact, read_encryption_header, seal_backup_async,
-    BackupEncryptor, S3BackupError, S3ClientWrapper,
+    is_backup_artifact_name, is_encrypted_artifact, read_encryption_header, BackupEncryptor,
+    S3BackupError, S3ClientWrapper,
 };
 
 /// A base backup fetched for recovery. The S3 variant is removed when dropped.
@@ -223,19 +223,25 @@ impl PitrStore {
         let stored = match encryptor {
             Some(encryptor) => {
                 archived.encryption_key = Some(encryptor.key_identifier().to_string());
-                seal_backup_async(
-                    data,
-                    segment.compression,
-                    Some(encryptor),
-                    BackupArtifactIdentity::wal_segment(&segment.segment_id),
-                )
-                .await
-                .map_err(|err| {
-                    PitrError::Encryption(format!(
-                        "unable to encrypt segment {}: {err}",
-                        segment.segment_id
-                    ))
-                })?
+                // Sealed in the encryptor's session: the segments of one session share one
+                // derived key, so that reading a large archive derives it once.
+                let encryptor = encryptor.clone();
+                let compression = segment.compression;
+                let segment_id = segment.segment_id.clone();
+                blocking(move || {
+                    encryptor
+                        .encrypt_in_session(
+                            &data,
+                            compression,
+                            &BackupArtifactIdentity::wal_segment(&segment_id),
+                        )
+                        .map_err(|err| {
+                            PitrError::Encryption(format!(
+                                "unable to encrypt segment {segment_id}: {err}"
+                            ))
+                        })
+                })
+                .await?
             }
             None => data,
         };
