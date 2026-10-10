@@ -6,6 +6,7 @@
     "pkg:cargo/fastrand",
     "pkg:cargo/inotify",
     "pkg:cargo/portable-atomic",
-    "pkg:cargo/zmij"
+    "pkg:cargo/zmij",
+    "pkg:pypi/typing-extensions"
   ]
 }
