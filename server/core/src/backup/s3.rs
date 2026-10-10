@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{Read, Write};
 use std::sync::LazyLock;
 use std::time::Duration;
 
@@ -60,7 +59,6 @@ pub enum S3BackupError {
     ConfigError(String),
     UploadError(String),
     DownloadError(String),
-    CredentialsError(String),
     InvalidChecksum { expected: String, actual: String },
     IoError(std::io::Error),
     SdkError(String),
@@ -72,7 +70,6 @@ impl std::fmt::Display for S3BackupError {
             S3BackupError::ConfigError(msg) => write!(f, "S3 configuration error: {}", msg),
             S3BackupError::UploadError(msg) => write!(f, "S3 upload error: {}", msg),
             S3BackupError::DownloadError(msg) => write!(f, "S3 download error: {}", msg),
-            S3BackupError::CredentialsError(msg) => write!(f, "S3 credentials error: {}", msg),
             S3BackupError::InvalidChecksum { expected, actual } => {
                 write!(
                     f,
@@ -905,33 +902,6 @@ impl S3ClientWrapper {
         Ok(self.list_backup_listing().await?.complete)
     }
 
-    /// Copy the backup `backup_key` (relative to the primary prefix), already uploaded to
-    /// the primary bucket with `metadata`, together with an identical metadata sidecar,
-    /// to the bucket of `region_config` under that region's own prefix. The copy keeps
-    /// the primary's checksum, timestamp and size, so `verify-s3 --region` and
-    /// `restore-s3 --region` treat it exactly like the primary object.
-    pub async fn replicate_backup(
-        &self,
-        backup_key: &str,
-        backup_data: &[u8],
-        metadata: &S3BackupMetadata,
-        region_config: &ReplicationRegionConfig,
-    ) -> Result<(), S3BackupError> {
-        let region = Self::for_region(region_config).await?;
-
-        region
-            .upload_with_metadata(Bytes::copy_from_slice(backup_data), backup_key, metadata)
-            .await?;
-
-        info!(
-            "Replicated backup {} to region {} ({})",
-            backup_key,
-            region_config.name(),
-            region.location()
-        );
-        Ok(())
-    }
-
     /// Why the copy of `backup_key` in `region` differs from the primary copy described by
     /// `primary`, or None when sidecar and reported size agree with it. Nothing is
     /// downloaded: the sidecars must agree on checksum and size, and the size S3 reports
@@ -1133,18 +1103,6 @@ impl S3ClientWrapper {
         }
 
         Ok(summarise_health(regions, current_timestamp))
-    }
-
-    /// The lag metrics of every region, computed from a fresh health check. When a health
-    /// check is already at hand, `lag_metrics_from_health` avoids repeating the requests.
-    pub async fn get_replication_lag_metrics(
-        &self,
-        replication_config: &ReplicationConfig,
-    ) -> Result<Vec<ReplicationLagMetrics>, S3BackupError> {
-        let health = self
-            .check_replication_health(replication_config, None)
-            .await?;
-        Ok(lag_metrics_from_health(&health, replication_config))
     }
 }
 
@@ -1530,11 +1488,14 @@ pub fn lag_metrics_from_health(
         .collect()
 }
 
+/// A writer that hashes what it writes, for tests.
+#[cfg(test)]
 pub struct ChecksumWriter<W> {
     writer: W,
     hasher: Sha256,
 }
 
+#[cfg(test)]
 impl<W> ChecksumWriter<W> {
     pub fn new(writer: W) -> Self {
         Self {
@@ -1549,7 +1510,8 @@ impl<W> ChecksumWriter<W> {
     }
 }
 
-impl<W: Write> Write for ChecksumWriter<W> {
+#[cfg(test)]
+impl<W: std::io::Write> std::io::Write for ChecksumWriter<W> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.hasher.update(buf);
         self.writer.write(buf)
@@ -1560,11 +1522,14 @@ impl<W: Write> Write for ChecksumWriter<W> {
     }
 }
 
+/// A reader that hashes what it reads, for tests.
+#[cfg(test)]
 pub struct ChecksumReader<R> {
     reader: R,
     hasher: Sha256,
 }
 
+#[cfg(test)]
 impl<R> ChecksumReader<R> {
     pub fn new(reader: R) -> Self {
         Self {
@@ -1579,7 +1544,8 @@ impl<R> ChecksumReader<R> {
     }
 }
 
-impl<R: Read> Read for ChecksumReader<R> {
+#[cfg(test)]
+impl<R: std::io::Read> std::io::Read for ChecksumReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let n = self.reader.read(buf)?;
         if let Some(slice) = buf.get(..n) {
@@ -1847,6 +1813,7 @@ pub(crate) mod fake_s3 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
     use std::sync::Arc;
 
     #[tokio::test]
@@ -2546,9 +2513,6 @@ mod tests {
 
         let err = S3BackupError::DownloadError("object not found".to_string());
         assert!(err.to_string().contains("S3 download error"));
-
-        let err = S3BackupError::CredentialsError("invalid key".to_string());
-        assert!(err.to_string().contains("S3 credentials error"));
 
         let err = S3BackupError::InvalidChecksum {
             expected: "abc123".to_string(),
