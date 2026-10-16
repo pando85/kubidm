@@ -20,7 +20,7 @@ doctest = false
 num_enum = { workspace = true }
 opentelemetry = { workspace = true, features = ["metrics"] }
 opentelemetry-otlp = { workspace = true, default-features = false, features = [
-    "serde",
+    "serde_json",
     "logs",
     "metrics",
     "http-proto",
