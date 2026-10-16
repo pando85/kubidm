@@ -25,7 +25,7 @@ use kubidmd_lib::prelude::*;
     get,
     path = "/v1/oauth2",
     responses(
-        (status = 200,content_type=APPLICATION_JSON, body=Vec<ProtoEntry>),
+        (status = 200, description = "Ok", content_type=APPLICATION_JSON, body=Vec<ProtoEntry>),
         ApiResponseWithout200,
     ),
     security(("token_jwt" = [])),
@@ -103,7 +103,7 @@ pub(crate) async fn oauth2_public_post(
     get,
     path = "/v1/oauth2/{rs_name}",
     responses(
-        (status = 200, body=Option<ProtoEntry>, content_type=APPLICATION_JSON),
+        (status = 200, description = "Ok", body=Option<ProtoEntry>, content_type=APPLICATION_JSON),
         ApiResponseWithout200,
     ),
     security(("token_jwt" = [])),
@@ -131,7 +131,7 @@ pub(crate) async fn oauth2_id_get(
     get,
     path = "/v1/oauth2/{rs_name}/_basic_secret",
     responses(
-        (status = 200,content_type=APPLICATION_JSON, body=Option<String>),
+        (status = 200, description = "Ok", content_type=APPLICATION_JSON, body=Option<String>),
         ApiResponseWithout200,
     ),
     security(("token_jwt" = [])),
@@ -443,7 +443,7 @@ pub(crate) async fn oauth2_id_sup_scopemap_delete(
     path = "/v1/oauth2/{rs_name}",
     responses(
         DefaultApiResponse,
-        (status = 404),
+        (status = 404, description = "Not Found"),
     ),
     security(("token_jwt" = [])),
     tag = "oauth2",
