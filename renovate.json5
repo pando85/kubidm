@@ -165,7 +165,7 @@
     },
     {
       description: 'Never automerge breaking dependency updates',
-      matchIsBreaking: true,
+      matchUpdateTypes: ['major'],
       automerge: false,
     },
     {
