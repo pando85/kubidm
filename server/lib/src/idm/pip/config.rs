@@ -7,58 +7,141 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 use url::Url;
 
 use super::PipAttributeValue;
 
+/// Placeholder printed instead of a secret in `Debug` output.
+struct Redacted;
+
+impl fmt::Debug for Redacted {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+/// Debug view of a header map that shows the header names but not their values,
+/// since headers commonly carry credentials.
+struct RedactedHeaders<'a>(&'a BTreeMap<String, String>);
+
+impl fmt::Debug for RedactedHeaders<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_map()
+            .entries(self.0.keys().map(|k| (k, Redacted)))
+            .finish()
+    }
+}
+
 /// Behavior when PIP fails to retrieve attributes
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum PipFallbackBehavior {
-    /// Use configured fallback values
-    #[default]
+    /// Use the configured `fallback_values` (which must be non-empty).
     UseFallback,
-    /// Deny the authorization request
+    /// Deny the authorization request (fail closed). This is the default, since
+    /// PIP attributes feed access decisions.
+    #[default]
     Deny,
     /// Continue without the attributes (may affect policy evaluation)
     Ignore,
 }
 
 /// Authentication method for PIP sources
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` is implemented manually and secret fields are skipped on
+/// serialization, so that secrets are never logged or written back out.
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum PipAuthConfig {
     /// No authentication
     None,
 
     /// Basic authentication
-    Basic { username: String, password: String },
+    Basic {
+        username: String,
+        #[serde(skip_serializing)]
+        password: String,
+    },
 
     /// Bearer token authentication
-    Bearer { token: String },
+    Bearer {
+        #[serde(skip_serializing)]
+        token: String,
+    },
 
     /// API key authentication (header or query param)
     ApiKey {
         key_name: String,
+        #[serde(skip_serializing)]
         key_value: String,
         location: ApiKeyLocation,
     },
 
-    /// OAuth2 client credentials flow
+    /// OAuth2 client credentials flow.
+    ///
+    /// Not yet supported: an HTTP PIP configured with it fails to construct.
     OAuth2ClientCredentials {
         token_url: Url,
         client_id: String,
+        #[serde(skip_serializing)]
         client_secret: String,
         scope: Option<String>,
     },
 
-    /// Mutual TLS authentication
+    /// Mutual TLS authentication.
+    ///
+    /// Not yet supported: an HTTP PIP configured with it fails to construct.
     MutualTls {
         cert_path: PathBuf,
         key_path: PathBuf,
     },
+}
+
+impl fmt::Debug for PipAuthConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PipAuthConfig::None => f.write_str("None"),
+            PipAuthConfig::Basic { username, .. } => f
+                .debug_struct("Basic")
+                .field("username", username)
+                .field("password", &Redacted)
+                .finish(),
+            PipAuthConfig::Bearer { .. } => {
+                f.debug_struct("Bearer").field("token", &Redacted).finish()
+            }
+            PipAuthConfig::ApiKey {
+                key_name, location, ..
+            } => f
+                .debug_struct("ApiKey")
+                .field("key_name", key_name)
+                .field("key_value", &Redacted)
+                .field("location", location)
+                .finish(),
+            PipAuthConfig::OAuth2ClientCredentials {
+                token_url,
+                client_id,
+                scope,
+                ..
+            } => f
+                .debug_struct("OAuth2ClientCredentials")
+                .field("token_url", token_url)
+                .field("client_id", client_id)
+                .field("client_secret", &Redacted)
+                .field("scope", scope)
+                .finish(),
+            PipAuthConfig::MutualTls {
+                cert_path,
+                key_path,
+            } => f
+                .debug_struct("MutualTls")
+                .field("cert_path", cert_path)
+                .field("key_path", key_path)
+                .finish(),
+        }
+    }
 }
 
 /// Where to place the API key
@@ -73,14 +156,61 @@ pub enum ApiKeyLocation {
 /// TLS configuration for PIP sources
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipTlsConfig {
-    /// Path to CA certificate for server verification
+    /// Path to CA certificate for server verification.
+    ///
+    /// Not yet supported: a PIP configured with it fails to construct.
     pub ca_path: Option<PathBuf>,
-    /// Whether to verify server certificate
+    /// Whether to verify the server certificate. Setting this to `false` disables
+    /// certificate verification (a warning is logged).
     #[serde(default = "default_verify_server")]
     pub verify_server: bool,
-    /// Allow insecure connections (for development only)
+    /// Allow insecure connections (for development only): disables certificate
+    /// verification and permits plain-text `http://` / `ldap://` URLs. Without
+    /// it, plain-text sources are rejected, since a network attacker could
+    /// inject attributes that feed access decisions.
     #[serde(default)]
     pub allow_insecure: bool,
+}
+
+/// Reject credentials embedded in a source URL (`https://user:pass@host`).
+pub(crate) fn validate_no_userinfo(id: &str, url: &Url) -> Result<(), String> {
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(format!(
+            "PIP '{id}': credentials must not be embedded in the URL, use the auth/bind settings"
+        ));
+    }
+    Ok(())
+}
+
+/// Validate the settings shared by every source type.
+pub(crate) fn validate_common(
+    id: &str,
+    timeout_secs: u64,
+    health_check: &PipHealthCheckConfig,
+    fallback_behavior: PipFallbackBehavior,
+    fallback_values: &BTreeMap<String, PipAttributeValue>,
+) -> Result<(), String> {
+    if timeout_secs == 0 {
+        return Err(format!("PIP '{id}': timeout_secs must be greater than 0"));
+    }
+    if health_check.timeout_secs == 0 {
+        return Err(format!(
+            "PIP '{id}': health_check.timeout_secs must be greater than 0"
+        ));
+    }
+    if health_check.failure_threshold == 0 {
+        return Err(format!(
+            "PIP '{id}': health_check.failure_threshold must be greater than 0"
+        ));
+    }
+    if fallback_behavior == PipFallbackBehavior::UseFallback && fallback_values.is_empty() {
+        // An empty fallback would silently behave like `ignore` (fail open).
+        return Err(format!(
+            "PIP '{id}': fallback_behavior = \"usefallback\" requires non-empty fallback_values \
+             (use \"ignore\" to continue without attributes, or \"deny\")"
+        ));
+    }
+    Ok(())
 }
 
 fn default_verify_server() -> bool {
@@ -145,15 +275,22 @@ impl Default for PipHealthCheckConfig {
 }
 
 /// HTTP PIP source configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` is implemented manually so that header values and credentials are
+/// never logged.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct HttpPipConfig {
     /// Unique identifier for this PIP source
     pub id: String,
 
-    /// Base URL for the HTTP endpoint
+    /// Base URL for the HTTP endpoint. Must be `https://` (or `http://` with
+    /// `tls.allow_insecure`), without credentials, query or fragment.
     pub base_url: Url,
 
-    /// Endpoint path template (supports variables like {uuid}, {username})
+    /// Endpoint path template, starting with `/` (supports variables like
+    /// {uuid}, {username}, {email} and subject context keys). Substituted
+    /// values must be non-empty and are percent-encoded; the resulting URL must
+    /// not be altered by URL normalisation.
     pub endpoint_path: String,
 
     /// HTTP method to use
@@ -176,15 +313,16 @@ pub struct HttpPipConfig {
     #[serde(default = "default_cache_ttl")]
     pub cache_ttl_secs: u64,
 
-    /// Headers to include in requests
-    #[serde(default)]
+    /// Headers to include in requests (also sent with health checks). Values may
+    /// carry credentials, so they are never serialized or logged.
+    #[serde(default, skip_serializing)]
     pub headers: BTreeMap<String, String>,
 
-    /// Fallback behavior when source is unavailable
+    /// Fallback behavior when source is unavailable (default: deny)
     #[serde(default)]
     pub fallback_behavior: PipFallbackBehavior,
 
-    /// Fallback attribute values
+    /// Fallback attribute values, returned when `fallback_behavior = "usefallback"`
     #[serde(default)]
     pub fallback_values: BTreeMap<String, PipAttributeValue>,
 
@@ -192,12 +330,33 @@ pub struct HttpPipConfig {
     #[serde(default)]
     pub health_check: PipHealthCheckConfig,
 
-    /// Health check endpoint path (relative to base_url)
+    /// Health check endpoint path (relative to base_url, starting with `/`)
     pub health_check_path: Option<String>,
 
     /// Attributes that this source provides
     #[serde(default)]
     pub provided_attributes: Vec<String>,
+}
+
+impl fmt::Debug for HttpPipConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HttpPipConfig")
+            .field("id", &self.id)
+            .field("base_url", &self.base_url)
+            .field("endpoint_path", &self.endpoint_path)
+            .field("method", &self.method)
+            .field("auth", &self.auth)
+            .field("tls", &self.tls)
+            .field("timeout_secs", &self.timeout_secs)
+            .field("cache_ttl_secs", &self.cache_ttl_secs)
+            .field("headers", &RedactedHeaders(&self.headers))
+            .field("fallback_behavior", &self.fallback_behavior)
+            .field("fallback_values", &self.fallback_values)
+            .field("health_check", &self.health_check)
+            .field("health_check_path", &self.health_check_path)
+            .field("provided_attributes", &self.provided_attributes)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -221,12 +380,15 @@ fn default_http_method() -> HttpMethod {
 }
 
 /// LDAP PIP source configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` is implemented manually so that the bind password is never logged.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct LdapPipConfig {
     /// Unique identifier for this PIP source
     pub id: String,
 
-    /// LDAP server URL (ldap:// or ldaps://)
+    /// LDAP server URL. Must be `ldaps://` (or `ldap://` with
+    /// `tls.allow_insecure`), without embedded credentials.
     pub url: Url,
 
     /// Base DN for searches
@@ -235,10 +397,16 @@ pub struct LdapPipConfig {
     /// Bind DN for authentication
     pub bind_dn: String,
 
-    /// Bind password
+    /// Bind password (never serialized or logged)
+    #[serde(skip_serializing)]
     pub bind_password: String,
 
-    /// Search filter template (supports variables like {uuid}, {username})
+    /// Search filter template (supports variables like {uuid}, {username},
+    /// {email} and subject context keys). The template is parsed once; values
+    /// are substituted into the parsed filter's assertion values, so they can
+    /// never change the filter's structure. Substituted values must be
+    /// non-empty; inside a DN-valued assertion (a template value containing
+    /// `=`) they are RFC 4514 escaped. The search must match exactly one entry.
     pub search_filter: String,
 
     /// Attributes to retrieve from LDAP entries
@@ -249,7 +417,7 @@ pub struct LdapPipConfig {
     #[serde(default)]
     pub tls: PipTlsConfig,
 
-    /// Connection timeout in seconds
+    /// Timeout in seconds for the whole connect + bind + search operation
     #[serde(default = "default_ldap_timeout")]
     pub timeout_secs: u64,
 
@@ -257,7 +425,7 @@ pub struct LdapPipConfig {
     #[serde(default = "default_cache_ttl")]
     pub cache_ttl_secs: u64,
 
-    /// Fallback behavior when source is unavailable
+    /// Fallback behavior when source is unavailable (default: deny)
     #[serde(default)]
     pub fallback_behavior: PipFallbackBehavior,
 
@@ -272,6 +440,27 @@ pub struct LdapPipConfig {
     /// Attribute mapping: LDAP attribute name -> PIP attribute name
     #[serde(default)]
     pub attribute_mapping: BTreeMap<String, String>,
+}
+
+impl fmt::Debug for LdapPipConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LdapPipConfig")
+            .field("id", &self.id)
+            .field("url", &self.url)
+            .field("base_dn", &self.base_dn)
+            .field("bind_dn", &self.bind_dn)
+            .field("bind_password", &Redacted)
+            .field("search_filter", &self.search_filter)
+            .field("attributes", &self.attributes)
+            .field("tls", &self.tls)
+            .field("timeout_secs", &self.timeout_secs)
+            .field("cache_ttl_secs", &self.cache_ttl_secs)
+            .field("fallback_behavior", &self.fallback_behavior)
+            .field("fallback_values", &self.fallback_values)
+            .field("health_check", &self.health_check)
+            .field("attribute_mapping", &self.attribute_mapping)
+            .finish()
+    }
 }
 
 fn default_ldap_timeout() -> u64 {
@@ -451,16 +640,69 @@ attributes = ["department", "manager", "location"]
             provided_attributes: vec!["test_attr".to_string()],
         };
 
-        assert_eq!(
-            http_config.fallback_behavior,
-            PipFallbackBehavior::UseFallback
+        assert_eq!(http_config.fallback_behavior, PipFallbackBehavior::Deny);
+    }
+
+    #[test]
+    fn test_fallback_behavior_default_is_deny() {
+        let behavior = PipFallbackBehavior::default();
+        assert_eq!(behavior, PipFallbackBehavior::Deny);
+
+        // Also when omitted from the configuration file.
+        let config_str = r#"
+type = "http"
+id = "hr_system"
+base_url = "https://hr.example.com/api"
+endpoint_path = "/employees/{username}"
+"#;
+        let PipSourceConfig::Http(http) = toml::from_str(config_str).unwrap() else {
+            panic!("expected an http source");
+        };
+        assert_eq!(http.fallback_behavior, PipFallbackBehavior::Deny);
+    }
+
+    #[test]
+    fn test_validate_common() {
+        let health = PipHealthCheckConfig::default();
+        let empty = BTreeMap::new();
+        let mut values = BTreeMap::new();
+        values.insert("a".to_string(), PipAttributeValue::Integer(0));
+
+        assert!(validate_common("x", 30, &health, PipFallbackBehavior::Deny, &empty).is_ok());
+        assert!(validate_common("x", 30, &health, PipFallbackBehavior::Ignore, &empty).is_ok());
+        assert!(
+            validate_common("x", 30, &health, PipFallbackBehavior::UseFallback, &values).is_ok()
+        );
+        // usefallback with no values would fail open.
+        assert!(
+            validate_common("x", 30, &health, PipFallbackBehavior::UseFallback, &empty).is_err()
+        );
+        assert!(validate_common("x", 0, &health, PipFallbackBehavior::Deny, &empty).is_err());
+
+        let zero_failures = PipHealthCheckConfig {
+            failure_threshold: 0,
+            ..PipHealthCheckConfig::default()
+        };
+        assert!(
+            validate_common("x", 30, &zero_failures, PipFallbackBehavior::Deny, &empty).is_err()
+        );
+        let zero_hc_timeout = PipHealthCheckConfig {
+            timeout_secs: 0,
+            ..PipHealthCheckConfig::default()
+        };
+        assert!(
+            validate_common("x", 30, &zero_hc_timeout, PipFallbackBehavior::Deny, &empty).is_err()
         );
     }
 
     #[test]
-    fn test_fallback_behavior_default_is_use_fallback() {
-        let behavior = PipFallbackBehavior::default();
-        assert_eq!(behavior, PipFallbackBehavior::UseFallback);
+    fn test_validate_no_userinfo() {
+        let ok = Url::parse("https://example.com/api").unwrap();
+        assert!(validate_no_userinfo("x", &ok).is_ok());
+        let user = Url::parse("https://user@example.com/api").unwrap();
+        assert!(validate_no_userinfo("x", &user).is_err());
+        let both = Url::parse("ldaps://user:pw@ldap.example.com").unwrap();
+        assert!(validate_no_userinfo("x", &both).is_err());
     }
 
     #[test]
@@ -489,7 +731,8 @@ attributes = ["department", "manager", "location"]
         let serialized = serde_json::to_string(&auth).unwrap();
         assert!(serialized.contains("basic"));
         assert!(serialized.contains("user"));
-        assert!(serialized.contains("pass"));
+        // Secrets are never serialized.
+        assert!(!serialized.contains("pass"));
     }
 
     #[test]
@@ -499,7 +742,40 @@ attributes = ["department", "manager", "location"]
         };
         let serialized = serde_json::to_string(&auth).unwrap();
         assert!(serialized.contains("bearer"));
-        assert!(serialized.contains("my_token"));
+        assert!(!serialized.contains("my_token"));
+
+        // Deserialization still reads the secret.
+        let parsed: PipAuthConfig =
+            serde_json::from_str(r#"{"type":"bearer","token":"my_token"}"#).unwrap();
+        assert!(matches!(parsed, PipAuthConfig::Bearer { token } if token == "my_token"));
+    }
+
+    #[test]
+    fn test_secret_fields_not_serialized() {
+        let ldap = LdapPipConfig {
+            id: "test".to_string(),
+            url: Url::parse("ldaps://ldap.example.com").unwrap(),
+            base_dn: "dc=example,dc=com".to_string(),
+            bind_dn: "cn=admin".to_string(),
+            bind_password: "s3cr3t-bind".to_string(),
+            search_filter: "(uid={username})".to_string(),
+            attributes: vec![],
+            tls: PipTlsConfig::default(),
+            timeout_secs: 30,
+            cache_ttl_secs: 60,
+            fallback_behavior: PipFallbackBehavior::Deny,
+            fallback_values: BTreeMap::new(),
+            health_check: PipHealthCheckConfig::default(),
+            attribute_mapping: BTreeMap::new(),
+        };
+        assert!(!serde_json::to_string(&ldap).unwrap().contains("s3cr3t"));
+
+        let auth = PipAuthConfig::ApiKey {
+            key_name: "X-Key".to_string(),
+            key_value: "s3cr3t-key".to_string(),
+            location: ApiKeyLocation::Header,
+        };
+        assert!(!serde_json::to_string(&auth).unwrap().contains("s3cr3t"));
     }
 
     #[test]
@@ -549,6 +825,102 @@ attributes = ["department", "manager", "location"]
             key_path: PathBuf::from("/path/to/key.pem"),
         };
         assert!(matches!(auth, PipAuthConfig::MutualTls { .. }));
+    }
+
+    #[test]
+    fn test_auth_config_debug_redacts_secrets() {
+        let cases = [
+            PipAuthConfig::Basic {
+                username: "user".to_string(),
+                password: "s3cr3t-basic".to_string(),
+            },
+            PipAuthConfig::Bearer {
+                token: "s3cr3t-bearer".to_string(),
+            },
+            PipAuthConfig::ApiKey {
+                key_name: "X-API-Key".to_string(),
+                key_value: "s3cr3t-apikey".to_string(),
+                location: ApiKeyLocation::Header,
+            },
+            PipAuthConfig::OAuth2ClientCredentials {
+                token_url: Url::parse("https://auth.example.com/token").unwrap(),
+                client_id: "client".to_string(),
+                client_secret: "s3cr3t-oauth".to_string(),
+                scope: None,
+            },
+        ];
+        for auth in cases {
+            let debug = format!("{auth:?}");
+            assert!(!debug.contains("s3cr3t"), "secret leaked: {debug}");
+            assert!(debug.contains("<redacted>"));
+        }
+        assert!(format!(
+            "{:?}",
+            PipAuthConfig::Basic {
+                username: "visible-user".to_string(),
+                password: "x".to_string()
+            }
+        )
+        .contains("visible-user"));
+    }
+
+    #[test]
+    fn test_http_and_ldap_config_debug_redacts_secrets() {
+        let mut headers = BTreeMap::new();
+        headers.insert(
+            "Authorization".to_string(),
+            "Bearer s3cr3t-header".to_string(),
+        );
+        let http = HttpPipConfig {
+            id: "test".to_string(),
+            base_url: Url::parse("https://example.com").unwrap(),
+            endpoint_path: "/test".to_string(),
+            method: HttpMethod::Get,
+            auth: Some(PipAuthConfig::Bearer {
+                token: "s3cr3t-token".to_string(),
+            }),
+            tls: PipTlsConfig::default(),
+            timeout_secs: 30,
+            cache_ttl_secs: 60,
+            headers,
+            fallback_behavior: PipFallbackBehavior::UseFallback,
+            fallback_values: BTreeMap::new(),
+            health_check: PipHealthCheckConfig::default(),
+            health_check_path: None,
+            provided_attributes: vec![],
+        };
+        let debug = format!("{http:?}");
+        assert!(!debug.contains("s3cr3t"), "secret leaked: {debug}");
+        assert!(debug.contains("Authorization"));
+
+        let ldap = LdapPipConfig {
+            id: "test".to_string(),
+            url: Url::parse("ldaps://ldap.example.com").unwrap(),
+            base_dn: "dc=example,dc=com".to_string(),
+            bind_dn: "cn=admin".to_string(),
+            bind_password: "s3cr3t-bind".to_string(),
+            search_filter: "(uid={username})".to_string(),
+            attributes: vec![],
+            tls: PipTlsConfig::default(),
+            timeout_secs: 30,
+            cache_ttl_secs: 60,
+            fallback_behavior: PipFallbackBehavior::UseFallback,
+            fallback_values: BTreeMap::new(),
+            health_check: PipHealthCheckConfig::default(),
+            attribute_mapping: BTreeMap::new(),
+        };
+        let debug = format!("{ldap:?}");
+        assert!(!debug.contains("s3cr3t"), "secret leaked: {debug}");
+        assert!(debug.contains("cn=admin"));
+
+        // Redaction must survive the wrapping config types.
+        let config = PipConfig {
+            sources: vec![PipSourceConfig::Http(http), PipSourceConfig::Ldap(ldap)],
+            default_cache_ttl_secs: 300,
+            max_cache_entries: 10,
+            enabled: true,
+        };
+        assert!(!format!("{config:?}").contains("s3cr3t"));
     }
 
     #[test]

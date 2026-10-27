@@ -75,7 +75,7 @@ When unsure, check what the fork's HEAD uses: `git grep -n '<name>' HEAD -- '*.r
   `patches/aws-runtime-1.7.2` workspace exclude.
 - **ServerRole**: `proto/src/config.rs` (`pub use kubidm_proto::config::ServerRole` in
   `server/core/src/config.rs`; upstream has its own local `ServerRole` enum, drop upstream's copy).
-- **proto**: `proto/src/internal/{authorization,pip}.rs` re-exported from `internal/mod.rs`.
+- **proto**: `proto/src/internal/authorization.rs` re-exported from `internal/mod.rs`.
 - **WAL / PITR helpers**: `DbEntry::stored_uuid()` / `stored_name()` in `server/lib/src/be/dbentry.rs`
   match `DbValueSetV2` variants directly; when upstream changes DB value formats, extend them (keep
   the legacy arms so old WAL segments replay). Symptom when missed: all `pitr_test::*` fail with

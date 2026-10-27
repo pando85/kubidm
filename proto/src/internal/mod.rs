@@ -17,11 +17,10 @@ use num_enum::TryFromPrimitive;
 mod authorization;
 mod credupdate;
 mod error;
-mod pip;
 mod raw;
 mod token;
 
-pub use self::{authorization::*, credupdate::*, error::*, pip::*, raw::*, token::*};
+pub use self::{authorization::*, credupdate::*, error::*, raw::*, token::*};
 
 pub const COOKIE_CSRF_NONCE: &str = "csrf-nonce";
 pub const COOKIE_AUTH_SESSION_ID: &str = "auth-session-id";

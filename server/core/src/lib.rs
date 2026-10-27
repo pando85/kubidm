@@ -1232,6 +1232,9 @@ pub async fn create_server_core(
         if config_test { "TEST " } else { "" },
         config
     );
+    if let Some(warning) = config.pip_config_ignored_warning() {
+        warn!("{}", warning);
+    }
     // Setup umask, so that every we touch or create is secure.
     #[cfg(not(target_family = "windows"))]
     unsafe {

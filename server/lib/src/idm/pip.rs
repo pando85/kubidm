@@ -16,6 +16,8 @@ use crate::prelude::*;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::fmt;
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -26,13 +28,8 @@ pub mod health;
 pub mod http;
 pub mod ldap;
 
-pub use cache::PipAttributeCache;
-#[allow(unused_imports)]
-pub use config::{PipConfig, PipFallbackBehavior, PipSourceConfig};
-#[allow(unused_imports)]
-pub use http::HttpPip;
-#[allow(unused_imports)]
-pub use ldap::LdapPip;
+use cache::PipAttributeCache;
+use config::PipFallbackBehavior;
 
 /// Unique identifier for a PIP instance
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Ord, PartialOrd)]
@@ -45,6 +42,12 @@ impl PipId {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl fmt::Display for PipId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
     }
 }
 
@@ -160,6 +163,18 @@ impl PipAttributeSet {
         }
     }
 
+    /// Build an attribute set from configured fallback values, namespaced to `pip_id`.
+    pub fn from_fallback_values(
+        pip_id: &PipId,
+        fallback_values: &BTreeMap<String, PipAttributeValue>,
+    ) -> Self {
+        let attributes = fallback_values
+            .iter()
+            .map(|(key, value)| (PipAttributeName::new(pip_id, key), value.clone()))
+            .collect();
+        PipAttributeSet { attributes }
+    }
+
     pub fn insert(&mut self, name: PipAttributeName, value: PipAttributeValue) {
         self.attributes.insert(name, value);
     }
@@ -188,6 +203,18 @@ impl PipAttributeSet {
         for (name, value) in other.attributes {
             self.attributes.insert(name, value);
         }
+    }
+
+    /// Keep only the named (un-namespaced) attributes of `pip_id`.
+    pub fn filter_named(&self, pip_id: &PipId, attribute_names: &[String]) -> PipAttributeSet {
+        let mut filtered = PipAttributeSet::new();
+        for name in attribute_names {
+            let full_name = PipAttributeName::new(pip_id, name);
+            if let Some(value) = self.attributes.get(&full_name) {
+                filtered.insert(full_name, value.clone());
+            }
+        }
+        filtered
     }
 }
 
@@ -233,42 +260,256 @@ impl PipSubject {
         context.insert(key.into(), value.into());
         PipSubject { context, ..self }
     }
+
+    /// Resolve a template placeholder name to the subject's raw value.
+    ///
+    /// The built-in names `uuid`, `username` and `email` take precedence over
+    /// context keys with the same name.
+    fn placeholder_value(&self, name: &str) -> Result<String, String> {
+        match name {
+            "uuid" => Ok(self.uuid.to_string()),
+            "username" => self
+                .username
+                .clone()
+                .ok_or_else(|| "template requires {username} but the subject has none".to_string()),
+            "email" => self
+                .email
+                .clone()
+                .ok_or_else(|| "template requires {email} but the subject has none".to_string()),
+            other => self.context.get(other).cloned().ok_or_else(|| {
+                format!("template placeholder {{{other}}} has no value for this subject")
+            }),
+        }
+    }
 }
 
-/// Result of a PIP attribute retrieval operation
+fn is_placeholder_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+}
+
+/// Render a `{placeholder}` template for `subject` in a single pass.
+///
+/// Every substituted value is passed through `encode` (which must make it safe
+/// for the target syntax, or reject it). The output of a substitution is never
+/// re-scanned, so a value containing `{...}` cannot trigger further
+/// substitution. A `{name}` placeholder that the subject cannot resolve is an
+/// error rather than being sent verbatim. Braces that do not form a placeholder
+/// are kept literally.
+pub(crate) fn render_template<F>(
+    template: &str,
+    subject: &PipSubject,
+    encode: F,
+) -> Result<String, String>
+where
+    F: Fn(&str) -> Result<String, String>,
+{
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+
+    while let Some(start) = rest.find('{') {
+        let (literal, from_brace) = rest.split_at(start);
+        out.push_str(literal);
+        let after_brace = from_brace.strip_prefix('{').unwrap_or(from_brace);
+
+        let placeholder = after_brace.find('}').and_then(|end| {
+            let (name, from_close) = after_brace.split_at(end);
+            is_placeholder_name(name).then(|| (name, from_close.strip_prefix('}').unwrap_or("")))
+        });
+
+        match placeholder {
+            Some((name, remainder)) => {
+                let value = subject.placeholder_value(name)?;
+                if value.is_empty() {
+                    // An empty value can merge neighbouring template parts (e.g.
+                    // `{a}{b}` into a dot-segment) or widen an LDAP assertion.
+                    return Err(format!(
+                        "template placeholder {{{name}}} has an empty value"
+                    ));
+                }
+                out.push_str(&encode(&value)?);
+                rest = remainder;
+            }
+            None => {
+                out.push('{');
+                rest = after_brace;
+            }
+        }
+    }
+    out.push_str(rest);
+
+    Ok(out)
+}
+
+/// Percent-encode a value for use as (part of) a URL path segment or query
+/// component. Everything except RFC 3986 "unreserved" characters is encoded, so
+/// the value cannot introduce `/`, `?`, `#`, `&`, `=`, `@` or `%` sequences.
+///
+/// `url::form_urlencoded` is not used because it encodes a space as `+`, which is
+/// only correct inside a query string, not in a path.
+pub(crate) fn percent_encode_component(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(byte));
+        } else {
+            let _ = write!(out, "%{byte:02X}");
+        }
+    }
+    out
+}
+
+/// Encode a subject value for substitution into a URL template.
+///
+/// Values `.` and `..` are rejected: URL parsers normalise them (even when
+/// percent-encoded) as dot-segments, which would let a value walk up the path.
+pub(crate) fn encode_url_value(value: &str) -> Result<String, String> {
+    if value == "." || value == ".." {
+        return Err(format!(
+            "value '{value}' is not allowed in a URL template (dot-segment)"
+        ));
+    }
+    Ok(percent_encode_component(value))
+}
+
+/// Why a PIP source could not provide attributes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PipFailure {
+    /// The source could not be reached, or is marked unhealthy and not due a retry.
+    Unavailable(String),
+    /// The request did not complete within the configured timeout.
+    Timeout,
+    /// The source answered but the answer could not be used, or the query could
+    /// not be built for this subject.
+    Error(String),
+}
+
+impl fmt::Display for PipFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PipFailure::Unavailable(reason) => write!(f, "unavailable: {reason}"),
+            PipFailure::Timeout => f.write_str("timed out"),
+            PipFailure::Error(error) => write!(f, "error: {error}"),
+        }
+    }
+}
+
+/// Result of a PIP attribute retrieval operation.
+///
+/// Every failure is resolved according to the source's [`PipFallbackBehavior`]
+/// into exactly one of `Fallback`, `Ignored` or `Denied`.
 #[derive(Debug)]
 pub enum PipResult {
     /// Successfully retrieved attributes
     Success(PipAttributeSet),
-    /// PIP source is unavailable/unhealthy
-    Unavailable { reason: String, fallback_used: bool },
-    /// Timeout occurred during retrieval
-    Timeout { fallback_used: bool },
-    /// Error occurred during retrieval
-    Error { error: String, fallback_used: bool },
+    /// The source failed and `fallback_behavior = "usefallback"`: `attributes`
+    /// holds the configured `fallback_values` (empty if none are configured).
+    Fallback {
+        failure: PipFailure,
+        attributes: PipAttributeSet,
+    },
+    /// The source failed and `fallback_behavior = "ignore"`: continue without
+    /// attributes from this source.
+    Ignored(PipFailure),
+    /// The source failed and `fallback_behavior = "deny"`: the caller must fail
+    /// closed and deny the request.
+    Denied(PipFailure),
 }
 
 impl PipResult {
+    /// Resolve a failure according to the configured fallback behaviour.
+    pub fn from_failure(
+        behavior: PipFallbackBehavior,
+        failure: PipFailure,
+        fallback: impl FnOnce() -> PipAttributeSet,
+    ) -> Self {
+        match behavior {
+            PipFallbackBehavior::UseFallback => PipResult::Fallback {
+                failure,
+                attributes: fallback(),
+            },
+            PipFallbackBehavior::Ignore => PipResult::Ignored(failure),
+            PipFallbackBehavior::Deny => PipResult::Denied(failure),
+        }
+    }
+
     pub fn is_success(&self) -> bool {
         matches!(self, PipResult::Success(_))
     }
 
+    /// The attributes to use: the retrieved ones, or the fallback values.
     pub fn attributes(&self) -> Option<&PipAttributeSet> {
         match self {
-            PipResult::Success(attrs) => Some(attrs),
-            _ => None,
+            PipResult::Success(attrs)
+            | PipResult::Fallback {
+                attributes: attrs, ..
+            } => Some(attrs),
+            PipResult::Ignored(_) | PipResult::Denied(_) => None,
         }
     }
 
     pub fn fallback_used(&self) -> bool {
+        matches!(self, PipResult::Fallback { .. })
+    }
+
+    pub fn is_denied(&self) -> bool {
+        matches!(self, PipResult::Denied(_))
+    }
+
+    pub fn failure(&self) -> Option<&PipFailure> {
         match self {
-            PipResult::Unavailable { fallback_used, .. } => *fallback_used,
-            PipResult::Timeout { fallback_used } => *fallback_used,
-            PipResult::Error { fallback_used, .. } => *fallback_used,
-            PipResult::Success(_) => false,
+            PipResult::Success(_) => None,
+            PipResult::Fallback { failure, .. }
+            | PipResult::Ignored(failure)
+            | PipResult::Denied(failure) => Some(failure),
+        }
+    }
+
+    /// Restrict the attributes of this result to the named ones of `pip_id`.
+    pub fn filter_named(self, pip_id: &PipId, attribute_names: &[String]) -> PipResult {
+        match self {
+            PipResult::Success(attrs) => {
+                PipResult::Success(attrs.filter_named(pip_id, attribute_names))
+            }
+            PipResult::Fallback {
+                failure,
+                attributes,
+            } => PipResult::Fallback {
+                failure,
+                attributes: attributes.filter_named(pip_id, attribute_names),
+            },
+            other => other,
         }
     }
 }
+
+/// Error returned by [`PipManager`] when attributes cannot be provided and the
+/// caller must fail closed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PipError {
+    /// A source failed and is configured with `fallback_behavior = "deny"`.
+    Denied { pip_id: PipId, failure: PipFailure },
+    /// An attribute names a PIP source that is not registered.
+    UnknownSource(PipId),
+}
+
+impl fmt::Display for PipError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PipError::Denied { pip_id, failure } => {
+                write!(
+                    f,
+                    "PIP source '{pip_id}' failed and denies access: {failure}"
+                )
+            }
+            PipError::UnknownSource(pip_id) => write!(f, "unknown PIP source '{pip_id}'"),
+        }
+    }
+}
+
+impl std::error::Error for PipError {}
 
 /// Health status of a PIP source
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -284,8 +525,14 @@ impl PipHealthStatus {
         matches!(self, PipHealthStatus::Healthy)
     }
 
+    /// Whether requests may be sent to the source without waiting for a retry
+    /// interval. `Unknown` (never contacted) is retrievable so that the first
+    /// request establishes the source's health.
     pub fn can_retrieve(self) -> bool {
-        matches!(self, PipHealthStatus::Healthy | PipHealthStatus::Degraded)
+        matches!(
+            self,
+            PipHealthStatus::Healthy | PipHealthStatus::Degraded | PipHealthStatus::Unknown
+        )
     }
 }
 
@@ -311,10 +558,9 @@ pub trait PolicyInformationPoint: Send + Sync {
     /// Retrieve attributes for the given subject.
     ///
     /// This method should:
-    /// - Query the external source for attributes
-    /// - Handle timeouts appropriately
-    /// - Apply fallback values if configured
     /// - Return cached values if available and within TTL
+    /// - Query the external source for attributes, bounded by a timeout
+    /// - Resolve any failure through the configured fallback behaviour
     async fn retrieve_attributes(&self, subject: &PipSubject) -> PipResult;
 
     /// Retrieve specific named attributes for the given subject.
@@ -334,6 +580,8 @@ pub trait PolicyInformationPoint: Send + Sync {
     async fn health_check(&self) -> PipHealthCheck;
 
     /// Get the current cached health status without performing a check.
+    ///
+    /// This must never block: it is called from async contexts.
     fn cached_health_status(&self) -> PipHealthStatus;
 
     /// Get the list of attribute names this PIP can provide.
@@ -372,55 +620,97 @@ impl PipManager {
         self.pips.iter().map(|(id, pip)| (id, pip.clone()))
     }
 
-    /// Retrieve attributes from all registered PIPs for the given subject.
-    ///
-    /// Attributes from all healthy PIPs are merged into a single set.
-    pub async fn retrieve_all_attributes(&self, subject: &PipSubject) -> PipAttributeSet {
-        let mut all_attributes = PipAttributeSet::new();
-
-        for pip in self.pips.values() {
-            if !pip.cached_health_status().can_retrieve() {
-                continue;
+    /// Fold one source's result into `all_attributes`, failing closed on `Denied`.
+    fn merge_result(
+        pip_id: &PipId,
+        result: PipResult,
+        all_attributes: &mut PipAttributeSet,
+    ) -> Result<(), PipError> {
+        match result {
+            PipResult::Success(attrs) => all_attributes.merge(attrs),
+            PipResult::Fallback {
+                failure,
+                attributes,
+            } => {
+                admin_warn!(
+                    "PIP source '{}' failed ({}), using {} fallback value(s)",
+                    pip_id,
+                    failure,
+                    attributes.len()
+                );
+                all_attributes.merge(attributes);
             }
-
-            let result = pip.retrieve_attributes(subject).await;
-            if let Some(attrs) = result.attributes() {
-                all_attributes.merge(attrs.clone());
+            PipResult::Ignored(failure) => {
+                admin_warn!(
+                    "PIP source '{}' failed ({}), continuing without its attributes",
+                    pip_id,
+                    failure
+                );
+            }
+            PipResult::Denied(failure) => {
+                admin_warn!(
+                    "PIP source '{}' failed ({}), denying the request",
+                    pip_id,
+                    failure
+                );
+                return Err(PipError::Denied {
+                    pip_id: pip_id.clone(),
+                    failure,
+                });
             }
         }
+        Ok(())
+    }
 
-        all_attributes
+    /// Retrieve attributes from all registered PIPs for the given subject.
+    ///
+    /// Attributes from all sources (retrieved or fallback values) are merged into
+    /// a single set. If any source fails with `fallback_behavior = "deny"`, an
+    /// error is returned and the caller must deny the request.
+    pub async fn retrieve_all_attributes(
+        &self,
+        subject: &PipSubject,
+    ) -> Result<PipAttributeSet, PipError> {
+        let mut all_attributes = PipAttributeSet::new();
+
+        for (pip_id, pip) in &self.pips {
+            let result = pip.retrieve_attributes(subject).await;
+            Self::merge_result(pip_id, result, &mut all_attributes)?;
+        }
+
+        Ok(all_attributes)
     }
 
     /// Retrieve specific attributes from the appropriate PIP(s).
     ///
-    /// Parses the attribute names to determine which PIP(s) to query.
+    /// Parses the `pip:<source>:<name>` attribute names to determine which PIP(s)
+    /// to query; each source is queried once. Names without the `pip:` prefix are
+    /// skipped. A name referencing an unregistered source, or a source failing
+    /// with `fallback_behavior = "deny"`, is an error.
     pub async fn retrieve_named_attributes(
         &self,
         subject: &PipSubject,
         attribute_names: &[String],
-    ) -> PipAttributeSet {
-        let mut all_attributes = PipAttributeSet::new();
-
+    ) -> Result<PipAttributeSet, PipError> {
+        let mut by_source: BTreeMap<PipId, Vec<String>> = BTreeMap::new();
         for attr_name in attribute_names {
             if let Some((pip_id, internal_name)) = PipAttributeName::parse(attr_name) {
-                if let Some(pip) = self.pips.get(&pip_id) {
-                    if pip.cached_health_status().can_retrieve() {
-                        let result = pip
-                            .retrieve_named_attributes(
-                                subject,
-                                std::slice::from_ref(&internal_name),
-                            )
-                            .await;
-                        if let Some(attrs) = result.attributes() {
-                            all_attributes.merge(attrs.clone());
-                        }
-                    }
-                }
+                by_source.entry(pip_id).or_default().push(internal_name);
             }
         }
 
-        all_attributes
+        let mut all_attributes = PipAttributeSet::new();
+
+        for (pip_id, names) in by_source {
+            let pip = self
+                .pips
+                .get(&pip_id)
+                .ok_or_else(|| PipError::UnknownSource(pip_id.clone()))?;
+            let result = pip.retrieve_named_attributes(subject, &names).await;
+            Self::merge_result(&pip_id, result, &mut all_attributes)?;
+        }
+
+        Ok(all_attributes)
     }
 
     /// Perform health checks on all registered PIPs.
@@ -595,6 +885,28 @@ mod tests {
     }
 
     #[test]
+    fn test_pip_attribute_set_from_fallback_values_and_filter() {
+        let pip_id = PipId::new("hr");
+        let mut fallback = BTreeMap::new();
+        fallback.insert(
+            "department".to_string(),
+            PipAttributeValue::String("Unknown".to_string()),
+        );
+        fallback.insert("level".to_string(), PipAttributeValue::Integer(0));
+
+        let set = PipAttributeSet::from_fallback_values(&pip_id, &fallback);
+        assert_eq!(set.len(), 2);
+        assert_eq!(
+            set.get(&PipAttributeName::new(&pip_id, "department")),
+            Some(&PipAttributeValue::String("Unknown".to_string()))
+        );
+
+        let filtered = set.filter_named(&pip_id, &["level".to_string(), "missing".to_string()]);
+        assert_eq!(filtered.len(), 1);
+        assert!(filtered.contains(&PipAttributeName::new(&pip_id, "level")));
+    }
+
+    #[test]
     fn test_pip_attribute_value_string() {
         let val = PipAttributeValue::String("test".to_string());
         assert_eq!(val.as_str(), Some("test"));
@@ -706,44 +1018,145 @@ mod tests {
     }
 
     #[test]
+    fn test_render_template_substitutes_and_encodes() {
+        let uuid = Uuid::new_v4();
+        let subject = PipSubject::from_uuid(uuid)
+            .with_username("alice")
+            .with_context("device_id", "dev 1");
+
+        let rendered = render_template(
+            "/u/{username}/{uuid}/d/{device_id}",
+            &subject,
+            encode_url_value,
+        )
+        .unwrap();
+        assert_eq!(rendered, format!("/u/alice/{uuid}/d/dev%201"));
+    }
+
+    fn raw(v: &str) -> Result<String, String> {
+        Ok(v.to_string())
+    }
+
+    #[test]
+    fn test_render_template_is_single_pass() {
+        // A value that looks like a placeholder must not be expanded again.
+        let subject = PipSubject::from_uuid(Uuid::new_v4())
+            .with_username("{email}")
+            .with_email("victim@example.com");
+
+        let rendered = render_template("{username}", &subject, raw).unwrap();
+        assert_eq!(rendered, "{email}");
+    }
+
+    #[test]
+    fn test_render_template_missing_value_is_error() {
+        let subject = PipSubject::from_uuid(Uuid::new_v4());
+        assert!(render_template("/u/{username}", &subject, raw).is_err());
+        assert!(render_template("/u/{email}", &subject, raw).is_err());
+        assert!(render_template("/u/{nope}", &subject, raw).is_err());
+    }
+
+    #[test]
+    fn test_render_template_empty_value_is_error() {
+        let subject = PipSubject::from_uuid(Uuid::new_v4())
+            .with_username("")
+            .with_context("a", "");
+        assert!(render_template("/u/{username}", &subject, raw).is_err());
+        assert!(render_template("(uid={a})", &subject, raw).is_err());
+    }
+
+    #[test]
+    fn test_render_template_keeps_non_placeholder_braces() {
+        let subject = PipSubject::from_uuid(Uuid::new_v4());
+        assert_eq!(
+            render_template("{ } {} {a b} {", &subject, raw).unwrap(),
+            "{ } {} {a b} {"
+        );
+    }
+
+    #[test]
+    fn test_encode_url_value_rejects_dot_segments() {
+        assert!(encode_url_value(".").is_err());
+        assert!(encode_url_value("..").is_err());
+        assert_eq!(encode_url_value("...").unwrap(), "...");
+        assert_eq!(encode_url_value("a/../b").unwrap(), "a%2F..%2Fb");
+    }
+
+    #[test]
+    fn test_percent_encode_component() {
+        assert_eq!(percent_encode_component("abc-._~XYZ09"), "abc-._~XYZ09");
+        assert_eq!(
+            percent_encode_component("../a b/?x=1&y#z@h%"),
+            "..%2Fa%20b%2F%3Fx%3D1%26y%23z%40h%25"
+        );
+        assert_eq!(percent_encode_component("é"), "%C3%A9");
+    }
+
+    #[test]
     fn test_pip_result_success() {
         let attrs = PipAttributeSet::new();
         let result = PipResult::Success(attrs);
         assert!(result.is_success());
         assert!(result.attributes().is_some());
         assert!(!result.fallback_used());
+        assert!(!result.is_denied());
+        assert!(result.failure().is_none());
     }
 
     #[test]
-    fn test_pip_result_unavailable() {
-        let result = PipResult::Unavailable {
-            reason: "source down".to_string(),
-            fallback_used: true,
-        };
+    fn test_pip_result_from_failure_use_fallback_returns_values() {
+        let pip_id = PipId::new("hr");
+        let mut fallback = BTreeMap::new();
+        fallback.insert(
+            "department".to_string(),
+            PipAttributeValue::String("Unknown".to_string()),
+        );
+
+        let result = PipResult::from_failure(
+            PipFallbackBehavior::UseFallback,
+            PipFailure::Timeout,
+            || PipAttributeSet::from_fallback_values(&pip_id, &fallback),
+        );
         assert!(!result.is_success());
-        assert!(result.attributes().is_none());
         assert!(result.fallback_used());
+        assert!(!result.is_denied());
+        assert_eq!(result.failure(), Some(&PipFailure::Timeout));
+        let attrs = result
+            .attributes()
+            .expect("fallback values must be returned");
+        assert_eq!(
+            attrs.get(&PipAttributeName::new(&pip_id, "department")),
+            Some(&PipAttributeValue::String("Unknown".to_string()))
+        );
     }
 
     #[test]
-    fn test_pip_result_timeout() {
-        let result = PipResult::Timeout {
-            fallback_used: false,
-        };
-        assert!(!result.is_success());
+    fn test_pip_result_from_failure_ignore() {
+        let result = PipResult::from_failure(
+            PipFallbackBehavior::Ignore,
+            PipFailure::Unavailable("source down".to_string()),
+            PipAttributeSet::new,
+        );
+        assert!(matches!(result, PipResult::Ignored(_)));
         assert!(result.attributes().is_none());
         assert!(!result.fallback_used());
+        assert!(!result.is_denied());
     }
 
     #[test]
-    fn test_pip_result_error() {
-        let result = PipResult::Error {
-            error: "connection failed".to_string(),
-            fallback_used: true,
-        };
-        assert!(!result.is_success());
+    fn test_pip_result_from_failure_deny() {
+        let result = PipResult::from_failure(
+            PipFallbackBehavior::Deny,
+            PipFailure::Error("connection failed".to_string()),
+            || panic!("fallback values must not be computed for deny"),
+        );
+        assert!(result.is_denied());
         assert!(result.attributes().is_none());
-        assert!(result.fallback_used());
+        assert!(!result.fallback_used());
+        assert_eq!(
+            result.failure(),
+            Some(&PipFailure::Error("connection failed".to_string()))
+        );
     }
 
     #[test]
@@ -771,7 +1184,8 @@ mod tests {
     fn test_pip_health_status_unknown() {
         let status = PipHealthStatus::Unknown;
         assert!(!status.is_healthy());
-        assert!(!status.can_retrieve());
+        // Never contacted: the first request must be allowed to establish health.
+        assert!(status.can_retrieve());
     }
 
     #[test]
@@ -811,7 +1225,7 @@ mod tests {
     #[test]
     fn test_pip_manager_register_and_get() {
         let mut manager = PipManager::new(Duration::from_secs(300));
-        let mock_pip = Arc::new(MockPip::new(PipId::new("test_pip")));
+        let mock_pip = Arc::new(MockPip::success(PipId::new("test_pip")));
         manager.register(mock_pip.clone());
 
         assert!(manager.get(&PipId::new("test_pip")).is_some());
@@ -821,8 +1235,8 @@ mod tests {
     #[test]
     fn test_pip_manager_iter() {
         let mut manager = PipManager::new(Duration::from_secs(300));
-        manager.register(Arc::new(MockPip::new(PipId::new("pip1"))));
-        manager.register(Arc::new(MockPip::new(PipId::new("pip2"))));
+        manager.register(Arc::new(MockPip::success(PipId::new("pip1"))));
+        manager.register(Arc::new(MockPip::success(PipId::new("pip2"))));
 
         let count = manager.iter().count();
         assert_eq!(count, 2);
@@ -831,7 +1245,7 @@ mod tests {
     #[test]
     fn test_pip_manager_health_summary() {
         let mut manager = PipManager::new(Duration::from_secs(300));
-        manager.register(Arc::new(MockPip::new(PipId::new("healthy_pip"))));
+        manager.register(Arc::new(MockPip::success(PipId::new("healthy_pip"))));
 
         let summary = manager.health_summary();
         assert_eq!(summary.len(), 1);
@@ -841,13 +1255,111 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_pip_manager_merges_success_and_fallback() {
+        let mut manager = PipManager::new(Duration::from_secs(300));
+        manager.register(Arc::new(MockPip::success(PipId::new("ok"))));
+        manager.register(Arc::new(MockPip::failing(
+            PipId::new("down"),
+            PipFallbackBehavior::UseFallback,
+        )));
+        manager.register(Arc::new(MockPip::failing(
+            PipId::new("optional"),
+            PipFallbackBehavior::Ignore,
+        )));
+
+        let subject = PipSubject::from_uuid(Uuid::new_v4());
+        let attrs = manager
+            .retrieve_all_attributes(&subject)
+            .await
+            .expect("no source denies");
+
+        assert_eq!(
+            attrs.get(&PipAttributeName::new(&PipId::new("ok"), "attr")),
+            Some(&PipAttributeValue::String("live".to_string()))
+        );
+        assert_eq!(
+            attrs.get(&PipAttributeName::new(&PipId::new("down"), "attr")),
+            Some(&PipAttributeValue::String("fallback".to_string()))
+        );
+        assert!(!attrs.contains(&PipAttributeName::new(&PipId::new("optional"), "attr")));
+    }
+
+    #[tokio::test]
+    async fn test_pip_manager_deny_fails_closed() {
+        let mut manager = PipManager::new(Duration::from_secs(300));
+        manager.register(Arc::new(MockPip::success(PipId::new("ok"))));
+        manager.register(Arc::new(MockPip::failing(
+            PipId::new("strict"),
+            PipFallbackBehavior::Deny,
+        )));
+
+        let subject = PipSubject::from_uuid(Uuid::new_v4());
+        let err = manager
+            .retrieve_all_attributes(&subject)
+            .await
+            .expect_err("deny must fail closed");
+        assert_eq!(
+            err,
+            PipError::Denied {
+                pip_id: PipId::new("strict"),
+                failure: PipFailure::Unavailable("mock down".to_string()),
+            }
+        );
+
+        let err = manager
+            .retrieve_named_attributes(&subject, &["pip:strict:attr".to_string()])
+            .await
+            .expect_err("deny must fail closed");
+        assert!(matches!(err, PipError::Denied { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_pip_manager_named_attributes() {
+        let mut manager = PipManager::new(Duration::from_secs(300));
+        manager.register(Arc::new(MockPip::success(PipId::new("ok"))));
+        manager.register(Arc::new(MockPip::failing(
+            PipId::new("down"),
+            PipFallbackBehavior::UseFallback,
+        )));
+
+        let subject = PipSubject::from_uuid(Uuid::new_v4());
+        let attrs = manager
+            .retrieve_named_attributes(
+                &subject,
+                &[
+                    "pip:ok:attr".to_string(),
+                    "pip:ok:other".to_string(),
+                    "pip:down:attr".to_string(),
+                    "not_a_pip_attr".to_string(),
+                ],
+            )
+            .await
+            .expect("no source denies");
+        assert_eq!(attrs.len(), 2);
+
+        let err = manager
+            .retrieve_named_attributes(&subject, &["pip:missing:attr".to_string()])
+            .await
+            .expect_err("unknown source must be an error");
+        assert_eq!(err, PipError::UnknownSource(PipId::new("missing")));
+    }
+
     struct MockPip {
         id: PipId,
+        failing: Option<PipFallbackBehavior>,
     }
 
     impl MockPip {
-        fn new(id: PipId) -> Self {
-            MockPip { id }
+        fn success(id: PipId) -> Self {
+            MockPip { id, failing: None }
+        }
+
+        fn failing(id: PipId, behavior: PipFallbackBehavior) -> Self {
+            MockPip {
+                id,
+                failing: Some(behavior),
+            }
         }
     }
 
@@ -858,15 +1370,38 @@ mod tests {
         }
 
         async fn retrieve_attributes(&self, _subject: &PipSubject) -> PipResult {
-            PipResult::Success(PipAttributeSet::new())
+            match self.failing {
+                None => {
+                    let mut attrs = PipAttributeSet::new();
+                    attrs.insert(
+                        PipAttributeName::new(&self.id, "attr"),
+                        PipAttributeValue::String("live".to_string()),
+                    );
+                    PipResult::Success(attrs)
+                }
+                Some(behavior) => {
+                    let mut fallback = BTreeMap::new();
+                    fallback.insert(
+                        "attr".to_string(),
+                        PipAttributeValue::String("fallback".to_string()),
+                    );
+                    PipResult::from_failure(
+                        behavior,
+                        PipFailure::Unavailable("mock down".to_string()),
+                        || PipAttributeSet::from_fallback_values(&self.id, &fallback),
+                    )
+                }
+            }
         }
 
         async fn retrieve_named_attributes(
             &self,
-            _subject: &PipSubject,
-            _attribute_names: &[String],
+            subject: &PipSubject,
+            attribute_names: &[String],
         ) -> PipResult {
-            PipResult::Success(PipAttributeSet::new())
+            self.retrieve_attributes(subject)
+                .await
+                .filter_named(&self.id, attribute_names)
         }
 
         async fn health_check(&self) -> PipHealthCheck {
