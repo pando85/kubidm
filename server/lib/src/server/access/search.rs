@@ -14,10 +14,6 @@ pub enum SearchResult {
     Deny,
     Grant,
     Allow(BTreeSet<Attribute>),
-    #[allow(dead_code)]
-    ReauthRequired {
-        reason: String,
-    },
 }
 
 pub fn apply_search_access(
@@ -33,7 +29,6 @@ pub fn apply_search_access(
     let mut grant = false;
     let constrain = BTreeSet::default();
     let mut allow = BTreeSet::new();
-    let mut reauth_required: Option<String> = None;
 
     // The access control profile
     match search_filter_entry(ident, related_acp, entry, current_time) {
@@ -42,9 +37,6 @@ pub fn apply_search_access(
         AccessSrchResult::Ignore => {}
         // AccessSrchResult::Constrain { mut attr } => constrain.append(&mut attr),
         AccessSrchResult::Allow { mut attr } => allow.append(&mut attr),
-        AccessSrchResult::ReauthRequired { reason } => {
-            reauth_required = Some(reason);
-        }
     };
 
     match search_oauth2_filter_entry(ident, entry) {
@@ -53,9 +45,6 @@ pub fn apply_search_access(
         AccessSrchResult::Ignore => {}
         // AccessSrchResult::Constrain { mut attr } => constrain.append(&mut attr),
         AccessSrchResult::Allow { mut attr } => allow.append(&mut attr),
-        AccessSrchResult::ReauthRequired { reason } => {
-            reauth_required = Some(reason);
-        }
     };
 
     match search_applications_filter_entry(ident, entry) {
@@ -64,9 +53,6 @@ pub fn apply_search_access(
         AccessSrchResult::Ignore => {}
         // AccessSrchResult::Constrain { mut attr } => constrain.append(&mut attr),
         AccessSrchResult::Allow { mut attr } => allow.append(&mut attr),
-        AccessSrchResult::ReauthRequired { reason } => {
-            reauth_required = Some(reason);
-        }
     };
 
     match search_sync_account_filter_entry(ident, entry) {
@@ -75,9 +61,6 @@ pub fn apply_search_access(
         AccessSrchResult::Ignore => {}
         // AccessSrchResult::Constrain{ mut attr } => constrain.append(&mut attr),
         AccessSrchResult::Allow { mut attr } => allow.append(&mut attr),
-        AccessSrchResult::ReauthRequired { reason } => {
-            reauth_required = Some(reason);
-        }
     };
 
     // We'll add more modules later.
@@ -88,8 +71,6 @@ pub fn apply_search_access(
         SearchResult::Deny
     } else if grant {
         SearchResult::Grant
-    } else if let Some(reason) = reauth_required {
-        SearchResult::ReauthRequired { reason }
     } else {
         let allowed_attrs = if !constrain.is_empty() {
             // bit_and
@@ -182,9 +163,19 @@ fn search_filter_entry(
     let ident_memberof = ident.get_memberof();
     let ident_uuid = ident.get_uuid();
 
-    let acp_results: Vec<(BTreeSet<Attribute>, bool, Option<u32>)> = related_acp
+    // Profiles that require a privileged (re-authenticated) session only apply to
+    // read-write sessions. For any other session they contribute nothing, while the
+    // remaining profiles still apply.
+    let privileged_session = matches!(ident.access_scope(), AccessScope::ReadWrite);
+
+    let allowed_attrs: BTreeSet<Attribute> = related_acp
         .iter()
         .filter_map(|acs| {
+            if acs.acp.acp.require_reauth && !privileged_session {
+                debug!(entry = ?entry.get_display_id(), acs = %acs.acp.acp.name, "acs requires a privileged session, skipping");
+                return None;
+            }
+
             // Assert that the receiver condition applies.
             match &acs.receiver_condition {
                 AccessControlReceiverCondition::GroupChecked => {
@@ -212,15 +203,6 @@ fn search_filter_entry(
                         }
                     }
                 }
-                AccessControlReceiverCondition::Delegated { scope_filter_resolved } => {
-                    // Check if the entry matches the delegated scope filter
-                    if let Some(filter) = scope_filter_resolved {
-                        if !entry.entry_match_no_index(filter) {
-                            debug!(entry = ?entry.get_display_id(), acs = %acs.acp.acp.name, "entry DOES NOT match delegated scope filter");
-                            return None
-                        }
-                    }
-                }
             };
 
             match &acs.target_condition {
@@ -228,15 +210,6 @@ fn search_filter_entry(
                     if !entry.entry_match_no_index(f_res) {
                         debug!(entry = ?entry.get_display_id(), acs = %acs.acp.acp.name, action="search_filter", "entry DOES NOT match acs");
                         return None
-                    }
-                }
-                AccessControlTargetCondition::DelegatedScope { scope_filter_resolved } => {
-                    // Check if the entry matches the delegated scope filter
-                    if let Some(filter) = scope_filter_resolved {
-                        if !entry.entry_match_no_index(filter) {
-                            debug!(entry = ?entry.get_display_id(), acs = %acs.acp.acp.name, "entry DOES NOT match delegated scope filter");
-                            return None
-                        }
                     }
                 }
             };
@@ -254,24 +227,9 @@ fn search_filter_entry(
             // -- Conditions pass -- release the attributes.
             debug!(entry = ?entry.get_display_id(), acs = %acs.acp.acp.name, "acs applied to entry");
             // add search_attrs to allowed.
-            Some((acs.acp.attrs.clone(), acs.acp.acp.require_reauth, acs.acp.acp.reauth_max_age))
+            Some(acs.acp.attrs.iter().cloned())
         })
-        .collect();
-
-    // Check if any ACP requires reauth
-    let any_requires_reauth = acp_results.iter().any(|(_, req_reauth, _)| *req_reauth);
-
-    if any_requires_reauth && !matches!(ident.access_scope(), AccessScope::ReadWrite) {
-        return AccessSrchResult::ReauthRequired {
-            reason:
-                "This operation requires elevated privileges. Please re-authenticate to continue."
-                    .to_string(),
-        };
-    }
-
-    let allowed_attrs: BTreeSet<Attribute> = acp_results
-        .into_iter()
-        .flat_map(|(a, _, _)| a.into_iter())
+        .flatten()
         .collect();
 
     AccessSrchResult::Allow {

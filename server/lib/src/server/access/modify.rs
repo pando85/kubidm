@@ -25,10 +25,6 @@ pub enum ModifyResult<'a> {
         pres_cls: BTreeSet<&'a str>,
         rem_cls: BTreeSet<&'a str>,
     },
-    #[allow(dead_code)]
-    ReauthRequired {
-        reason: String,
-    },
 }
 
 pub fn apply_modify_access<'a>(
@@ -80,9 +76,7 @@ pub fn apply_modify_access<'a>(
             allow_pres_cls.append(&mut pres_class);
             allow_rem_cls.append(&mut rem_class);
         }
-        AccessModResult::Constrain { .. }
-        | AccessModResult::Ignore
-        | AccessModResult::ReauthRequired { .. } => {}
+        AccessModResult::Constrain { .. } | AccessModResult::Ignore => {}
     }
 
     // Check with protected if we should proceed.
@@ -108,9 +102,7 @@ pub fn apply_modify_access<'a>(
         // Can't grant.
         // AccessModResult::Grant |
         // Can't allow
-        AccessModResult::Allow { .. }
-        | AccessModResult::Ignore
-        | AccessModResult::ReauthRequired { .. } => {}
+        AccessModResult::Allow { .. } | AccessModResult::Ignore => {}
     }
 
     if !grant && !denied {
@@ -128,9 +120,7 @@ pub fn apply_modify_access<'a>(
             // Can't grant.
             // AccessModResult::Grant |
             // Can't allow
-            AccessModResult::Allow { .. }
-            | AccessModResult::Ignore
-            | AccessModResult::ReauthRequired { .. } => {}
+            AccessModResult::Allow { .. } | AccessModResult::Ignore => {}
         }
 
         // Setup the acp's here
@@ -164,15 +154,6 @@ pub fn apply_modify_access<'a>(
                             }
                         }
                     }
-                    AccessControlReceiverCondition::Delegated { scope_filter_resolved } => {
-                        // Check if the entry matches the delegated scope filter
-                        if let Some(filter) = scope_filter_resolved {
-                            if !entry.entry_match_no_index(filter) {
-                                debug!(entry = ?entry.get_display_id(), acm = %acm.acp.acp.name, "entry DOES NOT match delegated scope filter");
-                                return None;
-                            }
-                        }
-                    }
                 };
 
                 match &acm.target_condition {
@@ -180,15 +161,6 @@ pub fn apply_modify_access<'a>(
                         if !entry.entry_match_no_index(f_res) {
                             debug!(entry = ?entry.get_display_id(), acm = %acm.acp.acp.name, "entry DOES NOT match acs");
                             return None;
-                        }
-                    }
-                    AccessControlTargetCondition::DelegatedScope { scope_filter_resolved } => {
-                        // Check if the entry matches the delegated scope filter
-                        if let Some(filter) = scope_filter_resolved {
-                            if !entry.entry_match_no_index(filter) {
-                                debug!(entry = ?entry.get_display_id(), acm = %acm.acp.acp.name, "entry DOES NOT match delegated scope filter");
-                                return None;
-                            }
                         }
                     }
                 };
@@ -226,7 +198,6 @@ pub fn apply_modify_access<'a>(
                 allow_pres_cls.append(&mut pres_class);
                 allow_rem_cls.append(&mut rem_class);
             }
-            AccessModResult::ReauthRequired { .. } => {}
         }
     }
 

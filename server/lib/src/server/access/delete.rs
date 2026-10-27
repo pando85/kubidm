@@ -13,10 +13,6 @@ use time::OffsetDateTime;
 pub enum DeleteResult {
     Deny,
     Grant,
-    #[allow(dead_code)]
-    ReauthRequired {
-        reason: String,
-    },
 }
 
 enum IResult {
@@ -157,21 +153,6 @@ fn delete_filter_entry<'a>(
                     return false;
                 }
             }
-            AccessControlReceiverCondition::Delegated {
-                scope_filter_resolved,
-            } => {
-                // Check if the entry matches the delegated scope filter
-                if let Some(filter) = scope_filter_resolved {
-                    if !entry.entry_match_no_index(filter) {
-                        trace!(
-                            "entry {:?} DOES NOT match delegated scope filter for acs {}",
-                            entry.get_uuid(),
-                            acd.acp.acp.name
-                        );
-                        return false;
-                    }
-                }
-            }
         };
 
         match &acd.target_condition {
@@ -184,21 +165,6 @@ fn delete_filter_entry<'a>(
                     );
                     // Does not match, fail.
                     return false;
-                }
-            }
-            AccessControlTargetCondition::DelegatedScope {
-                scope_filter_resolved,
-            } => {
-                // Check if the entry matches the delegated scope filter
-                if let Some(filter) = scope_filter_resolved {
-                    if !entry.entry_match_no_index(filter) {
-                        trace!(
-                            "entry {:?} DOES NOT match delegated scope filter for acs {}",
-                            entry.get_uuid(),
-                            acd.acp.acp.name
-                        );
-                        return false;
-                    }
                 }
             }
         };

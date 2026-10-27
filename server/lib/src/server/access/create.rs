@@ -17,10 +17,6 @@ pub enum CreateResult<'a> {
         pres: BTreeSet<Attribute>,
         pres_cls: BTreeSet<&'a str>,
     },
-    #[allow(dead_code)]
-    ReauthRequired {
-        reason: String,
-    },
 }
 
 enum IResult<'a> {
@@ -228,9 +224,6 @@ fn create_filter_entry<'a>(
                 // Currently, this is unsatisfiable for creates.
                 return false;
             }
-            AccessControlReceiverCondition::Delegated { .. } => {
-                // Delegated access is handled at filter resolution time
-            }
         };
 
         match &accr.target_condition {
@@ -240,9 +233,6 @@ fn create_filter_entry<'a>(
                     // Does not match, fail this rule.
                     return false;
                 }
-            }
-            AccessControlTargetCondition::DelegatedScope { .. } => {
-                // Delegated scope is handled at filter resolution time
             }
         };
 

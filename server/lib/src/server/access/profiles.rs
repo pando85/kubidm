@@ -78,10 +78,8 @@ impl AccessControlSearch {
                 receiver: AccessControlReceiver::Group(btreeset!(receiver)),
                 target: AccessControlTarget::Scope(targetscope),
                 require_reauth: false,
-                reauth_max_age: None,
                 time_restriction_start: None,
                 time_restriction_end: None,
-                scope_filter: None,
             },
             attrs,
         }
@@ -113,13 +111,27 @@ impl AccessControlSearch {
                 receiver: AccessControlReceiver::Group(btreeset!(receiver)),
                 target: AccessControlTarget::Scope(targetscope),
                 require_reauth: false,
-                reauth_max_age: None,
                 time_restriction_start,
                 time_restriction_end,
-                scope_filter: None,
             },
             attrs,
         }
+    }
+
+    /// ⚠️  - Manually create a search access profile that requires a privileged
+    /// (read-write) session.
+    /// This is a TEST ONLY method and will never be exposed in production.
+    #[cfg(test)]
+    pub(super) fn from_raw_require_reauth(
+        name: &str,
+        uuid: Uuid,
+        receiver: Uuid,
+        targetscope: Filter<FilterValid>,
+        attrs: &str,
+    ) -> Self {
+        let mut acs = Self::from_raw(name, uuid, receiver, targetscope, attrs);
+        acs.acp.require_reauth = true;
+        acs
     }
 
     /// ⚠️  - Manually create a search access profile from values.
@@ -138,82 +150,10 @@ impl AccessControlSearch {
                 receiver: AccessControlReceiver::EntryManager,
                 target,
                 require_reauth: false,
-                reauth_max_age: None,
                 time_restriction_start: None,
                 time_restriction_end: None,
-                scope_filter: None,
             },
             attrs: attrs.split_whitespace().map(Attribute::from).collect(),
-        }
-    }
-
-    /// ⚠️  - Manually create a search access profile with delegated receiver.
-    /// This is a TEST ONLY method and will never be exposed in production.
-    #[cfg(test)]
-    #[allow(dead_code)]
-    pub(super) fn from_delegated_receiver(
-        name: &str,
-        uuid: Uuid,
-        scope_group: Option<Uuid>,
-        scope_filter: Option<Filter<FilterValid>>,
-        target: AccessControlTarget,
-        attrs: &str,
-    ) -> Self {
-        let mut attrs_set: BTreeSet<_> = attrs.split_whitespace().map(Attribute::from).collect();
-        if attrs_set.contains(&Attribute::MemberOf) {
-            attrs_set.insert(Attribute::DirectMemberOf);
-        }
-        AccessControlSearch {
-            acp: AccessControlProfile {
-                name: name.to_string(),
-                uuid,
-                receiver: AccessControlReceiver::Delegated {
-                    scope_group,
-                    scope_filter,
-                },
-                target,
-                require_reauth: false,
-                reauth_max_age: None,
-                time_restriction_start: None,
-                time_restriction_end: None,
-                scope_filter: None,
-            },
-            attrs: attrs_set,
-        }
-    }
-
-    /// ⚠️  - Manually create a search access profile with delegated target scope.
-    /// This is a TEST ONLY method and will never be exposed in production.
-    #[cfg(test)]
-    #[allow(dead_code)]
-    pub(super) fn from_delegated_target(
-        name: &str,
-        uuid: Uuid,
-        receiver_group: Uuid,
-        scope_group: Option<Uuid>,
-        scope_filter: Option<Filter<FilterValid>>,
-        attrs: &str,
-    ) -> Self {
-        let mut attrs_set: BTreeSet<_> = attrs.split_whitespace().map(Attribute::from).collect();
-        if attrs_set.contains(&Attribute::MemberOf) {
-            attrs_set.insert(Attribute::DirectMemberOf);
-        }
-        AccessControlSearch {
-            acp: AccessControlProfile {
-                name: name.to_string(),
-                uuid,
-                receiver: AccessControlReceiver::Group(btreeset!(receiver_group)),
-                target: AccessControlTarget::DelegatedScope {
-                    scope_group,
-                    scope_filter,
-                },
-                require_reauth: false,
-                reauth_max_age: None,
-                time_restriction_start: None,
-                time_restriction_end: None,
-                scope_filter: None,
-            },
-            attrs: attrs_set,
         }
     }
 }
@@ -263,10 +203,8 @@ impl AccessControlDelete {
                 receiver: AccessControlReceiver::Group(btreeset!(receiver)),
                 target: AccessControlTarget::Scope(targetscope),
                 require_reauth: false,
-                reauth_max_age: None,
                 time_restriction_start: None,
                 time_restriction_end: None,
-                scope_filter: None,
             },
         }
     }
@@ -282,68 +220,8 @@ impl AccessControlDelete {
                 receiver: AccessControlReceiver::EntryManager,
                 target,
                 require_reauth: false,
-                reauth_max_age: None,
                 time_restriction_start: None,
                 time_restriction_end: None,
-                scope_filter: None,
-            },
-        }
-    }
-
-    /// ⚠️  - Manually create a delete access profile with delegated receiver.
-    /// This is a TEST ONLY method and will never be exposed in production.
-    #[cfg(test)]
-    #[allow(dead_code)]
-    pub(super) fn from_delegated_receiver(
-        name: &str,
-        uuid: Uuid,
-        scope_group: Option<Uuid>,
-        scope_filter: Option<Filter<FilterValid>>,
-        target: AccessControlTarget,
-    ) -> Self {
-        AccessControlDelete {
-            acp: AccessControlProfile {
-                name: name.to_string(),
-                uuid,
-                receiver: AccessControlReceiver::Delegated {
-                    scope_group,
-                    scope_filter,
-                },
-                target,
-                require_reauth: false,
-                reauth_max_age: None,
-                time_restriction_start: None,
-                time_restriction_end: None,
-                scope_filter: None,
-            },
-        }
-    }
-
-    /// ⚠️  - Manually create a delete access profile with delegated target scope.
-    /// This is a TEST ONLY method and will never be exposed in production.
-    #[cfg(test)]
-    #[allow(dead_code)]
-    pub(super) fn from_delegated_target(
-        name: &str,
-        uuid: Uuid,
-        receiver_group: Uuid,
-        scope_group: Option<Uuid>,
-        scope_filter: Option<Filter<FilterValid>>,
-    ) -> Self {
-        AccessControlDelete {
-            acp: AccessControlProfile {
-                name: name.to_string(),
-                uuid,
-                receiver: AccessControlReceiver::Group(btreeset!(receiver_group)),
-                target: AccessControlTarget::DelegatedScope {
-                    scope_group,
-                    scope_filter,
-                },
-                require_reauth: false,
-                reauth_max_age: None,
-                time_restriction_start: None,
-                time_restriction_end: None,
-                scope_filter: None,
             },
         }
     }
@@ -411,10 +289,8 @@ impl AccessControlCreate {
                 receiver: AccessControlReceiver::Group(btreeset!(receiver)),
                 target: AccessControlTarget::Scope(targetscope),
                 require_reauth: false,
-                reauth_max_age: None,
                 time_restriction_start: None,
                 time_restriction_end: None,
-                scope_filter: None,
             },
             classes: classes.split_whitespace().map(AttrString::from).collect(),
             attrs: attrs.split_whitespace().map(Attribute::from).collect(),
@@ -438,76 +314,8 @@ impl AccessControlCreate {
                 receiver: AccessControlReceiver::EntryManager,
                 target,
                 require_reauth: false,
-                reauth_max_age: None,
                 time_restriction_start: None,
                 time_restriction_end: None,
-                scope_filter: None,
-            },
-            classes: classes.split_whitespace().map(AttrString::from).collect(),
-            attrs: attrs.split_whitespace().map(Attribute::from).collect(),
-        }
-    }
-
-    /// ⚠️  - Manually create a create access profile with delegated receiver.
-    /// This is a TEST ONLY method and will never be exposed in production.
-    #[cfg(test)]
-    #[allow(dead_code)]
-    pub(super) fn from_delegated_receiver(
-        name: &str,
-        uuid: Uuid,
-        scope_group: Option<Uuid>,
-        scope_filter: Option<Filter<FilterValid>>,
-        target: AccessControlTarget,
-        classes: &str,
-        attrs: &str,
-    ) -> Self {
-        AccessControlCreate {
-            acp: AccessControlProfile {
-                name: name.to_string(),
-                uuid,
-                receiver: AccessControlReceiver::Delegated {
-                    scope_group,
-                    scope_filter,
-                },
-                target,
-                require_reauth: false,
-                reauth_max_age: None,
-                time_restriction_start: None,
-                time_restriction_end: None,
-                scope_filter: None,
-            },
-            classes: classes.split_whitespace().map(AttrString::from).collect(),
-            attrs: attrs.split_whitespace().map(Attribute::from).collect(),
-        }
-    }
-
-    /// ⚠️  - Manually create a create access profile with delegated target scope.
-    /// This is a TEST ONLY method and will never be exposed in production.
-    #[cfg(test)]
-    #[allow(dead_code)]
-    pub(super) fn from_delegated_target(
-        name: &str,
-        uuid: Uuid,
-        receiver_group: Uuid,
-        scope_group: Option<Uuid>,
-        scope_filter: Option<Filter<FilterValid>>,
-        classes: &str,
-        attrs: &str,
-    ) -> Self {
-        AccessControlCreate {
-            acp: AccessControlProfile {
-                name: name.to_string(),
-                uuid,
-                receiver: AccessControlReceiver::Group(btreeset!(receiver_group)),
-                target: AccessControlTarget::DelegatedScope {
-                    scope_group,
-                    scope_filter,
-                },
-                require_reauth: false,
-                reauth_max_age: None,
-                time_restriction_start: None,
-                time_restriction_end: None,
-                scope_filter: None,
             },
             classes: classes.split_whitespace().map(AttrString::from).collect(),
             attrs: attrs.split_whitespace().map(Attribute::from).collect(),
@@ -597,10 +405,8 @@ impl AccessControlModify {
                 receiver: AccessControlReceiver::Group(btreeset!(receiver)),
                 target: AccessControlTarget::Scope(targetscope),
                 require_reauth: false,
-                reauth_max_age: None,
                 time_restriction_start: None,
                 time_restriction_end: None,
-                scope_filter: None,
             },
             pres_classes: pres_classes
                 .split_whitespace()
@@ -634,96 +440,8 @@ impl AccessControlModify {
                 receiver: AccessControlReceiver::EntryManager,
                 target,
                 require_reauth: false,
-                reauth_max_age: None,
                 time_restriction_start: None,
                 time_restriction_end: None,
-                scope_filter: None,
-            },
-            pres_classes: pres_classes
-                .split_whitespace()
-                .map(AttrString::from)
-                .collect(),
-            rem_classes: rem_classes
-                .split_whitespace()
-                .map(AttrString::from)
-                .collect(),
-            presattrs: presattrs.split_whitespace().map(Attribute::from).collect(),
-            remattrs: remattrs.split_whitespace().map(Attribute::from).collect(),
-        }
-    }
-
-    /// ⚠️  - Manually create a modify access profile with delegated receiver.
-    /// This is a TEST ONLY method and will never be exposed in production.
-    #[cfg(test)]
-    #[allow(dead_code, clippy::too_many_arguments)]
-    pub(super) fn from_delegated_receiver(
-        name: &str,
-        uuid: Uuid,
-        scope_group: Option<Uuid>,
-        scope_filter: Option<Filter<FilterValid>>,
-        target: AccessControlTarget,
-        presattrs: &str,
-        remattrs: &str,
-        pres_classes: &str,
-        rem_classes: &str,
-    ) -> Self {
-        AccessControlModify {
-            acp: AccessControlProfile {
-                name: name.to_string(),
-                uuid,
-                receiver: AccessControlReceiver::Delegated {
-                    scope_group,
-                    scope_filter,
-                },
-                target,
-                require_reauth: false,
-                reauth_max_age: None,
-                time_restriction_start: None,
-                time_restriction_end: None,
-                scope_filter: None,
-            },
-            pres_classes: pres_classes
-                .split_whitespace()
-                .map(AttrString::from)
-                .collect(),
-            rem_classes: rem_classes
-                .split_whitespace()
-                .map(AttrString::from)
-                .collect(),
-            presattrs: presattrs.split_whitespace().map(Attribute::from).collect(),
-            remattrs: remattrs.split_whitespace().map(Attribute::from).collect(),
-        }
-    }
-
-    /// ⚠️  - Manually create a modify access profile with delegated target scope.
-    /// This is a TEST ONLY method and will never be exposed in production.
-    #[cfg(test)]
-    #[allow(dead_code, clippy::too_many_arguments)]
-    pub(super) fn from_delegated_target(
-        name: &str,
-        uuid: Uuid,
-        receiver_group: Uuid,
-        scope_group: Option<Uuid>,
-        scope_filter: Option<Filter<FilterValid>>,
-        presattrs: &str,
-        remattrs: &str,
-        pres_classes: &str,
-        rem_classes: &str,
-    ) -> Self {
-        AccessControlModify {
-            acp: AccessControlProfile {
-                name: name.to_string(),
-                uuid,
-                receiver: AccessControlReceiver::Group(btreeset!(receiver_group)),
-                target: AccessControlTarget::DelegatedScope {
-                    scope_group,
-                    scope_filter,
-                },
-                require_reauth: false,
-                reauth_max_age: None,
-                time_restriction_start: None,
-                time_restriction_end: None,
-                scope_filter: None,
             },
             pres_classes: pres_classes
                 .split_whitespace()
@@ -744,10 +462,6 @@ pub enum AccessControlReceiver {
     None,
     Group(BTreeSet<Uuid>),
     EntryManager,
-    Delegated {
-        scope_group: Option<Uuid>,
-        scope_filter: Option<Filter<FilterValid>>,
-    },
 }
 
 #[derive(Debug, Clone)]
@@ -755,9 +469,6 @@ pub enum AccessControlReceiverCondition {
     // None,
     GroupChecked,
     EntryManager,
-    Delegated {
-        scope_filter_resolved: Option<Filter<FilterValidResolved>>,
-    },
 }
 
 /*
@@ -772,19 +483,12 @@ impl AccessControlReceiverCondition {
 pub enum AccessControlTarget {
     None,
     Scope(Filter<FilterValid>),
-    DelegatedScope {
-        scope_group: Option<Uuid>,
-        scope_filter: Option<Filter<FilterValid>>,
-    },
 }
 
 #[derive(Debug, Clone)]
 pub enum AccessControlTargetCondition {
     // None,
     Scope(Filter<FilterValidResolved>),
-    DelegatedScope {
-        scope_filter_resolved: Option<Filter<FilterValidResolved>>,
-    },
 }
 
 /*
@@ -805,10 +509,8 @@ pub struct AccessControlProfile {
     pub receiver: AccessControlReceiver,
     pub target: AccessControlTarget,
     pub require_reauth: bool,
-    pub reauth_max_age: Option<u32>,
     pub time_restriction_start: Option<time::OffsetDateTime>,
     pub time_restriction_end: Option<time::OffsetDateTime>,
-    pub scope_filter: Option<Filter<FilterValid>>,
 }
 
 impl AccessControlProfile {
@@ -835,6 +537,23 @@ impl AccessControlProfile {
         // copy uuid
         let uuid = value.get_uuid();
 
+        // Kubidm delegated administration. Delegated profiles are rewritten at parse time
+        // into the upstream receiver and target types, so that the enforcement paths only
+        // ever see `Group` receivers and `Scope` targets, and inherit their fail-closed
+        // behaviour. Both delegated classes share the same scope attributes.
+        let delegated_receiver = value.attribute_equality(
+            Attribute::Class,
+            &EntryClass::AccessControlReceiverDelegated.into(),
+        );
+        let delegated_target = value.attribute_equality(
+            Attribute::Class,
+            &EntryClass::AccessControlTargetDelegatedScope.into(),
+        );
+        let delegated_scope_group = value.get_ava_single_refer(Attribute::DelegatedScopeGroup);
+        let delegated_scope_filter = value
+            .get_ava_single_protofilter(Attribute::DelegatedScopeFilter)
+            .cloned();
+
         let receiver = if value.attribute_equality(
             Attribute::Class,
             &EntryClass::AccessControlReceiverGroup.into(),
@@ -855,40 +574,26 @@ impl AccessControlProfile {
             &EntryClass::AccessControlReceiverEntryManager.into(),
         ) {
             AccessControlReceiver::EntryManager
-        } else if value.attribute_equality(
-            Attribute::Class,
-            &EntryClass::AccessControlReceiverDelegated.into(),
-        ) {
-            let scope_group = value.get_ava_single_refer(Attribute::DelegatedScopeGroup);
-
-            let scope_filter = if let Some(f) =
-                value.get_ava_single_protofilter(Attribute::DelegatedScopeFilter)
-            {
-                let ident = Identity::from_internal();
-                let filter_i = Filter::from_rw(&ident, f, qs).map_err(|e| {
-                    admin_error!(
-                        "{} validation failed {:?}",
-                        Attribute::DelegatedScopeFilter,
-                        e
-                    );
-                    e
-                })?;
-                Some(filter_i.validate(qs.get_schema()).map_err(|e| {
-                    admin_error!(
-                        "{} Schema Violation {:?}",
-                        Attribute::DelegatedScopeFilter,
-                        e
-                    );
-                    OperationError::SchemaViolation(e)
-                })?)
-            } else {
-                None
-            };
-
-            AccessControlReceiver::Delegated {
-                scope_group,
-                scope_filter,
+        } else if delegated_receiver {
+            // Receiving a profile through a delegated role is not implemented.
+            if value.attribute_pres(Attribute::AcpReceiverDelegated) {
+                admin_error!(?name, "{} is unsupported", Attribute::AcpReceiverDelegated);
+                return Err(OperationError::InvalidAcpState(format!(
+                    "{} is unsupported",
+                    Attribute::AcpReceiverDelegated
+                )));
             }
+
+            // The members of the delegated scope group receive this profile.
+            delegated_scope_group
+                .map(|group| AccessControlReceiver::Group(btreeset!(group)))
+                .ok_or_else(|| {
+                    admin_error!(?name, "Missing {}", Attribute::DelegatedScopeGroup);
+                    OperationError::InvalidAcpState(format!(
+                        "Missing {}",
+                        Attribute::DelegatedScopeGroup
+                    ))
+                })?
         } else {
             warn!(
                 ?name,
@@ -897,7 +602,9 @@ impl AccessControlProfile {
             AccessControlReceiver::None
         };
 
-        let target = if value.attribute_equality(
+        // Collect the target scope terms, which are all required to match.
+        let mut target_terms: Vec<ProtoFilter> = Vec::with_capacity(3);
+        let has_target = if value.attribute_equality(
             Attribute::Class,
             &EntryClass::AccessControlTargetScope.into(),
         ) {
@@ -912,6 +619,54 @@ impl AccessControlProfile {
                         Attribute::AcpTargetScope
                     ))
                 })?;
+            target_terms.push(targetscope_f);
+            true
+        } else if delegated_target {
+            if delegated_scope_group.is_none() && delegated_scope_filter.is_none() {
+                admin_error!(
+                    ?name,
+                    "Missing {} or {}",
+                    Attribute::DelegatedScopeGroup,
+                    Attribute::DelegatedScopeFilter
+                );
+                return Err(OperationError::InvalidAcpState(format!(
+                    "Missing {} or {}",
+                    Attribute::DelegatedScopeGroup,
+                    Attribute::DelegatedScopeFilter
+                )));
+            }
+
+            // The targets are the members of the delegated scope group ...
+            if let Some(group) = delegated_scope_group {
+                target_terms.push(ProtoFilter::Eq(
+                    Attribute::MemberOf.to_string(),
+                    group.to_string(),
+                ));
+            }
+            // ... that also match the delegated scope filter.
+            if let Some(scope_filter) = delegated_scope_filter.clone() {
+                target_terms.push(scope_filter);
+            }
+            true
+        } else {
+            false
+        };
+
+        // A delegated receiver's scope filter further narrows the targets. When the target
+        // is also delegated, the shared filter was already added above.
+        if has_target && delegated_receiver && !delegated_target {
+            if let Some(scope_filter) = delegated_scope_filter {
+                target_terms.push(scope_filter);
+            }
+        }
+
+        let target = if has_target {
+            // Keep a lone term as is, so upstream profiles parse exactly as before.
+            let targetscope_f = if target_terms.len() == 1 {
+                target_terms.swap_remove(0)
+            } else {
+                ProtoFilter::And(target_terms)
+            };
 
             let ident = Identity::from_internal();
 
@@ -927,40 +682,6 @@ impl AccessControlProfile {
                     OperationError::SchemaViolation(e)
                 })
                 .map(AccessControlTarget::Scope)?
-        } else if value.attribute_equality(
-            Attribute::Class,
-            &EntryClass::AccessControlTargetDelegatedScope.into(),
-        ) {
-            let scope_group = value.get_ava_single_refer(Attribute::DelegatedScopeGroup);
-
-            let scope_filter = if let Some(f) =
-                value.get_ava_single_protofilter(Attribute::DelegatedScopeFilter)
-            {
-                let ident = Identity::from_internal();
-                let filter_i = Filter::from_rw(&ident, f, qs).map_err(|e| {
-                    admin_error!(
-                        "{} validation failed {:?}",
-                        Attribute::DelegatedScopeFilter,
-                        e
-                    );
-                    e
-                })?;
-                Some(filter_i.validate(qs.get_schema()).map_err(|e| {
-                    admin_error!(
-                        "{} Schema Violation {:?}",
-                        Attribute::DelegatedScopeFilter,
-                        e
-                    );
-                    OperationError::SchemaViolation(e)
-                })?)
-            } else {
-                None
-            };
-
-            AccessControlTarget::DelegatedScope {
-                scope_group,
-                scope_filter,
-            }
         } else {
             warn!(
                 ?name,
@@ -973,7 +694,15 @@ impl AccessControlProfile {
             .get_ava_single_bool(Attribute::AcpRequireReauth)
             .unwrap_or(false);
 
-        let reauth_max_age = value.get_ava_single_uint32(Attribute::AcpReauthMaxAge);
+        // A maximum session age for step-up is not implemented. Reject it rather than
+        // silently ignoring a restriction the administrator asked for.
+        if value.attribute_pres(Attribute::AcpReauthMaxAge) {
+            admin_error!(?name, "{} is unsupported", Attribute::AcpReauthMaxAge);
+            return Err(OperationError::InvalidAcpState(format!(
+                "{} is unsupported",
+                Attribute::AcpReauthMaxAge
+            )));
+        }
 
         let time_restriction_start = value
             .get_ava_single_datetime(Attribute::AcpTimeRestrictionStart)
@@ -983,31 +712,14 @@ impl AccessControlProfile {
             .get_ava_single_datetime(Attribute::AcpTimeRestrictionEnd)
             .map(|dt| dt.to_offset(time::UtcOffset::UTC));
 
-        let scope_filter =
-            if let Some(f) = value.get_ava_single_protofilter(Attribute::AcpScopeFilter) {
-                let ident = Identity::from_internal();
-                let filter_i = Filter::from_rw(&ident, f, qs).map_err(|e| {
-                    admin_error!("{} validation failed {:?}", Attribute::AcpScopeFilter, e);
-                    e
-                })?;
-                Some(filter_i.validate(qs.get_schema()).map_err(|e| {
-                    admin_error!("{} Schema Violation {:?}", Attribute::AcpScopeFilter, e);
-                    OperationError::SchemaViolation(e)
-                })?)
-            } else {
-                None
-            };
-
         Ok(AccessControlProfile {
             name,
             uuid,
             receiver,
             target,
             require_reauth,
-            reauth_max_age,
             time_restriction_start,
             time_restriction_end,
-            scope_filter,
         })
     }
 }
