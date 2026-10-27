@@ -62,6 +62,7 @@ use ldap3_proto::simple::{LdapPartialAttribute, LdapSearchResultEntry};
 use std::{
     cmp::Ordering,
     collections::{BTreeMap as Map, BTreeMap, BTreeSet},
+    fmt,
     sync::Arc,
 };
 use time::OffsetDateTime;
@@ -172,6 +173,52 @@ pub struct EntryReduced {
 // One day this is going to be Map<Attribute, ValueSet> - @yaleman
 // Today is that day - @firstyear
 pub type Eattrs = Map<Attribute, ValueSet>;
+
+/// Why a stored entry could not be loaded by [`Entry::from_dbentry`].
+#[derive(Debug, PartialEq)]
+pub enum DbEntryLoadReason {
+    /// The stored value set of `attribute` could not be converted into a value set.
+    InvalidValueSet {
+        attribute: Attribute,
+        error: OperationError,
+    },
+    /// The entry has no single, valid uuid attribute.
+    MissingUuid,
+}
+
+/// A stored entry that could not be loaded, together with the identity that could be
+/// recovered from its raw attributes. The row id alone does not let an operator find the
+/// entry in a backup or in the database, the uuid and name do.
+#[derive(Debug, PartialEq)]
+pub struct DbEntryLoadError {
+    pub entry_id: u64,
+    pub entry_uuid: Option<Uuid>,
+    pub entry_name: Option<String>,
+    pub reason: DbEntryLoadReason,
+}
+
+impl fmt::Display for DbEntryLoadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "entry id {}", self.entry_id)?;
+        match &self.entry_uuid {
+            Some(uuid) => write!(f, " uuid {uuid}")?,
+            None => write!(f, " uuid <unknown>")?,
+        }
+        match &self.entry_name {
+            Some(name) => write!(f, " name {name}")?,
+            None => write!(f, " name <unknown>")?,
+        }
+        match &self.reason {
+            DbEntryLoadReason::InvalidValueSet { attribute, error } => {
+                write!(
+                    f,
+                    ": attribute {attribute} has an invalid stored value set ({error:?})"
+                )
+            }
+            DbEntryLoadReason::MissingUuid => write!(f, ": entry has no valid uuid"),
+        }
+    }
+}
 
 pub trait GetUuid {
     fn get_uuid(&self) -> Uuid;
@@ -331,6 +378,9 @@ impl Entry<EntryInit, EntryNew> {
             .map(|(k, v)| {
                 trace!(?k, ?v, "attribute");
                 let attr_nk = Attribute::from(k.as_str());
+                // TODO: Make this look up the syntax, then use that
+                // to guide the Valueset.
+
                 let nv = valueset::from_result_value_iter(
                     v.iter().map(|vr| qs.clone_value(&attr_nk, vr)),
                 );
@@ -538,7 +588,7 @@ impl From<&SchemaAttribute> for EntryInitNew {
         attrs.insert(Attribute::Syntax, vs_syntax![s.syntax]);
         attrs.insert(
             Attribute::Class,
-            vs_iutf8![
+            vs_iutf8n![
                 EntryClass::Object.into(),
                 EntryClass::System.into(),
                 EntryClass::AttributeType.into()
@@ -570,31 +620,31 @@ impl From<&SchemaClass> for EntryInitNew {
         attrs.insert(Attribute::Uuid, vs_uuid![s.uuid]);
         attrs.insert(
             Attribute::Class,
-            vs_iutf8![
+            vs_iutf8n![
                 EntryClass::Object.into(),
                 EntryClass::System.into(),
                 EntryClass::ClassType.into()
             ],
         );
 
-        let vs_systemmay = ValueSetIutf8::from_iter(s.systemmay.iter().map(|sm| sm.as_str()));
+        let vs_systemmay = ValueSetIutf8N::from_iter(s.systemmay.iter().map(|sm| sm.as_str()));
         if let Some(vs) = vs_systemmay {
             attrs.insert(Attribute::SystemMay, vs);
         }
 
-        let vs_systemmust = ValueSetIutf8::from_iter(s.systemmust.iter().map(|sm| sm.as_str()));
+        let vs_systemmust = ValueSetIutf8N::from_iter(s.systemmust.iter().map(|sm| sm.as_str()));
         if let Some(vs) = vs_systemmust {
             attrs.insert(Attribute::SystemMust, vs);
         }
 
         let vs_systemexcludes =
-            ValueSetIutf8::from_iter(s.systemexcludes.iter().map(|sm| sm.as_str()));
+            ValueSetIutf8N::from_iter(s.systemexcludes.iter().map(|sm| sm.as_str()));
         if let Some(vs) = vs_systemexcludes {
             attrs.insert(Attribute::SystemExcludes, vs);
         }
 
         let vs_systemsupplements =
-            ValueSetIutf8::from_iter(s.systemsupplements.iter().map(|sm| sm.as_str()));
+            ValueSetIutf8N::from_iter(s.systemsupplements.iter().map(|sm| sm.as_str()));
         if let Some(vs) = vs_systemsupplements {
             attrs.insert(Attribute::SystemSupplements, vs);
         }
@@ -770,7 +820,10 @@ impl Entry<EntryIncremental, EntryNew> {
                         };
 
                         // Move the current uuid to source_uuid
-                        cnf_ent.add_ava(Attribute::SourceUuid, Value::Uuid(db_ent.valid.uuid));
+                        cnf_ent.set_ava_set(
+                            &Attribute::SourceUuid,
+                            ValueSetUuidN::new(db_ent.valid.uuid),
+                        );
 
                         // We need to make a random uuid in the conflict gen process.
                         let new_uuid = Uuid::new_v4();
@@ -904,7 +957,6 @@ impl Entry<EntryIncremental, EntryNew> {
                             match (self.attrs.get(attr_name), db_ent.attrs.get(attr_name)) {
                                 (Some(vs_left), Some(vs_right)) if take_left => {
                                     changes.insert(attr_name.clone(), cid_left.clone());
-                                    #[allow(clippy::todo)]
                                     if let Some(merged_attr_state) =
                                         vs_left.repl_merge_valueset(vs_right, trim_cid)
                                     {
@@ -917,7 +969,6 @@ impl Entry<EntryIncremental, EntryNew> {
                                 }
                                 (Some(vs_left), Some(vs_right)) => {
                                     changes.insert(attr_name.clone(), cid_right.clone());
-                                    #[allow(clippy::todo)]
                                     if let Some(merged_attr_state) =
                                         vs_right.repl_merge_valueset(vs_left, trim_cid)
                                     {
@@ -1008,7 +1059,7 @@ impl Entry<EntryIncremental, EntryNew> {
                 // we just send the tombstone ecstate rather than attrs. Our
                 // db stub also lacks these attributes too.
                 let mut attrs_new: Eattrs = Map::new();
-                let class_ava = vs_iutf8![EntryClass::Object.into(), EntryClass::Tombstone.into()];
+                let class_ava = vs_iutf8n![EntryClass::Object.into(), EntryClass::Tombstone.into()];
                 let last_mod_ava = vs_cid![left_at.clone()];
                 let created_ava = vs_cid![left_at.clone()];
 
@@ -1059,7 +1110,7 @@ impl Entry<EntryIncremental, EntryNew> {
                 };
 
                 let mut attrs_new: Eattrs = Map::new();
-                let class_ava = vs_iutf8![EntryClass::Object.into(), EntryClass::Tombstone.into()];
+                let class_ava = vs_iutf8n![EntryClass::Object.into(), EntryClass::Tombstone.into()];
                 let last_mod_ava = vs_cid![at.clone()];
                 let created_ava = vs_cid![at.clone()];
 
@@ -1102,7 +1153,11 @@ impl Entry<EntryIncremental, EntryCommitted> {
             warn!(uuid = ?self.valid.uuid, err = ?e, "Entry failed schema check, moving to a conflict state");
             ne.add_ava_int(Attribute::Class, EntryClass::Recycled.into());
             ne.add_ava_int(Attribute::Class, EntryClass::Conflict.into());
-            ne.add_ava_int(Attribute::SourceUuid, Value::Uuid(self.valid.uuid));
+
+            ne.set_ava_int(
+                Attribute::SourceUuid,
+                ValueSetUuidN::new(self.valid.uuid) as ValueSet,
+            );
         }
         ne
     }
@@ -1215,9 +1270,9 @@ impl Entry<EntryInvalid, EntryCommitted> {
         self.add_ava(Attribute::Class, EntryClass::Recycled.into());
         self.add_ava(Attribute::Class, EntryClass::Conflict.into());
         // Add all the source uuids we conflicted against.
-        for source_uuid in iter {
-            self.add_ava(Attribute::SourceUuid, Value::Uuid(source_uuid));
-        }
+        if let Some(vs) = ValueSetUuidN::from_iter(iter) {
+            self.set_ava_set(&Attribute::SourceUuid, vs as ValueSet)
+        };
     }
 
     /// Extract this entry from the recycle bin into a live state.
@@ -1886,36 +1941,62 @@ impl Entry<EntrySealed, EntryCommitted> {
         }
     }
 
-    pub fn from_dbentry(db_e: DbEntry, id: u64) -> Option<Self> {
-        // Convert attrs from db format to value
+    /// Load a stored entry. On failure the returned error carries the row id and the
+    /// uuid and name recovered from the raw attributes, and names the attribute that
+    /// could not be loaded, so that the entry can be identified by an operator. The caller
+    /// logs it, with what it was doing.
+    pub fn from_dbentry(db_e: DbEntry, id: u64) -> Result<Self, Box<DbEntryLoadError>> {
+        // Recover the identity of the entry up front so that any failure below can be
+        // reported against it. Only identifiers are taken, never attribute values.
+        let entry_uuid = db_e.stored_uuid();
+        let entry_name = db_e.stored_name().map(str::to_string);
 
+        // Convert attrs from db format to value
         let (attrs, ecstate) = match db_e.ent {
             DbEntryVers::V3 { changestate, attrs } => {
                 let ecstate = EntryChangeState::from_db_changestate(changestate);
 
-                let r_attrs = attrs
-                    .into_iter()
+                let mut r_attrs = Eattrs::default();
+                for (k, dbvs) in attrs {
                     // Skip anything empty as new VS can't deal with it.
-                    .filter(|(_k, vs)| !vs.is_empty())
-                    .map(|(k, dbvs)| {
-                        valueset::from_db_valueset_v2(dbvs)
-                            .map(|vs: ValueSet| (k, vs))
-                            .map_err(|e| {
-                                error!(?e, "from_dbentry failed");
-                            })
-                    })
-                    .collect::<Result<Eattrs, ()>>()
-                    .ok()?;
+                    if dbvs.is_empty() {
+                        continue;
+                    }
+                    match valueset::from_db_valueset_v2(dbvs) {
+                        Ok(vs) => {
+                            r_attrs.insert(k, vs);
+                        }
+                        Err(error) => {
+                            return Err(Box::new(DbEntryLoadError {
+                                entry_id: id,
+                                entry_uuid,
+                                entry_name,
+                                reason: DbEntryLoadReason::InvalidValueSet {
+                                    attribute: k,
+                                    error,
+                                },
+                            }));
+                        }
+                    }
+                }
 
                 (r_attrs, ecstate)
             }
         };
 
-        let uuid = attrs
+        let Some(uuid) = attrs
             .get(&Attribute::Uuid)
-            .and_then(|vs| vs.to_uuid_single())?;
+            .and_then(|vs| vs.to_uuid_single())
+        else {
+            return Err(Box::new(DbEntryLoadError {
+                entry_id: id,
+                entry_uuid,
+                entry_name,
+                reason: DbEntryLoadReason::MissingUuid,
+            }));
+        };
 
-        Some(Entry {
+        Ok(Entry {
             valid: EntrySealed { uuid, ecstate },
             state: EntryCommitted { id },
             attrs,
@@ -1980,7 +2061,7 @@ impl Entry<EntrySealed, EntryCommitted> {
         // Duplicate this to a tombstone entry
         let mut attrs_new: Eattrs = Map::new();
 
-        let class_ava = vs_iutf8![EntryClass::Object.into(), EntryClass::Tombstone.into()];
+        let class_ava = vs_iutf8n![EntryClass::Object.into(), EntryClass::Tombstone.into()];
         let last_mod_ava = vs_cid![cid.clone()];
         let created_ava = vs_cid![cid.clone()];
 
@@ -2607,6 +2688,16 @@ impl<VALID, STATE> Entry<VALID, STATE> {
         // Doesn't matter if it already exists, equality will replace.
     }
 
+    fn set_ava_int(&mut self, attr: Attribute, vs: ValueSet) {
+        if let Some(existing_vs) = self.attrs.get_mut(&attr) {
+            // This is the suboptimal path. This can only exist in rare cases.
+            let _ = existing_vs.merge(&vs);
+        } else {
+            // Normally this is what's taken.
+            self.attrs.insert(attr, vs);
+        }
+    }
+
     /// Overwrite the current set of values for an attribute, with this new set.
     fn set_ava_iter_int<T>(&mut self, attr: Attribute, iter: T)
     where
@@ -2617,13 +2708,9 @@ impl<VALID, STATE> Entry<VALID, STATE> {
             return;
         };
 
-        if let Some(existing_vs) = self.attrs.get_mut(&attr) {
-            // This is the suboptimal path. This can only exist in rare cases.
-            let _ = existing_vs.merge(&vs);
-        } else {
-            // Normally this is what's taken.
-            self.attrs.insert(attr, vs);
-        }
+        debug!(?attr, ?vs);
+
+        self.set_ava_int(attr, vs)
     }
 
     /// Update the last_changed flag of this entry to the given change identifier.
@@ -2639,6 +2726,11 @@ impl<VALID, STATE> Entry<VALID, STATE> {
         self.attrs
             .get(&Attribute::Spn)
             .map(|vs| vs.to_proto_string_clone_iter())
+            .or_else(|| {
+                self.attrs
+                    .get(&Attribute::Name)
+                    .map(|vs| vs.to_proto_string_clone_iter())
+            })
             .or_else(|| {
                 self.attrs
                     .get(&Attribute::Uuid)
@@ -2685,6 +2777,10 @@ impl<VALID, STATE> Entry<VALID, STATE> {
 
     pub fn get_ava_refer<A: AsRef<Attribute>>(&self, attr: A) -> Option<&BTreeSet<Uuid>> {
         self.get_ava_set(attr).and_then(|vs| vs.as_refer_set())
+    }
+
+    pub fn get_ava_refer_single<A: AsRef<Attribute>>(&self, attr: A) -> Option<Uuid> {
+        self.get_ava_set(attr).and_then(|vs| vs.to_refer_single())
     }
 
     pub fn get_ava_as_iutf8_iter<A: AsRef<Attribute>>(
@@ -3266,8 +3362,7 @@ where
         self.valid.ecstate.change_ava(&self.valid.cid, attr_ref);
 
         let rm = if let Some(vs) = self.attrs.get_mut(attr_ref) {
-            vs.remove(value, &self.valid.cid);
-            vs.is_empty()
+            vs.remove(value, &self.valid.cid)
         } else {
             false
         };
@@ -3285,10 +3380,7 @@ where
         self.valid.ecstate.change_ava(&self.valid.cid, attr_ref);
 
         let rm = if let Some(vs) = self.attrs.get_mut(attr_ref) {
-            values.iter().for_each(|k| {
-                vs.remove(k, &self.valid.cid);
-            });
-            vs.is_empty()
+            values.iter().any(|k| vs.remove(k, &self.valid.cid))
         } else {
             false
         };
@@ -3370,11 +3462,35 @@ where
     pub fn merge_ava_set(&mut self, attr: &Attribute, vs: ValueSet) -> Result<(), OperationError> {
         self.valid.ecstate.change_ava(&self.valid.cid, attr);
         if let Some(existing_vs) = self.attrs.get_mut(attr) {
+            debug!(?attr, ?existing_vs, ?vs);
             existing_vs.merge(&vs)
         } else {
             self.attrs.insert(attr.clone(), vs);
             Ok(())
         }
+    }
+
+    pub(crate) fn migrate_ava<A: AsRef<Attribute>>(
+        &mut self,
+        attr: A,
+    ) -> Result<(), OperationError> {
+        let attr_ref = attr.as_ref();
+        // In theory we should update the change state, but this causes issues if we
+        // are altering a tombstone, which *may* happen.
+
+        // self.valid.ecstate.change_ava(&self.valid.cid, attr_ref);
+
+        let maybe_vs = if let Some(vs) = self.attrs.get(attr_ref) {
+            vs.migrate()?
+        } else {
+            None
+        };
+
+        if let Some(vs) = maybe_vs {
+            self.attrs.insert(attr_ref.clone(), vs);
+        }
+
+        Ok(())
     }
 
     /// Apply the content of this modlist to this entry, enforcing the expressed state.
@@ -3444,6 +3560,105 @@ mod tests {
         modify::{Modify, ModifyList},
         value::{IndexType, PartialValue, Value},
     };
+
+    #[test]
+    fn test_from_dbentry_reports_invalid_attribute() {
+        use crate::be::dbentry::{DbEntry, DbEntryVers};
+        use crate::be::dbrepl::DbEntryChangeState;
+        use crate::be::dbvalue::{DbCidV1, DbValueSetV2};
+        use crate::entry::DbEntryLoadReason;
+        use std::collections::BTreeMap;
+        use std::time::Duration;
+
+        let entry_uuid = Uuid::new_v4();
+        let cid = DbCidV1 {
+            timestamp: Duration::from_secs(1),
+            server_id: Uuid::new_v4(),
+        };
+
+        let mut attrs = BTreeMap::new();
+        attrs.insert(Attribute::Uuid, DbValueSetV2::Uuid(vec![entry_uuid]));
+        attrs.insert(
+            Attribute::Name,
+            DbValueSetV2::Iname(vec!["broken_entry".to_string()]),
+        );
+        // A date time that can not be parsed makes the value set conversion fail.
+        attrs.insert(
+            Attribute::AccountExpire,
+            DbValueSetV2::DateTime(vec!["not a date".to_string()]),
+        );
+
+        let db_e = DbEntry {
+            ent: DbEntryVers::V3 {
+                changestate: DbEntryChangeState::V1Live {
+                    at: cid,
+                    changes: BTreeMap::new(),
+                },
+                attrs,
+            },
+        };
+
+        let err = Entry::from_dbentry(db_e, 42).expect_err("invalid value set must be rejected");
+
+        assert_eq!(err.entry_id, 42);
+        assert_eq!(err.entry_uuid, Some(entry_uuid));
+        assert_eq!(err.entry_name.as_deref(), Some("broken_entry"));
+        assert_eq!(
+            err.reason,
+            DbEntryLoadReason::InvalidValueSet {
+                attribute: Attribute::AccountExpire,
+                error: OperationError::InvalidValueState,
+            }
+        );
+
+        // The rendered message must let an operator find the entry and the attribute.
+        let rendered = err.to_string();
+        assert!(rendered.contains("42"));
+        assert!(rendered.contains(&entry_uuid.to_string()));
+        assert!(rendered.contains("broken_entry"));
+        assert!(rendered.contains(Attribute::AccountExpire.as_str()));
+        // Values are never part of the message.
+        assert!(!rendered.contains("not a date"));
+    }
+
+    #[test]
+    fn test_from_dbentry_reports_missing_uuid() {
+        use crate::be::dbentry::{DbEntry, DbEntryVers};
+        use crate::be::dbrepl::DbEntryChangeState;
+        use crate::be::dbvalue::{DbCidV1, DbValueSetV2};
+        use crate::entry::DbEntryLoadReason;
+        use std::collections::BTreeMap;
+        use std::time::Duration;
+
+        let cid = DbCidV1 {
+            timestamp: Duration::from_secs(1),
+            server_id: Uuid::new_v4(),
+        };
+
+        let mut attrs = BTreeMap::new();
+        attrs.insert(
+            Attribute::Name,
+            DbValueSetV2::Iname(vec!["no_uuid_entry".to_string()]),
+        );
+
+        let db_e = DbEntry {
+            ent: DbEntryVers::V3 {
+                changestate: DbEntryChangeState::V1Live {
+                    at: cid,
+                    changes: BTreeMap::new(),
+                },
+                attrs,
+            },
+        };
+
+        let err = Entry::from_dbentry(db_e, 7).expect_err("entry without uuid must be rejected");
+
+        assert_eq!(err.entry_id, 7);
+        assert_eq!(err.entry_uuid, None);
+        assert_eq!(err.entry_name.as_deref(), Some("no_uuid_entry"));
+        assert_eq!(err.reason, DbEntryLoadReason::MissingUuid);
+        assert!(err.to_string().contains("no_uuid_entry"));
+    }
 
     #[test]
     fn test_entry_basic() {
@@ -3564,8 +3779,8 @@ mod tests {
 
         // Assert present for multivalue
         let present_multivalue_mods = ModifyList::new_valid_list(vec![
-            Modify::Present(Attribute::Class, Value::new_iutf8("test")),
-            Modify::Present(Attribute::Class, Value::new_iutf8("multi_test")),
+            Modify::Present(Attribute::Class, Value::new_iutf8n("test")),
+            Modify::Present(Attribute::Class, Value::new_iutf8n("multi_test")),
         ]);
 
         assert!(e.apply_modlist(&present_multivalue_mods).is_ok());

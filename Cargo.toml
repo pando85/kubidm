@@ -158,7 +158,8 @@ sketching = { path = "./libs/sketching", version = "=1.12.0-dev" }
 
 kanidm-hsm-crypto = { version = "^0.4.0" }
 
-aws-config = { version = "1.5.13", default-features = false, features = [
+aws-config = { version = "1.6", default-features = false, features = [
+    "default-https-client",
     "rt-tokio",
     "sso",
 ] }
@@ -208,11 +209,12 @@ dyn-clone = "^1.0.20"
 enum-iterator = "2.3.0"
 fantoccini = "0.22.0"
 filetime = "^0.2.29"
+flate2 = "1.1.9"
 fs4 = "^1.0.2"
 futures = "0.3.34"
 futures-util = { version = "0.3.34", features = ["sink"] }
 gethostname = "1.1.0"
-gix = { version = "0.87.1", default-features = false, features = ["sha1"] }
+gix = { version = "0.90.0", default-features = false, features = ["sha1"] }
 haproxy-protocol = { version = "0.0.4" }
 hashbrown = { version = "0.17.1", features = ["serde", "inline-more"] }
 hex = "^0.4.3"
@@ -227,7 +229,7 @@ image = { version = "0.25.9", default-features = false, features = [
     "webp",
 ] }
 itertools = "0.15.0"
-jsonschema = "0.56.0"
+jsonschema = "0.60.0"
 ldap3_client = "^0.8.0"
 ldap3_proto = { version = "^0.8.0", features = ["serde"] }
 lettre = { version = "0.11.22", default-features = false }
@@ -322,7 +324,7 @@ utoipa = { version = "6.0.0", features = ["url", "uuid"] }
 utoipa-swagger-ui = { version = "10.0.0", default-features = false, features = [
     "vendored",
 ] }
-uuid = "1.26.1"
+uuid = "1.28.0"
 webauthn-authenticator-rs = { version = "0.6.1-dev", default-features = false }
 webauthn-rs = { version = "0.6.1-dev", features = ["preview-features"] }
 webauthn-rs-core = "0.6.1-dev"

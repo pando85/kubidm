@@ -59,6 +59,7 @@ fn create_test_replication_config() -> ReplicationConfig {
         enabled: true,
         regions: vec![
             ReplicationRegionConfig {
+                name: None,
                 region: "eu-west-1".to_string(),
                 bucket: "kubidm-backups-eu".to_string(),
                 endpoint: Some("https://s3.eu-west-1.amazonaws.com".to_string()),
@@ -69,6 +70,7 @@ fn create_test_replication_config() -> ReplicationConfig {
                 kms_key_id: None,
             },
             ReplicationRegionConfig {
+                name: None,
                 region: "ap-southeast-1".to_string(),
                 bucket: "kubidm-backups-ap".to_string(),
                 endpoint: None,
@@ -80,8 +82,6 @@ fn create_test_replication_config() -> ReplicationConfig {
             },
         ],
         sync_interval_seconds: 300,
-        max_retries: 3,
-        retry_delay_seconds: 30,
     }
 }
 
@@ -491,8 +491,6 @@ fn test_replication_config_defaults() {
     assert!(!config.enabled);
     assert_eq!(config.regions.len(), 0);
     assert_eq!(config.sync_interval_seconds, 300);
-    assert_eq!(config.max_retries, 3);
-    assert_eq!(config.retry_delay_seconds, 30);
 }
 
 #[test]
@@ -816,6 +814,7 @@ fn test_encryption_algorithm_variants() {
 #[test]
 fn test_replication_region_config_endpoint_handling() {
     let with_endpoint = ReplicationRegionConfig {
+        name: None,
         region: "us-west-2".to_string(),
         bucket: "west-bucket".to_string(),
         endpoint: Some("https://s3.us-west-2.amazonaws.com".to_string()),
@@ -828,6 +827,7 @@ fn test_replication_region_config_endpoint_handling() {
     assert!(with_endpoint.endpoint.is_some());
 
     let without_endpoint = ReplicationRegionConfig {
+        name: None,
         region: "us-east-1".to_string(),
         bucket: "east-bucket".to_string(),
         endpoint: None,

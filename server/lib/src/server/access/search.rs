@@ -117,8 +117,8 @@ fn search_filter_entry(
             let valid_account_request_class = entry
                 .get_ava_as_iutf8(Attribute::Class)
                 .map(|classes| {
-                    trace!(?classes);
                     classes.contains(&EntryClass::Account.to_string())
+                        || classes.contains(&EntryClass::AccountSignupRequest.to_string())
                 })
                 .unwrap_or(false);
 
@@ -196,14 +196,12 @@ fn search_filter_entry(
                     // fetch it as a multivalue btreeset for future in case we allow
                     // multiple entry manager by in future.
                     {
-                        let entry_manager_uuids = entry.get_ava_refer(Attribute::EntryManagedBy)?;
+                        let entry_manager_uuid = entry.get_ava_refer_single(Attribute::EntryManagedBy)?;
                         let group_check = ident_memberof
-                            // Have at least one group allowed.
-                            .map(|imo| imo.intersection(entry_manager_uuids).next().is_some())
+                            .map(|imo| imo.contains(&entry_manager_uuid))
                             .unwrap_or_default();
 
-                        let user_check =
-                            entry_manager_uuids.contains(&ident_uuid);
+                        let user_check = entry_manager_uuid == ident_uuid;
 
                         if !(group_check || user_check) {
                             // Not the entry manager
@@ -461,7 +459,7 @@ mod tests {
     fn make_sealed_entry(class: &str, uuid: Uuid) -> Arc<EntrySealedCommitted> {
         Arc::new(
             entry_init!(
-                (Attribute::Class, Value::new_iutf8(class)),
+                (Attribute::Class, Value::new_iutf8n(class)),
                 (Attribute::Uuid, Value::Uuid(uuid))
             )
             .into_sealed_committed(),

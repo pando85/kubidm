@@ -2372,7 +2372,7 @@ async fn test_repl_increment_memberof_basic(server_a: &QueryServer, server_b: &Q
             (Attribute::Class, EntryClass::Group.to_value()),
             (Attribute::Name, Value::new_iname("testgroup1")),
             (Attribute::Uuid, Value::Uuid(g_uuid)),
-            (Attribute::Member, Value::Refer(t_uuid))
+            (Attribute::Member, Value::ReferN(t_uuid))
         ),])
         .is_ok());
 
@@ -2469,7 +2469,7 @@ async fn test_repl_increment_memberof_conflict(server_a: &QueryServer, server_b:
             (Attribute::Name, Value::new_iname("testgroup1")),
             // This UUID is what will conflict
             (Attribute::Uuid, Value::Uuid(g_uuid)),
-            (Attribute::Member, Value::Refer(t_uuid))
+            (Attribute::Member, Value::ReferN(t_uuid))
         ),])
         .is_ok());
 
@@ -2604,7 +2604,7 @@ async fn test_repl_increment_refint_tombstone(server_a: &QueryServer, server_b: 
     assert!(server_a_txn
         .internal_modify_uuid(
             g_uuid,
-            &ModifyList::new_purge_and_set(Attribute::Member, Value::Refer(t_uuid))
+            &ModifyList::new_purge_and_set(Attribute::Member, Value::ReferN(t_uuid))
         )
         .is_ok());
     server_a_txn.commit().expect("Failed to commit");
@@ -2700,7 +2700,7 @@ async fn test_repl_increment_refint_conflict(server_a: &QueryServer, server_b: &
             (Attribute::Class, EntryClass::Group.to_value()),
             (Attribute::Name, Value::new_iname("testgroup1")),
             (Attribute::Uuid, Value::Uuid(g_uuid)),
-            (Attribute::Member, Value::Refer(t_uuid))
+            (Attribute::Member, Value::ReferN(t_uuid))
         ),])
         .is_ok());
 
@@ -2816,7 +2816,7 @@ async fn test_repl_increment_refint_delete_to_member_holder(
     assert!(server_a_txn
         .internal_modify_uuid(
             g_uuid,
-            &ModifyList::new_purge_and_set(Attribute::Member, Value::Refer(t_uuid))
+            &ModifyList::new_purge_and_set(Attribute::Member, Value::ReferN(t_uuid))
         )
         .is_ok());
     server_a_txn.commit().expect("Failed to commit");
@@ -2910,7 +2910,7 @@ async fn test_repl_increment_attrunique_conflict_basic(
             (Attribute::Class, EntryClass::Group.to_value()),
             (Attribute::Name, Value::new_iname("testgroup_a")),
             (Attribute::Uuid, Value::Uuid(g_a_uuid)),
-            (Attribute::Member, Value::Refer(t_uuid))
+            (Attribute::Member, Value::ReferN(t_uuid))
         ),])
         .is_ok());
 
@@ -2921,7 +2921,7 @@ async fn test_repl_increment_attrunique_conflict_basic(
             (Attribute::Class, EntryClass::Group.to_value()),
             (Attribute::Name, Value::new_iname("testgroup_b")),
             (Attribute::Uuid, Value::Uuid(g_b_uuid)),
-            (Attribute::Member, Value::Refer(t_uuid))
+            (Attribute::Member, Value::ReferN(t_uuid))
         ),])
         .is_ok());
 
@@ -2933,8 +2933,8 @@ async fn test_repl_increment_attrunique_conflict_basic(
             (Attribute::Class, EntryClass::Group.to_value()),
             (Attribute::Name, Value::new_iname("testgroup_c")),
             (Attribute::Uuid, Value::Uuid(g_c_uuid)),
-            (Attribute::Member, Value::Refer(g_a_uuid)),
-            (Attribute::Member, Value::Refer(g_b_uuid))
+            (Attribute::Member, Value::ReferN(g_a_uuid)),
+            (Attribute::Member, Value::ReferN(g_b_uuid))
         ),])
         .is_ok());
 
@@ -4010,7 +4010,7 @@ async fn test_repl_refresh_preserves_valid_may_references(
             (Attribute::Class, EntryClass::Group.to_value()),
             (Attribute::Name, Value::new_iname("testgroup1")),
             (Attribute::Uuid, Value::Uuid(g_uuid)),
-            (Attribute::Member, Value::Refer(t_uuid))
+            (Attribute::Member, Value::ReferN(t_uuid))
         ),])
         .is_ok());
 
@@ -4074,7 +4074,7 @@ async fn test_repl_refresh_self_heals_optional_authoritative_references(
     let mut work_set = server_a_txn.internal_search_writeable(&filt).unwrap();
 
     for (_, entry) in work_set.iter_mut() {
-        entry.add_ava(Attribute::Member, Value::Refer(dangling_uuid));
+        entry.add_ava(Attribute::Member, Value::ReferN(dangling_uuid));
     }
 
     assert!(server_a_txn.internal_apply_writable(work_set).is_ok());
@@ -4152,7 +4152,7 @@ async fn test_repl_refresh_self_heals_derived_references(
         (Attribute::Class, EntryClass::DynGroup.to_value()),
         (Attribute::Uuid, Value::Uuid(dyn_uuid)),
         (Attribute::Name, Value::new_iname("test_dyngroup")),
-        (Attribute::DynMember, Value::Refer(dangling_mb_uuid)),
+        (Attribute::DynMember, Value::ReferN(dangling_mb_uuid)),
         (
             Attribute::DynGroupFilter,
             Value::JsonFilt(kubidm_proto::internal::Filter::Eq(
@@ -4167,7 +4167,7 @@ async fn test_repl_refresh_self_heals_derived_references(
         (Attribute::Class, EntryClass::MemberOf.to_value()),
         (Attribute::Name, Value::new_iname("testgroup")),
         (Attribute::Uuid, Value::Uuid(tgroup_uuid)),
-        (Attribute::MemberOf, Value::Refer(dangling_mo_uuid))
+        (Attribute::MemberOf, Value::ReferN(dangling_mo_uuid))
     );
 
     assert!(server_a_txn.internal_create(vec![e_dyn, e_group]).is_ok());
@@ -4210,3 +4210,91 @@ async fn test_repl_refresh_self_heals_derived_references(
 // The code path is implemented in post_repl_refresh (refint.rs lines 331-347) and
 // returns an error when is_attribute_must_for_entry returns true. This behavior is
 // covered by the implementation and can be tested with integration tests if needed.
+
+/// A replication refresh replaces the whole database and its server uuid. With WAL
+/// archiving enabled on the consumer, the archive must follow it: the segment of the old
+/// identity is closed under it, and the change waits on disk for the archive index, which
+/// records it as a boundary recovery never replays across.
+#[tokio::test]
+async fn test_repl_refresh_with_wal_archive_changes_the_archive_identity() {
+    use crate::be::{Backend, BackendConfig};
+    use crate::repl::wal::{list_segments, read_pending_events, WalServerUuidChange};
+    use crate::schema::Schema;
+    use kubidm_proto::backup::WalArchiveConfig;
+
+    sketching::test_init();
+    let dir = tempfile::tempdir().expect("Failed to create a temporary directory");
+    let wal_dir = dir.path().join("wal");
+
+    let new_backend = |name: &'static str, wal: Option<WalArchiveConfig>| {
+        let schema = Schema::new().expect("Failed to init schema");
+        let idxmeta = {
+            let schema_txn = schema.write();
+            schema_txn.reload_idxmeta()
+        };
+        let be = Backend::new(
+            BackendConfig::new_test(name).with_wal_archive(wal),
+            idxmeta,
+            false,
+        )
+        .expect("Failed to init BE");
+        (be, schema)
+    };
+
+    let (be_a, schema_a) = new_backend("db_a", None);
+    let server_a = QueryServer::new(be_a, schema_a, "example.com".to_string(), Duration::ZERO)
+        .expect("Failed to setup Query Server");
+    let (be_b, schema_b) = new_backend(
+        "db_b",
+        Some(WalArchiveConfig {
+            enabled: true,
+            local_path: Some(wal_dir.clone()),
+            ..WalArchiveConfig::default()
+        }),
+    );
+    let archiver = be_b.wal_archiver().expect("WAL archiving must be enabled");
+    let server_b = QueryServer::new(be_b, schema_b, "example.com".to_string(), Duration::ZERO)
+        .expect("Failed to setup Query Server");
+    for server in [&server_a, &server_b] {
+        server
+            .initialise_helper(duration_from_epoch_now(), DOMAIN_TGT_LEVEL)
+            .await
+            .expect("init failed!");
+    }
+
+    let old_uuid = archiver.lock().expect("lock").server_uuid();
+    assert!(archiver.lock().expect("lock").has_pending_records());
+
+    // B refreshes from A.
+    let mut server_b_txn = server_b.write(duration_from_epoch_now()).await.unwrap();
+    let mut server_a_txn = server_a.read().await.unwrap();
+    assert!(repl_initialise(&mut server_a_txn, &mut server_b_txn)
+        .and_then(|_| server_b_txn.commit())
+        .is_ok());
+    drop(server_a_txn);
+
+    let new_uuid = server_b
+        .write(duration_from_epoch_now())
+        .await
+        .unwrap()
+        .get_server_uuid();
+    assert_ne!(new_uuid, old_uuid);
+
+    let mut archiver = archiver.lock().expect("lock");
+    assert_eq!(archiver.server_uuid(), new_uuid);
+    let changes = read_pending_events(&wal_dir).server_uuid_changes;
+    assert_eq!(changes.len(), 1);
+    let WalServerUuidChange { from, to, .. } = changes[0];
+    assert_eq!((from, to), (old_uuid, new_uuid));
+    assert_eq!(archiver.pending_events().server_uuid_changes, changes);
+
+    // What the server wrote before the refresh is in a segment of the old identity, the
+    // refresh and what follows in segments of the new one.
+    archiver.flush_current_segment().expect("flush");
+    let owners: Vec<Uuid> = list_segments(&wal_dir)
+        .expect("list")
+        .iter()
+        .map(|segment| segment.server_uuid)
+        .collect();
+    assert_eq!(owners, vec![old_uuid, new_uuid]);
+}

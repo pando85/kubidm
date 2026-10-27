@@ -53,7 +53,7 @@ pub(crate) mod authorization;
 pub(crate) mod cache_buster;
 pub(crate) mod errors;
 mod extractors;
-mod generic;
+pub(crate) mod generic;
 mod javascript;
 mod manifest;
 pub(crate) mod middleware;
@@ -192,6 +192,7 @@ pub async fn create_https_server(
     server_message_tx: broadcast::Sender<CoreAction>,
     maybe_tls_acceptor: Option<TlsAcceptor>,
     tls_acceptor_reload_tx: &broadcast::Sender<TlsAcceptor>,
+    metrics_endpoint: Option<generic::MetricsEndpoint>,
 ) -> Result<Vec<task::JoinHandle<()>>, ()> {
     let js_checksums = match config.role {
         ServerRole::WriteReplicaNoUI => String::new(),
@@ -379,7 +380,23 @@ pub async fn create_https_server(
         .route("/status", get(generic::status))
         .route("/healthz", get(generic::healthz))
         .route("/maintenance", get(generic::maintenance_status))
-        .route("/readyz", get(generic::readyz))
+        .route("/readyz", get(generic::readyz));
+
+    // Only served when enabled: without it, /metrics is not found like any other path.
+    let openapi = apidocs::openapi().await.map_err(|err| {
+        error!(?err, "Unable to build the OpenAPI document");
+    })?;
+
+    let app = match metrics_endpoint {
+        Some(endpoint) => app.merge(
+            Router::new()
+                .route("/metrics", get(generic::metrics))
+                .with_state(endpoint),
+        ),
+        None => app,
+    };
+
+    let app = app
         // 404 handler
         .fallback(handler_404)
         // This must be the LAST middleware.
@@ -390,7 +407,7 @@ pub async fn create_https_server(
             state.clone(),
             middleware::kopid_middleware,
         ))
-        .merge(apidocs::router())
+        .merge(apidocs::router(openapi))
         // Apply Request Timeouts
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,

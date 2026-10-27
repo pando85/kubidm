@@ -91,12 +91,14 @@ impl ValueSetT for ValueSetTimeBoundedMember {
 
     fn remove(&mut self, pv: &PartialValue, _cid: &Cid) -> bool {
         match pv {
-            PartialValue::TimeBoundedMember(uuid) => self.map.remove(uuid).is_some(),
+            PartialValue::TimeBoundedMember(uuid) => {
+                self.map.remove(uuid);
+            }
             _ => {
                 debug_assert!(false);
-                false
             }
-        }
+        };
+        self.map.is_empty()
     }
 
     fn contains(&self, pv: &PartialValue) -> bool {
@@ -431,7 +433,8 @@ mod tests {
         let mut vs = ValueSetTimeBoundedMember::new_from_iter(vec![member1, member2])
             .expect("Failed to create valueset");
 
-        assert!(vs.remove(
+        // remove returns true only when the set is now empty.
+        assert!(!vs.remove(
             &PartialValue::TimeBoundedMember(uuid1),
             &crate::prelude::Cid::new_zero()
         ));
@@ -442,6 +445,12 @@ mod tests {
             &crate::prelude::Cid::new_zero()
         ));
         assert_eq!(vs.len(), 1);
+
+        assert!(vs.remove(
+            &PartialValue::TimeBoundedMember(uuid2),
+            &crate::prelude::Cid::new_zero()
+        ));
+        assert_eq!(vs.len(), 0);
     }
 
     #[test]

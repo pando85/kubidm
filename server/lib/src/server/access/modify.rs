@@ -148,14 +148,13 @@ pub fn apply_modify_access<'a>(
                         // fetch it as a multivalue btreeset for future in case we allow
                         // multiple entry manager by in future.
                         {
-                            let entry_manager_uuids = entry.get_ava_refer(Attribute::EntryManagedBy)?;
+                            let entry_manager_uuid = entry.get_ava_refer_single(Attribute::EntryManagedBy)?;
                             let group_check = ident_memberof
                                 // Have at least one group allowed.
-                                .map(|imo| imo.intersection(entry_manager_uuids).next().is_some())
+                                .map(|imo| imo.contains(&entry_manager_uuid))
                                 .unwrap_or_default();
 
-                            let user_check =
-                                entry_manager_uuids.contains(&ident_uuid);
+                            let user_check = entry_manager_uuid == ident_uuid;
 
                             if !(group_check || user_check) {
                                 // Not the entry manager
@@ -597,7 +596,7 @@ mod tests {
     fn make_sealed_entry(class: &str) -> Arc<EntrySealedCommitted> {
         Arc::new(
             entry_init!(
-                (Attribute::Class, Value::new_iutf8(class)),
+                (Attribute::Class, Value::new_iutf8n(class)),
                 (
                     Attribute::Uuid,
                     Value::Uuid(uuid::uuid!("00000000-0000-0000-0000-000000000100"))
@@ -614,8 +613,8 @@ mod tests {
     ) -> Arc<EntrySealedCommitted> {
         Arc::new(
             entry_init!(
-                (Attribute::Class, Value::new_iutf8(class1)),
-                (Attribute::Class, Value::new_iutf8(class2)),
+                (Attribute::Class, Value::new_iutf8n(class1)),
+                (Attribute::Class, Value::new_iutf8n(class2)),
                 (Attribute::Uuid, Value::Uuid(uuid))
             )
             .into_sealed_committed(),
@@ -824,7 +823,7 @@ mod tests {
         let ident = make_user_ident_rw();
         let entry = Arc::new(
             entry_init!(
-                (Attribute::Class, Value::new_iutf8("domain_info")),
+                (Attribute::Class, Value::new_iutf8n("domain_info")),
                 (
                     Attribute::Uuid,
                     Value::Uuid(uuid::uuid!("ffffffff-ffff-ffff-ffff-000000000100"))

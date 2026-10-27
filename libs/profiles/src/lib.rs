@@ -65,7 +65,10 @@ struct ProfileConfig {
     server_config_path: String,
     server_migration_path: String,
     server_ui_pkg_path: String,
+    // Still accepted, as `deny_unknown_fields` would otherwise reject the profiles that set
+    // it (developer.toml), but no longer read.
     #[serde(default)]
+    #[allow(dead_code)]
     server_ui_pkg_path_make_absolute: bool,
     client_config_path: String,
     resolver_config_path: String,

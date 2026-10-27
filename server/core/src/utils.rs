@@ -1,53 +1,45 @@
 use filetime::FileTime;
-use std::{fs::File, io::ErrorKind, path::Path, time::SystemTime};
+use std::{fs::File, io, path::Path, time::SystemTime};
 
-pub fn touch_file_or_quit<P: AsRef<Path>>(file_path: P) {
-    /*
-    Attempt to touch the file file_path, will quit the application if it fails for any reason.
-
-    Will also create a new file if it doesn't already exist.
-    */
-
+/// Touch the file at `file_path`: create it when it does not exist, set its access and
+/// modification times to now otherwise. Fails, without ending the process, when it can do
+/// neither, so that a caller inside a running server (the scheduled backup verification)
+/// can report the error instead of stopping the server.
+pub fn touch_file<P: AsRef<Path>>(file_path: P) -> io::Result<()> {
     let file_path: &Path = file_path.as_ref();
 
     if file_path.exists() {
         let t = FileTime::from_system_time(SystemTime::now());
-        match filetime::set_file_times(file_path, t, t) {
-            Ok(_) => debug!(
-                "Successfully touched existing file {}, can continue",
-                file_path.display()
-            ),
-            Err(e) => {
-                match e.kind() {
-                    ErrorKind::PermissionDenied => {
-                        // we bail here because you won't be able to write them back...
-                        error!(
-                            "Permission denied writing to {}, quitting.",
-                            file_path.display()
-                        )
-                    }
-                    _ => {
-                        error!(
-                            "Failed to write to {} due to error: {:?} ... quitting.",
-                            file_path.display(),
-                            e
-                        )
-                    }
-                }
-                std::process::exit(1);
-            }
-        }
+        filetime::set_file_times(file_path, t, t).inspect_err(|err| {
+            error!(?err, "Failed to write to {}", file_path.display());
+        })?;
+        debug!(
+            "Successfully touched existing file {}, can continue",
+            file_path.display()
+        );
     } else {
-        match File::create(file_path) {
-            Ok(_) => debug!("Successfully touched new file {}", file_path.display()),
-            Err(e) => {
-                error!(
-                    "Failed to write to {} due to error: {:?} ... quitting.",
-                    file_path.display(),
-                    e
-                );
-                std::process::exit(1);
-            }
-        };
+        File::create(file_path).inspect_err(|err| {
+            error!(?err, "Failed to write to {}", file_path.display());
+        })?;
+        debug!("Successfully touched new file {}", file_path.display());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::touch_file;
+
+    #[test]
+    fn touch_file_creates_or_touches_and_reports_failures() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("db");
+        touch_file(&path).expect("create");
+        assert!(path.is_file());
+        touch_file(&path).expect("touch");
+
+        // A file in a directory that does not exist can not be created: an error, never
+        // the end of the process.
+        assert!(touch_file(dir.path().join("missing").join("db")).is_err());
     }
 }

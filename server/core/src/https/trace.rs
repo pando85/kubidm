@@ -28,7 +28,8 @@ impl<B> tower_http::trace::MakeSpan<B> for SpanCreator {
         let is_deferred = request.uri() == "/"
             || request.uri() == "/status"
             || request.uri() == "/healthz"
-            || request.uri() == "/readyz";
+            || request.uri() == "/readyz"
+            || request.uri() == "/metrics";
 
         tracing::span!(
             Level::INFO,

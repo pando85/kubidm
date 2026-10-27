@@ -7,6 +7,7 @@ test("guided UI CSP remains self-hosted and worker-free", async ({ request }) =>
 
     expect(csp).toContain("default-src 'self'");
     expect(csp).toContain("script-src 'self'");
+    expect(csp).toContain("style-src 'self' 'unsafe-inline'");
     expect(csp).toContain("worker-src 'none'");
     // Kubidm currently permits unsafe-eval globally. If this is tightened later,
     // Rive needs wasm-unsafe-eval or another verified WASM execution strategy.
