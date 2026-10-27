@@ -4298,3 +4298,220 @@ async fn test_repl_refresh_with_wal_archive_changes_the_archive_identity() {
         .collect();
     assert_eq!(owners, vec![old_uuid, new_uuid]);
 }
+
+// Kubidm: OAuth2 federation providers over replication.
+
+fn repl_federation_entry(uuid: Uuid, name: &str, link_policy: &str) -> EntryInitNew {
+    entry_init!(
+        (Attribute::Class, EntryClass::Object.to_value()),
+        (Attribute::Class, EntryClass::OAuth2Federation.to_value()),
+        (Attribute::Uuid, Value::Uuid(uuid)),
+        (Attribute::Name, Value::new_iname(name)),
+        (Attribute::OAuth2ClientId, Value::new_utf8s("client_id")),
+        (Attribute::OAuth2ClientSecret, Value::new_utf8s("secret")),
+        (
+            Attribute::OAuth2Issuer,
+            Value::Url(Url::parse("https://idp.example.com").unwrap())
+        ),
+        (
+            Attribute::OAuth2AuthorisationEndpoint,
+            Value::Url(Url::parse("https://idp.example.com/authorise").unwrap())
+        ),
+        (
+            Attribute::OAuth2TokenEndpoint,
+            Value::Url(Url::parse("https://idp.example.com/token").unwrap())
+        ),
+        (
+            Attribute::OAuth2TokenIntrospectEndpoint,
+            Value::Url(Url::parse("https://idp.example.com/introspect").unwrap())
+        ),
+        // Only "manual" is valid, so any other value makes the provider invalid while
+        // the entry stays schema valid.
+        (Attribute::OAuth2LinkPolicy, Value::new_iutf8(link_policy))
+    )
+}
+
+/// Write to `server` directly (no IDM layer reload), as an older version or another
+/// node would have.
+async fn repl_qs_write<F>(server: &QueryServer, ct: Duration, f: F)
+where
+    F: FnOnce(&mut QueryServerWriteTransaction<'_>),
+{
+    let mut txn = server.write(ct).await.unwrap();
+    f(&mut txn);
+    txn.commit().expect("failed to commit");
+}
+
+/// Apply the changes of `from` to the IDM server `to` and commit through the IDM
+/// layer, so that the post commit reloads run as on a real consumer.
+async fn repl_incremental_idm(from: &QueryServer, to: &IdmServer, ct: Duration) {
+    let mut from_txn = from.read().await.unwrap();
+    let mut to_txn = to.proxy_write(ct).await.unwrap();
+    repl_incremental(&mut from_txn, &mut to_txn.qs_write);
+    to_txn
+        .commit()
+        .expect("failed to commit replicated changes");
+}
+
+/// Kubidm: incremental replication of an OAuth2 federation create, modify and delete
+/// reloads the client providers on the consumer, without a restart.
+#[qs_pair_test]
+async fn test_repl_increment_oauth2_federation_reload(
+    server_a: &QueryServer,
+    server_b: &QueryServer,
+) {
+    let ct = duration_from_epoch_now();
+
+    let mut server_a_txn = server_a.write(ct).await.unwrap();
+    let mut server_b_txn = server_b.read().await.unwrap();
+    assert!(repl_initialise(&mut server_b_txn, &mut server_a_txn)
+        .and_then(|_| server_a_txn.commit())
+        .is_ok());
+    drop(server_b_txn);
+
+    let (idms_a, _idms_a_delayed, _idms_a_audit) = IdmServer::new(
+        server_a.clone(),
+        &Url::parse("https://idm.example.com").unwrap(),
+        true,
+        ct,
+    )
+    .await
+    .expect("failed to start the consumer idm server");
+
+    let fed_uuid = Uuid::new_v4();
+    repl_qs_write(server_b, ct, |txn| {
+        txn.internal_create(vec![repl_federation_entry(
+            fed_uuid,
+            "repl_federation",
+            "manual",
+        )])
+        .expect("failed to create federation");
+    })
+    .await;
+
+    repl_incremental_idm(server_b, &idms_a, ct).await;
+    {
+        let idms_prox_read = idms_a.proxy_write(ct).await.unwrap();
+        let provider = idms_prox_read
+            .oauth2_client_providers
+            .get(&fed_uuid)
+            .expect("replicated federation not loaded on the consumer");
+        assert_eq!(provider.client_basic_secret, "secret");
+    }
+
+    // Rotate the secret.
+    repl_qs_write(server_b, ct, |txn| {
+        txn.internal_modify_uuid(
+            fed_uuid,
+            &ModifyList::new_purge_and_set(
+                Attribute::OAuth2ClientSecret,
+                Value::new_utf8s("rotated"),
+            ),
+        )
+        .expect("failed to rotate the federation secret");
+    })
+    .await;
+
+    repl_incremental_idm(server_b, &idms_a, ct).await;
+    {
+        let idms_prox_read = idms_a.proxy_write(ct).await.unwrap();
+        assert_eq!(
+            idms_prox_read
+                .oauth2_client_providers
+                .get(&fed_uuid)
+                .map(|p| p.client_basic_secret.as_str()),
+            Some("rotated")
+        );
+    }
+
+    // Delete it.
+    repl_qs_write(server_b, ct, |txn| {
+        txn.internal_delete_uuid(fed_uuid)
+            .expect("failed to delete the federation");
+    })
+    .await;
+
+    repl_incremental_idm(server_b, &idms_a, ct).await;
+    {
+        let idms_prox_read = idms_a.proxy_write(ct).await.unwrap();
+        assert!(idms_prox_read
+            .oauth2_client_providers
+            .get(&fed_uuid)
+            .is_none());
+    }
+}
+
+/// Kubidm: an invalid OAuth2 provider stored on the supplier does not block a refresh
+/// or incremental replication. The consumer skips it and loads the valid ones.
+#[qs_pair_test]
+async fn test_repl_oauth2_federation_invalid_does_not_block(
+    server_a: &QueryServer,
+    server_b: &QueryServer,
+) {
+    let ct = duration_from_epoch_now();
+    let good_uuid = Uuid::new_v4();
+    let bad_uuid = Uuid::new_v4();
+
+    repl_qs_write(server_b, ct, |txn| {
+        txn.internal_create(vec![
+            repl_federation_entry(good_uuid, "good_federation", "manual"),
+            repl_federation_entry(bad_uuid, "bad_federation", "auto"),
+        ])
+        .expect("the entries are schema valid");
+    })
+    .await;
+
+    let (idms_a, _idms_a_delayed, _idms_a_audit) = IdmServer::new(
+        server_a.clone(),
+        &Url::parse("https://idm.example.com").unwrap(),
+        true,
+        ct,
+    )
+    .await
+    .expect("failed to start the consumer idm server");
+
+    // A refresh marks every entry as changed, including the invalid provider.
+    {
+        let mut server_b_txn = server_b.read().await.unwrap();
+        let mut idms_prox_write = idms_a.proxy_write(ct).await.unwrap();
+        repl_initialise(&mut server_b_txn, &mut idms_prox_write.qs_write)
+            .expect("failed to apply the refresh");
+        idms_prox_write
+            .commit()
+            .expect("an invalid replicated provider must not block a refresh");
+    }
+
+    {
+        let idms_prox_read = idms_a.proxy_write(ct).await.unwrap();
+        assert!(idms_prox_read
+            .oauth2_client_providers
+            .get(&good_uuid)
+            .is_some());
+        assert!(idms_prox_read
+            .oauth2_client_providers
+            .get(&bad_uuid)
+            .is_none());
+    }
+
+    // Incremental replication of a newly invalid provider is skipped as well.
+    repl_qs_write(server_b, ct, |txn| {
+        txn.internal_modify_uuid(
+            good_uuid,
+            &ModifyList::new_purge_and_set(
+                Attribute::OAuth2LinkPolicy,
+                Value::new_iutf8("admin_approval"),
+            ),
+        )
+        .expect("the entry is schema valid");
+    })
+    .await;
+
+    repl_incremental_idm(server_b, &idms_a, ct).await;
+    {
+        let idms_prox_read = idms_a.proxy_write(ct).await.unwrap();
+        assert!(idms_prox_read
+            .oauth2_client_providers
+            .get(&good_uuid)
+            .is_none());
+    }
+}

@@ -2183,6 +2183,7 @@ fn oauth2_federation_admin_attrs() -> Vec<Attribute> {
         Attribute::OAuth2ClientSecret,
         Attribute::OAuth2AuthorisationEndpoint,
         Attribute::OAuth2TokenEndpoint,
+        Attribute::OAuth2TokenIntrospectEndpoint,
         Attribute::OAuth2RequestScopes,
         Attribute::OAuth2Issuer,
         Attribute::OAuth2JwksUri,

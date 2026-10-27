@@ -47,6 +47,13 @@ pub enum OAuth2SubjectVerifier {
     Rfc7662TokenIntrospection { endpoint: Url },
 }
 
+/// A loaded `OAuth2Client` (upstream) or `OAuth2Federation` (Kubidm) provider.
+///
+/// Kubidm: `jwks_uri`, `userinfo_endpoint`, `display_name`, `email_domains` and
+/// `federation_id` are reserved. They are stored and loaded but not used by the login
+/// flow, which only trusts the RFC 7662 introspection of the access token against a
+/// pre-linked account. `link_policy` is always `Manual`, and `idp_initiated_enabled` and
+/// `auto_discovery` are always false, because any other value is rejected at load.
 #[derive(Clone)]
 #[allow(dead_code)]
 pub struct OAuth2ClientProvider {
@@ -243,10 +250,15 @@ impl IdmServerProxyWriteTransaction<'_> {
     /// This runs on commit when a provider entry changed. A provider that was changed in
     /// this transaction and is invalid fails the reload, so the change is rejected. Invalid
     /// providers that were not changed are logged and skipped, so a pre-existing bad entry
-    /// never blocks unrelated writes (or replication).
+    /// never blocks unrelated writes.
+    ///
+    /// A transaction that applies replicated changes is always lenient: the content was
+    /// already accepted by the supplier, and failing here would block replication (a
+    /// refresh marks every entry as changed) until the entry is fixed on the supplier.
     #[instrument(level = "debug", skip_all)]
     pub(crate) fn reload_oauth2_client_providers(&mut self) -> Result<(), OperationError> {
-        self.reload_oauth2_client_providers_inner(true)
+        let strict_for_changed = !self.qs_write.is_replication_apply();
+        self.reload_oauth2_client_providers_inner(strict_for_changed)
     }
 
     /// As [Self::reload_oauth2_client_providers], but every invalid provider entry is
@@ -298,6 +310,38 @@ impl IdmServerProxyWriteTransaction<'_> {
 
         Ok(())
     }
+}
+
+/// Kubidm: the server itself sends the client secret and the access token to the token
+/// and introspection endpoints, so they must use https. Plain http is only accepted when
+/// the host is a loopback address (`localhost`, `127.0.0.0/8` or `::1`), for local
+/// development and tests.
+fn require_secure_backchannel_url(
+    uuid: Uuid,
+    endpoint_name: &str,
+    url: &Url,
+) -> Result<(), OperationError> {
+    if url.scheme() == "https" {
+        return Ok(());
+    }
+
+    let is_loopback = match url.host() {
+        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    };
+
+    if url.scheme() == "http" && is_loopback {
+        return Ok(());
+    }
+
+    error!(
+        ?uuid,
+        %url,
+        "OAuth2 provider {endpoint_name} endpoint must use https (http is only allowed on loopback addresses)"
+    );
+    Err(OperationError::InvalidValueState)
 }
 
 fn oauth2_client_provider_from_entry(
@@ -356,16 +400,43 @@ fn oauth2_client_provider_from_entry(
         .map(|s| s.map(str::to_string).collect())
         .unwrap_or_default();
 
+    let is_federation =
+        provider_entry.attribute_equality(Attribute::Class, &EntryClass::OAuth2Federation.into());
+
     // OAuth2LinkPolicy is Utf8StringInsensitive and OAuth2FederationId is
     // Utf8StringIname, so they must be read with the matching accessors.
-    let link_policy = provider_entry
-        .get_ava_single_iutf8(Attribute::OAuth2LinkPolicy)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(AccountLinkPolicy::Manual);
+    //
+    // Kubidm: only admin linked accounts (`manual`) are implemented. Absent means manual.
+    // Anything else, including the reserved `auto` and `admin_approval`, is rejected
+    // rather than silently treated as manual.
+    let link_policy = match provider_entry.get_ava_single_iutf8(Attribute::OAuth2LinkPolicy) {
+        None => AccountLinkPolicy::Manual,
+        Some(value) => match value.parse::<AccountLinkPolicy>() {
+            Ok(AccountLinkPolicy::Manual) => AccountLinkPolicy::Manual,
+            Ok(policy) => {
+                error!(?uuid, %policy, "OAuth2 provider link policy is not implemented, only 'manual' is supported");
+                return Err(OperationError::InvalidValueState);
+            }
+            Err(()) => {
+                error!(?uuid, %value, "OAuth2 provider link policy is invalid, only 'manual' is supported");
+                return Err(OperationError::InvalidValueState);
+            }
+        },
+    };
 
+    // Kubidm: IdP initiated login and OIDC auto discovery are not implemented. Enabling
+    // them is rejected so that a configuration never appears to do something it does not.
     let idp_initiated_enabled = provider_entry
         .get_ava_single_bool(Attribute::OAuth2IdpInitiatedEnabled)
         .unwrap_or(false);
+
+    if idp_initiated_enabled {
+        error!(
+            ?uuid,
+            "OAuth2 provider enables IdP initiated login, which is not implemented"
+        );
+        return Err(OperationError::InvalidValueState);
+    }
 
     let federation_id = provider_entry
         .get_ava_single_iname(Attribute::OAuth2FederationId)
@@ -375,10 +446,20 @@ fn oauth2_client_provider_from_entry(
         .get_ava_single_bool(Attribute::OAuth2AutoDiscovery)
         .unwrap_or(false);
 
+    if auto_discovery {
+        error!(
+            ?uuid,
+            "OAuth2 provider enables OIDC auto discovery, which is not implemented"
+        );
+        return Err(OperationError::InvalidValueState);
+    }
+
     let (authorisation_endpoint, token_endpoint) =
         match (authorisation_endpoint, token_endpoint, issuer.as_ref()) {
             (Some(auth), Some(token), _) => (auth, token),
-            (None, None, Some(issuer_url)) => {
+            // Kubidm: a federation must set both endpoints explicitly. Deriving them from
+            // the issuer guesses a provider specific layout and drops any issuer path.
+            (None, None, Some(issuer_url)) if !is_federation => {
                 let mut auth = issuer_url.clone();
                 auth.set_path("/oauth2/authorize");
 
@@ -388,7 +469,10 @@ fn oauth2_client_provider_from_entry(
                 (auth, token)
             }
             _ => {
-                error!(?uuid, "OAuth2 provider missing required endpoints");
+                error!(
+                    ?uuid,
+                    "OAuth2 provider missing required authorisation or token endpoint"
+                );
                 return Err(OperationError::InvalidValueState);
             }
         };
@@ -396,6 +480,13 @@ fn oauth2_client_provider_from_entry(
     let maybe_rfc7662_endpoint = provider_entry
         .get_ava_single_url(Attribute::OAuth2TokenIntrospectEndpoint)
         .cloned();
+
+    // Kubidm: the client secret and the access token are sent to these endpoints by the
+    // server, so they must use https. Plain http is only accepted on loopback addresses.
+    require_secure_backchannel_url(uuid, "token", &token_endpoint)?;
+    if let Some(endpoint) = maybe_rfc7662_endpoint.as_ref() {
+        require_secure_backchannel_url(uuid, "token introspection", endpoint)?;
+    }
 
     let user_sub_verifier = match maybe_rfc7662_endpoint {
         Some(endpoint) => OAuth2SubjectVerifier::Rfc7662TokenIntrospection { endpoint },
@@ -428,7 +519,7 @@ fn oauth2_client_provider_from_entry(
 
 #[cfg(test)]
 mod tests {
-    use super::AccountLinkPolicy;
+    use super::{require_secure_backchannel_url, AccountLinkPolicy, OAuth2SubjectVerifier};
     use crate::prelude::*;
 
     /// Kubidm: OAuth2 federation entries are valid at the target domain level, and every
@@ -452,7 +543,19 @@ mod tests {
             (Attribute::OAuth2ClientSecret, Value::new_utf8s("secret")),
             (
                 Attribute::OAuth2Issuer,
-                Value::Url(Url::parse("https://idp.example.com").unwrap())
+                Value::Url(Url::parse("https://idp.example.com/realms/main").unwrap())
+            ),
+            (
+                Attribute::OAuth2AuthorisationEndpoint,
+                Value::Url(Url::parse("https://idp.example.com/realms/main/auth").unwrap())
+            ),
+            (
+                Attribute::OAuth2TokenEndpoint,
+                Value::Url(Url::parse("https://idp.example.com/realms/main/token").unwrap())
+            ),
+            (
+                Attribute::OAuth2TokenIntrospectEndpoint,
+                Value::Url(Url::parse("https://idp.example.com/realms/main/introspect").unwrap())
             ),
             (
                 Attribute::OAuth2JwksUri,
@@ -474,12 +577,12 @@ mod tests {
                 Attribute::OAuth2DisplayName,
                 Value::new_utf8s("Example IdP")
             ),
-            (Attribute::OAuth2LinkPolicy, Value::new_iutf8("auto")),
+            (Attribute::OAuth2LinkPolicy, Value::new_iutf8("manual")),
             (
                 Attribute::OAuth2FederationId,
                 Value::new_iname("example_fed")
             ),
-            (Attribute::OAuth2IdpInitiatedEnabled, Value::Bool(true)),
+            (Attribute::OAuth2IdpInitiatedEnabled, Value::Bool(false)),
             (Attribute::OAuth2AutoDiscovery, Value::Bool(false))
         );
 
@@ -500,7 +603,7 @@ mod tests {
         assert_eq!(provider.name, "test_federation");
         assert_eq!(
             provider.issuer.as_ref().map(Url::as_str),
-            Some("https://idp.example.com/")
+            Some("https://idp.example.com/realms/main")
         );
         assert_eq!(
             provider.jwks_uri.as_ref().map(Url::as_str),
@@ -508,14 +611,28 @@ mod tests {
         );
         assert_eq!(provider.email_domains.len(), 2);
         assert_eq!(provider.display_name.as_deref(), Some("Example IdP"));
-        assert_eq!(provider.link_policy, AccountLinkPolicy::Auto);
+        assert_eq!(provider.link_policy, AccountLinkPolicy::Manual);
         assert_eq!(provider.federation_id.as_deref(), Some("example_fed"));
-        assert!(provider.idp_initiated_enabled);
-        // Endpoints are derived from the issuer when not set explicitly.
+        assert!(!provider.idp_initiated_enabled);
+        assert!(!provider.auto_discovery);
+        // The explicit endpoints are used as is, keeping the issuer path.
         assert_eq!(
             provider.authorisation_endpoint.as_str(),
-            "https://idp.example.com/oauth2/authorize"
+            "https://idp.example.com/realms/main/auth"
         );
+        assert_eq!(
+            provider.token_endpoint.as_str(),
+            "https://idp.example.com/realms/main/token"
+        );
+        // The introspection endpoint is in the federation schema and becomes the subject
+        // verifier. Without it every federation login is denied.
+        match &provider.user_sub_verifier {
+            OAuth2SubjectVerifier::Rfc7662TokenIntrospection { endpoint } => assert_eq!(
+                endpoint.as_str(),
+                "https://idp.example.com/realms/main/introspect"
+            ),
+            OAuth2SubjectVerifier::None => panic!("federation loaded without a verifier"),
+        }
 
         idms_prox_write.commit().expect("failed to commit");
     }
@@ -531,6 +648,18 @@ mod tests {
             (
                 Attribute::OAuth2Issuer,
                 Value::Url(Url::parse("https://idp.example.com").unwrap())
+            ),
+            (
+                Attribute::OAuth2AuthorisationEndpoint,
+                Value::Url(Url::parse("https://idp.example.com/authorise").unwrap())
+            ),
+            (
+                Attribute::OAuth2TokenEndpoint,
+                Value::Url(Url::parse("https://idp.example.com/token").unwrap())
+            ),
+            (
+                Attribute::OAuth2TokenIntrospectEndpoint,
+                Value::Url(Url::parse("https://idp.example.com/introspect").unwrap())
             )
         )
     }
@@ -589,14 +718,11 @@ mod tests {
             .is_none());
     }
 
-    /// Only a token endpoint: the authorisation endpoint can not be derived, so the
-    /// provider configuration is invalid (the entry itself is schema valid).
+    /// An unimplemented link policy: the provider configuration is invalid (the entry
+    /// itself is schema valid).
     fn invalid_federation_entry(uuid: Uuid, name: &str) -> EntryInitNew {
         let mut bad = federation_entry(uuid, name);
-        bad.add_ava(
-            Attribute::OAuth2TokenEndpoint,
-            Value::Url(Url::parse("https://idp.example.com/token").unwrap()),
-        );
+        bad.add_ava(Attribute::OAuth2LinkPolicy, Value::new_iutf8("auto"));
         bad
     }
 
@@ -647,10 +773,7 @@ mod tests {
             .qs_write
             .internal_modify_uuid(
                 good_uuid,
-                &ModifyList::new_append(
-                    Attribute::OAuth2TokenEndpoint,
-                    Value::Url(Url::parse("https://idp.example.com/token").unwrap()),
-                ),
+                &ModifyList::new_append(Attribute::OAuth2LinkPolicy, Value::new_iutf8("auto")),
             )
             .expect("the entry itself is schema valid");
         assert_eq!(
@@ -664,7 +787,7 @@ mod tests {
             .qs_write
             .internal_search_uuid(good_uuid)
             .unwrap()
-            .attribute_pres(Attribute::OAuth2TokenEndpoint));
+            .attribute_pres(Attribute::OAuth2LinkPolicy));
         assert!(idms_prox_write
             .oauth2_client_providers
             .get(&good_uuid)
@@ -756,5 +879,217 @@ mod tests {
             .oauth2_client_providers
             .get(&bad_uuid)
             .is_none());
+    }
+
+    /// Create `entry` and commit, returning the commit result. A failed commit leaves
+    /// nothing behind.
+    async fn commit_provider(idms: &IdmServer, entry: EntryInitNew) -> Result<(), OperationError> {
+        let ct = duration_from_epoch_now();
+        let mut idms_prox_write = idms.proxy_write(ct).await.unwrap();
+        idms_prox_write
+            .qs_write
+            .internal_create(vec![entry])
+            .expect("the entry itself is schema valid");
+        idms_prox_write.commit()
+    }
+
+    /// As [federation_entry], with `attr` replaced by `values` (removed when empty).
+    fn federation_entry_with(uuid: Uuid, attr: &Attribute, values: Vec<Value>) -> EntryInitNew {
+        let mut entry = federation_entry(uuid, "variant_federation");
+        entry.remove_ava(attr);
+        for value in values {
+            entry.add_ava(attr.clone(), value);
+        }
+        entry
+    }
+
+    fn replace_ava(entry: &mut EntryInitNew, attr: Attribute, value: Value) {
+        entry.remove_ava(&attr);
+        entry.add_ava(attr, value);
+    }
+
+    fn url_value(url: &str) -> Value {
+        Value::Url(Url::parse(url).unwrap())
+    }
+
+    /// Kubidm: a federation must set both the authorisation and the token endpoint, they
+    /// are never derived from the issuer.
+    #[idm_test]
+    async fn test_idm_oauth2_federation_requires_explicit_endpoints(
+        idms: &IdmServer,
+        _idms_delayed: &mut IdmServerDelayed,
+    ) {
+        for attr in [
+            Attribute::OAuth2AuthorisationEndpoint,
+            Attribute::OAuth2TokenEndpoint,
+        ] {
+            let entry = federation_entry_with(Uuid::new_v4(), &attr, vec![]);
+            assert_eq!(
+                commit_provider(idms, entry).await,
+                Err(OperationError::InvalidValueState),
+                "a federation without {attr} must be rejected"
+            );
+        }
+
+        let mut entry = federation_entry(Uuid::new_v4(), "issuer_only");
+        entry.remove_ava(Attribute::OAuth2AuthorisationEndpoint);
+        entry.remove_ava(Attribute::OAuth2TokenEndpoint);
+        assert_eq!(
+            commit_provider(idms, entry).await,
+            Err(OperationError::InvalidValueState),
+            "a federation with only an issuer must be rejected"
+        );
+    }
+
+    /// Kubidm: only the `manual` link policy (or none) is accepted.
+    #[idm_test]
+    async fn test_idm_oauth2_federation_link_policy(
+        idms: &IdmServer,
+        _idms_delayed: &mut IdmServerDelayed,
+    ) {
+        for policy in ["auto", "admin_approval", "Auto", "garbage"] {
+            let entry = federation_entry_with(
+                Uuid::new_v4(),
+                &Attribute::OAuth2LinkPolicy,
+                vec![Value::new_iutf8(policy)],
+            );
+            assert_eq!(
+                commit_provider(idms, entry).await,
+                Err(OperationError::InvalidValueState),
+                "link policy {policy:?} must be rejected"
+            );
+        }
+
+        for (name, values) in [
+            ("manual_federation", vec![Value::new_iutf8("manual")]),
+            ("upper_manual_federation", vec![Value::new_iutf8("MANUAL")]),
+            ("unset_federation", vec![]),
+        ] {
+            let uuid = Uuid::new_v4();
+            let mut entry = federation_entry_with(uuid, &Attribute::OAuth2LinkPolicy, values);
+            replace_ava(&mut entry, Attribute::Name, Value::new_iname(name));
+            commit_provider(idms, entry)
+                .await
+                .expect("a manual link policy must be accepted");
+
+            let idms_prox_write = idms.proxy_write(duration_from_epoch_now()).await.unwrap();
+            assert_eq!(
+                idms_prox_write
+                    .oauth2_client_providers
+                    .get(&uuid)
+                    .map(|p| p.link_policy),
+                Some(AccountLinkPolicy::Manual)
+            );
+        }
+    }
+
+    /// Kubidm: OIDC auto discovery and IdP initiated login are not implemented, so
+    /// enabling them is rejected. Explicitly disabling them is fine.
+    #[idm_test]
+    async fn test_idm_oauth2_federation_unimplemented_features(
+        idms: &IdmServer,
+        _idms_delayed: &mut IdmServerDelayed,
+    ) {
+        for attr in [
+            Attribute::OAuth2AutoDiscovery,
+            Attribute::OAuth2IdpInitiatedEnabled,
+        ] {
+            let entry = federation_entry_with(Uuid::new_v4(), &attr, vec![Value::Bool(true)]);
+            assert_eq!(
+                commit_provider(idms, entry).await,
+                Err(OperationError::InvalidValueState),
+                "{attr}=true must be rejected"
+            );
+
+            let mut entry = federation_entry_with(Uuid::new_v4(), &attr, vec![Value::Bool(false)]);
+            replace_ava(
+                &mut entry,
+                Attribute::Name,
+                Value::new_iname(&format!("{attr}_off")),
+            );
+            commit_provider(idms, entry)
+                .await
+                .unwrap_or_else(|err| panic!("{attr}=false must be accepted: {err:?}"));
+        }
+    }
+
+    /// Kubidm: the token and introspection endpoints must use https, except on loopback.
+    #[idm_test]
+    async fn test_idm_oauth2_federation_backchannel_https(
+        idms: &IdmServer,
+        _idms_delayed: &mut IdmServerDelayed,
+    ) {
+        for attr in [
+            Attribute::OAuth2TokenEndpoint,
+            Attribute::OAuth2TokenIntrospectEndpoint,
+        ] {
+            let entry = federation_entry_with(
+                Uuid::new_v4(),
+                &attr,
+                vec![url_value("http://idp.example.com/endpoint")],
+            );
+            assert_eq!(
+                commit_provider(idms, entry).await,
+                Err(OperationError::InvalidValueState),
+                "a non loopback http {attr} must be rejected"
+            );
+        }
+
+        // Loopback http is accepted, for the testkit and local development. The
+        // authorisation endpoint is a browser redirect and is not restricted here.
+        let uuid = Uuid::new_v4();
+        let mut entry = federation_entry(uuid, "loopback_federation");
+        replace_ava(
+            &mut entry,
+            Attribute::OAuth2AuthorisationEndpoint,
+            url_value("http://idp.example.com/authorise"),
+        );
+        replace_ava(
+            &mut entry,
+            Attribute::OAuth2TokenEndpoint,
+            url_value("http://localhost:8443/token"),
+        );
+        replace_ava(
+            &mut entry,
+            Attribute::OAuth2TokenIntrospectEndpoint,
+            url_value("http://127.0.0.1:8443/introspect"),
+        );
+        commit_provider(idms, entry)
+            .await
+            .expect("loopback http endpoints must be accepted");
+    }
+
+    #[test]
+    fn test_require_secure_backchannel_url() {
+        let check = |url: &str| {
+            require_secure_backchannel_url(Uuid::nil(), "test", &Url::parse(url).unwrap())
+        };
+
+        for good in [
+            "https://idp.example.com/token",
+            "https://127.0.0.1/token",
+            "http://localhost/token",
+            "http://LOCALHOST:8080/token",
+            "http://127.0.0.1:8080/token",
+            "http://127.1.2.3/token",
+            "http://[::1]:8080/token",
+        ] {
+            assert!(check(good).is_ok(), "{good} must be accepted");
+        }
+
+        for bad in [
+            "http://idp.example.com/token",
+            "http://10.0.0.1/token",
+            "http://[::2]/token",
+            "http://localhost.example.com/token",
+            "http://0.0.0.0/token",
+            "ftp://localhost/token",
+        ] {
+            assert_eq!(
+                check(bad),
+                Err(OperationError::InvalidValueState),
+                "{bad} must be rejected"
+            );
+        }
     }
 }

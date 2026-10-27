@@ -200,7 +200,7 @@ pub fn phase_2_schema_classes() -> Vec<EntryInitNew> {
         // Time-bounded access
         SCHEMA_CLASS_TIME_BOUNDED_GRANT.clone().into(),
         // OAuth2 Federation (DL14+)
-        SCHEMA_CLASS_OAUTH2_FEDERATION.clone().into(),
+        SCHEMA_CLASS_OAUTH2_FEDERATION_DL14.clone().into(),
         SCHEMA_CLASS_OAUTH2_LINKED_ACCOUNT.clone().into(),
     ]
 }

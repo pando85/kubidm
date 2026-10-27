@@ -246,6 +246,8 @@ pub struct QueryServerWriteTransaction<'a> {
 
     // Store the list of changed uuids for other invalidation needs?
     pub(super) changed_uuid: HashSet<Uuid>,
+    // Kubidm: this transaction applies replicated changes (incremental or refresh).
+    pub(crate) replication_apply: bool,
     _db_ticket: SemaphorePermit<'a>,
     _write_ticket: SemaphorePermit<'a>,
     resolve_filter_cache_clear: bool,
@@ -2298,6 +2300,7 @@ impl QueryServer {
             accesscontrols: self.accesscontrols.write(curtime),
             changed_flags: ChangeFlag::empty(),
             changed_uuid: HashSet::new(),
+            replication_apply: false,
             _db_ticket: db_ticket,
             _write_ticket: write_ticket,
             resolve_filter_cache: self.resolve_filter_cache.read(),
@@ -3091,6 +3094,14 @@ impl<'a> QueryServerWriteTransaction<'a> {
         self.changed_uuid.contains(uuid)
     }
 
+    /// Kubidm: does this transaction apply replicated changes (incremental or refresh)?
+    /// Validation of the replicated content is the supplier's job, so post commit
+    /// reloads must skip invalid content rather than fail and block replication.
+    #[inline]
+    pub(crate) fn is_replication_apply(&self) -> bool {
+        self.replication_apply
+    }
+
     /// Indicate that we are about to re-bootstrap this server. You should ONLY
     /// call this during a replication refresh!!!
     pub(crate) fn set_phase_bootstrap(&mut self) {
@@ -3220,6 +3231,7 @@ impl<'a> QueryServerWriteTransaction<'a> {
             trim_cid: _,
             changed_flags,
             changed_uuid: _,
+            replication_apply: _,
             resolve_filter_cache: _,
             resolve_filter_cache_clear,
             mut resolve_filter_cache_write,

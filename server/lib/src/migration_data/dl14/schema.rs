@@ -1671,7 +1671,7 @@ pub static SCHEMA_ATTR_OAUTH2_LINK_POLICY: LazyLock<SchemaAttribute> =
         uuid: UUID_SCHEMA_ATTR_OAUTH2_LINK_POLICY,
         name: Attribute::OAuth2LinkPolicy,
         description:
-            "Policy for account linking: 'auto' (same email), 'manual', or 'admin_approval'"
+            "Policy for account linking. Only 'manual' (admin linked accounts) is implemented"
                 .to_string(),
         syntax: SyntaxType::Utf8StringInsensitive,
         ..Default::default()
@@ -1697,7 +1697,10 @@ pub static SCHEMA_ATTR_OAUTH2_FEDERATION_ID: LazyLock<SchemaAttribute> =
         ..Default::default()
     });
 
-pub static SCHEMA_CLASS_OAUTH2_FEDERATION: LazyLock<SchemaClass> = LazyLock::new(|| {
+/// The OAuth2 federation class as written to the on-disk schema at DL14. The DL14 schema
+/// has no `OAuth2TokenIntrospectEndpoint` attribute (upstream adds it at DL 1.11), so it
+/// can not be referenced here. See [SCHEMA_CLASS_OAUTH2_FEDERATION].
+pub static SCHEMA_CLASS_OAUTH2_FEDERATION_DL14: LazyLock<SchemaClass> = LazyLock::new(|| {
     SchemaClass {
     uuid: UUID_SCHEMA_CLASS_OAUTH2_FEDERATION,
     name: EntryClass::OAuth2Federation.into(),
@@ -1725,6 +1728,17 @@ pub static SCHEMA_CLASS_OAUTH2_FEDERATION: LazyLock<SchemaClass> = LazyLock::new
     ],
     ..Default::default()
 }
+});
+
+/// The OAuth2 federation class for DL >= 1.11, registered in memory by
+/// `crate::schema::kubidm_schema_classes`. It adds the RFC 7662 introspection endpoint,
+/// without which a federation login can never verify the subject.
+pub static SCHEMA_CLASS_OAUTH2_FEDERATION: LazyLock<SchemaClass> = LazyLock::new(|| {
+    let mut class = SCHEMA_CLASS_OAUTH2_FEDERATION_DL14.clone();
+    class
+        .systemmay
+        .push(Attribute::OAuth2TokenIntrospectEndpoint);
+    class
 });
 
 pub static SCHEMA_CLASS_OAUTH2_LINKED_ACCOUNT: LazyLock<SchemaClass> =
