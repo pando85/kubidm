@@ -178,6 +178,9 @@ pub enum OperationError {
     // Account Signup Errors
     AS0001FeatureDisabled,
 
+    // Kubidm Approval Errors
+    AP0001ApprovalQuorumUnreachable,
+
     // Credential Update Errors
     CU0001WebauthnAttestationNotTrusted,
     CU0002WebauthnRegistrationError,
@@ -612,6 +615,7 @@ impl OperationError {
             Self::KU004PamInitFailed => Some("Failed to initialise PAM authentication".into()),
             Self::KU005ErrorCheckingAccount => Some("Error checking account".into()),
             Self::KU006OnlyRootAllowed => Some("Only root is allowed to perform this operation".into()),
+            Self::AP0001ApprovalQuorumUnreachable => Some("The approval policy can never be satisfied for this request: too few approvers other than the requester".into()),
             Self::LD0001AnonymousNotAllowed => Some("Anonymous is not allowed to access LDAP with this method.".into()),
             Self::MG0001InvalidReMigrationLevel => None,
             Self::MG0002RaiseDomainLevelExceedsMaximum => None,

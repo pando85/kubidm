@@ -423,3 +423,4 @@ pub const ENTRYCLASS_KEY_OBJECT_JWE_A256GCM: &str = "key_object_jwe_a256gcm";
 pub const ENTRYCLASS_KEY_OBJECT_INTERNAL: &str = "key_object_internal";
 pub const ENTRYCLASS_APPROVAL_POLICY: &str = "approval_policy";
 pub const ENTRYCLASS_APPROVAL_REQUEST: &str = "approval_request";
+pub const ENTRYCLASS_APPROVAL_DECISION_RECORD: &str = "approval_decision_record";

@@ -151,6 +151,14 @@ impl ApprovalPolicyOpt {
     }
 }
 
+/// Shown in place of the policy, target or requester of a request once it is deleted.
+const DELETED: &str = "<deleted>";
+
+fn display_uuid(uuid: Option<uuid::Uuid>) -> String {
+    uuid.map(|u| u.to_string())
+        .unwrap_or_else(|| DELETED.to_string())
+}
+
 impl ApprovalRequestOpt {
     pub async fn exec(&self, _opt: &KubidmClientParser, client: &KubidmClient) {
         match self {
@@ -181,12 +189,21 @@ impl ApprovalRequestOpt {
 
                 for req in requests {
                     println!("Request: {} ({})", req.uuid, req.state);
-                    println!("  Policy: {} ({})", req.policy_name, req.policy_uuid);
+                    println!(
+                        "  Policy: {} ({})",
+                        req.policy_name.as_deref().unwrap_or(DELETED),
+                        display_uuid(req.policy_uuid)
+                    );
                     println!("  Operation: {}", req.operation_type);
-                    println!("  Target: {} ({})", req.target_spn, req.target_uuid);
+                    println!(
+                        "  Target: {} ({})",
+                        req.target_spn,
+                        display_uuid(req.target_uuid)
+                    );
                     println!(
                         "  Requestor: {} ({})",
-                        req.requestor_spn, req.requestor_uuid
+                        req.requestor_spn,
+                        display_uuid(req.requestor_uuid)
                     );
                     println!("  Created: {:?}", req.created_at);
                     if let Some(exp) = req.expires_at {
@@ -220,10 +237,22 @@ impl ApprovalRequestOpt {
                 };
 
                 println!("Request: {} ({})", req.uuid, req.state);
-                println!("Policy: {} ({})", req.policy_name, req.policy_uuid);
+                println!(
+                    "Policy: {} ({})",
+                    req.policy_name.as_deref().unwrap_or(DELETED),
+                    display_uuid(req.policy_uuid)
+                );
                 println!("Operation: {}", req.operation_type);
-                println!("Target: {} ({})", req.target_spn, req.target_uuid);
-                println!("Requestor: {} ({})", req.requestor_spn, req.requestor_uuid);
+                println!(
+                    "Target: {} ({})",
+                    req.target_spn,
+                    display_uuid(req.target_uuid)
+                );
+                println!(
+                    "Requestor: {} ({})",
+                    req.requestor_spn,
+                    display_uuid(req.requestor_uuid)
+                );
                 println!("Created: {:?}", req.created_at);
                 if let Some(exp) = req.expires_at {
                     println!("Expires: {:?}", exp);

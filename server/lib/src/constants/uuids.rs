@@ -489,6 +489,10 @@ pub const UUID_SCHEMA_ATTR_APPROVAL_EXPIRES: Uuid = uuid!("00000000-0000-0000-00
 pub const UUID_SCHEMA_ATTR_APPROVAL_OPERATION_DETAILS: Uuid =
     uuid!("00000000-0000-0000-0000-ffff0000025c");
 pub const UUID_SCHEMA_CLASS_APPROVAL_REQUEST: Uuid = uuid!("00000000-0000-0000-0000-ffff0000025d");
+// Fork custom range (ffff000003xx), away from the start of that range where other fork
+// additions are allocated.
+pub const UUID_SCHEMA_CLASS_APPROVAL_DECISION_RECORD: Uuid =
+    uuid!("00000000-0000-0000-0000-ffff00000320");
 
 // Approval Workflow Groups
 pub const UUID_IDM_APPROVAL_ADMINS: Uuid = uuid!("00000000-0000-0000-0000-000000000059");

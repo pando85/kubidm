@@ -820,6 +820,13 @@ impl QueryServerWriteTransaction<'_> {
 
         // Kubidm fork builtin entries (delegated roles, approval admins group). The
         // upstream entry lists for this level do not contain them.
+        //
+        // Kubidm: this domain migration is the only place that creates them (and the
+        // idm_high_privilege membership) in an existing database. That is enough because no
+        // released fork version targets DL 1.12 (released databases reach it through the
+        // 1.11 -> 1.12 migration), and pre-release builds re-run the migrations of the
+        // current level on every start (development taint). Once a release targets 1.12,
+        // fork builtins added later need a migration of their own.
         self.internal_migrate_or_create_batch(
             "phase 6 - kubidm builtin entries",
             migration_data::dl14::kubidm_builtin_entries()?,
@@ -1055,6 +1062,13 @@ impl QueryServerWriteTransaction<'_> {
 
         // Kubidm fork builtin entries (delegated roles, approval admins group). The
         // upstream entry lists for this level do not contain them.
+        //
+        // Kubidm: this domain migration is the only place that creates them (and the
+        // idm_high_privilege membership) in an existing database. That is enough because no
+        // released fork version targets DL 1.12 (released databases reach it through the
+        // 1.11 -> 1.12 migration), and pre-release builds re-run the migrations of the
+        // current level on every start (development taint). Once a release targets 1.12,
+        // fork builtins added later need a migration of their own.
         self.internal_migrate_or_create_batch(
             "phase 6 - kubidm builtin entries",
             migration_data::dl14::kubidm_builtin_entries()?,

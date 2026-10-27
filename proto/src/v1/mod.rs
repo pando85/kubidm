@@ -275,6 +275,9 @@ pub enum ApprovalRequestState {
     Expired,
     Cancelled,
     Escalated,
+    /// Kubidm: the policy, target or requester of a pending request has been deleted, so
+    /// the request can no longer be decided. Never stored, only reported.
+    Invalid,
 }
 
 impl fmt::Display for ApprovalRequestState {
@@ -292,6 +295,7 @@ impl ApprovalRequestState {
             ApprovalRequestState::Expired => "expired",
             ApprovalRequestState::Cancelled => "cancelled",
             ApprovalRequestState::Escalated => "escalated",
+            ApprovalRequestState::Invalid => "invalid",
         }
     }
 }
@@ -307,6 +311,7 @@ impl std::str::FromStr for ApprovalRequestState {
             "expired" => Ok(ApprovalRequestState::Expired),
             "cancelled" => Ok(ApprovalRequestState::Cancelled),
             "escalated" => Ok(ApprovalRequestState::Escalated),
+            "invalid" => Ok(ApprovalRequestState::Invalid),
             _ => Err("invalid approval request state"),
         }
     }
@@ -347,12 +352,15 @@ pub struct ApprovalDecision {
 #[derive(Debug, Serialize, Deserialize, Clone, ToSchema)]
 pub struct ApprovalRequest {
     pub uuid: Uuid,
-    pub policy_uuid: Uuid,
-    pub policy_name: String,
+    /// `None` once the policy has been deleted.
+    pub policy_uuid: Option<Uuid>,
+    pub policy_name: Option<String>,
     pub operation_type: ApprovalOperationType,
-    pub target_uuid: Uuid,
+    /// `None` once the target has been deleted.
+    pub target_uuid: Option<Uuid>,
     pub target_spn: String,
-    pub requestor_uuid: Uuid,
+    /// `None` once the requester has been deleted.
+    pub requestor_uuid: Option<Uuid>,
     pub requestor_spn: String,
     #[serde(with = "time::serde::timestamp")]
     pub created_at: time::OffsetDateTime,
@@ -533,6 +541,7 @@ mod tests {
             ApprovalRequestState::Expired,
             ApprovalRequestState::Cancelled,
             ApprovalRequestState::Escalated,
+            ApprovalRequestState::Invalid,
         ];
         for variant in variants {
             let restored = round_trip(&variant);
@@ -567,7 +576,11 @@ mod tests {
             ApprovalRequestState::from_str("escalated"),
             Ok(ApprovalRequestState::Escalated)
         ));
-        assert!(ApprovalRequestState::from_str("invalid").is_err());
+        assert_eq!(
+            ApprovalRequestState::from_str("invalid"),
+            Ok(ApprovalRequestState::Invalid)
+        );
+        assert!(ApprovalRequestState::from_str("bogus").is_err());
     }
 
     #[test]
@@ -625,12 +638,12 @@ mod tests {
         let ts = time::OffsetDateTime::UNIX_EPOCH;
         let original = ApprovalRequest {
             uuid: Uuid::new_v4(),
-            policy_uuid: Uuid::new_v4(),
-            policy_name: "high_priv_policy".to_string(),
+            policy_uuid: Some(Uuid::new_v4()),
+            policy_name: Some("high_priv_policy".to_string()),
             operation_type: ApprovalOperationType::SchemaModify,
-            target_uuid: Uuid::new_v4(),
+            target_uuid: Some(Uuid::new_v4()),
             target_spn: "target@example.com".to_string(),
-            requestor_uuid: Uuid::new_v4(),
+            requestor_uuid: None,
             requestor_spn: "requestor@example.com".to_string(),
             created_at: ts,
             expires_at: Some(ts),

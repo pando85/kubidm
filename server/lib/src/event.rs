@@ -802,6 +802,29 @@ impl RefreshTimeBoundedMembershipEvent {
     }
 }
 
+/// Kubidm: expire, escalate and reconcile approval requests, see
+/// `QueryServerWriteTransaction::approval_sweep`.
+#[derive(Debug)]
+pub struct ApprovalSweepEvent {
+    pub ident: Identity,
+    pub eventid: Uuid,
+}
+
+impl Default for ApprovalSweepEvent {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ApprovalSweepEvent {
+    pub fn new() -> Self {
+        ApprovalSweepEvent {
+            ident: Identity::from_internal(),
+            eventid: Uuid::new_v4(),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct ReviveRecycledEvent {
     pub ident: Identity,

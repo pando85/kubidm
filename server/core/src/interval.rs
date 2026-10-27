@@ -24,7 +24,7 @@ use crate::actors::{QueryServerReadV1, QueryServerWriteV1};
 use kubidm_proto::backup::{ReplicationConfig, S3Config};
 use kubidmd_lib::constants::PURGE_FREQUENCY;
 use kubidmd_lib::event::{
-    PurgeDeleteAfterEvent, PurgeRecycledEvent, PurgeTombstoneEvent,
+    ApprovalSweepEvent, PurgeDeleteAfterEvent, PurgeRecycledEvent, PurgeTombstoneEvent,
     RefreshTimeBoundedMembershipEvent,
 };
 use kubidmd_lib::prelude::duration_from_epoch_now;
@@ -54,6 +54,9 @@ impl IntervalActor {
                     .handle_refresh_time_bounded_membership_event(
                         RefreshTimeBoundedMembershipEvent::new(),
                     )
+                    .await;
+                server
+                    .handle_approval_sweep_event(ApprovalSweepEvent::new())
                     .await;
 
                 tokio::select! {

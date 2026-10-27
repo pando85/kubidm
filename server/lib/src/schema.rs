@@ -1035,6 +1035,7 @@ fn kubidm_bootstrap_schema_classes() -> Vec<SchemaClass> {
         dl14::SCHEMA_CLASS_OAUTH2_LINKED_ACCOUNT.clone(),
         dl14::SCHEMA_CLASS_APPROVAL_POLICY.clone(),
         dl14::SCHEMA_CLASS_APPROVAL_REQUEST.clone(),
+        dl14::SCHEMA_CLASS_APPROVAL_DECISION_RECORD.clone(),
     ]
 }
 

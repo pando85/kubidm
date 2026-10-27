@@ -1866,16 +1866,17 @@ pub static SCHEMA_ATTR_APPROVAL_REQUEST_POLICY: LazyLock<SchemaAttribute> =
         ..Default::default()
     });
 
-pub static SCHEMA_ATTR_APPROVAL_TARGET: LazyLock<SchemaAttribute> =
-    LazyLock::new(|| SchemaAttribute {
+pub static SCHEMA_ATTR_APPROVAL_TARGET: LazyLock<SchemaAttribute> = LazyLock::new(|| {
+    SchemaAttribute {
         uuid: UUID_SCHEMA_ATTR_APPROVAL_TARGET,
         name: Attribute::ApprovalTarget,
-        description: "Reference to the entry that is the target of the approval request"
+        description: "Reference to the entry that is the target of the approval request, or on an approval decision record, the request it decides"
             .to_string(),
         indexed: true,
         syntax: SyntaxType::ReferenceUuid,
         ..Default::default()
-    });
+    }
+});
 
 pub static SCHEMA_ATTR_APPROVAL_REQUESTOR: LazyLock<SchemaAttribute> =
     LazyLock::new(|| SchemaAttribute {
@@ -1903,11 +1904,11 @@ pub static SCHEMA_ATTR_APPROVAL_DECISION: LazyLock<SchemaAttribute> = LazyLock::
         uuid: UUID_SCHEMA_ATTR_APPROVAL_DECISION,
         name: Attribute::ApprovalDecision,
         description:
-            "The JSON-encoded approval decision records (approver, action, time, and optional comment) of an approval request"
+            "One JSON-encoded approval decision (approver, action, time, comment and the approver slots it may fill) of an approval decision record"
                 .to_string(),
-        // Kubidm: the Json syntax has no value set constructor, so it can not be written,
-        // and there is no multi-value Utf8String syntax. All decisions of a request are
-        // stored as one single-line JSON array string instead.
+        // Kubidm: each decision is its own `approval_decision_record` entry, created once
+        // and never modified, see `SCHEMA_CLASS_APPROVAL_DECISION_RECORD`. The Json syntax
+        // has no value set constructor, so the record is a single-line JSON string.
         syntax: SyntaxType::Utf8String,
         ..Default::default()
     }
@@ -1946,14 +1947,15 @@ pub static SCHEMA_CLASS_APPROVAL_REQUEST: LazyLock<SchemaClass> = LazyLock::new(
     uuid: UUID_SCHEMA_CLASS_APPROVAL_REQUEST,
     name: EntryClass::ApprovalRequest.into(),
     description: "A request for approval to perform a sensitive operation".to_string(),
-    systemmust: vec![
+    systemmust: vec![Attribute::ApprovalOperationType, Attribute::ApprovalState],
+    // Kubidm: the policy, target and requester are optional so that deleting one of them
+    // is not blocked by referential integrity. A pending request that lost one of them is
+    // invalid: it can not be decided, and the approval sweep expires it.
+    systemmay: vec![
         Attribute::ApprovalRequestPolicy,
-        Attribute::ApprovalOperationType,
         Attribute::ApprovalTarget,
         Attribute::ApprovalRequestor,
-        Attribute::ApprovalState,
-    ],
-    systemmay: vec![
+        // Legacy, no longer written or read: decisions are approval decision records.
         Attribute::ApprovalDecision,
         Attribute::ApprovalEscalationLevel,
         Attribute::ApprovalExpires,
@@ -1961,3 +1963,24 @@ pub static SCHEMA_CLASS_APPROVAL_REQUEST: LazyLock<SchemaClass> = LazyLock::new(
     ],
     ..Default::default()
 });
+
+/// Kubidm: one decision on an approval request.
+///
+/// Decisions are separate entries rather than values of an attribute of the request. In
+/// replication, concurrent changes to the same attribute of an entry on two replicas are
+/// resolved by keeping the newer value set, so two approvers deciding on different replicas
+/// within one replication interval would lose one of the decisions, even with one value per
+/// decision. A merge that unions the values can not be propagated either, since it has no
+/// change id of its own. Creating an entry per decision has neither problem: entries with
+/// distinct uuids never conflict.
+pub static SCHEMA_CLASS_APPROVAL_DECISION_RECORD: LazyLock<SchemaClass> =
+    LazyLock::new(|| SchemaClass {
+        uuid: UUID_SCHEMA_CLASS_APPROVAL_DECISION_RECORD,
+        name: EntryClass::ApprovalDecisionRecord.into(),
+        description: "One decision on an approval request".to_string(),
+        systemmust: vec![Attribute::ApprovalDecision],
+        // The request it decides. Optional so that deleting the request is not blocked
+        // by referential integrity; a record without a request is ignored.
+        systemmay: vec![Attribute::ApprovalTarget],
+        ..Default::default()
+    });

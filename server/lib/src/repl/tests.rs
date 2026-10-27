@@ -4515,3 +4515,130 @@ async fn test_repl_oauth2_federation_invalid_does_not_block(
             .is_none());
     }
 }
+
+/// Kubidm: two approvers decide on the same approval request on different replicas within
+/// one replication interval. Both decisions reach both replicas (whichever direction
+/// replicates first), and the state recomputed from them is the same on both replicas,
+/// although neither replica stored it.
+#[qs_pair_test]
+async fn test_repl_increment_approval_decisions_union(
+    server_a: &QueryServer,
+    server_b: &QueryServer,
+) {
+    use kubidm_proto::v1::{
+        ApprovalDecisionAction, ApprovalDecisionRequest, ApprovalOperationType, ApprovalPattern,
+        ApprovalPolicyCreateRequest, ApprovalRequestState,
+    };
+
+    let ct = duration_from_epoch_now();
+    let mut server_a_txn = server_a.write(ct).await.unwrap();
+    let mut server_b_txn = server_b.read().await.unwrap();
+    assert!(repl_initialise(&mut server_b_txn, &mut server_a_txn)
+        .and_then(|_| server_a_txn.commit())
+        .is_ok());
+    drop(server_b_txn);
+
+    // A policy needing both idm_admin and admin, and a request from anonymous.
+    let mut server_a_txn = server_a.write(ct).await.unwrap();
+    let idm_admin = Identity::from_impersonate_entry_readwrite(
+        server_a_txn.internal_search_uuid(UUID_IDM_ADMIN).unwrap(),
+    );
+    let anon = Identity::from_impersonate_entry_readwrite(
+        server_a_txn.internal_search_uuid(UUID_ANONYMOUS).unwrap(),
+    );
+    server_a_txn
+        .approval_policy_create(
+            &idm_admin,
+            &ApprovalPolicyCreateRequest {
+                name: "repl_policy".to_string(),
+                description: None,
+                operation_types: vec![ApprovalOperationType::SchemaModify],
+                approvers: vec![UUID_IDM_ADMIN, UUID_ADMIN],
+                backup_approvers: vec![],
+                pattern: ApprovalPattern::All,
+                timeout_seconds: 3600,
+                escalation_timeout_seconds: None,
+            },
+        )
+        .expect("failed to create approval policy");
+    let request_uuid = server_a_txn
+        .approval_request_create(
+            &anon,
+            "repl_policy",
+            &ApprovalOperationType::SchemaModify,
+            UUID_IDM_ADMINS,
+            &BTreeMap::new(),
+            ct,
+        )
+        .expect("failed to create approval request");
+    server_a_txn.commit().expect("Failed to commit");
+
+    let mut server_a_txn = server_a.read().await.unwrap();
+    let mut server_b_txn = server_b.write(duration_from_epoch_now()).await.unwrap();
+    repl_incremental(&mut server_a_txn, &mut server_b_txn);
+    server_b_txn.commit().expect("Failed to commit");
+    drop(server_a_txn);
+
+    let approve = || ApprovalDecisionRequest {
+        action: ApprovalDecisionAction::Approve,
+        comment: None,
+    };
+
+    // idm_admin approves on A, admin approves on B, before either replicates.
+    let mut server_a_txn = server_a.write(duration_from_epoch_now()).await.unwrap();
+    let idm_admin = Identity::from_impersonate_entry_readwrite(
+        server_a_txn.internal_search_uuid(UUID_IDM_ADMIN).unwrap(),
+    );
+    server_a_txn
+        .approval_request_decision(&idm_admin, request_uuid, approve(), ct)
+        .expect("failed to approve on A");
+    server_a_txn.commit().expect("Failed to commit");
+
+    let mut server_b_txn = server_b.write(duration_from_epoch_now()).await.unwrap();
+    let admin = Identity::from_impersonate_entry_readwrite(
+        server_b_txn.internal_search_uuid(UUID_ADMIN).unwrap(),
+    );
+    server_b_txn
+        .approval_request_decision(&admin, request_uuid, approve(), ct)
+        .expect("failed to approve on B");
+    server_b_txn.commit().expect("Failed to commit");
+
+    // B -> A, then A -> B.
+    let mut server_a_txn = server_a.write(duration_from_epoch_now()).await.unwrap();
+    let mut server_b_txn = server_b.read().await.unwrap();
+    repl_incremental(&mut server_b_txn, &mut server_a_txn);
+    server_a_txn.commit().expect("Failed to commit");
+    drop(server_b_txn);
+
+    let mut server_a_txn = server_a.read().await.unwrap();
+    let mut server_b_txn = server_b.write(duration_from_epoch_now()).await.unwrap();
+    repl_incremental(&mut server_a_txn, &mut server_b_txn);
+    server_b_txn.commit().expect("Failed to commit");
+    drop(server_a_txn);
+
+    for (name, server) in [("A", server_a), ("B", server_b)] {
+        let mut txn = server.read().await.unwrap();
+        let records = txn
+            .internal_search(filter!(f_and!([
+                f_eq(Attribute::Class, EntryClass::ApprovalDecisionRecord.into()),
+                f_eq(Attribute::ApprovalTarget, PartialValue::Refer(request_uuid))
+            ])))
+            .expect("failed to search decision records");
+        assert_eq!(
+            records.len(),
+            2,
+            "a concurrent decision was lost in replication on {name}"
+        );
+        let entry = txn.internal_search_uuid(request_uuid).unwrap();
+        // Neither replica saw both decisions when deciding, so neither stored "approved".
+        assert_eq!(
+            entry.get_ava_single_iutf8(Attribute::ApprovalState),
+            Some("pending")
+        );
+        let request = txn
+            .approval_request_get(&Identity::from_internal(), request_uuid)
+            .expect("failed to read approval request");
+        assert_eq!(request.state, ApprovalRequestState::Approved);
+        assert_eq!(request.decisions.len(), 2);
+    }
+}
