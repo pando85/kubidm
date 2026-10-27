@@ -349,7 +349,8 @@ impl QueryServerWriteTransaction<'_> {
         mut e: Entry<EntryInit, EntryNew>,
         attrs: &[Attribute],
     ) -> Result<(), OperationError> {
-        trace!("operating on {:?}", e.get_uuid());
+        debug!("operating on {:?}", e.get_display_id());
+        trace!(?e, ?attrs);
 
         let Some(filt) = e.filter_from_attrs(&[Attribute::Uuid]) else {
             return Err(OperationError::FilterGeneration);
@@ -764,6 +765,10 @@ impl QueryServerWriteTransaction<'_> {
         // Add DL15 classes
         all_classes.extend(migration_data::dl15::phase_2_schema_classes());
 
+        // Kubidm fork-only schema (delegation, step-up reauth, ACP time restrictions).
+        all_attrs.extend(crate::schema::kubidm_schema_attributes());
+        all_classes.extend(crate::schema::kubidm_schema_classes());
+
         self.schema.extend_in_memory(all_attrs, all_classes)
     }
 
@@ -890,6 +895,10 @@ impl QueryServerWriteTransaction<'_> {
 
         all_classes.extend(migration_data::dl_1_12::phase_2_schema_classes());
 
+        // Kubidm fork-only schema (delegation, step-up reauth, ACP time restrictions).
+        all_attrs.extend(crate::schema::kubidm_schema_attributes());
+        all_classes.extend(crate::schema::kubidm_schema_classes());
+
         self.schema.extend_in_memory(all_attrs, all_classes)
     }
 
@@ -902,6 +911,98 @@ impl QueryServerWriteTransaction<'_> {
         }
 
         use migration_data::dl_1_12 as dl_target;
+
+        if self.get_phase() >= ServerPhase::DomainInfoReady {
+            // Rewrite all entries in place to cause them to re-write their on disk format.
+            let filter = filter_all!(f_or!([
+                // Uuid
+                f_pres(Attribute::DomainUuid),
+                f_pres(Attribute::InMemoriam),
+                f_pres(Attribute::OAuth2AccountCredentialUuid),
+                f_pres(Attribute::Uuid),
+                f_pres(Attribute::CascadeDeleted),
+                // Refer
+                f_pres(Attribute::KeyProvider),
+                f_pres(Attribute::LinkedGroup),
+                f_pres(Attribute::SyncParentUuid),
+                f_pres(Attribute::Refers),
+                f_pres(Attribute::OAuth2AccountProvider),
+                f_pres(Attribute::EntryManagedBy),
+                // kubidm refer
+                f_pres(Attribute::AcpReceiverDelegated),
+                f_pres(Attribute::DelegatedScopeGroup),
+                f_pres(Attribute::DelegatedBy),
+                f_pres(Attribute::DelegatedRoleTemplate),
+                // Iutf8
+                f_pres(Attribute::LoginShell),
+                f_pres(Attribute::DomainLdapBasedn),
+                f_pres(Attribute::AttributeName),
+                f_pres(Attribute::ClassName),
+                f_pres(Attribute::SyncExternalId),
+                // Iname
+                f_pres(Attribute::DomainName),
+                f_pres(Attribute::OAuth2RsName),
+                f_pres(Attribute::Name),
+                // Url
+                f_pres(Attribute::ApplicationUrl),
+                f_pres(Attribute::OAuth2RsOriginLanding),
+                f_pres(Attribute::OAuth2TokenEndpoint),
+                f_pres(Attribute::SyncCredentialPortal),
+                f_pres(Attribute::OAuth2AuthorisationEndpoint),
+                f_pres(Attribute::OAuth2TokenIntrospectEndpoint),
+            ]));
+
+            let mut entries = self.internal_search_writeable(&filter)?;
+
+            // Migrate the formerly multivalue types to single value types.
+            for (_, entry) in entries.iter_mut() {
+                for attr in [
+                    // Uuid
+                    Attribute::DomainUuid,
+                    Attribute::InMemoriam,
+                    Attribute::OAuth2AccountCredentialUuid,
+                    Attribute::Uuid,
+                    Attribute::CascadeDeleted,
+                    // Refer
+                    Attribute::KeyProvider,
+                    Attribute::LinkedGroup,
+                    Attribute::SyncParentUuid,
+                    Attribute::Refers,
+                    Attribute::OAuth2AccountProvider,
+                    Attribute::EntryManagedBy,
+                    // kubidm refer
+                    Attribute::AcpReceiverDelegated,
+                    Attribute::DelegatedScopeGroup,
+                    Attribute::DelegatedBy,
+                    Attribute::DelegatedRoleTemplate,
+                    // Iutf8
+                    Attribute::LoginShell,
+                    Attribute::DomainLdapBasedn,
+                    Attribute::AttributeName,
+                    Attribute::ClassName,
+                    Attribute::SyncExternalId,
+                    // Iname
+                    Attribute::DomainName,
+                    Attribute::OAuth2RsName,
+                    Attribute::Name,
+                    // Url
+                    Attribute::ApplicationUrl,
+                    Attribute::OAuth2RsOriginLanding,
+                    Attribute::OAuth2TokenEndpoint,
+                    Attribute::SyncCredentialPortal,
+                    Attribute::OAuth2AuthorisationEndpoint,
+                    Attribute::OAuth2TokenIntrospectEndpoint,
+                ] {
+                    entry.migrate_ava(attr)?;
+                }
+            }
+
+            let count = entries.len();
+
+            self.internal_apply_writable(entries)?;
+
+            debug!("Updated DB format for {} entries", count);
+        }
 
         // =========== Apply changes ==============
         self.migrate_schema_1_12()?;
@@ -1131,7 +1232,7 @@ mod tests {
             Attribute::Member,
             // This achieves both because this removes IDM_ADMIN from the group
             // while setting only anon as a member.
-            ValueSetRefer::new(UUID_ANONYMOUS),
+            ValueSetReferN::new(UUID_ANONYMOUS),
         );
         write_txn
             .internal_modify_uuid(UUID_IDM_ADMINS, &modlist)
@@ -1167,6 +1268,8 @@ mod tests {
         let idm_admins_entry = write_txn
             .internal_search_uuid(UUID_IDM_ADMINS)
             .expect("Unable to retrieve all persons");
+
+        debug!(?idm_admins_entry);
 
         let members = idm_admins_entry
             .get_ava_refer(Attribute::Member)
@@ -1515,7 +1618,10 @@ mod tests {
             (Attribute::Class, EntryClass::Object.to_value()),
             (Attribute::Class, EntryClass::AttributeType.to_value()),
             (Attribute::Uuid, Value::Uuid(custom_attr_uuid)),
-            (Attribute::AttributeName, Value::from(Attribute::TestAttr)),
+            (
+                Attribute::AttributeName,
+                Value::new_iutf8(Attribute::TestAttr.as_str())
+            ),
             (Attribute::Description, Value::new_utf8s("Test Attribute")),
             (Attribute::MultiValue, Value::new_bool(false)),
             (Attribute::Unique, Value::new_bool(false)),
@@ -1530,9 +1636,15 @@ mod tests {
             (Attribute::Class, EntryClass::Object.to_value()),
             (Attribute::Class, EntryClass::ClassType.to_value()),
             (Attribute::Uuid, Value::Uuid(custom_class_uuid)),
-            (Attribute::ClassName, EntryClass::TestClass.to_value()),
+            (
+                Attribute::ClassName,
+                Value::new_iutf8(EntryClass::TestClass.as_str())
+            ),
             (Attribute::Description, Value::new_utf8s("Test Class")),
-            (Attribute::May, Value::from(Attribute::TestAttr))
+            (
+                Attribute::May,
+                Value::new_iutf8n(Attribute::TestAttr.as_str())
+            )
         );
 
         write_txn
@@ -1623,14 +1735,15 @@ mod tests {
         let oauth2_client_entry = EntryInitNew::from_iter([
             (
                 Attribute::Class,
-                vs_iutf8!(
+                ValueSetIutf8N::from_iter([
                     EntryClass::Object.into(),
                     EntryClass::Account.into(),
                     EntryClass::OAuth2ResourceServer.into(),
-                    EntryClass::OAuth2ResourceServerBasic.into()
-                ),
+                    EntryClass::OAuth2ResourceServerBasic.into(),
+                ])
+                .unwrap() as _,
             ),
-            (Attribute::Name, vs_iname!("test_oauth2_client")),
+            (Attribute::Name, ValueSetIname::new("test_oauth2_client")),
             (
                 Attribute::DisplayName,
                 vs_utf8!("test_oauth2_client".to_string()),
@@ -1638,7 +1751,7 @@ mod tests {
             (Attribute::Uuid, vs_uuid!(oauth2_client_uuid)),
             (
                 Attribute::OAuth2RsOriginLanding,
-                vs_url!(Url::parse("https://demo.example.com").unwrap()),
+                ValueSetUrl::new(Url::parse("https://demo.example.com").unwrap()) as ValueSet,
             ),
         ]);
 

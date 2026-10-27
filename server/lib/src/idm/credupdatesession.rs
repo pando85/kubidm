@@ -1011,7 +1011,7 @@ impl IdmServerProxyWriteTransaction<'_> {
         &mut self,
         event: CredentialUpdateAccountRecovery,
         ct: Duration,
-    ) -> Result<(), OperationError> {
+    ) -> Result<Uuid, OperationError> {
         if !self.qs_write.domain_info().allow_account_recovery() {
             error!("Account Recovery is Disabled, Rejecting Attempt");
             return Err(OperationError::CU0010AccountRecoveryDisabled);
@@ -1061,7 +1061,7 @@ impl IdmServerProxyWriteTransaction<'_> {
         &mut self,
         event: InitCredentialUpdateIntentSendEvent,
         ct: Duration,
-    ) -> Result<(), OperationError> {
+    ) -> Result<Uuid, OperationError> {
         let (account, _resolved_account_policy, perms) =
             self.validate_init_credential_update(event.target, &event.ident)?;
 
@@ -1093,7 +1093,7 @@ impl IdmServerProxyWriteTransaction<'_> {
         perms: CredUpdateSessionPerms,
         to_email: String,
         ct: Duration,
-    ) -> Result<(), OperationError> {
+    ) -> Result<Uuid, OperationError> {
         // ==== AUTHORISATION CHECKED ===
         let (intent_id, expiry_time) =
             self.build_credential_update_intent(max_ttl, account, perms, ct)?;
@@ -3519,7 +3519,7 @@ mod tests {
         let test_entry = EntryInitNew::from_iter([
             (
                 Attribute::Class,
-                ValueSetIutf8::from_iter([
+                ValueSetIutf8N::from_iter([
                     EntryClass::Object.into(),
                     EntryClass::Account.into(),
                     EntryClass::PosixAccount.into(),
@@ -3654,7 +3654,7 @@ mod tests {
         let test_entry = EntryInitNew::from_iter([
             (
                 Attribute::Class,
-                ValueSetIutf8::from_iter([
+                ValueSetIutf8N::from_iter([
                     EntryClass::Object.into(),
                     EntryClass::Account.into(),
                     EntryClass::Person.into(),

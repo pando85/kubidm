@@ -206,7 +206,7 @@ pub static SCHEMA_ATTR_BADLIST_PASSWORD: LazyLock<SchemaAttribute> = LazyLock::n
     name: Attribute::BadlistPassword,
     description: "A password that is badlisted meaning that it can not be set as a valid password by any user account".to_string(),
     multivalue: true,
-    syntax: SyntaxType::Utf8StringInsensitive,
+    syntax: SyntaxType::Utf8StringInsensitiveN,
     ..Default::default()
 }
 });
@@ -1631,7 +1631,7 @@ pub static SCHEMA_ATTR_OAUTH2_EMAIL_DOMAIN: LazyLock<SchemaAttribute> =
         uuid: UUID_SCHEMA_ATTR_OAUTH2_EMAIL_DOMAIN,
         name: Attribute::OAuth2EmailDomain,
         description: "Email domain for home realm discovery routing".to_string(),
-        syntax: SyntaxType::Utf8StringInsensitive,
+        syntax: SyntaxType::Utf8StringInsensitiveN,
         multivalue: true,
         indexed: true,
         ..Default::default()
@@ -1660,7 +1660,7 @@ pub static SCHEMA_ATTR_OAUTH2_LINK_LOCAL_ACCOUNT: LazyLock<SchemaAttribute> =
         uuid: UUID_SCHEMA_ATTR_OAUTH2_LINK_LOCAL_ACCOUNT,
         name: Attribute::OAuth2LinkLocalAccount,
         description: "Reference to a local account linked to this federated identity".to_string(),
-        syntax: SyntaxType::ReferenceUuid,
+        syntax: SyntaxType::ReferenceUuidN,
         multivalue: true,
         indexed: true,
         ..Default::default()
@@ -1764,7 +1764,7 @@ pub static SCHEMA_ATTR_APPROVAL_OPERATION_TYPE: LazyLock<SchemaAttribute> =
         description: "The type of operation requiring approval".to_string(),
         indexed: true,
         multivalue: true,
-        syntax: SyntaxType::Utf8StringInsensitive,
+        syntax: SyntaxType::Utf8StringInsensitiveN,
         ..Default::default()
     });
 
@@ -1785,7 +1785,7 @@ pub static SCHEMA_ATTR_APPROVER: LazyLock<SchemaAttribute> = LazyLock::new(|| Sc
     description: "A reference to a user who can approve requests".to_string(),
     indexed: true,
     multivalue: true,
-    syntax: SyntaxType::ReferenceUuid,
+    syntax: SyntaxType::ReferenceUuidN,
     ..Default::default()
 });
 
@@ -1797,7 +1797,7 @@ pub static SCHEMA_ATTR_BACKUP_APPROVER: LazyLock<SchemaAttribute> =
         description: "A reference to a backup approver for escalation".to_string(),
         indexed: true,
         multivalue: true,
-        syntax: SyntaxType::ReferenceUuid,
+        syntax: SyntaxType::ReferenceUuidN,
         ..Default::default()
     });
 

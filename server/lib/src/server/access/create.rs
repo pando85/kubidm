@@ -147,12 +147,15 @@ fn create_filter_entry<'a>(
                 Attribute::DisplayName,
                 Attribute::Mail,
                 Attribute::Name,
+                Attribute::S256,
                 Attribute::Uuid,
             ]);
 
             let pres_cls = BTreeSet::from([
                 EntryClass::Object.into(),
                 EntryClass::AccountSignupRequest.into(),
+                EntryClass::Account.into(),
+                EntryClass::Person.into(),
             ]);
 
             // We may create account signup requests.
@@ -369,6 +372,7 @@ fn message_queue<'a>(ident: &Identity, entry: &Entry<EntryInit, EntryNew>) -> IR
                         Attribute::MailDestination,
                         Attribute::MessageTemplate,
                         Attribute::SendAfter,
+                        Attribute::Uuid,
                     ]);
 
                     let allow_cls = BTreeSet::from([
@@ -426,12 +430,12 @@ mod tests {
     }
 
     fn make_entry_with_class(class: &str) -> Entry<EntryInit, EntryNew> {
-        entry_init!((Attribute::Class, Value::new_iutf8(class)))
+        entry_init!((Attribute::Class, Value::new_iutf8n(class)))
     }
 
     fn make_entry_with_class_and_uuid(class: &str, uuid: Uuid) -> Entry<EntryInit, EntryNew> {
         entry_init!(
-            (Attribute::Class, Value::new_iutf8(class)),
+            (Attribute::Class, Value::new_iutf8n(class)),
             (Attribute::Uuid, Value::Uuid(uuid))
         )
     }

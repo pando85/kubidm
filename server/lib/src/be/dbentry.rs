@@ -84,6 +84,8 @@ impl DbEntry {
     pub fn stored_uuid(&self) -> Option<Uuid> {
         match &self.ent {
             DbEntryVers::V3 { attrs, .. } => match attrs.get(&Attribute::Uuid) {
+                Some(DbValueSetV2::UuidSingle(uuid)) => Some(*uuid),
+                // Entries written before uuid became a single value set.
                 Some(DbValueSetV2::Uuid(uuids)) => uuids.first().copied(),
                 _ => None,
             },
@@ -96,6 +98,10 @@ impl DbEntry {
     pub fn stored_name(&self) -> Option<&str> {
         match &self.ent {
             DbEntryVers::V3 { attrs, .. } => match attrs.get(&Attribute::Name) {
+                Some(DbValueSetV2::InameSingle(name)) | Some(DbValueSetV2::Iutf8Single(name)) => {
+                    Some(name.as_str())
+                }
+                // Entries written before name became a single value set.
                 Some(DbValueSetV2::Iname(names))
                 | Some(DbValueSetV2::Iutf8(names))
                 | Some(DbValueSetV2::Utf8(names)) => names.first().map(String::as_str),
@@ -228,6 +234,34 @@ mod tests {
                 _ => panic!("sample entry has no uuid"),
             },
         };
+
+        assert_eq!(entry.stored_uuid(), Some(expected_uuid));
+        assert_eq!(entry.stored_name(), Some("testuser"));
+    }
+
+    #[test]
+    fn test_dbentry_stored_identity_single_value() {
+        // Entries now store uuid and name as single value sets. Read them back from
+        // json, as WAL records and raw rows are.
+        let sid = Uuid::new_v4();
+        let expected_uuid = Uuid::new_v4();
+        let mut attrs = BTreeMap::new();
+        attrs.insert(Attribute::Uuid, DbValueSetV2::UuidSingle(expected_uuid));
+        attrs.insert(
+            Attribute::Name,
+            DbValueSetV2::InameSingle("testuser".to_string()),
+        );
+        let entry = DbEntry {
+            ent: DbEntryVers::V3 {
+                changestate: DbEntryChangeState::V1Live {
+                    at: make_cid(sid, 0),
+                    changes: BTreeMap::new(),
+                },
+                attrs,
+            },
+        };
+        let json = serde_json::to_vec(&entry).unwrap();
+        let entry: DbEntry = serde_json::from_slice(&json).unwrap();
 
         assert_eq!(entry.stored_uuid(), Some(expected_uuid));
         assert_eq!(entry.stored_name(), Some("testuser"));

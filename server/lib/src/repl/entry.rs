@@ -366,7 +366,7 @@ mod tests {
             Attribute::Uuid,
             vs_uuid![uuid!("00000000-0000-0000-0000-000000000001")],
         );
-        attrs.insert(Attribute::Class, vs_iutf8!["object", "account"]);
+        attrs.insert(Attribute::Class, vs_iutf8n!["object", "account"]);
         EntryChangeState::new_without_schema(&cid, &attrs)
     }
 
@@ -377,7 +377,7 @@ mod tests {
             Attribute::Uuid,
             vs_uuid![uuid!("00000000-0000-0000-0000-000000000001")],
         );
-        attrs.insert(Attribute::Class, vs_iutf8!["object", "tombstone"]);
+        attrs.insert(Attribute::Class, vs_iutf8n!["object", "tombstone"]);
         attrs.insert(Attribute::LastModifiedCid, vs_cid![cid.clone()]);
         EntryChangeState::new_without_schema(&cid, &attrs)
     }
@@ -414,7 +414,7 @@ mod tests {
     fn test_entry_change_state_new_without_schema_tombstone() {
         let cid = make_cid(uuid!("00000000-0000-0000-0000-000000000001"), 10);
         let mut attrs = Eattrs::default();
-        attrs.insert(Attribute::Class, vs_iutf8!["object", "tombstone"]);
+        attrs.insert(Attribute::Class, vs_iutf8n!["object", "tombstone"]);
         attrs.insert(
             Attribute::Uuid,
             vs_uuid![uuid!("00000000-0000-0000-0000-000000000001")],

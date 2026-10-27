@@ -29,7 +29,7 @@ impl QueryServerReadTransaction<'_> {
     ) -> Result<ApprovalPolicy, OperationError> {
         let filter = filter!(f_and!([
             f_eq(Attribute::Class, EntryClass::ApprovalPolicy.into()),
-            f_eq(Attribute::ApprovalPolicyName, PartialValue::new_utf8s(name))
+            f_eq(Attribute::ApprovalPolicyName, PartialValue::new_iname(name))
         ]));
         let entries = self.internal_search(filter)?;
 
@@ -49,7 +49,7 @@ impl QueryServerReadTransaction<'_> {
                 f_eq(Attribute::Class, EntryClass::ApprovalRequest.into()),
                 f_eq(
                     Attribute::ApprovalState,
-                    PartialValue::new_utf8s(s.as_str())
+                    PartialValue::new_iutf8(s.as_str())
                 )
             ])),
             None => filter!(f_eq(Attribute::Class, EntryClass::ApprovalRequest.into())),
@@ -88,18 +88,22 @@ impl QueryServerWriteTransaction<'_> {
     ) -> Result<(), OperationError> {
         let uuid = Uuid::new_v4();
 
-        let approvers: Vec<Value> = request.approvers.iter().map(|u| Value::Refer(*u)).collect();
+        let approvers: Vec<Value> = request
+            .approvers
+            .iter()
+            .map(|u| Value::ReferN(*u))
+            .collect();
 
         let backup_approvers: Vec<Value> = request
             .backup_approvers
             .iter()
-            .map(|u| Value::Refer(*u))
+            .map(|u| Value::ReferN(*u))
             .collect();
 
         let op_types: Vec<Value> = request
             .operation_types
             .iter()
-            .map(|o| Value::new_utf8(o.to_string()))
+            .map(|o| Value::new_iutf8n(&o.to_string()))
             .collect();
 
         let mut entry: Entry<EntryInit, EntryNew> = Entry::new();
@@ -110,11 +114,11 @@ impl QueryServerWriteTransaction<'_> {
         entry.set_ava(Attribute::Uuid, vec![Value::Uuid(uuid)]);
         entry.set_ava(
             Attribute::ApprovalPolicyName,
-            vec![Value::new_utf8(request.name.clone())],
+            vec![Value::new_iname(&request.name)],
         );
         entry.set_ava(
             Attribute::ApprovalPatternAttr,
-            vec![Value::new_utf8(request.pattern.to_string())],
+            vec![Value::new_iutf8(&request.pattern.to_string())],
         );
         entry.set_ava(
             Attribute::ApprovalTimeout,
@@ -151,7 +155,7 @@ impl QueryServerWriteTransaction<'_> {
     ) -> Result<(), OperationError> {
         let filter = filter!(f_and!([
             f_eq(Attribute::Class, EntryClass::ApprovalPolicy.into()),
-            f_eq(Attribute::ApprovalPolicyName, PartialValue::new_utf8s(name))
+            f_eq(Attribute::ApprovalPolicyName, PartialValue::new_iname(name))
         ]));
         self.internal_delete(&filter)
     }
@@ -164,7 +168,7 @@ impl QueryServerWriteTransaction<'_> {
     ) -> Result<(), OperationError> {
         let filter = filter!(f_and!([
             f_eq(Attribute::Class, EntryClass::ApprovalPolicy.into()),
-            f_eq(Attribute::ApprovalPolicyName, PartialValue::new_utf8s(name))
+            f_eq(Attribute::ApprovalPolicyName, PartialValue::new_iname(name))
         ]));
         let modlist = ModifyList::new_list(vec![
             Modify::Purged(Attribute::ApprovalPolicyEnabled),
@@ -270,7 +274,7 @@ fn approval_policy_from_entry(
     let uuid = entry.get_uuid();
 
     let name = entry
-        .get_ava_single_utf8(Attribute::ApprovalPolicyName)
+        .get_ava_single_iname(Attribute::ApprovalPolicyName)
         .ok_or(OperationError::MissingAttribute(
             Attribute::ApprovalPolicyName,
         ))?;
@@ -469,4 +473,66 @@ fn approval_request_from_entry(
         required_decisions,
         operation_details,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::migration_data::dl14::schema::{
+        SCHEMA_ATTR_APPROVAL_OPERATION_TYPE, SCHEMA_ATTR_APPROVAL_PATTERN,
+        SCHEMA_ATTR_APPROVAL_POLICY_NAME, SCHEMA_ATTR_APPROVER, SCHEMA_ATTR_BACKUP_APPROVER,
+    };
+    use crate::prelude::*;
+    use crate::schema::SchemaAttribute;
+
+    fn check(schema: &SchemaAttribute, attr: &Attribute, vals: Vec<Value>, expected_len: usize) {
+        let mut entry: Entry<EntryInit, EntryNew> = Entry::new();
+        entry.set_ava(attr.clone(), vals);
+        let vs = entry.get_ava_set(attr).expect("attribute missing");
+        assert_eq!(vs.len(), expected_len);
+        schema
+            .validate_ava(attr, vs)
+            .expect("values do not satisfy the declared attribute syntax");
+    }
+
+    /// The values written by `approval_policy_create` must satisfy the syntax declared in the
+    /// schema, and the multi-value attributes must retain every value that was written.
+    #[test]
+    fn test_approval_policy_multi_value_syntax() {
+        check(
+            &SCHEMA_ATTR_APPROVER,
+            &Attribute::Approver,
+            vec![Value::ReferN(UUID_ADMIN), Value::ReferN(UUID_IDM_ADMINS)],
+            2,
+        );
+        check(
+            &SCHEMA_ATTR_BACKUP_APPROVER,
+            &Attribute::BackupApprover,
+            vec![
+                Value::ReferN(UUID_IDM_ADMINS),
+                Value::ReferN(UUID_SYSTEM_ADMINS),
+            ],
+            2,
+        );
+        check(
+            &SCHEMA_ATTR_APPROVAL_OPERATION_TYPE,
+            &Attribute::ApprovalOperationType,
+            vec![
+                Value::new_iutf8n("create_high_privilege_entry"),
+                Value::new_iutf8n("schema_modify"),
+            ],
+            2,
+        );
+        check(
+            &SCHEMA_ATTR_APPROVAL_POLICY_NAME,
+            &Attribute::ApprovalPolicyName,
+            vec![Value::new_iname("multi_approver_policy")],
+            1,
+        );
+        check(
+            &SCHEMA_ATTR_APPROVAL_PATTERN,
+            &Attribute::ApprovalPatternAttr,
+            vec![Value::new_iutf8("majority")],
+            1,
+        );
+    }
 }

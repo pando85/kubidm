@@ -8,8 +8,8 @@ description: Use when syncing changes from the upstream kanidm/kanidm repository
 This skill handles syncing changes from the upstream `kanidm/kanidm` repository into the
 `pando85/kubidm` fork.
 
-Last run: 2026-10-06, PR #445 (43 upstream commits, 345 files, 172 conflicts, ~3h wall clock with 5
-parallel agents).
+Last run: 2026-10-27, PR #511 (13 upstream commits, 124 files, 20 conflicts; 5 mechanical). Previous:
+2026-10-06, PR #445 (43 commits, 172 conflicts, ~3h wall clock with 5 parallel agents).
 
 ## Repository Context
 
@@ -76,6 +76,10 @@ When unsure, check what the fork's HEAD uses: `git grep -n '<name>' HEAD -- '*.r
 - **ServerRole**: `proto/src/config.rs` (`pub use kubidm_proto::config::ServerRole` in
   `server/core/src/config.rs`; upstream has its own local `ServerRole` enum, drop upstream's copy).
 - **proto**: `proto/src/internal/{authorization,pip}.rs` re-exported from `internal/mod.rs`.
+- **WAL / PITR helpers**: `DbEntry::stored_uuid()` / `stored_name()` in `server/lib/src/be/dbentry.rs`
+  match `DbValueSetV2` variants directly; when upstream changes DB value formats, extend them (keep
+  the legacy arms so old WAL segments replay). Symptom when missed: all `pitr_test::*` fail with
+  `CorruptedEntry`.
 - **Tests**: the fork uses the `AuthenticatorBackend` / `perform_register` webauthn test API, not
   upstream's `WebauthnAuthenticator` / `do_registration`.
 
@@ -89,6 +93,15 @@ When unsure, check what the fork's HEAD uses: `git grep -n '<name>' HEAD -- '*.r
   (upstream `ffff00000229` is the fork's `UUID_SCHEMA_ATTR_OAUTH2_ISSUER`). Upstream's next numbers
   (`ffff00000230+`) are already taken; expect this every sync. Always finish with a duplicate check
   (script below).
+- **SyntaxType numbering**: same idea as UUIDs. The fork's `SyntaxType::TimeBoundedMember = 47`, so
+  upstream's `UuidN`..`UrlN` (upstream 47..51) live at 48..52 in `server/lib/src/value.rs`. New
+  upstream syntaxes go after the fork's highest number.
+- **Fork schema extras**: fork-only attributes/classes that must exist at DL >= 1.11 (delegation,
+  step-up re-auth, ACP time restriction, fork `AccessControlProfile`) live in
+  `kubidm_schema_attributes()` / `kubidm_schema_classes()` in `schema.rs`, chained last in
+  `generate_in_memory`, `migrate_schema_1_11` and `migrate_schema_1_12`. When upstream adds a
+  `migrate_schema_1_N`, chain them there too, and add fork single-value attrs to any upstream
+  on-disk rewrite list in migrations.
 - **SECURITY.md**: the fork removed AI-content restrictions (commit f6b16569f). Do not adopt
   upstream's "AI Usage in Vulnerability Reports" section.
 - **Dependencies**: accept upstream bumps, but keep the fork's version when it is newer (renovate
