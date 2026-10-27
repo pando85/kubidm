@@ -271,6 +271,20 @@ impl QueryServerWriteTransaction<'_> {
     }
 }
 
+/// Extract the referenced uuids from a reference valueset. Both the single value
+/// (`ReferenceUuid`) and multi value (`ReferenceUuidN`) syntaxes are supported, so that
+/// they can be resolved for presentation in the same way. Returns `None` if the valueset
+/// is not a reference type.
+fn valueset_reference_uuids(value: &ValueSet) -> Option<Vec<Uuid>> {
+    match value.syntax() {
+        SyntaxType::ReferenceUuidN => value
+            .as_refer_set()
+            .map(|r_set| r_set.iter().copied().collect()),
+        SyntaxType::ReferenceUuid => value.to_refer_single().map(|uuid| vec![uuid]),
+        _ => None,
+    }
+}
+
 /// The `QueryServerTransaction` trait provides a set of common read only operations to be
 /// shared between [`QueryServerReadTransaction`] and [`QueryServerWriteTransaction`]s.
 ///
@@ -1329,10 +1343,9 @@ pub trait QueryServerTransaction<'a> {
 
     // In the opposite direction, we can resolve values for presentation
     fn resolve_valueset(&mut self, value: &ValueSet) -> Result<Vec<String>, OperationError> {
-        if let Some(r_set) = value.as_refer_set() {
+        if let Some(r_set) = valueset_reference_uuids(value) {
             let v: Result<Vec<_>, _> = r_set
-                .iter()
-                .copied()
+                .into_iter()
                 .map(|ur| {
                     let nv = self.uuid_to_spn(ur)?;
                     match nv {
@@ -1384,10 +1397,9 @@ pub trait QueryServerTransaction<'a> {
         value: &ValueSet,
         basedn: &str,
     ) -> Result<Vec<Vec<u8>>, OperationError> {
-        if let Some(r_set) = value.as_refer_set() {
+        if let Some(r_set) = valueset_reference_uuids(value) {
             let v: Result<Vec<_>, _> = r_set
-                .iter()
-                .copied()
+                .into_iter()
                 .map(|ur| {
                     let rdn = self.uuid_to_rdn(ur)?;
                     Ok(format!("{rdn},{basedn}").into_bytes())
