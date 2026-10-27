@@ -167,10 +167,11 @@ impl TimeBoundedMember {
         valid_from: Option<OffsetDateTime>,
         valid_until: OffsetDateTime,
     ) -> Self {
+        // Normalise to UTC, which is how these are stored and loaded.
         Self {
             uuid,
-            valid_from,
-            valid_until,
+            valid_from: valid_from.map(|vf| vf.to_offset(time::UtcOffset::UTC)),
+            valid_until: valid_until.to_offset(time::UtcOffset::UTC),
         }
     }
 
@@ -178,6 +179,17 @@ impl TimeBoundedMember {
         let after_start = self.valid_from.is_none_or(|vf| when >= vf);
         let before_end = when < self.valid_until;
         after_start && before_end
+    }
+
+    /// A grant with a start time must end strictly after it starts, otherwise
+    /// it can never be valid. Both times must also be storable as RFC 3339, so
+    /// that a value which can not be persisted is rejected at write time.
+    pub fn has_valid_window(&self) -> bool {
+        let storable = |odt: &OffsetDateTime| odt.format(&Rfc3339).is_ok();
+
+        self.valid_from
+            .is_none_or(|vf| vf < self.valid_until && storable(&vf))
+            && storable(&self.valid_until)
     }
 }
 
@@ -2356,8 +2368,8 @@ impl Value {
             | Value::CredentialType(_)
             | Value::Json(_)
             | Value::Sha256(_)
-            | Value::WebauthnAttestationCaList(_)
-            | Value::TimeBoundedMember(_) => true,
+            | Value::WebauthnAttestationCaList(_) => true,
+            Value::TimeBoundedMember(m) => m.has_valid_window(),
         }
     }
 
@@ -2731,7 +2743,7 @@ mod tests {
     }
 
     mod time_bounded_member_tests {
-        use super::super::TimeBoundedMember;
+        use super::super::{TimeBoundedMember, Value};
         use std::time::Duration;
         use time::OffsetDateTime;
 
@@ -2835,6 +2847,8 @@ mod tests {
             let member = TimeBoundedMember::new(uuid, Some(instant), instant);
 
             assert!(!member.is_valid_at(instant));
+            assert!(!member.has_valid_window());
+            assert!(!Value::TimeBoundedMember(member).validate());
         }
 
         #[test]
@@ -2967,6 +2981,57 @@ mod tests {
             let cloned = member.clone();
 
             assert_eq!(member, cloned);
+        }
+
+        #[test]
+        fn test_time_bounded_member_new_normalises_utc() {
+            // An offset with a seconds component can not be expressed in RFC 3339.
+            let odd_offset = time::UtcOffset::from_hms(1, 0, 30).unwrap();
+            let start = baseline_time().to_offset(odd_offset);
+            let end = (baseline_time() + Duration::from_secs(3600)).to_offset(odd_offset);
+
+            let member = TimeBoundedMember::new(create_test_uuid(), Some(start), end);
+            assert_eq!(member.valid_from.unwrap().offset(), time::UtcOffset::UTC);
+            assert_eq!(member.valid_until.offset(), time::UtcOffset::UTC);
+            // Same instants.
+            assert_eq!(member.valid_from, Some(start));
+            assert_eq!(member.valid_until, end);
+            assert!(member.has_valid_window());
+        }
+
+        #[test]
+        fn test_time_bounded_member_rejects_unstorable_times() {
+            let uuid = create_test_uuid();
+            let start = baseline_time();
+            let end = start + Duration::from_secs(3600);
+
+            // Bypass the normalisation in new() to get an unformattable offset.
+            let odd_offset = time::UtcOffset::from_hms(1, 0, 30).unwrap();
+            let bad_from = TimeBoundedMember {
+                uuid,
+                valid_from: Some(start.to_offset(odd_offset)),
+                valid_until: end,
+            };
+            assert!(!bad_from.has_valid_window());
+            assert!(!Value::TimeBoundedMember(bad_from).validate());
+
+            let bad_until = TimeBoundedMember {
+                uuid,
+                valid_from: None,
+                valid_until: end.to_offset(odd_offset),
+            };
+            assert!(!bad_until.has_valid_window());
+
+            // Years outside 0..=9999 can not be formatted as RFC 3339.
+            let negative_year = time::Date::from_calendar_date(-1, time::Month::January, 1)
+                .unwrap()
+                .midnight()
+                .assume_utc();
+            let bad_year_from = TimeBoundedMember::new(uuid, Some(negative_year), end);
+            assert!(!bad_year_from.has_valid_window());
+            let bad_year_until = TimeBoundedMember::new(uuid, None, negative_year);
+            assert!(!bad_year_until.has_valid_window());
+            assert!(!Value::TimeBoundedMember(bad_year_until).validate());
         }
     }
 }

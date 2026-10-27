@@ -782,6 +782,27 @@ impl PurgeDeleteAfterEvent {
 }
 
 #[derive(Debug)]
+pub struct RefreshTimeBoundedMembershipEvent {
+    pub ident: Identity,
+    pub eventid: Uuid,
+}
+
+impl Default for RefreshTimeBoundedMembershipEvent {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RefreshTimeBoundedMembershipEvent {
+    pub fn new() -> Self {
+        RefreshTimeBoundedMembershipEvent {
+            ident: Identity::from_internal(),
+            eventid: Uuid::new_v4(),
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct ReviveRecycledEvent {
     pub ident: Identity,
     // This is the filter, as it will be processed.

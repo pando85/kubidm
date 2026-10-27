@@ -95,6 +95,14 @@ impl QueryServerWriteTransaction<'_> {
     }
 
     #[instrument(level = "debug", skip_all)]
+    /// Recompute memberof for time bounded members whose grant has expired or become
+    /// active since memberof was last applied. Returns the number of members updated,
+    /// so that the caller only needs to commit when this is non-zero.
+    pub fn refresh_time_bounded_memberships(&mut self) -> Result<usize, OperationError> {
+        crate::plugins::memberof::refresh_time_bounded_memberships(self)
+    }
+
+    #[instrument(level = "debug", skip_all)]
     pub fn revive_recycled(&mut self, re: &ReviveRecycledEvent) -> Result<(), OperationError> {
         // Revive an entry to live. This is a specialised function, and draws a lot of
         // inspiration from modify.

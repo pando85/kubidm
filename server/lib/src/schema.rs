@@ -290,7 +290,11 @@ impl SchemaAttribute {
             // SyntaxType::Json => matches!(v, PartialValue::Json),
             // Should not be queried
             SyntaxType::Json | SyntaxType::Message => false,
-            SyntaxType::TimeBoundedMember => matches!(v, PartialValue::TimeBoundedMember(_)),
+            // Refer is allowed so referential integrity can locate and remove grants.
+            SyntaxType::TimeBoundedMember => {
+                matches!(v, PartialValue::TimeBoundedMember(_))
+                    || matches!(v, PartialValue::Refer(_))
+            }
         };
         if r {
             Ok(())
@@ -1076,7 +1080,9 @@ impl SchemaWriteTransaction<'_> {
                 // So that when an rs is removed we trigger removal of the sessions.
                 a.syntax == SyntaxType::Oauth2Session ||
                 // When an application is removed we trigger removal of passwords
-                a.syntax == SyntaxType::ApplicationPassword
+                a.syntax == SyntaxType::ApplicationPassword ||
+                // When a member is removed we trigger removal of its time bounded grants
+                a.syntax == SyntaxType::TimeBoundedMember
             // May not need to be a ref type since it doesn't have external links/impact?
             // || a.syntax == SyntaxType::Session
             {

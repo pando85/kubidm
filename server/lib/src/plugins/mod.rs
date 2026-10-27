@@ -23,7 +23,7 @@ mod eckeygen;
 pub(crate) mod gidnumber;
 pub(crate) mod hmac_name_unique;
 mod keyobject;
-mod memberof;
+pub(crate) mod memberof;
 mod namehistory;
 mod oauth2;
 mod refint;
