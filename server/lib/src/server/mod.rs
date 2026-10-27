@@ -271,6 +271,13 @@ impl QueryServerWriteTransaction<'_> {
     }
 }
 
+/// Kubidm: OAuth2 client providers are loaded from both `OAuth2Client` and
+/// `OAuth2Federation` entries, so a change to either kind must reload them.
+pub(crate) fn is_oauth2_client_provider<VALID, STATE>(e: &Entry<VALID, STATE>) -> bool {
+    e.attribute_equality(Attribute::Class, &EntryClass::OAuth2Client.into())
+        || e.attribute_equality(Attribute::Class, &EntryClass::OAuth2Federation.into())
+}
+
 /// Extract the referenced uuids from a reference valueset. Both the single value
 /// (`ReferenceUuid`) and multi value (`ReferenceUuidN`) syntaxes are supported, so that
 /// they can be resolved for presentation in the same way. Returns `None` if the valueset
@@ -2161,13 +2168,17 @@ impl QueryServer {
 
         let be_txn = self.be.read()?;
 
+        // Read transactions have no caller supplied time. Access control time restrictions
+        // are evaluated at the time the transaction was opened.
+        let curtime = duration_from_epoch_now();
+
         Ok(QueryServerReadTransaction {
             be_txn,
             schema,
             d_info: self.d_info.read(),
             system_config: self.system_config.read(),
             feature_config: self.feature_config.read(),
-            accesscontrols: self.accesscontrols.read(),
+            accesscontrols: self.accesscontrols.read(curtime),
             key_providers: self.key_providers.read(),
             _db_ticket: db_ticket,
             _read_ticket: read_ticket,
@@ -2284,7 +2295,7 @@ impl QueryServer {
             trim_cid,
             be_txn,
             schema: schema_write,
-            accesscontrols: self.accesscontrols.write(),
+            accesscontrols: self.accesscontrols.write(curtime),
             changed_flags: ChangeFlag::empty(),
             changed_uuid: HashSet::new(),
             _db_ticket: db_ticket,
@@ -3072,6 +3083,12 @@ impl<'a> QueryServerWriteTransaction<'a> {
     #[inline]
     pub(crate) fn get_changed_oauth2_client(&self) -> bool {
         self.changed_flags.contains(ChangeFlag::OAUTH2_CLIENT)
+    }
+
+    /// Was the entry with this uuid created, modified or deleted in this transaction?
+    #[inline]
+    pub(crate) fn is_changed_uuid(&self, uuid: &Uuid) -> bool {
+        self.changed_uuid.contains(uuid)
     }
 
     /// Indicate that we are about to re-bootstrap this server. You should ONLY

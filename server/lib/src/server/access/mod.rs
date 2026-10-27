@@ -14,7 +14,8 @@
 //!   requirements (also search).
 
 use hashbrown::HashMap;
-use std::{cell::Cell, collections::BTreeSet, ops::DerefMut, sync::Arc};
+use std::{cell::Cell, collections::BTreeSet, ops::DerefMut, sync::Arc, time::Duration};
+use time::OffsetDateTime;
 
 use concread::{arcache::ARCacheBuilder, cowcell::*};
 use uuid::Uuid;
@@ -289,6 +290,8 @@ pub trait AccessControlsTransaction<'a> {
 
     #[allow(clippy::mut_from_ref)]
     fn get_acp_resolve_filter_cache(&self) -> &mut ResolveFilterCacheReadTxn<'a>;
+    /// The time of the enclosing transaction, used to evaluate ACP time restrictions.
+    fn get_curtime(&self) -> OffsetDateTime;
 
     #[instrument(level = "trace", name = "access::search_related_acp", skip_all)]
     fn search_related_acp<'b>(
@@ -398,7 +401,7 @@ pub trait AccessControlsTransaction<'a> {
         let allowed_entries: Vec<_> = entries
             .into_iter()
             .filter(|e| {
-                match apply_search_access(ident, related_acp.as_slice(), e) {
+                match apply_search_access(ident, related_acp.as_slice(), e, self.get_curtime()) {
                     SearchResult::Deny => false,
                     SearchResult::Grant => true,
                     SearchResult::Allow(allowed_attrs) => {
@@ -497,7 +500,7 @@ pub trait AccessControlsTransaction<'a> {
         let allowed_entries: Vec<_> = entries
             .into_iter()
             .filter_map(|entry| {
-                match apply_search_access(&se.ident, &search_related_acp, &entry) {
+                match apply_search_access(&se.ident, &search_related_acp, &entry, self.get_curtime()) {
                     SearchResult::Deny => {
                         None
                     }
@@ -684,7 +687,13 @@ pub trait AccessControlsTransaction<'a> {
         let r = entries.iter().all(|e| {
             debug!(entry_id = %e.get_display_id());
 
-            match apply_modify_access(&me.ident, related_acp.as_slice(), sync_agmts, e) {
+            match apply_modify_access(
+                &me.ident,
+                related_acp.as_slice(),
+                sync_agmts,
+                e,
+                self.get_curtime(),
+            ) {
                 ModifyResult::Deny => {
                     security_error!("modify access denied.");
                     false
@@ -867,7 +876,13 @@ pub trait AccessControlsTransaction<'a> {
 
             let sync_agmts = self.get_sync_agreements();
 
-            match apply_modify_access(&me.ident, related_acp.as_slice(), sync_agmts, e) {
+            match apply_modify_access(
+                &me.ident,
+                related_acp.as_slice(),
+                sync_agmts,
+                e,
+                self.get_curtime(),
+            ) {
                 ModifyResult::Deny => {
                     security_error!("modify access denied.");
                     false
@@ -983,7 +998,7 @@ pub trait AccessControlsTransaction<'a> {
             debug!(?requested_pres_classes, "Requested present class set");
             debug!(entry_id = %e.get_display_id());
 
-            match apply_create_access(&ce.ident, related_acp.as_slice(), e) {
+            match apply_create_access(&ce.ident, related_acp.as_slice(), e, self.get_curtime()) {
                 CreateResult::Deny => false,
                 CreateResult::Grant => true,
                 CreateResult::Allow { pres, pres_cls } => {
@@ -1069,7 +1084,7 @@ pub trait AccessControlsTransaction<'a> {
 
         // For each entry
         let r = entries.iter().all(|e| {
-            match apply_delete_access(&de.ident, related_acp.as_slice(), e) {
+            match apply_delete_access(&de.ident, related_acp.as_slice(), e, self.get_curtime()) {
                 DeleteResult::Deny => false,
                 DeleteResult::Grant => true,
                 DeleteResult::ReauthRequired { .. } => false,
@@ -1142,19 +1157,26 @@ pub trait AccessControlsTransaction<'a> {
         sync_agmts: &HashMap<Uuid, BTreeSet<Attribute>>,
     ) -> AccessEffectivePermission {
         // == search ==
-        let search_effective = match apply_search_access(ident, search_related_acp, entry) {
-            SearchResult::Deny => Access::Deny,
-            SearchResult::Grant => Access::Grant,
-            SearchResult::Allow(allowed_attrs) => {
-                // Bound by requested attrs?
-                Access::Allow(allowed_attrs.into_iter().collect())
-            }
-            SearchResult::ReauthRequired { .. } => Access::Deny,
-        };
+        let search_effective =
+            match apply_search_access(ident, search_related_acp, entry, self.get_curtime()) {
+                SearchResult::Deny => Access::Deny,
+                SearchResult::Grant => Access::Grant,
+                SearchResult::Allow(allowed_attrs) => {
+                    // Bound by requested attrs?
+                    Access::Allow(allowed_attrs.into_iter().collect())
+                }
+                SearchResult::ReauthRequired { .. } => Access::Deny,
+            };
 
         // == modify ==
         let (modify_pres, modify_rem, modify_pres_class, modify_rem_class) =
-            match apply_modify_access(ident, modify_related_acp, sync_agmts, entry) {
+            match apply_modify_access(
+                ident,
+                modify_related_acp,
+                sync_agmts,
+                entry,
+                self.get_curtime(),
+            ) {
                 ModifyResult::Deny => (
                     Access::Deny,
                     Access::Deny,
@@ -1187,7 +1209,8 @@ pub trait AccessControlsTransaction<'a> {
             };
 
         // == delete ==
-        let delete_status = apply_delete_access(ident, delete_related_acp, entry);
+        let delete_status =
+            apply_delete_access(ident, delete_related_acp, entry, self.get_curtime());
 
         let delete = match delete_status {
             DeleteResult::Deny => false,
@@ -1211,6 +1234,7 @@ pub trait AccessControlsTransaction<'a> {
 pub struct AccessControlsWriteTransaction<'a> {
     inner: CowCellWriteTxn<'a, AccessControlsInner>,
     acp_resolve_filter_cache: Cell<ResolveFilterCacheReadTxn<'a>>,
+    curtime: OffsetDateTime,
 }
 
 impl AccessControlsWriteTransaction<'_> {
@@ -1293,6 +1317,10 @@ impl<'a> AccessControlsTransaction<'a> for AccessControlsWriteTransaction<'a> {
             &mut (*mptr) as &mut ResolveFilterCacheReadTxn<'a>
         }
     }
+
+    fn get_curtime(&self) -> OffsetDateTime {
+        self.curtime
+    }
 }
 
 // =========================================================================
@@ -1303,6 +1331,7 @@ pub struct AccessControlsReadTransaction<'a> {
     inner: CowCellReadTxn<AccessControlsInner>,
     // acp_related_search_cache: Cell<ARCacheReadTxn<'a, Uuid, Vec<Uuid>>>,
     acp_resolve_filter_cache: Cell<ResolveFilterCacheReadTxn<'a>>,
+    curtime: OffsetDateTime,
 }
 
 unsafe impl Sync for AccessControlsReadTransaction<'_> {}
@@ -1335,6 +1364,10 @@ impl<'a> AccessControlsTransaction<'a> for AccessControlsReadTransaction<'a> {
             let mptr = self.acp_resolve_filter_cache.as_ptr();
             &mut (*mptr) as &mut ResolveFilterCacheReadTxn<'a>
         }
+    }
+
+    fn get_curtime(&self) -> OffsetDateTime {
+        self.curtime
     }
 }
 
@@ -1369,20 +1402,24 @@ impl AccessControls {
         self.acp_resolve_filter_cache.try_quiesce();
     }
 
-    pub fn read(&self) -> AccessControlsReadTransaction<'_> {
+    /// `curtime` is the time of the enclosing transaction, see `get_curtime`.
+    pub fn read(&self, curtime: Duration) -> AccessControlsReadTransaction<'_> {
         AccessControlsReadTransaction {
             inner: self.inner.read(),
             // acp_related_search_cache: Cell::new(self.acp_related_search_cache.read()),
             acp_resolve_filter_cache: Cell::new(self.acp_resolve_filter_cache.read()),
+            curtime: OffsetDateTime::UNIX_EPOCH + curtime,
         }
     }
 
-    pub fn write(&self) -> AccessControlsWriteTransaction<'_> {
+    /// `curtime` is the time of the enclosing transaction, see `get_curtime`.
+    pub fn write(&self, curtime: Duration) -> AccessControlsWriteTransaction<'_> {
         AccessControlsWriteTransaction {
             inner: self.inner.write(),
             // acp_related_search_cache_wr: self.acp_related_search_cache.write(),
             // acp_related_search_cache: Cell::new(self.acp_related_search_cache.read()),
             acp_resolve_filter_cache: Cell::new(self.acp_resolve_filter_cache.read()),
+            curtime: OffsetDateTime::UNIX_EPOCH + curtime,
         }
     }
 }
@@ -1698,6 +1735,24 @@ mod tests {
 
         let mut qs_read = qs.read().await.unwrap();
         assert_eq!(search_as_reader(&mut qs_read), 1);
+        drop(qs_read);
+
+        // The restriction is evaluated at the transaction time, not the wall clock, and
+        // the end of the window is exclusive.
+        for (offset, expected) in [
+            (std::time::Duration::from_secs(86_400 - 1), 1),
+            (std::time::Duration::from_secs(86_400), 0),
+        ] {
+            let mut qs_write = qs.write(ct + offset).await.unwrap();
+            let reader = qs_write.internal_search_uuid(reader_uuid).unwrap();
+            let ident = Identity::from_impersonate_entry_readonly(reader);
+            let filter = filter!(f_eq(Attribute::Name, PartialValue::new_iname("tr_target")));
+            let found = qs_write
+                .impersonate_search(filter.clone(), filter, &ident)
+                .expect("search failed")
+                .len();
+            assert_eq!(found, expected, "offset {offset:?}");
+        }
     }
 
     #[qs_test]
@@ -2148,7 +2203,7 @@ mod tests {
             $expect:expr
         ) => {{
             let ac = AccessControls::default();
-            let mut acw = ac.write();
+            let mut acw = ac.write(duration_from_epoch_now());
             acw.update_search($controls).expect("Failed to update");
             let acw = acw;
 
@@ -2169,7 +2224,7 @@ mod tests {
         expect: Vec<EntrySealedCommitted>,
     ) {
         let ac = AccessControls::default();
-        let mut acw = ac.write();
+        let mut acw = ac.write(duration_from_epoch_now());
         acw.update_search(controls).expect("Failed to update");
         let acw = acw;
 
@@ -2428,7 +2483,7 @@ mod tests {
             $expect:expr
         ) => {{
             let ac = AccessControls::default();
-            let mut acw = ac.write();
+            let mut acw = ac.write(duration_from_epoch_now());
             acw.update_modify($controls).expect("Failed to update");
             let acw = acw;
 
@@ -2450,7 +2505,7 @@ mod tests {
             $expect:expr
         ) => {{
             let ac = AccessControls::default();
-            let mut acw = ac.write();
+            let mut acw = ac.write(duration_from_epoch_now());
             acw.update_modify($controls).expect("Failed to update");
             let mut sync_agmt = HashMap::new();
             let mut set = BTreeSet::new();
@@ -2716,7 +2771,7 @@ mod tests {
             $expect:expr
         ) => {{
             let ac = AccessControls::default();
-            let mut acw = ac.write();
+            let mut acw = ac.write(duration_from_epoch_now());
             acw.update_create($controls).expect("Failed to update");
             let acw = acw;
 
@@ -2872,7 +2927,7 @@ mod tests {
             $expect:expr
         ) => {{
             let ac = AccessControls::default();
-            let mut acw = ac.write();
+            let mut acw = ac.write(duration_from_epoch_now());
             acw.update_delete($controls).expect("Failed to update");
             let acw = acw;
 
@@ -2978,7 +3033,7 @@ mod tests {
             $expect:expr
         ) => {{
             let ac = AccessControls::default();
-            let mut acw = ac.write();
+            let mut acw = ac.write(duration_from_epoch_now());
             acw.update_search($search_controls)
                 .expect("Failed to update");
             acw.update_modify($modify_controls)
@@ -5141,7 +5196,7 @@ mod tests {
         let run_batch = |bme: &crate::server::batch_modify::BatchModifyEvent,
                          acps: Vec<AccessControlModify>| {
             let ac = AccessControls::default();
-            let mut acw = ac.write();
+            let mut acw = ac.write(duration_from_epoch_now());
             acw.update_modify(acps).expect("Failed to update");
             acw.batch_modify_allow_operation(bme, &data_set)
                 .expect("op failed")

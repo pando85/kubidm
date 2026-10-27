@@ -1,4 +1,4 @@
-use super::{ChangeFlag, QueryServerWriteTransaction};
+use super::{is_oauth2_client_provider, ChangeFlag, QueryServerWriteTransaction};
 use crate::{prelude::*, server::Plugins};
 use std::collections::BTreeMap;
 
@@ -230,7 +230,7 @@ impl QueryServerWriteTransaction<'_> {
             && norm_cand
                 .iter()
                 .chain(pre_candidates.iter().map(|e| e.as_ref()))
-                .any(|e| e.attribute_equality(Attribute::Class, &EntryClass::OAuth2Client.into()))
+                .any(is_oauth2_client_provider)
         {
             self.changed_flags.insert(ChangeFlag::OAUTH2_CLIENT)
         }

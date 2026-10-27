@@ -291,7 +291,22 @@ pub(crate) fn kubidm_builtin_entries() -> Result<Vec<EntryInitNew>, OperationErr
         BUILTIN_DELEGATED_ROLE_GROUP_ADMIN.clone().into(),
         // Approval workflows
         BUILTIN_GROUP_APPROVAL_ADMINS.clone().try_into()?,
+        // Must come after the fork's privileged groups (they have to exist) and after the
+        // upstream idm_high_privilege group (it has to exist, this only adds members).
+        kubidm_high_privilege_members(),
     ])
+}
+
+/// Kubidm fork-only privileged builtin groups that are members of `idm_high_privilege`, so
+/// that they are protected like the upstream privileged groups (for example, members of
+/// `idm_group_admins` can not modify them). The upstream group definitions do not contain
+/// them, so the membership is asserted as a partial entry: on migration, multi-value
+/// attributes are only added, so the upstream members are kept.
+fn kubidm_high_privilege_members() -> EntryInitNew {
+    entry_init!(
+        (Attribute::Uuid, Value::Uuid(UUID_IDM_HIGH_PRIVILEGE)),
+        (Attribute::Member, Value::ReferN(UUID_IDM_APPROVAL_ADMINS))
+    )
 }
 
 pub fn phase_7_builtin_access_control_profiles() -> Vec<EntryInitNew> {

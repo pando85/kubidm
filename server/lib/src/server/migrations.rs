@@ -1348,9 +1348,33 @@ mod tests {
         write_txn.commit().expect("Unable to commit");
 
         let mut write_txn = server.write(duration_from_epoch_now()).await.unwrap();
+        // idm_approval_admins is high privilege at the previous level too. Remove that to
+        // check that the migration restores it.
+        let is_high_privilege = |txn: &mut QueryServerWriteTransaction<'_>| {
+            txn.internal_search_uuid(UUID_IDM_HIGH_PRIVILEGE)
+                .expect("idm_high_privilege missing")
+                .attribute_equality(
+                    Attribute::Member,
+                    &PartialValue::Refer(UUID_IDM_APPROVAL_ADMINS),
+                )
+        };
+        assert!(is_high_privilege(&mut write_txn));
+        write_txn
+            .internal_modify_uuid(
+                UUID_IDM_HIGH_PRIVILEGE,
+                &ModifyList::new_remove(
+                    Attribute::Member,
+                    PartialValue::Refer(UUID_IDM_APPROVAL_ADMINS),
+                ),
+            )
+            .expect("failed to remove high privilege membership");
+        assert!(!is_high_privilege(&mut write_txn));
+
         write_txn
             .internal_apply_domain_migration(DOMAIN_TGT_LEVEL)
             .expect("Unable to set domain level");
+
+        assert!(is_high_privilege(&mut write_txn));
 
         let fed = write_txn
             .internal_search_uuid(fed_uuid)

@@ -14,6 +14,7 @@ use super::{
 use crate::prelude::*;
 use hashbrown::HashMap;
 use std::{collections::BTreeSet, ops::Sub, sync::Arc};
+use time::OffsetDateTime;
 
 pub enum ModifyResult<'a> {
     Deny,
@@ -35,6 +36,7 @@ pub fn apply_modify_access<'a>(
     related_acp: &'a [AccessControlModifyResolved],
     sync_agreements: &HashMap<Uuid, BTreeSet<Attribute>>,
     entry: &Arc<EntrySealedCommitted>,
+    current_time: OffsetDateTime,
 ) -> ModifyResult<'a> {
     let mut denied = false;
     let mut grant = false;
@@ -195,6 +197,7 @@ pub fn apply_modify_access<'a>(
                 if !check_time_restriction(
                     acm.acp.acp.time_restriction_start,
                     acm.acp.acp.time_restriction_end,
+                    current_time,
                 ) {
                     debug!(entry = ?entry.get_display_id(), acm = %acm.acp.acp.name, "time restriction not satisfied");
                     return None;
@@ -914,7 +917,13 @@ mod tests {
         let entry = make_sealed_entry("account");
         let acps: Vec<AccessControlModifyResolved> = vec![];
         let sync_agreements = HashMap::new();
-        let result = apply_modify_access(&ident, &acps, &sync_agreements, &entry);
+        let result = apply_modify_access(
+            &ident,
+            &acps,
+            &sync_agreements,
+            &entry,
+            OffsetDateTime::UNIX_EPOCH + duration_from_epoch_now(),
+        );
         assert!(matches!(result, ModifyResult::Grant));
     }
 
@@ -928,7 +937,13 @@ mod tests {
         );
         let acps: Vec<AccessControlModifyResolved> = vec![];
         let sync_agreements = HashMap::new();
-        let result = apply_modify_access(&ident, &acps, &sync_agreements, &entry);
+        let result = apply_modify_access(
+            &ident,
+            &acps,
+            &sync_agreements,
+            &entry,
+            OffsetDateTime::UNIX_EPOCH + duration_from_epoch_now(),
+        );
         match result {
             ModifyResult::Allow {
                 pres,
@@ -959,7 +974,13 @@ mod tests {
         );
         let acps: Vec<AccessControlModifyResolved> = vec![];
         let sync_agreements = HashMap::new();
-        let result = apply_modify_access(&ident, &acps, &sync_agreements, &entry);
+        let result = apply_modify_access(
+            &ident,
+            &acps,
+            &sync_agreements,
+            &entry,
+            OffsetDateTime::UNIX_EPOCH + duration_from_epoch_now(),
+        );
         assert!(matches!(result, ModifyResult::Deny));
     }
 
@@ -969,7 +990,13 @@ mod tests {
         let entry = make_sealed_entry("account");
         let acps: Vec<AccessControlModifyResolved> = vec![];
         let sync_agreements = HashMap::new();
-        let result = apply_modify_access(&ident, &acps, &sync_agreements, &entry);
+        let result = apply_modify_access(
+            &ident,
+            &acps,
+            &sync_agreements,
+            &entry,
+            OffsetDateTime::UNIX_EPOCH + duration_from_epoch_now(),
+        );
         match result {
             ModifyResult::Allow {
                 pres,

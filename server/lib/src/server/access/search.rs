@@ -8,6 +8,7 @@ use super::{
 };
 use crate::prelude::*;
 use std::{collections::BTreeSet, ops::Sub, sync::Arc};
+use time::OffsetDateTime;
 
 pub enum SearchResult {
     Deny,
@@ -23,6 +24,7 @@ pub fn apply_search_access(
     ident: &Identity,
     related_acp: &[AccessControlSearchResolved],
     entry: &Arc<EntrySealedCommitted>,
+    current_time: OffsetDateTime,
 ) -> SearchResult {
     // This could be considered "slow" due to allocs each iter with the entry. We
     // could move these out of the loop and reuse, but there are likely risks to
@@ -34,7 +36,7 @@ pub fn apply_search_access(
     let mut reauth_required: Option<String> = None;
 
     // The access control profile
-    match search_filter_entry(ident, related_acp, entry) {
+    match search_filter_entry(ident, related_acp, entry, current_time) {
         AccessSrchResult::Deny => denied = true,
         AccessSrchResult::Grant => grant = true,
         AccessSrchResult::Ignore => {}
@@ -103,6 +105,7 @@ fn search_filter_entry(
     ident: &Identity,
     related_acp: &[AccessControlSearchResolved],
     entry: &Arc<EntrySealedCommitted>,
+    current_time: OffsetDateTime,
 ) -> AccessSrchResult {
     // If this is an internal search, return our working set.
     match &ident.origin {
@@ -242,6 +245,7 @@ fn search_filter_entry(
             if !check_time_restriction(
                 acs.acp.acp.time_restriction_start,
                 acs.acp.acp.time_restriction_end,
+                current_time,
             ) {
                 debug!(entry = ?entry.get_display_id(), acs = %acs.acp.acp.name, "time restriction not satisfied");
                 return None;
@@ -474,7 +478,12 @@ mod tests {
             uuid::uuid!("00000000-0000-0000-0000-000000000100"),
         );
         let acps: Vec<AccessControlSearchResolved> = vec![];
-        let result = search_filter_entry(&ident, &acps, &entry);
+        let result = search_filter_entry(
+            &ident,
+            &acps,
+            &entry,
+            OffsetDateTime::UNIX_EPOCH + duration_from_epoch_now(),
+        );
         assert!(matches!(result, AccessSrchResult::Grant));
     }
 
@@ -486,7 +495,12 @@ mod tests {
             uuid::uuid!("00000000-0000-0000-0000-000000000100"),
         );
         let acps: Vec<AccessControlSearchResolved> = vec![];
-        let result = search_filter_entry(&ident, &acps, &entry);
+        let result = search_filter_entry(
+            &ident,
+            &acps,
+            &entry,
+            OffsetDateTime::UNIX_EPOCH + duration_from_epoch_now(),
+        );
         assert!(matches!(result, AccessSrchResult::Grant));
     }
 
@@ -498,7 +512,12 @@ mod tests {
             uuid::uuid!("00000000-0000-0000-0000-000000000100"),
         );
         let acps: Vec<AccessControlSearchResolved> = vec![];
-        let result = search_filter_entry(&ident, &acps, &entry);
+        let result = search_filter_entry(
+            &ident,
+            &acps,
+            &entry,
+            OffsetDateTime::UNIX_EPOCH + duration_from_epoch_now(),
+        );
         assert!(matches!(result, AccessSrchResult::Deny));
     }
 
@@ -513,7 +532,12 @@ mod tests {
             .into_sealed_committed(),
         );
         let acps: Vec<AccessControlSearchResolved> = vec![];
-        let result = search_filter_entry(&ident, &acps, &entry);
+        let result = search_filter_entry(
+            &ident,
+            &acps,
+            &entry,
+            OffsetDateTime::UNIX_EPOCH + duration_from_epoch_now(),
+        );
         assert!(matches!(result, AccessSrchResult::Deny));
     }
 
@@ -537,7 +561,12 @@ mod tests {
             uuid::uuid!("00000000-0000-0000-0000-000000000100"),
         );
         let acps: Vec<AccessControlSearchResolved> = vec![];
-        let result = search_filter_entry(&ident, &acps, &target);
+        let result = search_filter_entry(
+            &ident,
+            &acps,
+            &target,
+            OffsetDateTime::UNIX_EPOCH + duration_from_epoch_now(),
+        );
         assert!(matches!(result, AccessSrchResult::Deny));
     }
 
@@ -549,7 +578,12 @@ mod tests {
             uuid::uuid!("00000000-0000-0000-0000-000000000100"),
         );
         let acps: Vec<AccessControlSearchResolved> = vec![];
-        let result = search_filter_entry(&ident, &acps, &entry);
+        let result = search_filter_entry(
+            &ident,
+            &acps,
+            &entry,
+            OffsetDateTime::UNIX_EPOCH + duration_from_epoch_now(),
+        );
         match result {
             AccessSrchResult::Allow { attr } => assert!(attr.is_empty()),
             _ => panic!("Expected Allow with empty attrs"),
@@ -564,7 +598,12 @@ mod tests {
             uuid::uuid!("00000000-0000-0000-0000-000000000100"),
         );
         let acps: Vec<AccessControlSearchResolved> = vec![];
-        let result = search_filter_entry(&ident, &acps, &entry);
+        let result = search_filter_entry(
+            &ident,
+            &acps,
+            &entry,
+            OffsetDateTime::UNIX_EPOCH + duration_from_epoch_now(),
+        );
         match result {
             AccessSrchResult::Allow { attr } => assert!(attr.is_empty()),
             _ => panic!("Expected Allow with empty attrs"),
@@ -612,7 +651,12 @@ mod tests {
             uuid::uuid!("00000000-0000-0000-0000-000000000100"),
         );
         let acps: Vec<AccessControlSearchResolved> = vec![];
-        let result = apply_search_access(&ident, &acps, &entry);
+        let result = apply_search_access(
+            &ident,
+            &acps,
+            &entry,
+            OffsetDateTime::UNIX_EPOCH + duration_from_epoch_now(),
+        );
         assert!(matches!(result, SearchResult::Grant));
     }
 
@@ -624,7 +668,12 @@ mod tests {
             uuid::uuid!("00000000-0000-0000-0000-000000000100"),
         );
         let acps: Vec<AccessControlSearchResolved> = vec![];
-        let result = apply_search_access(&ident, &acps, &entry);
+        let result = apply_search_access(
+            &ident,
+            &acps,
+            &entry,
+            OffsetDateTime::UNIX_EPOCH + duration_from_epoch_now(),
+        );
         match result {
             SearchResult::Allow(attrs) => assert!(attrs.is_empty()),
             _ => panic!("Expected Allow with empty attrs"),

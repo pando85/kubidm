@@ -239,8 +239,28 @@ pub async fn discover_oidc_provider(
 }
 
 impl IdmServerProxyWriteTransaction<'_> {
+    /// Reload the OAuth2 client providers (`OAuth2Client` and `OAuth2Federation` entries).
+    /// This runs on commit when a provider entry changed. A provider that was changed in
+    /// this transaction and is invalid fails the reload, so the change is rejected. Invalid
+    /// providers that were not changed are logged and skipped, so a pre-existing bad entry
+    /// never blocks unrelated writes (or replication).
     #[instrument(level = "debug", skip_all)]
     pub(crate) fn reload_oauth2_client_providers(&mut self) -> Result<(), OperationError> {
+        self.reload_oauth2_client_providers_inner(true)
+    }
+
+    /// As [Self::reload_oauth2_client_providers], but every invalid provider entry is
+    /// logged and skipped. Used at startup, so a bad entry does not stop the server.
+    #[instrument(level = "debug", skip_all)]
+    pub(crate) fn reload_oauth2_client_providers_lenient(&mut self) -> Result<(), OperationError> {
+        self.reload_oauth2_client_providers_inner(false)
+    }
+
+    /// `strict_for_changed`: fail on an invalid provider that was changed in this txn.
+    fn reload_oauth2_client_providers_inner(
+        &mut self,
+        strict_for_changed: bool,
+    ) -> Result<(), OperationError> {
         let oauth2_client_entries = self.qs_write.internal_search(filter!(f_or!([
             f_eq(Attribute::Class, EntryClass::OAuth2Client.into()),
             f_eq(Attribute::Class, EntryClass::OAuth2Federation.into())
@@ -253,125 +273,23 @@ impl IdmServerProxyWriteTransaction<'_> {
 
         for provider_entry in oauth2_client_entries {
             let uuid = provider_entry.get_uuid();
-            trace!(?uuid, "Checking OAuth2 Provider configuration");
-
-            let name = provider_entry
-                .get_ava_single_iname(Attribute::Name)
-                .map(str::to_string)
-                .ok_or(OperationError::InvalidValueState)?;
-
-            let client_id = provider_entry
-                .get_ava_single_utf8(Attribute::OAuth2ClientId)
-                .map(str::to_string)
-                .ok_or(OperationError::InvalidValueState)?;
-
-            let client_basic_secret = provider_entry
-                .get_ava_single_utf8(Attribute::OAuth2ClientSecret)
-                .map(str::to_string)
-                .ok_or(OperationError::InvalidValueState)?;
-
-            let issuer = provider_entry
-                .get_ava_single_url(Attribute::OAuth2Issuer)
-                .cloned();
-
-            let authorisation_endpoint = provider_entry
-                .get_ava_single_url(Attribute::OAuth2AuthorisationEndpoint)
-                .cloned();
-
-            let token_endpoint = provider_entry
-                .get_ava_single_url(Attribute::OAuth2TokenEndpoint)
-                .cloned();
-
-            let request_scopes = provider_entry
-                .get_ava_as_oauthscopes(Attribute::OAuth2RequestScopes)
-                .map(|s| s.map(str::to_string).collect())
-                .unwrap_or_default();
-
-            let jwks_uri = provider_entry
-                .get_ava_single_url(Attribute::OAuth2JwksUri)
-                .cloned();
-
-            let userinfo_endpoint = provider_entry
-                .get_ava_single_url(Attribute::OAuth2UserinfoEndpoint)
-                .cloned();
-
-            let display_name = provider_entry
-                .get_ava_single_utf8(Attribute::OAuth2DisplayName)
-                .map(str::to_string);
-
-            let email_domains: BTreeSet<String> = provider_entry
-                .get_ava_iter_iutf8(Attribute::OAuth2EmailDomain)
-                .map(|s| s.map(str::to_string).collect())
-                .unwrap_or_default();
-
-            // OAuth2LinkPolicy is Utf8StringInsensitive and OAuth2FederationId is
-            // Utf8StringIname, so they must be read with the matching accessors.
-            let link_policy = provider_entry
-                .get_ava_single_iutf8(Attribute::OAuth2LinkPolicy)
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(AccountLinkPolicy::Manual);
-
-            let idp_initiated_enabled = provider_entry
-                .get_ava_single_bool(Attribute::OAuth2IdpInitiatedEnabled)
-                .unwrap_or(false);
-
-            let federation_id = provider_entry
-                .get_ava_single_iname(Attribute::OAuth2FederationId)
-                .map(str::to_string);
-
-            let auto_discovery = provider_entry
-                .get_ava_single_bool(Attribute::OAuth2AutoDiscovery)
-                .unwrap_or(false);
-
-            let (authorisation_endpoint, token_endpoint) =
-                match (authorisation_endpoint, token_endpoint, issuer.as_ref()) {
-                    (Some(auth), Some(token), _) => (auth, token),
-                    (None, None, Some(issuer_url)) => {
-                        let mut auth = issuer_url.clone();
-                        auth.set_path("/oauth2/authorize");
-
-                        let mut token = issuer_url.clone();
-                        token.set_path("/oauth2/token");
-
-                        (auth, token)
-                    }
-                    _ => {
-                        error!(?uuid, "OAuth2 provider missing required endpoints");
-                        return Err(OperationError::InvalidValueState);
-                    }
-                };
-
-            let maybe_rfc7662_endpoint = provider_entry
-                .get_ava_single_url(Attribute::OAuth2TokenIntrospectEndpoint)
-                .cloned();
-
-            let user_sub_verifier = match maybe_rfc7662_endpoint {
-                Some(endpoint) => OAuth2SubjectVerifier::Rfc7662TokenIntrospection { endpoint },
-                None => OAuth2SubjectVerifier::None,
-            };
-
-            let provider = OAuth2ClientProvider {
-                name,
-                uuid,
-                client_id,
-                client_basic_secret,
-                client_redirect_uri: client_redirect_uri.clone(),
-                request_scopes,
-                authorisation_endpoint,
-                token_endpoint,
-                user_sub_verifier,
-                issuer,
-                jwks_uri,
-                userinfo_endpoint,
-                display_name,
-                email_domains,
-                link_policy,
-                idp_initiated_enabled,
-                federation_id,
-                auto_discovery,
-            };
-
-            oauth2_client_provider_structs.push((uuid, provider));
+            match oauth2_client_provider_from_entry(&provider_entry, &client_redirect_uri) {
+                Ok(provider) => oauth2_client_provider_structs.push((uuid, provider)),
+                // Kubidm: only the providers changed in this transaction are validated
+                // strictly, so the offending change is rejected. Any other invalid
+                // provider (including all of them at startup) is skipped.
+                Err(err) if !(strict_for_changed && self.qs_write.is_changed_uuid(&uuid)) => {
+                    error!(
+                        ?err,
+                        ?uuid,
+                        "Skipping invalid OAuth2 client provider configuration"
+                    );
+                }
+                Err(err) => {
+                    error!(?err, ?uuid, "Invalid OAuth2 client provider configuration");
+                    return Err(err);
+                }
+            }
         }
 
         self.oauth2_client_providers.clear();
@@ -380,6 +298,132 @@ impl IdmServerProxyWriteTransaction<'_> {
 
         Ok(())
     }
+}
+
+fn oauth2_client_provider_from_entry(
+    provider_entry: &EntrySealedCommitted,
+    client_redirect_uri: &Url,
+) -> Result<OAuth2ClientProvider, OperationError> {
+    let uuid = provider_entry.get_uuid();
+    trace!(?uuid, "Checking OAuth2 Provider configuration");
+
+    let name = provider_entry
+        .get_ava_single_iname(Attribute::Name)
+        .map(str::to_string)
+        .ok_or(OperationError::InvalidValueState)?;
+
+    let client_id = provider_entry
+        .get_ava_single_utf8(Attribute::OAuth2ClientId)
+        .map(str::to_string)
+        .ok_or(OperationError::InvalidValueState)?;
+
+    let client_basic_secret = provider_entry
+        .get_ava_single_utf8(Attribute::OAuth2ClientSecret)
+        .map(str::to_string)
+        .ok_or(OperationError::InvalidValueState)?;
+
+    let issuer = provider_entry
+        .get_ava_single_url(Attribute::OAuth2Issuer)
+        .cloned();
+
+    let authorisation_endpoint = provider_entry
+        .get_ava_single_url(Attribute::OAuth2AuthorisationEndpoint)
+        .cloned();
+
+    let token_endpoint = provider_entry
+        .get_ava_single_url(Attribute::OAuth2TokenEndpoint)
+        .cloned();
+
+    let request_scopes = provider_entry
+        .get_ava_as_oauthscopes(Attribute::OAuth2RequestScopes)
+        .map(|s| s.map(str::to_string).collect())
+        .unwrap_or_default();
+
+    let jwks_uri = provider_entry
+        .get_ava_single_url(Attribute::OAuth2JwksUri)
+        .cloned();
+
+    let userinfo_endpoint = provider_entry
+        .get_ava_single_url(Attribute::OAuth2UserinfoEndpoint)
+        .cloned();
+
+    let display_name = provider_entry
+        .get_ava_single_utf8(Attribute::OAuth2DisplayName)
+        .map(str::to_string);
+
+    let email_domains: BTreeSet<String> = provider_entry
+        .get_ava_iter_iutf8(Attribute::OAuth2EmailDomain)
+        .map(|s| s.map(str::to_string).collect())
+        .unwrap_or_default();
+
+    // OAuth2LinkPolicy is Utf8StringInsensitive and OAuth2FederationId is
+    // Utf8StringIname, so they must be read with the matching accessors.
+    let link_policy = provider_entry
+        .get_ava_single_iutf8(Attribute::OAuth2LinkPolicy)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(AccountLinkPolicy::Manual);
+
+    let idp_initiated_enabled = provider_entry
+        .get_ava_single_bool(Attribute::OAuth2IdpInitiatedEnabled)
+        .unwrap_or(false);
+
+    let federation_id = provider_entry
+        .get_ava_single_iname(Attribute::OAuth2FederationId)
+        .map(str::to_string);
+
+    let auto_discovery = provider_entry
+        .get_ava_single_bool(Attribute::OAuth2AutoDiscovery)
+        .unwrap_or(false);
+
+    let (authorisation_endpoint, token_endpoint) =
+        match (authorisation_endpoint, token_endpoint, issuer.as_ref()) {
+            (Some(auth), Some(token), _) => (auth, token),
+            (None, None, Some(issuer_url)) => {
+                let mut auth = issuer_url.clone();
+                auth.set_path("/oauth2/authorize");
+
+                let mut token = issuer_url.clone();
+                token.set_path("/oauth2/token");
+
+                (auth, token)
+            }
+            _ => {
+                error!(?uuid, "OAuth2 provider missing required endpoints");
+                return Err(OperationError::InvalidValueState);
+            }
+        };
+
+    let maybe_rfc7662_endpoint = provider_entry
+        .get_ava_single_url(Attribute::OAuth2TokenIntrospectEndpoint)
+        .cloned();
+
+    let user_sub_verifier = match maybe_rfc7662_endpoint {
+        Some(endpoint) => OAuth2SubjectVerifier::Rfc7662TokenIntrospection { endpoint },
+        None => OAuth2SubjectVerifier::None,
+    };
+
+    let provider = OAuth2ClientProvider {
+        name,
+        uuid,
+        client_id,
+        client_basic_secret,
+        client_redirect_uri: client_redirect_uri.clone(),
+        request_scopes,
+        authorisation_endpoint,
+        token_endpoint,
+        user_sub_verifier,
+        issuer,
+        jwks_uri,
+        userinfo_endpoint,
+        display_name,
+        email_domains,
+        link_policy,
+        idp_initiated_enabled,
+        federation_id,
+        auto_discovery,
+    };
+
+    Ok(provider)
 }
 
 #[cfg(test)]
@@ -474,5 +518,243 @@ mod tests {
         );
 
         idms_prox_write.commit().expect("failed to commit");
+    }
+
+    fn federation_entry(uuid: Uuid, name: &str) -> EntryInitNew {
+        entry_init!(
+            (Attribute::Class, EntryClass::Object.to_value()),
+            (Attribute::Class, EntryClass::OAuth2Federation.to_value()),
+            (Attribute::Uuid, Value::Uuid(uuid)),
+            (Attribute::Name, Value::new_iname(name)),
+            (Attribute::OAuth2ClientId, Value::new_utf8s("client_id")),
+            (Attribute::OAuth2ClientSecret, Value::new_utf8s("secret")),
+            (
+                Attribute::OAuth2Issuer,
+                Value::Url(Url::parse("https://idp.example.com").unwrap())
+            )
+        )
+    }
+
+    /// Kubidm: creating, modifying and deleting a federation at runtime reloads the
+    /// provider list on commit, without a restart or an explicit reload.
+    #[idm_test]
+    async fn test_idm_oauth2_federation_reload_on_change(
+        idms: &IdmServer,
+        _idms_delayed: &mut IdmServerDelayed,
+    ) {
+        let ct = duration_from_epoch_now();
+        let fed_uuid = Uuid::new_v4();
+
+        let mut idms_prox_write = idms.proxy_write(ct).await.unwrap();
+        idms_prox_write
+            .qs_write
+            .internal_create(vec![federation_entry(fed_uuid, "runtime_federation")])
+            .expect("failed to create oauth2 federation entry");
+        idms_prox_write.commit().expect("failed to commit");
+
+        let mut idms_prox_write = idms.proxy_write(ct).await.unwrap();
+        let provider = idms_prox_write
+            .oauth2_client_providers
+            .get(&fed_uuid)
+            .expect("federation provider not loaded after create");
+        assert_eq!(provider.display_name, None);
+        idms_prox_write
+            .qs_write
+            .internal_modify_uuid(
+                fed_uuid,
+                &ModifyList::new_purge_and_set(
+                    Attribute::OAuth2DisplayName,
+                    Value::new_utf8s("Runtime IdP"),
+                ),
+            )
+            .expect("failed to modify oauth2 federation entry");
+        idms_prox_write.commit().expect("failed to commit");
+
+        let mut idms_prox_write = idms.proxy_write(ct).await.unwrap();
+        let provider = idms_prox_write
+            .oauth2_client_providers
+            .get(&fed_uuid)
+            .expect("federation provider missing after modify");
+        assert_eq!(provider.display_name.as_deref(), Some("Runtime IdP"));
+        idms_prox_write
+            .qs_write
+            .internal_delete_uuid(fed_uuid)
+            .expect("failed to delete oauth2 federation entry");
+        idms_prox_write.commit().expect("failed to commit");
+
+        let idms_prox_write = idms.proxy_write(ct).await.unwrap();
+        assert!(idms_prox_write
+            .oauth2_client_providers
+            .get(&fed_uuid)
+            .is_none());
+    }
+
+    /// Only a token endpoint: the authorisation endpoint can not be derived, so the
+    /// provider configuration is invalid (the entry itself is schema valid).
+    fn invalid_federation_entry(uuid: Uuid, name: &str) -> EntryInitNew {
+        let mut bad = federation_entry(uuid, name);
+        bad.add_ava(
+            Attribute::OAuth2TokenEndpoint,
+            Value::Url(Url::parse("https://idp.example.com/token").unwrap()),
+        );
+        bad
+    }
+
+    fn set_display_name(txn: &mut QueryServerWriteTransaction<'_>, uuid: Uuid, name: &str) {
+        txn.internal_modify_uuid(
+            uuid,
+            &ModifyList::new_purge_and_set(Attribute::OAuth2DisplayName, Value::new_utf8s(name)),
+        )
+        .expect("failed to modify oauth2 federation entry");
+    }
+
+    /// Kubidm: creating an invalid federation, or modifying a federation so that it becomes
+    /// invalid, is rejected at commit.
+    #[idm_test]
+    async fn test_idm_oauth2_federation_invalid_change_rejected(
+        idms: &IdmServer,
+        _idms_delayed: &mut IdmServerDelayed,
+    ) {
+        let ct = duration_from_epoch_now();
+        let good_uuid = Uuid::new_v4();
+        let bad_uuid = Uuid::new_v4();
+
+        let mut idms_prox_write = idms.proxy_write(ct).await.unwrap();
+        idms_prox_write
+            .qs_write
+            .internal_create(vec![federation_entry(good_uuid, "good_federation")])
+            .expect("failed to create oauth2 federation entry");
+        idms_prox_write.commit().expect("failed to commit");
+
+        // Create an invalid provider.
+        let mut idms_prox_write = idms.proxy_write(ct).await.unwrap();
+        idms_prox_write
+            .qs_write
+            .internal_create(vec![invalid_federation_entry(bad_uuid, "bad_federation")])
+            .expect("the entry itself is schema valid");
+        assert_eq!(
+            idms_prox_write.commit(),
+            Err(OperationError::InvalidValueState)
+        );
+
+        // Make a valid provider invalid.
+        let mut idms_prox_write = idms.proxy_write(ct).await.unwrap();
+        assert!(idms_prox_write
+            .qs_write
+            .internal_search_uuid(bad_uuid)
+            .is_err());
+        idms_prox_write
+            .qs_write
+            .internal_modify_uuid(
+                good_uuid,
+                &ModifyList::new_append(
+                    Attribute::OAuth2TokenEndpoint,
+                    Value::Url(Url::parse("https://idp.example.com/token").unwrap()),
+                ),
+            )
+            .expect("the entry itself is schema valid");
+        assert_eq!(
+            idms_prox_write.commit(),
+            Err(OperationError::InvalidValueState)
+        );
+
+        // Nothing was committed: the provider is still valid and loaded.
+        let mut idms_prox_write = idms.proxy_write(ct).await.unwrap();
+        assert!(!idms_prox_write
+            .qs_write
+            .internal_search_uuid(good_uuid)
+            .unwrap()
+            .attribute_pres(Attribute::OAuth2TokenEndpoint));
+        assert!(idms_prox_write
+            .oauth2_client_providers
+            .get(&good_uuid)
+            .is_some());
+    }
+
+    /// Kubidm: an invalid provider that is already stored (for example written by an older
+    /// version, or replicated) does not block writes to other providers; it is skipped.
+    #[idm_test]
+    async fn test_idm_oauth2_federation_invalid_existing_does_not_block(
+        idms: &IdmServer,
+        _idms_delayed: &mut IdmServerDelayed,
+    ) {
+        let ct = duration_from_epoch_now();
+        let good_uuid = Uuid::new_v4();
+        let bad_uuid = Uuid::new_v4();
+
+        let mut idms_prox_write = idms.proxy_write(ct).await.unwrap();
+        idms_prox_write
+            .qs_write
+            .internal_create(vec![federation_entry(good_uuid, "good_federation")])
+            .expect("failed to create oauth2 federation entry");
+        idms_prox_write.commit().expect("failed to commit");
+
+        // Store the invalid provider bypassing the IDM layer reload, as an older version
+        // would have. The block drops the rest of the IDM transaction (and its locks).
+        {
+            let mut idms_prox_write = idms.proxy_write(ct).await.unwrap();
+            idms_prox_write
+                .qs_write
+                .internal_create(vec![invalid_federation_entry(bad_uuid, "bad_federation")])
+                .expect("the entry itself is schema valid");
+            idms_prox_write.qs_write.commit().expect("failed to commit");
+        }
+
+        // A modify of a different, valid provider succeeds and reloads the providers.
+        let mut idms_prox_write = idms.proxy_write(ct).await.unwrap();
+        set_display_name(&mut idms_prox_write.qs_write, good_uuid, "Good IdP");
+        idms_prox_write
+            .commit()
+            .expect("an unrelated invalid provider must not block the write");
+
+        let idms_prox_write = idms.proxy_write(ct).await.unwrap();
+        assert_eq!(
+            idms_prox_write
+                .oauth2_client_providers
+                .get(&good_uuid)
+                .and_then(|p| p.display_name.as_deref()),
+            Some("Good IdP")
+        );
+        assert!(idms_prox_write
+            .oauth2_client_providers
+            .get(&bad_uuid)
+            .is_none());
+    }
+
+    /// Kubidm: the server starts with an invalid provider stored, skipping it and serving
+    /// the valid ones.
+    #[qs_test]
+    async fn test_idm_oauth2_federation_invalid_startup(server: &QueryServer) {
+        let ct = duration_from_epoch_now();
+        let good_uuid = Uuid::new_v4();
+        let bad_uuid = Uuid::new_v4();
+
+        let mut qs_write = server.write(ct).await.unwrap();
+        qs_write
+            .internal_create(vec![
+                federation_entry(good_uuid, "good_federation"),
+                invalid_federation_entry(bad_uuid, "bad_federation"),
+            ])
+            .expect("the entries are schema valid");
+        qs_write.commit().expect("failed to commit");
+
+        let (idms, _idms_delayed, _idms_audit) = IdmServer::new(
+            server.clone(),
+            &Url::parse("https://idm.example.com").unwrap(),
+            true,
+            ct,
+        )
+        .await
+        .expect("an invalid provider must not prevent startup");
+
+        let idms_prox_write = idms.proxy_write(ct).await.unwrap();
+        assert!(idms_prox_write
+            .oauth2_client_providers
+            .get(&good_uuid)
+            .is_some());
+        assert!(idms_prox_write
+            .oauth2_client_providers
+            .get(&bad_uuid)
+            .is_none());
     }
 }

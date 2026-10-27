@@ -1,6 +1,6 @@
 use crate::{
     prelude::*,
-    server::{ChangeFlag, CreateEvent, Plugins},
+    server::{is_oauth2_client_provider, ChangeFlag, CreateEvent, Plugins},
 };
 
 impl QueryServerWriteTransaction<'_> {
@@ -131,9 +131,7 @@ impl QueryServerWriteTransaction<'_> {
         }
 
         if !self.changed_flags.contains(ChangeFlag::OAUTH2_CLIENT)
-            && commit_cand
-                .iter()
-                .any(|e| e.attribute_equality(Attribute::Class, &EntryClass::OAuth2Client.into()))
+            && commit_cand.iter().any(is_oauth2_client_provider)
         {
             self.changed_flags.insert(ChangeFlag::OAUTH2_CLIENT)
         }

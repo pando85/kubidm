@@ -1753,16 +1753,17 @@ pub static SCHEMA_ATTR_APPROVAL_POLICY_NAME: LazyLock<SchemaAttribute> =
         ..Default::default()
     });
 
-pub static SCHEMA_ATTR_APPROVAL_OPERATION_TYPE: LazyLock<SchemaAttribute> =
-    LazyLock::new(|| SchemaAttribute {
+pub static SCHEMA_ATTR_APPROVAL_OPERATION_TYPE: LazyLock<SchemaAttribute> = LazyLock::new(|| {
+    SchemaAttribute {
         uuid: UUID_SCHEMA_ATTR_APPROVAL_OPERATION_TYPE,
         name: Attribute::ApprovalOperationType,
-        description: "The type of operation requiring approval".to_string(),
+        description: "The operation types an approval policy covers, or the single operation type of an approval request".to_string(),
         indexed: true,
         multivalue: true,
         syntax: SyntaxType::Utf8StringInsensitiveN,
         ..Default::default()
-    });
+    }
+});
 
 pub static SCHEMA_ATTR_APPROVAL_PATTERN: LazyLock<SchemaAttribute> =
     LazyLock::new(|| SchemaAttribute {
@@ -1883,17 +1884,20 @@ pub static SCHEMA_ATTR_APPROVAL_STATE: LazyLock<SchemaAttribute> = LazyLock::new
     }
 });
 
-pub static SCHEMA_ATTR_APPROVAL_DECISION: LazyLock<SchemaAttribute> =
-    LazyLock::new(|| SchemaAttribute {
+pub static SCHEMA_ATTR_APPROVAL_DECISION: LazyLock<SchemaAttribute> = LazyLock::new(|| {
+    SchemaAttribute {
         uuid: UUID_SCHEMA_ATTR_APPROVAL_DECISION,
         name: Attribute::ApprovalDecision,
         description:
-            "An approval decision record containing approver, action, time, and optional comment"
+            "The JSON-encoded approval decision records (approver, action, time, and optional comment) of an approval request"
                 .to_string(),
-        multivalue: true,
-        syntax: SyntaxType::Json,
+        // Kubidm: the Json syntax has no value set constructor, so it can not be written,
+        // and there is no multi-value Utf8String syntax. All decisions of a request are
+        // stored as one single-line JSON array string instead.
+        syntax: SyntaxType::Utf8String,
         ..Default::default()
-    });
+    }
+});
 
 pub static SCHEMA_ATTR_APPROVAL_ESCALATION_LEVEL: LazyLock<SchemaAttribute> =
     LazyLock::new(|| SchemaAttribute {
@@ -1919,7 +1923,8 @@ pub static SCHEMA_ATTR_APPROVAL_OPERATION_DETAILS: LazyLock<SchemaAttribute> =
         uuid: UUID_SCHEMA_ATTR_APPROVAL_OPERATION_DETAILS,
         name: Attribute::ApprovalOperationDetails,
         description: "JSON-encoded details about the operation requiring approval".to_string(),
-        syntax: SyntaxType::JsonFilter,
+        // Kubidm: a JSON object of string keys and values, stored as a single-line string.
+        syntax: SyntaxType::Utf8String,
         ..Default::default()
     });
 

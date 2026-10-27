@@ -47,7 +47,12 @@ pub fn make_authorization_decision(
                     matched_rules.push(acp.acp.acp.name.clone());
                 }
 
-                match apply_search_access(ident, &related_acp, &target_entry) {
+                match apply_search_access(
+                    ident,
+                    &related_acp,
+                    &target_entry,
+                    access_controls.get_curtime(),
+                ) {
                     SearchResult::Deny => {
                         denied_by = Some("Access denied by policy".to_string());
                         AuthorizationDecision::Deny
@@ -97,7 +102,12 @@ pub fn make_authorization_decision(
                     matched_rules.push(acp.acp.acp.name.clone());
                 }
 
-                match apply_delete_access(ident, &related_acp, &target_entry) {
+                match apply_delete_access(
+                    ident,
+                    &related_acp,
+                    &target_entry,
+                    access_controls.get_curtime(),
+                ) {
                     DeleteResult::Deny => {
                         denied_by = Some("Access denied by policy".to_string());
                         AuthorizationDecision::Deny
@@ -122,7 +132,13 @@ pub fn make_authorization_decision(
                 }
 
                 let sync_agmts = access_controls.get_sync_agreements();
-                match apply_modify_access(ident, &related_acp, sync_agmts, &target_entry) {
+                match apply_modify_access(
+                    ident,
+                    &related_acp,
+                    sync_agmts,
+                    &target_entry,
+                    access_controls.get_curtime(),
+                ) {
                     ModifyResult::Deny => {
                         denied_by = Some("Access denied by policy".to_string());
                         AuthorizationDecision::Deny

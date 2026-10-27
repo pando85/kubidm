@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use super::ChangeFlag;
+use super::{is_oauth2_client_provider, ChangeFlag};
 use crate::{plugins::Plugins, prelude::*};
 
 pub(crate) struct ModifyPartial<'a> {
@@ -249,9 +249,7 @@ impl QueryServerWriteTransaction<'_> {
                 .iter()
                 .zip(pre_candidates.iter().map(|e| e.as_ref()))
                 .any(|(post, pre)| {
-                    post.attribute_equality(Attribute::Class, &EntryClass::OAuth2Client.into())
-                        || pre
-                            .attribute_equality(Attribute::Class, &EntryClass::OAuth2Client.into())
+                    is_oauth2_client_provider(post) || is_oauth2_client_provider(pre)
                 })
         {
             self.changed_flags.insert(ChangeFlag::OAUTH2_CLIENT)
@@ -466,9 +464,7 @@ impl QueryServerWriteTransaction<'_> {
         }
 
         if !self.changed_flags.contains(ChangeFlag::OAUTH2_CLIENT)
-            && norm_cand
-                .iter()
-                .any(|e| e.attribute_equality(Attribute::Class, &EntryClass::OAuth2Client.into()))
+            && norm_cand.iter().any(is_oauth2_client_provider)
         {
             self.changed_flags.insert(ChangeFlag::OAUTH2_CLIENT)
         }
