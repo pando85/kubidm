@@ -25,6 +25,12 @@ use kubidm_proto::internal::{
     tag = "authorization",
     operation_id = "authorize"
 )]
+/// Decide whether the caller may perform an action on a resource.
+///
+/// The decision is ACP-level only: plugins (attribute uniqueness, referential integrity,
+/// value deny lists) may still deny the real operation. Only the caller's own permissions
+/// can be queried, so `subject` must be unset or the caller's uuid. A read-only session
+/// that would be allowed after re-authenticating gets `reauthrequired`.
 pub async fn authorize(
     State(state): State<ServerState>,
     Extension(kopid): Extension<KOpId>,
@@ -51,6 +57,11 @@ pub async fn authorize(
     tag = "authorization",
     operation_id = "authorize_batch"
 )]
+/// Decide up to 100 authorization requests in one call.
+///
+/// Each request is decided as by `/v1/authorize` (ACP-level only: plugins may still deny
+/// the real operation). A resource that is not found yields a `notfound` decision for
+/// that item instead of failing the batch.
 pub async fn authorize_batch(
     State(state): State<ServerState>,
     Extension(kopid): Extension<KOpId>,

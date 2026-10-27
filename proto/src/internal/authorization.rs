@@ -3,12 +3,20 @@ use std::collections::BTreeSet;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
+/// The maximum number of requests accepted by a single batch authorization call.
+pub const AUTHORIZATION_BATCH_MAX: usize = 100;
+
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum AuthorizationDecision {
     Allow,
     Deny,
+    /// The current session is not privileged, but would be allowed once the caller
+    /// re-authenticates.
     ReauthRequired,
+    /// The resource does not exist, or is not visible to the caller. Only returned as
+    /// an item of a batch response; a single request fails with an error instead.
+    NotFound,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, ToSchema)]
@@ -23,9 +31,13 @@ pub enum AuthorizationAction {
 #[derive(Debug, Serialize, Deserialize, Clone, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct AuthorizationRequest {
+    /// The subject of the decision. Only the authenticated caller is supported: if set,
+    /// it must be the caller's own uuid.
     pub subject: Option<Uuid>,
     pub resource: Uuid,
     pub action: AuthorizationAction,
+    /// The attributes to authorise. Unknown attribute names are denied. Required for
+    /// `modify`, where every attribute must be both presentable and removable.
     #[serde(default)]
     pub attributes: Option<BTreeSet<String>>,
     #[serde(default)]
@@ -38,13 +50,24 @@ pub struct AuthorizationResponse {
     pub decision: AuthorizationDecision,
     pub resource: Uuid,
     pub action: AuthorizationAction,
+    /// For `search`, the readable attributes. For `modify`, the attributes that may be
+    /// both added and removed.
     pub allowed_attributes: Option<BTreeSet<String>>,
+    /// For `modify`, the attributes that may be added (present).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub present_attributes: Option<BTreeSet<String>>,
+    /// For `modify`, the attributes that may be removed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remove_attributes: Option<BTreeSet<String>>,
     pub explanation: Option<AuthorizationExplanation>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct AuthorizationExplanation {
+    /// The access control profiles that apply to the caller. Only disclosed to members
+    /// of `idm_access_control_admins`, empty otherwise.
+    #[serde(default)]
     pub matched_rules: Vec<String>,
     pub denied_by: Option<String>,
     pub reason: String,
@@ -89,6 +112,8 @@ impl AuthorizationResponse {
             resource,
             action,
             allowed_attributes: None,
+            present_attributes: None,
+            remove_attributes: None,
             explanation: None,
         }
     }
@@ -103,6 +128,8 @@ impl AuthorizationResponse {
             resource,
             action,
             allowed_attributes: Some(attributes),
+            present_attributes: None,
+            remove_attributes: None,
             explanation: None,
         }
     }
@@ -113,6 +140,8 @@ impl AuthorizationResponse {
             resource,
             action,
             allowed_attributes: None,
+            present_attributes: None,
+            remove_attributes: None,
             explanation: None,
         }
     }
@@ -123,6 +152,20 @@ impl AuthorizationResponse {
             resource,
             action,
             allowed_attributes: None,
+            present_attributes: None,
+            remove_attributes: None,
+            explanation: None,
+        }
+    }
+
+    pub fn not_found(resource: Uuid, action: AuthorizationAction) -> Self {
+        Self {
+            decision: AuthorizationDecision::NotFound,
+            resource,
+            action,
+            allowed_attributes: None,
+            present_attributes: None,
+            remove_attributes: None,
             explanation: None,
         }
     }
@@ -130,24 +173,6 @@ impl AuthorizationResponse {
     pub fn with_explanation(mut self, explanation: AuthorizationExplanation) -> Self {
         self.explanation = Some(explanation);
         self
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct DecisionCacheEntry {
-    pub subject: Option<Uuid>,
-    pub resource: Uuid,
-    pub action: AuthorizationAction,
-    pub decision: AuthorizationDecision,
-    pub allowed_attributes: Option<BTreeSet<String>>,
-    pub cached_at: u64,
-    pub ttl_seconds: u64,
-}
-
-impl DecisionCacheEntry {
-    pub fn is_expired(&self, current_time: u64) -> bool {
-        current_time > self.cached_at + self.ttl_seconds
     }
 }
 
@@ -170,22 +195,6 @@ mod tests {
 
         let response = AuthorizationResponse::deny(Uuid::nil(), AuthorizationAction::Delete);
         assert_eq!(response.decision, AuthorizationDecision::Deny);
-    }
-
-    #[test]
-    fn test_cache_entry_expiration() {
-        let entry = DecisionCacheEntry {
-            subject: None,
-            resource: Uuid::nil(),
-            action: AuthorizationAction::Search,
-            decision: AuthorizationDecision::Allow,
-            allowed_attributes: None,
-            cached_at: 1000,
-            ttl_seconds: 60,
-        };
-
-        assert!(!entry.is_expired(1050));
-        assert!(entry.is_expired(1100));
     }
 
     #[test]
@@ -288,6 +297,7 @@ mod tests {
             AuthorizationDecision::Allow,
             AuthorizationDecision::Deny,
             AuthorizationDecision::ReauthRequired,
+            AuthorizationDecision::NotFound,
         ] {
             let json = serde_json::to_string(&decision).unwrap();
             let parsed: AuthorizationDecision = serde_json::from_str(&json).unwrap();
@@ -316,6 +326,8 @@ mod tests {
             resource: Uuid::nil(),
             action: AuthorizationAction::Search,
             allowed_attributes: Some(BTreeSet::from(["name".to_string()])),
+            present_attributes: None,
+            remove_attributes: None,
             explanation: Some(AuthorizationExplanation {
                 matched_rules: vec!["test_rule".to_string()],
                 denied_by: None,
@@ -492,25 +504,6 @@ mod tests {
     }
 
     #[test]
-    fn test_decision_cache_entry_with_attributes() {
-        let attrs: BTreeSet<String> =
-            BTreeSet::from(["name".to_string(), "displayname".to_string()]);
-        let entry = DecisionCacheEntry {
-            subject: Some(Uuid::nil()),
-            resource: Uuid::nil(),
-            action: AuthorizationAction::Search,
-            decision: AuthorizationDecision::Allow,
-            allowed_attributes: Some(attrs),
-            cached_at: 1000,
-            ttl_seconds: 60,
-        };
-
-        assert!(entry.allowed_attributes.is_some());
-        let entry_attrs = entry.allowed_attributes.unwrap();
-        assert_eq!(entry_attrs.len(), 2);
-    }
-
-    #[test]
     fn test_authorization_request_builder_chain() {
         let attrs: BTreeSet<String> = BTreeSet::from(["attr1".to_string()]);
         let req =
@@ -522,6 +515,40 @@ mod tests {
         assert_eq!(req.action, AuthorizationAction::Modify);
         assert!(req.attributes.is_some());
         assert!(req.include_explanation);
+    }
+
+    #[test]
+    fn test_authorization_response_backward_compatible() {
+        // A response from a server that does not know the modify attribute sets.
+        let json = r#"{
+            "decision": "allow",
+            "resource": "00000000-0000-0000-0000-000000000000",
+            "action": "search",
+            "allowedAttributes": ["name"],
+            "explanation": null
+        }"#;
+        let parsed: AuthorizationResponse = serde_json::from_str(json).unwrap();
+        assert!(parsed.present_attributes.is_none());
+        assert!(parsed.remove_attributes.is_none());
+
+        // And unset sets are not serialised.
+        let json = serde_json::to_string(&AuthorizationResponse::allow(
+            Uuid::nil(),
+            AuthorizationAction::Search,
+        ))
+        .unwrap();
+        assert!(!json.contains("presentAttributes"));
+        assert!(!json.contains("removeAttributes"));
+    }
+
+    #[test]
+    fn test_authorization_response_not_found() {
+        let response = AuthorizationResponse::not_found(Uuid::nil(), AuthorizationAction::Search);
+        assert_eq!(response.decision, AuthorizationDecision::NotFound);
+        assert_eq!(
+            serde_json::to_string(&AuthorizationDecision::NotFound).unwrap(),
+            "\"notfound\""
+        );
     }
 
     #[test]

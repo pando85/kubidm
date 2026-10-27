@@ -1511,16 +1511,23 @@ impl QueryServerReadV1 {
         req: kubidm_proto::internal::BatchAuthorizationRequest,
         eventid: Uuid,
     ) -> Result<kubidm_proto::internal::BatchAuthorizationResponse, OperationError> {
-        let mut responses = Vec::with_capacity(req.requests.len());
+        // Validate the identity once, and decide every request in one read transaction.
+        // Oversized batches are rejected before any request is decided.
+        let ct = duration_from_epoch_now();
+        let mut idms_prox_read = self.idms.proxy_read().await?;
+        let ident = idms_prox_read
+            .validate_client_auth_info_to_ident(client_auth_info, ct)
+            .map_err(|e| {
+                error!(?e, "Invalid identity");
+                e
+            })?;
 
-        for auth_req in req.requests {
-            let response = self
-                .handle_authorization_request(client_auth_info.clone(), auth_req, eventid)
-                .await?;
-            responses.push(response);
-        }
-
-        Ok(kubidm_proto::internal::BatchAuthorizationResponse { responses })
+        kubidmd_lib::server::authorization::make_batch_authorization_decision(
+            &mut idms_prox_read.qs_read,
+            &ident,
+            &req.requests,
+        )
+        .map(|responses| kubidm_proto::internal::BatchAuthorizationResponse { responses })
     }
 
     #[instrument(

@@ -324,7 +324,6 @@ impl Modify for SecurityAddon {
             internal::AuthorizationExplanation,
             internal::BatchAuthorizationRequest,
             internal::BatchAuthorizationResponse,
-            internal::DecisionCacheEntry,
             // terrible workaround for other things
             response_schema::CreationChallengeResponse,
 
