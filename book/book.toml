@@ -10,6 +10,7 @@ create-missing = true
 use-default-preprocessors = true
 
 [output.html]
+favicon-svg = "theme/favicon.svg"
 edit-url-template = "https://github.com/kubidm/kubidm/edit/master/book/{path}"
 git-repository-url = "https://github.com/kubidm/kubidm"
 additional-js = ["mermaid.min.js", "mermaid-init.js"]
