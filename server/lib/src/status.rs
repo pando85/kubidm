@@ -94,6 +94,30 @@ pub struct PeerInfo {
     pub stale: bool,
 }
 
+/// Aggregate counts of replication peers.
+///
+/// This is what the unauthenticated readiness endpoint exposes: peer URLs and
+/// replication timestamps are internal topology details and are not published there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+pub struct PeerSummary {
+    /// Number of configured replication peers.
+    pub total: usize,
+    /// Peers that are currently connected and not stale.
+    pub healthy: usize,
+    /// Peers whose relationship is considered stale.
+    pub stale: usize,
+}
+
+impl PeerSummary {
+    pub fn from_peers(peers: &[PeerInfo]) -> Self {
+        Self {
+            total: peers.len(),
+            healthy: peers.iter().filter(|p| p.connected && !p.stale).count(),
+            stale: peers.iter().filter(|p| p.stale).count(),
+        }
+    }
+}
+
 /// Local database health status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -115,8 +139,8 @@ pub struct ReadinessStatus {
     pub database_health: DatabaseHealth,
     /// Server phase (bootstrap, schema_ready, domain_info_ready, running).
     pub server_phase: String,
-    /// Information about replication peers (if replication is configured).
-    pub peers: Option<Vec<PeerInfo>>,
+    /// Counts of replication peers (if replication is configured).
+    pub peers: Option<PeerSummary>,
     /// Human-readable status message.
     pub message: String,
 }
@@ -365,7 +389,9 @@ impl ReplicationStateTracker {
         let replication_state = self.get_replication_state();
         let database_health = self.get_database_health();
         let server_phase = self.get_server_phase();
-        let peers = self.get_peers();
+        let peers = self
+            .get_peers()
+            .map(|peers| PeerSummary::from_peers(&peers));
 
         let message = match serving_ready {
             ServingReadiness::Ready => "Ready to serve traffic".to_string(),
@@ -570,6 +596,48 @@ mod tests {
         assert_eq!(status.database_health, DatabaseHealth::Healthy);
         assert_eq!(status.server_phase, "running");
         assert_eq!(status.message, "Ready to serve traffic");
+        assert!(status.peers.is_none());
+    }
+
+    #[test]
+    fn test_build_readiness_status_summarises_peers() {
+        let tracker = ReplicationStateTracker::new();
+        tracker.set_server_phase("running".to_string());
+        tracker.set_peers(Some(vec![
+            PeerInfo {
+                url: "repl://peer1.example.com:8444".to_string(),
+                connected: true,
+                last_success: Some(1234567890),
+                stale: false,
+            },
+            PeerInfo {
+                url: "repl://peer2.example.com:8444".to_string(),
+                connected: false,
+                last_success: None,
+                stale: false,
+            },
+            PeerInfo {
+                url: "repl://peer3.example.com:8444".to_string(),
+                connected: true,
+                last_success: Some(1234567000),
+                stale: true,
+            },
+        ]));
+
+        let status = tracker.build_readiness_status();
+        assert_eq!(
+            status.peers,
+            Some(PeerSummary {
+                total: 3,
+                healthy: 1,
+                stale: 1,
+            })
+        );
+
+        // No peer URLs or timestamps are exposed in the serialised response.
+        let json = serde_json::to_string(&status).expect("Failed to serialize");
+        assert!(!json.contains("peer1.example.com"));
+        assert!(!json.contains("1234567890"));
     }
 
     #[test]

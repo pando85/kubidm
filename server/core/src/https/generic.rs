@@ -7,7 +7,9 @@ use axum::http::{
 };
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::{Extension, Json};
-use kubidmd_lib::maintenance::{maintenance_public_status, MaintenancePublicStatus};
+use kubidmd_lib::maintenance::{
+    maintenance_public_status, MaintenanceHttpStatus, MaintenanceState,
+};
 use kubidmd_lib::prelude::APPLICATION_JSON;
 use kubidmd_lib::status::{LivenessStatus, ReadinessStatus, ServingReadiness, StatusRequestEvent};
 use sha2::{Digest, Sha256};
@@ -60,14 +62,17 @@ pub async fn healthz(State(state): State<ServerState>) -> Json<LivenessStatus> {
     get,
     path = "/maintenance",
     responses(
-        (status = 200, description = "Node maintenance state and capabilities", content_type = APPLICATION_JSON, body=MaintenancePublicStatus),
+        (status = 200, description = "Node maintenance state and capabilities", content_type = APPLICATION_JSON, body=MaintenanceHttpStatus),
     ),
     tag = "system",
     operation_id = "maintenance_status"
 )]
 /// Read-only node-local maintenance state and capability discovery.
-pub async fn maintenance_status() -> Json<MaintenancePublicStatus> {
-    maintenance_public_status().into()
+///
+/// This endpoint is unauthenticated, so it only reports the state and capabilities. The
+/// active operation id and last error are available on the privileged admin socket.
+pub async fn maintenance_status() -> Json<MaintenanceHttpStatus> {
+    MaintenanceHttpStatus::from(maintenance_public_status()).into()
 }
 
 #[utoipa::path(
@@ -92,10 +97,8 @@ pub async fn readyz(State(state): State<ServerState>) -> impl IntoResponse {
     // node operation is active.
     if !maintenance.state.is_serving() {
         status.serving_ready = ServingReadiness::NotReady;
-        status.message = format!(
-            "Node is unavailable for maintenance (state: {:?}, operation: {:?})",
-            maintenance.state, maintenance.active_operation_id
-        );
+        // The operation id is intentionally not included: this endpoint is unauthenticated.
+        status.message = maintenance_not_ready_message(maintenance.state);
     }
 
     let status_code = if status.serving_ready.is_ready() {
@@ -104,6 +107,10 @@ pub async fn readyz(State(state): State<ServerState>) -> impl IntoResponse {
         StatusCode::SERVICE_UNAVAILABLE
     };
     (status_code, Json(status))
+}
+
+fn maintenance_not_ready_message(state: MaintenanceState) -> String {
+    format!("Node is unavailable for maintenance (state: {state:?})")
 }
 
 /// The `/metrics` endpoint: the backup metrics it serves and, when
@@ -290,5 +297,16 @@ mod tests {
         for refused in ["Bearers3cret-token", "Bear s3cret-token", "bearer wrong"] {
             assert!(!protected.authorized(&headers(Some(refused))), "{refused}");
         }
+    }
+
+    /// The unauthenticated readiness message names the maintenance state only.
+    #[test]
+    fn the_maintenance_readiness_message_has_no_operation_details() {
+        let message = maintenance_not_ready_message(MaintenanceState::Fenced);
+        assert_eq!(
+            message,
+            "Node is unavailable for maintenance (state: Fenced)"
+        );
+        assert!(!message.contains("operation"));
     }
 }

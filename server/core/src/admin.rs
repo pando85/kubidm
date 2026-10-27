@@ -20,13 +20,12 @@ use kubidmd_lib::prelude::{duration_from_epoch_now, IdmServer};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::io;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
-use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout, Instant};
 use tokio_util::codec::{Decoder, Encoder, Framed};
@@ -39,6 +38,9 @@ const MAINTENANCE_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const MAINTENANCE_RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_SYNC_UNTIL_TIMEOUT: Duration = Duration::from_secs(60);
 const SYNC_UNTIL_POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// Upper bound of a single sync-until wait. Orchestrators that need longer simply repeat
+/// the request; an unbounded value would overflow the deadline computation.
+const MAX_SYNC_UNTIL_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum AdminTaskRequest {
@@ -308,6 +310,22 @@ struct HeldWriteFence {
     task: JoinHandle<()>,
 }
 
+/// A maintenance step that released the controller lock to do slow work: acquiring or
+/// releasing the write fence, reindexing, verifying or waiting for peers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InFlightStep {
+    Drain,
+    Run,
+    SyncUntil,
+    Resume,
+}
+
+/// Node-local maintenance state machine.
+///
+/// Every request first decides, under the controller lock, whether it may proceed and
+/// marks its step as in flight; it then does its slow work without the lock and
+/// finally records the outcome under the lock again. The methods here are the pure
+/// decisions; the async request handlers below do the I/O.
 #[derive(Default)]
 struct MaintenanceController {
     active_operation_id: Option<Uuid>,
@@ -315,6 +333,407 @@ struct MaintenanceController {
     held_write_fence: Option<HeldWriteFence>,
     last_run: Option<MaintenanceRunResult>,
     last_resumed_operation_id: Option<Uuid>,
+    /// Set while a step of the active operation runs outside the lock. No other step may
+    /// change the controller in the meantime: in particular a resume must not clear the
+    /// operation underneath a run or sync-until that later stores a fresh write fence,
+    /// which would leave a fence held that nothing can release.
+    in_flight: Option<InFlightStep>,
+}
+
+/// A change of the process-global maintenance state (readiness and write gate), which
+/// the caller applies while it still holds the controller lock so that the two always
+/// agree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StateTransition {
+    state: MaintenanceState,
+    operation_id: Option<Uuid>,
+    /// `Some` replaces the last error, `None` keeps it.
+    error: Option<Option<String>>,
+}
+
+impl StateTransition {
+    fn to(state: MaintenanceState, operation_id: Option<Uuid>) -> Self {
+        Self {
+            state,
+            operation_id,
+            error: None,
+        }
+    }
+
+    fn with_error(mut self, error: Option<String>) -> Self {
+        self.error = Some(error);
+        self
+    }
+
+    fn apply(self) {
+        if let Some(error) = self.error {
+            set_maintenance_error(error);
+        }
+        set_maintenance_state(self.state, self.operation_id);
+    }
+}
+
+/// How a drain request proceeds.
+enum DrainStart {
+    /// The operation already holds its fence: answer with it again.
+    Fenced(ReplicationFence),
+    /// Acquire the write fence. `fresh` is true when no operation was active before, so a
+    /// failure can roll the node back to serving.
+    Acquire {
+        fresh: bool,
+        transition: StateTransition,
+    },
+}
+
+type WriteFenceResult = Result<(HeldWriteFence, ReplicationFence), String>;
+
+/// The fence a locally recovering sync-until releases (if any was held), and the state to
+/// enter while it waits.
+type LocalRecovery = (Option<HeldWriteFence>, StateTransition);
+
+impl MaintenanceController {
+    fn in_flight_busy(&self, operation_id: Uuid) -> Option<AdminTaskResponse> {
+        self.in_flight.map(|step| {
+            maintenance_error(
+                MaintenanceErrorCode::Busy,
+                format!(
+                    "maintenance operation {operation_id} has a {step:?} step in progress, retry once it completes"
+                ),
+            )
+        })
+    }
+
+    fn begin_drain(&mut self, operation_id: Uuid) -> Result<DrainStart, AdminTaskResponse> {
+        let fresh = match self.active_operation_id {
+            Some(active) if active == operation_id => {
+                // A retry while the first drain (or any other step) is still running must
+                // not start a second fence acquisition: it can only time out behind the
+                // first one and then overwrite its result.
+                if let Some(busy) = self.in_flight_busy(operation_id) {
+                    return Err(busy);
+                }
+                if let Some(fence) = self.fence.clone() {
+                    return Ok(DrainStart::Fenced(fence));
+                }
+                // The operation lost its fence (a failed drain retry or re-fence): fence again.
+                false
+            }
+            Some(active) => {
+                return Err(maintenance_error(
+                    MaintenanceErrorCode::Busy,
+                    format!("maintenance operation {active} is already active"),
+                ));
+            }
+            None => true,
+        };
+
+        self.active_operation_id = Some(operation_id);
+        self.fence = None;
+        self.last_run = None;
+        self.in_flight = Some(InFlightStep::Drain);
+
+        Ok(DrainStart::Acquire {
+            fresh,
+            transition: StateTransition::to(MaintenanceState::Draining, Some(operation_id))
+                .with_error(None),
+        })
+    }
+
+    fn finish_drain(
+        &mut self,
+        operation_id: Uuid,
+        fresh: bool,
+        result: WriteFenceResult,
+    ) -> (AdminTaskResponse, StateTransition) {
+        self.in_flight = None;
+        match result {
+            Ok((held, fence)) => {
+                self.held_write_fence = Some(held);
+                self.fence = Some(fence.clone());
+                (
+                    AdminTaskResponse::MaintenanceDrain {
+                        operation_id,
+                        fence,
+                    },
+                    StateTransition::to(MaintenanceState::Fenced, Some(operation_id)),
+                )
+            }
+            Err(err) if fresh => {
+                // Nothing was fenced and nothing was active before this drain, so there is
+                // nothing to protect: go back to serving rather than gating writes until
+                // an operator notices and resumes. The operation counts as resumed, so an
+                // orchestrator that resumes after a failed drain gets an idempotent success.
+                self.active_operation_id = None;
+                self.fence = None;
+                self.last_resumed_operation_id = Some(operation_id);
+                (
+                    maintenance_error(MaintenanceErrorCode::Timeout, err.clone()),
+                    StateTransition::to(MaintenanceState::Serving, None).with_error(Some(err)),
+                )
+            }
+            Err(err) => (
+                // A retry for an operation that was already in progress (for example
+                // after a failed reindex re-fence): keep it failed, it needs a resume.
+                maintenance_error(MaintenanceErrorCode::Timeout, err.clone()),
+                StateTransition::to(MaintenanceState::Failed, Some(operation_id))
+                    .with_error(Some(err)),
+            ),
+        }
+    }
+
+    /// Start a run. The error is the immediate response, which is the previous result for
+    /// an idempotent retry.
+    fn begin_run(
+        &mut self,
+        operation_id: Uuid,
+        operation: MaintenanceOperation,
+    ) -> Result<(Option<HeldWriteFence>, StateTransition), AdminTaskResponse> {
+        if self.active_operation_id != Some(operation_id) {
+            return Err(maintenance_error(
+                MaintenanceErrorCode::OperationMismatch,
+                "operation id does not own the active maintenance fence",
+            ));
+        }
+        if let Some(busy) = self.in_flight_busy(operation_id) {
+            return Err(busy);
+        }
+        if let Some(previous) = self.last_run.as_ref() {
+            if previous.operation == operation {
+                return Err(AdminTaskResponse::MaintenanceRun {
+                    result: previous.clone(),
+                });
+            }
+            return Err(maintenance_error(
+                MaintenanceErrorCode::OperationMismatch,
+                "operation id was already used for a different maintenance operation",
+            ));
+        }
+        if self.held_write_fence.is_none() {
+            return Err(maintenance_error(
+                MaintenanceErrorCode::InvalidState,
+                "node is not currently fenced",
+            ));
+        }
+
+        self.in_flight = Some(InFlightStep::Run);
+        let held_for_reindex = if matches!(operation, MaintenanceOperation::Reindex) {
+            // The node is unfenced while it reindexes, so the drain fence no longer
+            // describes it; the re-fence afterwards captures a new one.
+            self.fence = None;
+            self.held_write_fence.take()
+        } else {
+            None
+        };
+        Ok((
+            held_for_reindex,
+            StateTransition::to(MaintenanceState::Maintenance, Some(operation_id)),
+        ))
+    }
+
+    /// Store the write fence re-acquired after the node was briefly unfenced.
+    fn store_refence(&mut self, result: WriteFenceResult) -> Result<(), String> {
+        match result {
+            Ok((held, fence)) => {
+                self.held_write_fence = Some(held);
+                self.fence = Some(fence);
+                Ok(())
+            }
+            Err(err) => {
+                // The previous fence no longer describes the node, never hand it out again.
+                self.fence = None;
+                Err(err)
+            }
+        }
+    }
+
+    fn finish_run(
+        &mut self,
+        operation_id: Uuid,
+        operation: MaintenanceOperation,
+        operation_error: Option<String>,
+        verification_errors: Vec<String>,
+    ) -> (MaintenanceRunResult, StateTransition) {
+        self.in_flight = None;
+        let success = operation_error.is_none() && verification_errors.is_empty();
+        let result = MaintenanceRunResult {
+            operation_id,
+            operation,
+            success,
+            verification_errors,
+            fence: self.fence.clone(),
+            error: operation_error.clone(),
+        };
+        self.last_run = Some(result.clone());
+
+        let transition = if success {
+            StateTransition::to(MaintenanceState::Fenced, Some(operation_id)).with_error(None)
+        } else {
+            let message =
+                operation_error.unwrap_or_else(|| "consistency verification failed".to_string());
+            StateTransition::to(MaintenanceState::Failed, Some(operation_id))
+                .with_error(Some(message))
+        };
+        (result, transition)
+    }
+
+    /// Start a sync-until. `Some` when this node owns the operation and must recover
+    /// locally: release the held fence (if any) and re-fence afterwards.
+    fn begin_sync_until(
+        &mut self,
+        operation_id: Uuid,
+    ) -> Result<Option<LocalRecovery>, AdminTaskResponse> {
+        match self.active_operation_id {
+            Some(active) if active != operation_id => Err(maintenance_error(
+                MaintenanceErrorCode::Busy,
+                format!("maintenance operation {active} is already active"),
+            )),
+            Some(_) => {
+                if let Some(busy) = self.in_flight_busy(operation_id) {
+                    return Err(busy);
+                }
+                self.in_flight = Some(InFlightStep::SyncUntil);
+                Ok(Some((
+                    self.held_write_fence.take(),
+                    StateTransition::to(MaintenanceState::Recovering, Some(operation_id)),
+                )))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn finish_sync_until(
+        &mut self,
+        operation_id: Uuid,
+        result: WriteFenceResult,
+    ) -> (Result<(), String>, StateTransition) {
+        self.in_flight = None;
+        match self.store_refence(result) {
+            Ok(()) => (
+                Ok(()),
+                StateTransition::to(MaintenanceState::Fenced, Some(operation_id)),
+            ),
+            Err(err) => (
+                Err(err.clone()),
+                StateTransition::to(MaintenanceState::Failed, Some(operation_id))
+                    .with_error(Some(err)),
+            ),
+        }
+    }
+
+    /// Start a resume, returning the fence to release. The error is the immediate
+    /// response, which is a success for an idempotent retry.
+    fn begin_resume(
+        &mut self,
+        operation_id: Uuid,
+    ) -> Result<Option<HeldWriteFence>, AdminTaskResponse> {
+        if self.active_operation_id.is_none()
+            && self.last_resumed_operation_id == Some(operation_id)
+        {
+            return Err(AdminTaskResponse::MaintenanceResume { operation_id });
+        }
+        if self.active_operation_id != Some(operation_id) {
+            return Err(maintenance_error(
+                MaintenanceErrorCode::OperationMismatch,
+                "operation id does not own the active maintenance fence",
+            ));
+        }
+        if let Some(busy) = self.in_flight_busy(operation_id) {
+            return Err(busy);
+        }
+
+        self.in_flight = Some(InFlightStep::Resume);
+        Ok(self.held_write_fence.take())
+    }
+
+    fn finish_resume(&mut self, operation_id: Uuid) -> StateTransition {
+        self.active_operation_id = None;
+        self.fence = None;
+        self.last_run = None;
+        self.last_resumed_operation_id = Some(operation_id);
+        self.in_flight = None;
+        StateTransition::to(MaintenanceState::Serving, None).with_error(None)
+    }
+
+    /// The handler of an in-flight step stopped (a panic, or its future was dropped)
+    /// before recording an outcome. The real state of the node is unknown, so release the
+    /// step's claim and mark the operation failed: a drain retry or a resume recovers it.
+    fn abandon_in_flight(&mut self, operation_id: Uuid, step: InFlightStep) -> StateTransition {
+        self.in_flight = None;
+        // A fence the step had taken out of the controller was released when the step
+        // was dropped, so a captured fence no longer describes a held one.
+        if self.held_write_fence.is_none() {
+            self.fence = None;
+        }
+        StateTransition::to(MaintenanceState::Failed, Some(operation_id)).with_error(Some(format!(
+            "maintenance {step:?} step of operation {operation_id} stopped before completing"
+        )))
+    }
+}
+
+fn lock_controller(
+    controller: &Mutex<MaintenanceController>,
+) -> MutexGuard<'_, MaintenanceController> {
+    // The lock is never held across an await. A panic while it was held must not wedge
+    // maintenance until a restart: the controller state is still meaningful, and an
+    // interrupted step is repaired by its `InFlightGuard`.
+    controller.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Owns the in-flight claim of one step between its `begin_*` and `finish_*`.
+///
+/// `finish` records the outcome. If the guard is dropped without finishing (a panic
+/// unwinding through the handler, or its future being dropped), the claim is released
+/// and the operation is marked failed, so the node never stays busy and write-gated
+/// until a restart.
+struct InFlightGuard {
+    controller: Arc<Mutex<MaintenanceController>>,
+    operation_id: Uuid,
+    step: InFlightStep,
+    publish: fn(StateTransition),
+    finished: bool,
+}
+
+impl InFlightGuard {
+    fn new(
+        controller: Arc<Mutex<MaintenanceController>>,
+        operation_id: Uuid,
+        step: InFlightStep,
+    ) -> Self {
+        Self {
+            controller,
+            operation_id,
+            step,
+            publish: StateTransition::apply,
+            finished: false,
+        }
+    }
+
+    /// Record the step's outcome and publish its state transition under the lock.
+    fn finish<T>(
+        mut self,
+        record: impl FnOnce(&mut MaintenanceController) -> (T, StateTransition),
+    ) -> T {
+        self.finished = true;
+        let mut state = lock_controller(&self.controller);
+        let (value, transition) = record(&mut state);
+        (self.publish)(transition);
+        value
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let mut state = lock_controller(&self.controller);
+        if state.active_operation_id == Some(self.operation_id)
+            && state.in_flight == Some(self.step)
+        {
+            let transition = state.abandon_in_flight(self.operation_id, self.step);
+            (self.publish)(transition);
+        }
+    }
 }
 
 pub(crate) struct AdminActor;
@@ -647,103 +1066,74 @@ async fn release_write_fence(held: HeldWriteFence) {
     }
 }
 
-fn fence_satisfaction(target: &ReplicationFence, current: &ReplicationFence) -> FenceSatisfaction {
-    if target.version != current.version {
-        return FenceSatisfaction::Unsatisfied;
-    }
-    if target.domain_uuid != current.domain_uuid {
-        return FenceSatisfaction::DomainMismatch;
-    }
-    if target.generation != current.generation {
-        return FenceSatisfaction::GenerationMismatch;
-    }
-
-    if target.ranges.iter().all(|(server_uuid, required)| {
-        current
-            .ranges
-            .get(server_uuid)
-            .is_some_and(|present| present.ts_max >= required.ts_max)
-    }) {
-        FenceSatisfaction::Satisfied
-    } else {
-        FenceSatisfaction::Unsatisfied
-    }
-}
-
 async fn maintenance_drain(
     server_rw: &'static QueryServerWriteV1,
     controller: Arc<Mutex<MaintenanceController>>,
     operation_id: Uuid,
 ) -> AdminTaskResponse {
-    {
-        let mut state = controller.lock().await;
-        if state.active_operation_id == Some(operation_id) {
-            if let Some(fence) = state.fence.clone() {
+    let (fresh, guard) = {
+        let mut state = lock_controller(&controller);
+        match state.begin_drain(operation_id) {
+            Ok(DrainStart::Fenced(fence)) => {
                 return AdminTaskResponse::MaintenanceDrain {
                     operation_id,
                     fence,
                 };
             }
-        } else if let Some(active) = state.active_operation_id {
-            return maintenance_error(
-                MaintenanceErrorCode::Busy,
-                format!("maintenance operation {active} is already active"),
-            );
-        }
-
-        state.active_operation_id = Some(operation_id);
-        state.fence = None;
-        state.last_run = None;
-    }
-
-    set_maintenance_error(None);
-    set_maintenance_state(MaintenanceState::Draining, Some(operation_id));
-
-    match acquire_write_fence(server_rw.idms.clone()).await {
-        Ok((held, fence)) => {
-            let mut state = controller.lock().await;
-            state.held_write_fence = Some(held);
-            state.fence = Some(fence.clone());
-            set_maintenance_state(MaintenanceState::Fenced, Some(operation_id));
-            AdminTaskResponse::MaintenanceDrain {
-                operation_id,
-                fence,
+            Ok(DrainStart::Acquire { fresh, transition }) => {
+                transition.apply();
+                (
+                    fresh,
+                    InFlightGuard::new(controller.clone(), operation_id, InFlightStep::Drain),
+                )
             }
+            Err(response) => return response,
         }
-        Err(err) => {
-            set_maintenance_error(Some(err.clone()));
-            set_maintenance_state(MaintenanceState::Failed, Some(operation_id));
-            maintenance_error(MaintenanceErrorCode::Timeout, err)
-        }
-    }
+    };
+
+    let result = acquire_write_fence(server_rw.idms.clone()).await;
+
+    guard.finish(|state| state.finish_drain(operation_id, fresh, result))
 }
 
-async fn run_verification(idms: &IdmServer) -> Result<Vec<String>, String> {
+async fn run_verification(idms: &'static IdmServer) -> Result<Vec<String>, String> {
     let mut read_txn = idms
         .proxy_read()
         .await
         .map_err(|err| format!("unable to acquire verification read transaction: {err:?}"))?;
-    Ok(read_txn
-        .qs_read
-        .maintenance_verify()
-        .into_iter()
-        .filter_map(|result| result.err().map(|err| format!("{err:?}")))
-        .collect())
+    // A full consistency verification reads the whole database: run it on the blocking
+    // pool so that it never stalls the async workers serving LDAP and HTTPS.
+    tokio::task::spawn_blocking(move || {
+        read_txn
+            .qs_read
+            .maintenance_verify()
+            .into_iter()
+            .filter_map(|result| result.err().map(|err| format!("{err:?}")))
+            .collect()
+    })
+    .await
+    .map_err(|err| format!("verification task failed: {err}"))
 }
 
-async fn run_reindex(idms: &IdmServer) -> Result<(), String> {
-    let result = {
-        let proxy_write =
-            with_maintenance_write_bypass(idms.proxy_write(duration_from_epoch_now()))
-                .await
-                .map_err(|err| format!("unable to acquire reindex write transaction: {err:?}"))?;
+async fn run_reindex(idms: Arc<IdmServer>) -> Result<(), String> {
+    // Reindexing rewrites every index of the database: blocking work that must not stall
+    // the async workers serving LDAP and HTTPS. The write transaction holds guards that
+    // are not `Send`, so it is opened on the blocking thread itself rather than moved there.
+    let runtime = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || {
+        let proxy_write = runtime
+            .block_on(with_maintenance_write_bypass(
+                idms.proxy_write(duration_from_epoch_now()),
+            ))
+            .map_err(|err| format!("unable to acquire reindex write transaction: {err:?}"))?;
         let mut qs_write = proxy_write.qs_write;
         qs_write
             .reindex(true)
             .and_then(|_| qs_write.commit())
             .map_err(|err| format!("reindex failed: {err:?}"))
-    };
-    result
+    })
+    .await
+    .map_err(|err| format!("reindex task failed: {err}"))?
 }
 
 async fn maintenance_run(
@@ -752,37 +1142,17 @@ async fn maintenance_run(
     operation_id: Uuid,
     operation: MaintenanceOperation,
 ) -> AdminTaskResponse {
-    let held_for_reindex = {
-        let mut state = controller.lock().await;
-        if state.active_operation_id != Some(operation_id) {
-            return maintenance_error(
-                MaintenanceErrorCode::OperationMismatch,
-                "operation id does not own the active maintenance fence",
-            );
-        }
-        if let Some(previous) = state.last_run.as_ref() {
-            if previous.operation == operation {
-                return AdminTaskResponse::MaintenanceRun {
-                    result: previous.clone(),
-                };
+    let (held_for_reindex, guard) = {
+        let mut state = lock_controller(&controller);
+        match state.begin_run(operation_id, operation) {
+            Ok((held, transition)) => {
+                transition.apply();
+                (
+                    held,
+                    InFlightGuard::new(controller.clone(), operation_id, InFlightStep::Run),
+                )
             }
-            return maintenance_error(
-                MaintenanceErrorCode::OperationMismatch,
-                "operation id was already used for a different maintenance operation",
-            );
-        }
-        if state.held_write_fence.is_none() {
-            return maintenance_error(
-                MaintenanceErrorCode::InvalidState,
-                "node is not currently fenced",
-            );
-        }
-
-        set_maintenance_state(MaintenanceState::Maintenance, Some(operation_id));
-        if matches!(operation, MaintenanceOperation::Reindex) {
-            state.held_write_fence.take()
-        } else {
-            None
+            Err(response) => return response,
         }
     };
 
@@ -796,22 +1166,17 @@ async fn maintenance_run(
 
     let mut operation_error = None;
     if matches!(operation, MaintenanceOperation::Reindex) {
-        if let Err(err) = run_reindex(&server_rw.idms).await {
+        if let Err(err) = run_reindex(server_rw.idms.clone()).await {
             operation_error = Some(err);
         }
 
-        match acquire_write_fence(server_rw.idms.clone()).await {
-            Ok((held, fence)) => {
-                let mut state = controller.lock().await;
-                state.held_write_fence = Some(held);
-                state.fence = Some(fence);
-            }
-            Err(err) => {
-                operation_error = Some(match operation_error {
-                    Some(previous) => format!("{previous}; unable to re-fence node: {err}"),
-                    None => format!("unable to re-fence node: {err}"),
-                });
-            }
+        let refence = acquire_write_fence(server_rw.idms.clone()).await;
+        let stored = lock_controller(&controller).store_refence(refence);
+        if let Err(err) = stored {
+            operation_error = Some(match operation_error {
+                Some(previous) => format!("{previous}; unable to re-fence node: {err}"),
+                None => format!("unable to re-fence node: {err}"),
+            });
         }
     }
 
@@ -826,33 +1191,24 @@ async fn maintenance_run(
         }
     };
 
-    let success = operation_error.is_none() && verification_errors.is_empty();
-    let fence = controller.lock().await.fence.clone();
-    let result = MaintenanceRunResult {
-        operation_id,
-        operation,
-        success,
-        verification_errors,
-        fence,
-        error: operation_error.clone(),
-    };
-
-    {
-        let mut state = controller.lock().await;
-        state.last_run = Some(result.clone());
-    }
-
-    if success {
-        set_maintenance_error(None);
-        set_maintenance_state(MaintenanceState::Fenced, Some(operation_id));
-    } else {
-        let message =
-            operation_error.unwrap_or_else(|| "consistency verification failed".to_string());
-        set_maintenance_error(Some(message));
-        set_maintenance_state(MaintenanceState::Failed, Some(operation_id));
-    }
-
+    let result = guard.finish(|state| {
+        state.finish_run(
+            operation_id,
+            operation,
+            operation_error,
+            verification_errors,
+        )
+    });
     AdminTaskResponse::MaintenanceRun { result }
+}
+
+/// The bounded wait of a sync-until request.
+fn sync_until_timeout(timeout_seconds: Option<u64>) -> Duration {
+    Duration::from_secs(
+        timeout_seconds
+            .unwrap_or(DEFAULT_SYNC_UNTIL_TIMEOUT.as_secs())
+            .clamp(1, MAX_SYNC_UNTIL_TIMEOUT.as_secs()),
+    )
 }
 
 async fn sync_until(
@@ -860,10 +1216,12 @@ async fn sync_until(
     target: &ReplicationFence,
     timeout_duration: Duration,
 ) -> Result<(ReplicationSyncResult, ReplicationFence), String> {
-    let deadline = Instant::now() + timeout_duration;
+    let deadline = Instant::now()
+        .checked_add(timeout_duration)
+        .ok_or_else(|| "sync-until timeout is out of range".to_string())?;
     loop {
         let current = capture_fence(idms).await?;
-        match fence_satisfaction(target, &current) {
+        match target.satisfaction(&current) {
             FenceSatisfaction::Satisfied => {
                 return Ok((ReplicationSyncResult::Satisfied, current));
             }
@@ -894,48 +1252,42 @@ async fn replication_sync_until(
     // operation, temporarily release the write fence so its replication consumer
     // can apply peer changes. It remains not-ready for the entire recovery window,
     // and a fresh write fence is captured before returning.
-    let locally_recovering = {
-        let mut state = controller.lock().await;
-        match state.active_operation_id {
-            Some(active) if active != operation_id => {
-                return maintenance_error(
-                    MaintenanceErrorCode::Busy,
-                    format!("maintenance operation {active} is already active"),
-                );
+    let local_recovery = {
+        let mut state = lock_controller(&controller);
+        match state.begin_sync_until(operation_id) {
+            Ok(Some((held, transition))) => {
+                transition.apply();
+                Some((
+                    held,
+                    InFlightGuard::new(controller.clone(), operation_id, InFlightStep::SyncUntil),
+                ))
             }
-            Some(_) => {
-                set_maintenance_state(MaintenanceState::Recovering, Some(operation_id));
-                state.held_write_fence.take()
-            }
-            None => None,
+            Ok(None) => None,
+            Err(response) => return response,
         }
     };
 
-    if let Some(held) = locally_recovering {
-        release_write_fence(held).await;
-    }
-
-    let timeout_duration = Duration::from_secs(
-        timeout_seconds
-            .unwrap_or(DEFAULT_SYNC_UNTIL_TIMEOUT.as_secs())
-            .max(1),
-    );
-    let sync_result = sync_until(&server_rw.idms, &fence, timeout_duration).await;
-
-    let has_local_operation = controller.lock().await.active_operation_id == Some(operation_id);
-    if has_local_operation {
-        match acquire_write_fence(server_rw.idms.clone()).await {
-            Ok((held, current_fence)) => {
-                let mut state = controller.lock().await;
-                state.held_write_fence = Some(held);
-                state.fence = Some(current_fence);
-                set_maintenance_state(MaintenanceState::Fenced, Some(operation_id));
+    // Only re-fence when this request released the fence. Deciding this up front, not by
+    // looking at the controller again, keeps a drain started meanwhile for the same id
+    // from being fenced twice.
+    let guard = match local_recovery {
+        Some((held, guard)) => {
+            if let Some(held) = held {
+                release_write_fence(held).await;
             }
-            Err(err) => {
-                set_maintenance_error(Some(err.clone()));
-                set_maintenance_state(MaintenanceState::Failed, Some(operation_id));
-                return maintenance_error(MaintenanceErrorCode::Database, err);
-            }
+            Some(guard)
+        }
+        None => None,
+    };
+
+    let sync_result =
+        sync_until(&server_rw.idms, &fence, sync_until_timeout(timeout_seconds)).await;
+
+    if let Some(guard) = guard {
+        let refence = acquire_write_fence(server_rw.idms.clone()).await;
+        let result = guard.finish(|state| state.finish_sync_until(operation_id, refence));
+        if let Err(err) = result {
+            return maintenance_error(MaintenanceErrorCode::Database, err);
         }
     }
 
@@ -952,33 +1304,22 @@ async fn maintenance_resume(
     controller: Arc<Mutex<MaintenanceController>>,
     operation_id: Uuid,
 ) -> AdminTaskResponse {
-    let held = {
-        let mut state = controller.lock().await;
-        if state.active_operation_id.is_none()
-            && state.last_resumed_operation_id == Some(operation_id)
-        {
-            return AdminTaskResponse::MaintenanceResume { operation_id };
+    let (held, guard) = {
+        let mut state = lock_controller(&controller);
+        match state.begin_resume(operation_id) {
+            Ok(held) => (
+                held,
+                InFlightGuard::new(controller.clone(), operation_id, InFlightStep::Resume),
+            ),
+            Err(response) => return response,
         }
-        if state.active_operation_id != Some(operation_id) {
-            return maintenance_error(
-                MaintenanceErrorCode::OperationMismatch,
-                "operation id does not own the active maintenance fence",
-            );
-        }
-
-        state.active_operation_id = None;
-        state.fence = None;
-        state.last_run = None;
-        state.last_resumed_operation_id = Some(operation_id);
-        state.held_write_fence.take()
     };
 
     if let Some(held) = held {
         release_write_fence(held).await;
     }
 
-    set_maintenance_error(None);
-    set_maintenance_state(MaintenanceState::Serving, None);
+    guard.finish(|state| ((), state.finish_resume(operation_id)));
     AdminTaskResponse::MaintenanceResume { operation_id }
 }
 
@@ -1085,7 +1426,7 @@ async fn handle_client(
                     }
                 }
                 AdminTaskRequest::MaintenanceStatus => {
-                    let fence = maintenance.lock().await.fence.clone();
+                    let fence = lock_controller(&maintenance).fence.clone();
                     AdminTaskResponse::MaintenanceStatus {
                         status: maintenance_public_status(),
                         fence,
@@ -1181,5 +1522,488 @@ mod maintenance_protocol_tests {
             operation_id.to_string()
         );
         assert_eq!(value["MaintenanceRun"]["result"]["success"], true);
+    }
+}
+
+#[cfg(test)]
+mod maintenance_controller_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    /// A stand-in for a held QueryServer write fence: a task that waits to be released.
+    fn held() -> HeldWriteFence {
+        let (release, released) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _ = released.await;
+        });
+        HeldWriteFence { release, task }
+    }
+
+    fn test_fence() -> ReplicationFence {
+        ReplicationFence {
+            version: 1,
+            domain_uuid: Uuid::new_v4(),
+            generation: None,
+            ranges: BTreeMap::new(),
+        }
+    }
+
+    fn expect_error<T>(result: Result<T, AdminTaskResponse>, expected: MaintenanceErrorCode) {
+        match result {
+            Err(AdminTaskResponse::MaintenanceError { code, .. }) => assert_eq!(code, expected),
+            Err(other) => panic!("unexpected response: {other:?}"),
+            Ok(_) => panic!("expected a {expected:?} error"),
+        }
+    }
+
+    /// Drain `operation_id` to completion, returning the fence it holds.
+    fn drained(controller: &mut MaintenanceController, operation_id: Uuid) -> ReplicationFence {
+        let fresh = match controller.begin_drain(operation_id) {
+            Ok(DrainStart::Acquire { fresh, .. }) => fresh,
+            Ok(DrainStart::Fenced(_)) => panic!("operation was already fenced"),
+            Err(other) => panic!("unexpected response: {other:?}"),
+        };
+        let fence = test_fence();
+        let (response, transition) =
+            controller.finish_drain(operation_id, fresh, Ok((held(), fence.clone())));
+        assert!(matches!(
+            response,
+            AdminTaskResponse::MaintenanceDrain { .. }
+        ));
+        assert_eq!(
+            transition,
+            StateTransition::to(MaintenanceState::Fenced, Some(operation_id))
+        );
+        fence
+    }
+
+    #[tokio::test]
+    async fn drain_retry_while_acquiring_is_busy() {
+        let mut controller = MaintenanceController::default();
+        let operation_id = Uuid::new_v4();
+
+        match controller.begin_drain(operation_id) {
+            Ok(DrainStart::Acquire { fresh, transition }) => {
+                assert!(fresh);
+                assert_eq!(
+                    transition,
+                    StateTransition::to(MaintenanceState::Draining, Some(operation_id))
+                        .with_error(None)
+                );
+            }
+            Ok(DrainStart::Fenced(_)) => panic!("nothing was fenced yet"),
+            Err(other) => panic!("unexpected response: {other:?}"),
+        }
+
+        // Same operation, still acquiring: must not start a second acquisition.
+        expect_error(
+            controller.begin_drain(operation_id),
+            MaintenanceErrorCode::Busy,
+        );
+        // A different operation is busy too.
+        expect_error(
+            controller.begin_drain(Uuid::new_v4()),
+            MaintenanceErrorCode::Busy,
+        );
+
+        let fence = test_fence();
+        let (response, transition) =
+            controller.finish_drain(operation_id, true, Ok((held(), fence.clone())));
+        assert!(matches!(
+            response,
+            AdminTaskResponse::MaintenanceDrain { .. }
+        ));
+        assert_eq!(transition.state, MaintenanceState::Fenced);
+        assert!(controller.in_flight.is_none());
+
+        // Once fenced, a retry is idempotent and returns the same fence.
+        match controller.begin_drain(operation_id) {
+            Ok(DrainStart::Fenced(returned)) => assert_eq!(returned, fence),
+            Ok(DrainStart::Acquire { .. }) => panic!("drain retry acquired a second fence"),
+            Err(other) => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_fresh_drain_rolls_back_to_serving() {
+        let mut controller = MaintenanceController::default();
+        let operation_id = Uuid::new_v4();
+
+        let fresh = match controller.begin_drain(operation_id) {
+            Ok(DrainStart::Acquire { fresh, .. }) => fresh,
+            _ => panic!("drain should start"),
+        };
+        let (response, transition) =
+            controller.finish_drain(operation_id, fresh, Err("timed out".to_string()));
+
+        assert!(matches!(
+            response,
+            AdminTaskResponse::MaintenanceError {
+                code: MaintenanceErrorCode::Timeout,
+                ..
+            }
+        ));
+        // Nothing was fenced: writes must not stay gated.
+        assert_eq!(
+            transition,
+            StateTransition::to(MaintenanceState::Serving, None)
+                .with_error(Some("timed out".to_string()))
+        );
+        assert!(controller.active_operation_id.is_none());
+        assert!(controller.in_flight.is_none());
+
+        // An orchestrator resuming after the failed drain gets an idempotent success.
+        assert!(matches!(
+            controller.begin_resume(operation_id),
+            Err(AdminTaskResponse::MaintenanceResume { operation_id: resumed }) if resumed == operation_id
+        ));
+
+        // The node is free for a new operation.
+        let next = Uuid::new_v4();
+        assert!(matches!(
+            controller.begin_drain(next),
+            Ok(DrainStart::Acquire { fresh: true, .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_reindex_refence_is_not_handed_out_again() {
+        let mut controller = MaintenanceController::default();
+        let operation_id = Uuid::new_v4();
+        drained(&mut controller, operation_id);
+
+        let (held_for_reindex, transition) = controller
+            .begin_run(operation_id, MaintenanceOperation::Reindex)
+            .expect("run should start");
+        assert!(held_for_reindex.is_some());
+        assert_eq!(transition.state, MaintenanceState::Maintenance);
+        // While the node is unfenced for the reindex, status shows no fence.
+        assert!(controller.fence.is_none());
+
+        assert!(controller
+            .store_refence(Err("unable to fence".to_string()))
+            .is_err());
+        let (result, transition) = controller.finish_run(
+            operation_id,
+            MaintenanceOperation::Reindex,
+            Some("unable to re-fence node: unable to fence".to_string()),
+            Vec::new(),
+        );
+        assert!(!result.success);
+        assert!(result.fence.is_none());
+        assert_eq!(transition.state, MaintenanceState::Failed);
+
+        // A drain retry must fence again instead of returning the stale fence, and a
+        // failure of that retry keeps the operation failed rather than serving.
+        let fresh = match controller.begin_drain(operation_id) {
+            Ok(DrainStart::Acquire { fresh, .. }) => fresh,
+            Ok(DrainStart::Fenced(_)) => panic!("stale fence was handed out"),
+            Err(other) => panic!("unexpected response: {other:?}"),
+        };
+        assert!(!fresh);
+        let (_, transition) =
+            controller.finish_drain(operation_id, fresh, Err("timed out".to_string()));
+        assert_eq!(transition.state, MaintenanceState::Failed);
+        assert_eq!(controller.active_operation_id, Some(operation_id));
+    }
+
+    #[tokio::test]
+    async fn resume_is_rejected_while_a_run_is_in_flight() {
+        let mut controller = MaintenanceController::default();
+        let operation_id = Uuid::new_v4();
+        drained(&mut controller, operation_id);
+
+        let (held_for_reindex, _) = controller
+            .begin_run(operation_id, MaintenanceOperation::Reindex)
+            .expect("run should start");
+        if let Some(to_release) = held_for_reindex {
+            release_write_fence(to_release).await;
+        }
+
+        // The run is unfenced and reindexing: resume, drain and another run are refused.
+        expect_error(
+            controller.begin_resume(operation_id),
+            MaintenanceErrorCode::Busy,
+        );
+        expect_error(
+            controller.begin_drain(operation_id),
+            MaintenanceErrorCode::Busy,
+        );
+        expect_error(
+            controller.begin_run(operation_id, MaintenanceOperation::Reindex),
+            MaintenanceErrorCode::Busy,
+        );
+        assert_eq!(controller.active_operation_id, Some(operation_id));
+
+        // The run re-fences and completes.
+        let fence = test_fence();
+        controller
+            .store_refence(Ok((held(), fence.clone())))
+            .expect("re-fence should be stored");
+        let (result, transition) = controller.finish_run(
+            operation_id,
+            MaintenanceOperation::Reindex,
+            None,
+            Vec::new(),
+        );
+        assert!(result.success);
+        assert_eq!(result.fence, Some(fence));
+        assert_eq!(
+            transition,
+            StateTransition::to(MaintenanceState::Fenced, Some(operation_id)).with_error(None)
+        );
+
+        // Now resume releases the re-acquired fence.
+        let to_release = controller
+            .begin_resume(operation_id)
+            .expect("resume should start");
+        assert!(to_release.is_some());
+        // A concurrent resume while releasing is busy, not a second release.
+        expect_error(
+            controller.begin_resume(operation_id),
+            MaintenanceErrorCode::Busy,
+        );
+        if let Some(to_release) = to_release {
+            release_write_fence(to_release).await;
+        }
+        assert_eq!(
+            controller.finish_resume(operation_id),
+            StateTransition::to(MaintenanceState::Serving, None).with_error(None)
+        );
+        assert!(controller.active_operation_id.is_none());
+        assert!(controller.held_write_fence.is_none());
+
+        // Resume is idempotent.
+        assert!(matches!(
+            controller.begin_resume(operation_id),
+            Err(AdminTaskResponse::MaintenanceResume { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn resume_is_rejected_while_sync_until_is_in_flight() {
+        let mut controller = MaintenanceController::default();
+        let operation_id = Uuid::new_v4();
+        drained(&mut controller, operation_id);
+
+        let local = controller
+            .begin_sync_until(operation_id)
+            .expect("sync-until should start");
+        let (to_release, transition) = local.expect("this node owns the operation");
+        assert!(to_release.is_some());
+        assert_eq!(transition.state, MaintenanceState::Recovering);
+
+        expect_error(
+            controller.begin_resume(operation_id),
+            MaintenanceErrorCode::Busy,
+        );
+        expect_error(
+            controller.begin_sync_until(operation_id),
+            MaintenanceErrorCode::Busy,
+        );
+        expect_error(
+            controller.begin_sync_until(Uuid::new_v4()),
+            MaintenanceErrorCode::Busy,
+        );
+
+        if let Some(to_release) = to_release {
+            release_write_fence(to_release).await;
+        }
+        let (result, transition) =
+            controller.finish_sync_until(operation_id, Ok((held(), test_fence())));
+        assert!(result.is_ok());
+        assert_eq!(
+            transition,
+            StateTransition::to(MaintenanceState::Fenced, Some(operation_id))
+        );
+
+        assert!(controller.begin_resume(operation_id).is_ok());
+    }
+
+    #[tokio::test]
+    async fn sync_until_without_local_operation_does_not_claim_the_controller() {
+        let mut controller = MaintenanceController::default();
+        let local = controller
+            .begin_sync_until(Uuid::new_v4())
+            .expect("sync-until should start");
+        assert!(local.is_none());
+        assert!(controller.in_flight.is_none());
+        assert!(controller.active_operation_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn run_requires_a_fence_and_is_idempotent() {
+        let mut controller = MaintenanceController::default();
+        let operation_id = Uuid::new_v4();
+
+        expect_error(
+            controller.begin_run(operation_id, MaintenanceOperation::Verify),
+            MaintenanceErrorCode::OperationMismatch,
+        );
+
+        drained(&mut controller, operation_id);
+        let (held_for_reindex, _) = controller
+            .begin_run(operation_id, MaintenanceOperation::Verify)
+            .expect("run should start");
+        // Verify keeps the node fenced.
+        assert!(held_for_reindex.is_none());
+        assert!(controller.held_write_fence.is_some());
+
+        let (result, transition) = controller.finish_run(
+            operation_id,
+            MaintenanceOperation::Verify,
+            None,
+            vec!["inconsistent".to_string()],
+        );
+        assert!(!result.success);
+        assert_eq!(
+            transition,
+            StateTransition::to(MaintenanceState::Failed, Some(operation_id))
+                .with_error(Some("consistency verification failed".to_string()))
+        );
+
+        // Retrying the same run returns the recorded result; another operation is refused.
+        match controller.begin_run(operation_id, MaintenanceOperation::Verify) {
+            Err(AdminTaskResponse::MaintenanceRun { result: previous }) => {
+                assert_eq!(previous, result)
+            }
+            Err(other) => panic!("unexpected response: {other:?}"),
+            Ok(_) => panic!("run was executed twice"),
+        }
+        expect_error(
+            controller.begin_run(operation_id, MaintenanceOperation::Reindex),
+            MaintenanceErrorCode::OperationMismatch,
+        );
+    }
+
+    /// Transitions published by test guards, instead of the process-global state.
+    static PUBLISHED: Mutex<Vec<StateTransition>> = Mutex::new(Vec::new());
+
+    fn record_transition(transition: StateTransition) {
+        PUBLISHED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(transition);
+    }
+
+    fn published_for(operation_id: Uuid) -> Vec<StateTransition> {
+        PUBLISHED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|transition| transition.operation_id == Some(operation_id))
+            .cloned()
+            .collect()
+    }
+
+    fn test_guard(
+        controller: &Arc<Mutex<MaintenanceController>>,
+        operation_id: Uuid,
+        step: InFlightStep,
+    ) -> InFlightGuard {
+        InFlightGuard {
+            controller: controller.clone(),
+            operation_id,
+            step,
+            publish: record_transition,
+            finished: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn abandoned_step_is_released_and_marked_failed() {
+        let controller = Arc::new(Mutex::new(MaintenanceController::default()));
+        let operation_id = Uuid::new_v4();
+
+        assert!(matches!(
+            lock_controller(&controller).begin_drain(operation_id),
+            Ok(DrainStart::Acquire { .. })
+        ));
+        let guard = test_guard(&controller, operation_id, InFlightStep::Drain);
+
+        // The handler panics while the step is in flight.
+        let outcome = tokio::spawn(async move {
+            let _guard = guard;
+            panic!("simulated failure inside a maintenance step");
+        })
+        .await;
+        assert!(outcome.is_err());
+
+        {
+            let state = lock_controller(&controller);
+            assert!(state.in_flight.is_none());
+            assert_eq!(state.active_operation_id, Some(operation_id));
+            assert!(state.fence.is_none());
+        }
+        let published = published_for(operation_id);
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].state, MaintenanceState::Failed);
+        assert!(matches!(&published[0].error, Some(Some(message)) if message.contains("Drain")));
+
+        // Not busy any more: the operation can be resumed (or the drain retried).
+        let mut state = lock_controller(&controller);
+        assert!(matches!(state.begin_resume(operation_id), Ok(None)));
+        state.finish_resume(operation_id);
+    }
+
+    #[tokio::test]
+    async fn abandoned_run_keeps_a_fence_it_did_not_take() {
+        let controller = Arc::new(Mutex::new(MaintenanceController::default()));
+        let operation_id = Uuid::new_v4();
+        let fence = drained(&mut lock_controller(&controller), operation_id);
+
+        match lock_controller(&controller).begin_run(operation_id, MaintenanceOperation::Verify) {
+            Ok((held_for_reindex, _)) => assert!(held_for_reindex.is_none()),
+            Err(other) => panic!("unexpected response: {other:?}"),
+        }
+        drop(test_guard(&controller, operation_id, InFlightStep::Run));
+
+        let state = lock_controller(&controller);
+        assert!(state.in_flight.is_none());
+        // Verify left the fence held, so it still describes the node and a resume
+        // releases it.
+        assert!(state.held_write_fence.is_some());
+        assert_eq!(state.fence, Some(fence));
+        assert_eq!(
+            published_for(operation_id)
+                .last()
+                .map(|transition| transition.state),
+            Some(MaintenanceState::Failed)
+        );
+    }
+
+    #[tokio::test]
+    async fn finished_step_is_not_abandoned() {
+        let controller = Arc::new(Mutex::new(MaintenanceController::default()));
+        let operation_id = Uuid::new_v4();
+
+        let fresh = match lock_controller(&controller).begin_drain(operation_id) {
+            Ok(DrainStart::Acquire { fresh, .. }) => fresh,
+            _ => panic!("drain should start"),
+        };
+        let guard = test_guard(&controller, operation_id, InFlightStep::Drain);
+        let response = guard
+            .finish(|state| state.finish_drain(operation_id, fresh, Ok((held(), test_fence()))));
+        assert!(matches!(
+            response,
+            AdminTaskResponse::MaintenanceDrain { .. }
+        ));
+
+        let published = published_for(operation_id);
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].state, MaintenanceState::Fenced);
+        assert!(lock_controller(&controller).in_flight.is_none());
+    }
+
+    #[test]
+    fn sync_until_timeout_is_bounded() {
+        assert_eq!(sync_until_timeout(None), DEFAULT_SYNC_UNTIL_TIMEOUT);
+        assert_eq!(sync_until_timeout(Some(0)), Duration::from_secs(1));
+        assert_eq!(sync_until_timeout(Some(30)), Duration::from_secs(30));
+        assert_eq!(sync_until_timeout(Some(u64::MAX)), MAX_SYNC_UNTIL_TIMEOUT);
+        // The bounded timeout never overflows a deadline.
+        assert!(Instant::now()
+            .checked_add(sync_until_timeout(Some(u64::MAX)))
+            .is_some());
     }
 }

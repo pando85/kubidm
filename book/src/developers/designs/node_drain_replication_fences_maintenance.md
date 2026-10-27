@@ -221,11 +221,11 @@ This lets a Kubernetes reconciler restart and replay requests safely.
 
 `/healthz` remains process liveness.
 
-`/readyz` becomes not-ready whenever maintenance state is not `Serving`, regardless of raw replication health. The readiness body includes maintenance state and the active operation id when safe to expose.
+`/readyz` becomes not-ready whenever maintenance state is not `Serving`, regardless of raw replication health. The readiness message names the maintenance state. It never includes the active operation id: `/readyz` is unauthenticated, so orchestrators must read operation ids from the admin socket `MaintenanceStatus` request.
 
 This ensures a drain removes the node from Kubernetes Service endpoints, but correctness never relies solely on EndpointSlice propagation because the write gate independently rejects new mutations.
 
-A new public read-only endpoint exposes maintenance capabilities and state so probes/operators can inspect the node without database authentication. Mutating operations remain restricted to the local admin control path in the first implementation.
+A new public read-only endpoint (`GET /maintenance`) exposes maintenance capabilities and state so probes/operators can inspect the node without database authentication. Because it is unauthenticated it omits the active operation id and the last error; both are only available from the admin socket `MaintenanceStatus` request. Mutating operations remain restricted to the local admin control path in the first implementation.
 
 ## Reindex implementation
 
@@ -241,10 +241,11 @@ Verification does not automatically repair data.
 
 ## Failure semantics
 
-- Drain timeout/failure: return failure and remain non-serving until the controller can prove a safe state or the caller explicitly resumes.
+- Drain timeout/failure: return failure. If nothing was fenced and no operation was active before the drain, the node rolls back to `Serving` (nothing needs protecting) and the operation counts as resumed, so a subsequent resume of it is an idempotent success. A failed drain retry for an operation that was already in progress leaves the node `Failed` and non-serving until the drain is retried successfully or the caller explicitly resumes.
+- Interrupted step (a handler stops before recording its outcome): the step's claim is released and the node becomes `Failed`, so a drain retry or a resume recovers it without a restart.
 - Fence mismatch/domain mismatch: fail without modifying data.
 - Sync-until refresh required: return `RefreshRequired`; do not claim the fence is satisfied.
-- Maintenance operation error or failed verification: remain `Fenced`, set last operation failure, and keep `/readyz` false.
+- Maintenance operation error or failed verification: report state `Failed` while keeping the write fence held, set last operation failure, and keep `/readyz` false.
 - Process restart during an in-memory maintenance operation: startup begins in normal `Serving` state in this first implementation because no destructive external-process operation is used. Persistent maintenance journaling is deferred until an operation requiring crash-sticky recovery semantics (for example future vacuum) is introduced.
 
 ## Security
@@ -275,7 +276,8 @@ This protocol proves handoff at explicit points without requiring global zero-la
 
 - Existing deployments that never use maintenance controls preserve current behaviour.
 - Existing `/healthz` semantics remain unchanged.
-- Existing `/readyz` remains compatible except for additional response fields and the intentional not-ready state during drain/maintenance.
+- **Breaking:** `/readyz` `peers` changed from a list of peer objects (URL, connection flag, timestamps) to counts `{ total, healthy, stale }`, so that the unauthenticated endpoint does not disclose replication topology. Apart from that and the intentional not-ready state during drain/maintenance, `/readyz` is unchanged.
+- **Breaking:** `/maintenance` no longer returns `active_operation_id` or `last_error`. Orchestrators must use the admin socket `MaintenanceStatus` request for both.
 - Upstream-style offline CLI commands remain available.
 - Kaniop can feature-detect native maintenance support and retain its scale-to-zero/offline Job fallback for Kanidm.
 

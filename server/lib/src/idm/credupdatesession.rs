@@ -175,6 +175,52 @@ pub(crate) struct CredentialUpdateSession {
 
     // Internal reg state of any inprogress totp or webauthn credentials.
     mfaregstate: MfaRegState,
+
+    // Snapshot of the credentials as they were when this session started. This is used to
+    // determine which sections have pending (uncommitted) changes, and whether it is safe to
+    // automatically commit. Passkeys are tracked by uuid -> label, since a passkey's key
+    // material can not change within a session (only add, remove or rename).
+    original_primary: Option<Credential>,
+    original_passkeys: BTreeMap<Uuid, String>,
+    original_attested_passkeys: BTreeMap<Uuid, String>,
+    original_unixcred: Option<Credential>,
+    original_sshkeys: BTreeMap<String, SshPublicKey>,
+}
+
+/// Which parts of a credential update session differ from the state at session start.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct PendingChanges {
+    primary: bool,
+    passkeys: bool,
+    attested_passkeys: bool,
+    unixcred: bool,
+    sshkeys: bool,
+}
+
+impl PendingChanges {
+    fn any(self) -> bool {
+        self.primary || self.passkeys || self.attested_passkeys || self.unixcred || self.sshkeys
+    }
+}
+
+fn passkey_labels<T>(passkeys: &BTreeMap<Uuid, (String, T)>) -> BTreeMap<Uuid, String> {
+    passkeys
+        .iter()
+        .map(|(uuid, (label, _))| (*uuid, label.clone()))
+        .collect()
+}
+
+/// True if every passkey from the original snapshot is still present with the same label,
+/// meaning the only possible difference is newly added passkeys.
+fn passkeys_only_added<T>(
+    original: &BTreeMap<Uuid, String>,
+    current: &BTreeMap<Uuid, (String, T)>,
+) -> bool {
+    original.iter().all(|(uuid, label)| {
+        current
+            .get(uuid)
+            .is_some_and(|(current_label, _)| current_label == label)
+    })
 }
 
 impl fmt::Debug for CredentialUpdateSession {
@@ -290,6 +336,58 @@ impl CredentialUpdateSession {
 
         (can_commit, warnings)
     }
+
+    fn pending_changes(&self) -> PendingChanges {
+        PendingChanges {
+            primary: self.primary != self.original_primary,
+            passkeys: passkey_labels(&self.passkeys) != self.original_passkeys,
+            attested_passkeys: passkey_labels(&self.attested_passkeys)
+                != self.original_attested_passkeys,
+            unixcred: self.unixcred != self.original_unixcred,
+            sshkeys: self.sshkeys != self.original_sshkeys,
+        }
+    }
+
+    /// Whether the account itself had no authentication credential when the session started.
+    /// This looks at the account, not at the session snapshot: credentials the session can
+    /// not see (access or policy filtered) still count, so they never look like a first one.
+    fn had_no_valid_credentials_at_start(&self) -> bool {
+        self.account.attested_passkeys.is_empty()
+            && self.account.passkeys.is_empty()
+            && self.account.primary.is_none()
+    }
+
+    fn has_valid_credentials(&self) -> bool {
+        !self.passkeys.is_empty() || !self.attested_passkeys.is_empty() || self.primary.is_some()
+    }
+
+    /// Auto-commit for the first credential: the account had no way to authenticate when the
+    /// session started, now has a credential that satisfies policy, and the only pending
+    /// changes are the addition of that first credential. Unrelated pending edits (ssh keys,
+    /// unix password) are never saved silently.
+    fn should_auto_commit_first_cred(&self, can_commit: bool, pending: PendingChanges) -> bool {
+        self.had_no_valid_credentials_at_start()
+            && can_commit
+            && self.has_valid_credentials()
+            && !pending.unixcred
+            && !pending.sshkeys
+            && passkeys_only_added(&self.original_passkeys, &self.passkeys)
+            && passkeys_only_added(&self.original_attested_passkeys, &self.attested_passkeys)
+    }
+
+    /// Auto-commit after passkey enrollment: passkeys are phishing resistant, so it is safe to
+    /// save immediately - but only if the *only* pending change in this session is the addition
+    /// of new (attested) passkeys. Any other pending edit (removals, renames, password, unix
+    /// password or ssh key changes) must be explicitly saved by the user.
+    fn should_auto_commit_passkey(&self, can_commit: bool, pending: PendingChanges) -> bool {
+        can_commit
+            && (pending.passkeys || pending.attested_passkeys)
+            && !pending.primary
+            && !pending.unixcred
+            && !pending.sshkeys
+            && passkeys_only_added(&self.original_passkeys, &self.passkeys)
+            && passkeys_only_added(&self.original_attested_passkeys, &self.attested_passkeys)
+    }
 }
 
 pub enum MfaRegStateStatus {
@@ -390,6 +488,18 @@ pub struct CredentialUpdateSessionStatus {
 
     sshkeys: BTreeMap<String, SshPublicKey>,
     sshkeys_state: CredentialState,
+
+    // Pending changes tracking
+    has_pending_changes: bool,
+    primary_has_pending_changes: bool,
+    passkeys_have_pending_changes: bool,
+    attested_passkeys_have_pending_changes: bool,
+    unixcred_has_pending_changes: bool,
+    sshkeys_have_pending_changes: bool,
+
+    // Auto-commit indicators
+    should_auto_commit_first_cred: bool,
+    should_auto_commit_passkey: bool,
 }
 
 impl CredentialUpdateSessionStatus {
@@ -444,14 +554,14 @@ impl Into<CUStatus> for CredentialUpdateSessionStatus {
             unixcred_state: self.unixcred_state.into(),
             sshkeys: self.sshkeys,
             sshkeys_state: self.sshkeys_state.into(),
-            has_pending_changes: false,
-            primary_has_pending_changes: false,
-            passkeys_have_pending_changes: false,
-            attested_passkeys_have_pending_changes: false,
-            unixcred_has_pending_changes: false,
-            sshkeys_have_pending_changes: false,
-            should_auto_commit_first_cred: false,
-            should_auto_commit_passkey: false,
+            has_pending_changes: self.has_pending_changes,
+            primary_has_pending_changes: self.primary_has_pending_changes,
+            passkeys_have_pending_changes: self.passkeys_have_pending_changes,
+            attested_passkeys_have_pending_changes: self.attested_passkeys_have_pending_changes,
+            unixcred_has_pending_changes: self.unixcred_has_pending_changes,
+            sshkeys_have_pending_changes: self.sshkeys_have_pending_changes,
+            should_auto_commit_first_cred: self.should_auto_commit_first_cred,
+            should_auto_commit_passkey: self.should_auto_commit_passkey,
         }
     }
 }
@@ -459,6 +569,11 @@ impl Into<CUStatus> for CredentialUpdateSessionStatus {
 impl From<&CredentialUpdateSession> for CredentialUpdateSessionStatus {
     fn from(session: &CredentialUpdateSession) -> Self {
         let (can_commit, warnings) = session.can_commit();
+
+        let pending = session.pending_changes();
+        let should_auto_commit_first_cred =
+            session.should_auto_commit_first_cred(can_commit, pending);
+        let should_auto_commit_passkey = session.should_auto_commit_passkey(can_commit, pending);
 
         let attested_passkeys_allowed_devices: Vec<String> = session
             .resolved_account_policy
@@ -523,6 +638,15 @@ impl From<&CredentialUpdateSession> for CredentialUpdateSessionStatus {
                     MfaRegStateStatus::AttestedPasskey(r.as_ref().clone())
                 }
             },
+
+            has_pending_changes: pending.any(),
+            primary_has_pending_changes: pending.primary,
+            passkeys_have_pending_changes: pending.passkeys,
+            attested_passkeys_have_pending_changes: pending.attested_passkeys,
+            unixcred_has_pending_changes: pending.unixcred,
+            sshkeys_have_pending_changes: pending.sshkeys,
+            should_auto_commit_first_cred,
+            should_auto_commit_passkey,
         }
     }
 }
@@ -953,6 +1077,13 @@ impl IdmServerProxyWriteTransaction<'_> {
         // Stash the issuer for some UI elements
         let issuer = self.qs_write.get_domain_display_name().to_string();
 
+        // Snapshot the starting state so we can report pending changes to the UI.
+        let original_primary = primary.clone();
+        let original_passkeys = passkey_labels(&passkeys);
+        let original_attested_passkeys = passkey_labels(&attested_passkeys);
+        let original_unixcred = unixcred.clone();
+        let original_sshkeys = sshkeys.clone();
+
         // - store account policy (if present)
         let session = CredentialUpdateSession {
             account,
@@ -972,6 +1103,11 @@ impl IdmServerProxyWriteTransaction<'_> {
             attested_passkeys_state,
             mfaregstate: MfaRegState::None,
             dirty: false,
+            original_primary,
+            original_passkeys,
+            original_attested_passkeys,
+            original_unixcred,
+            original_sshkeys,
         };
 
         let max_ttl = ct + MAXIMUM_CRED_UPDATE_TTL;
@@ -2929,7 +3065,7 @@ mod tests {
     use compact_jwt::JwsCompact;
     use kubidm_lib_crypto::{PW_MAX_LENGTH_NIST, PW_SFA_MIN_LENGTH_NIST};
     use kubidm_proto::{
-        internal::{CUExtPortal, CredentialDetailType, PasswordFeedback},
+        internal::{CUExtPortal, CUStatus, CredentialDetailType, PasswordFeedback},
         v1::{AuthAllowed, AuthIssueSession, AuthMech, OutboundMessage, UnixUserToken},
     };
     use sshkey_attest::proto::PublicKey as SshPublicKey;
@@ -4637,7 +4773,19 @@ mod tests {
             unixcred: _,
             sshkeys: _,
             sshkeys_state,
+            has_pending_changes,
+            primary_has_pending_changes: _,
+            passkeys_have_pending_changes: _,
+            attested_passkeys_have_pending_changes: _,
+            unixcred_has_pending_changes: _,
+            sshkeys_have_pending_changes: _,
+            should_auto_commit_first_cred,
+            should_auto_commit_passkey,
         } = custatus;
+
+        assert!(!has_pending_changes);
+        assert!(!should_auto_commit_first_cred);
+        assert!(!should_auto_commit_passkey);
 
         assert!(matches!(ext_cred_portal, CUExtPortal::Hidden));
         assert!(matches!(primary_state, CredentialState::AccessDeny));
@@ -6030,5 +6178,259 @@ mod tests {
             .await
             .expect("PasswordChangedTime should be set after switching to passkey");
         assert_eq!(pwd_changed_2, OffsetDateTime::UNIX_EPOCH + ct);
+    }
+
+    fn assert_no_pending_changes(c_status: &CredentialUpdateSessionStatus) {
+        assert!(!c_status.has_pending_changes);
+        assert!(!c_status.primary_has_pending_changes);
+        assert!(!c_status.passkeys_have_pending_changes);
+        assert!(!c_status.attested_passkeys_have_pending_changes);
+        assert!(!c_status.unixcred_has_pending_changes);
+        assert!(!c_status.sshkeys_have_pending_changes);
+        assert!(!c_status.should_auto_commit_passkey);
+    }
+
+    async fn register_passkey(
+        ct: Duration,
+        origin: &Url,
+        cutxn: &IdmServerCredUpdateTransaction<'_>,
+        cust: &CredentialUpdateSessionToken,
+        wa: &mut SoftPasskey,
+        label: &str,
+    ) -> CredentialUpdateSessionStatus {
+        let c_status = cutxn
+            .credential_passkey_init(cust, ct)
+            .expect("Failed to initiate passkey registration");
+
+        let passkey_chal = match c_status.mfaregstate {
+            MfaRegStateStatus::Passkey(c) => Some(c),
+            _ => None,
+        }
+        .expect("Unable to access passkey challenge, invalid state");
+
+        let passkey_resp = wa
+            .do_registration(origin.clone(), passkey_chal)
+            .expect("Failed to create soft passkey");
+
+        cutxn
+            .credential_passkey_finish(cust, ct, label.to_string(), &passkey_resp)
+            .expect("Failed to finish passkey registration")
+    }
+
+    #[idm_test]
+    async fn credential_update_pending_changes_password(
+        idms: &IdmServer,
+        _idms_delayed: &mut IdmServerDelayed,
+    ) {
+        let test_pw = readable_password_from_random();
+        let ct = Duration::from_secs(TEST_CURRENT_TIME);
+
+        let (cust, c_status) = setup_test_session(idms, ct).await;
+        // A fresh session has nothing pending.
+        assert_no_pending_changes(&c_status);
+        assert!(!c_status.should_auto_commit_first_cred);
+
+        let cutxn = idms.cred_update_transaction().await.unwrap();
+
+        let c_status = cutxn
+            .credential_update_status(&cust, ct)
+            .expect("Failed to get the current session status.");
+        assert_no_pending_changes(&c_status);
+        assert!(!c_status.should_auto_commit_first_cred);
+
+        // Adding the first credential is a pending change, and since the account
+        // had no credentials at all it should be auto committed.
+        let c_status = cutxn
+            .credential_primary_set_password(&cust, ct, &test_pw)
+            .expect("Failed to update the primary cred password");
+        assert!(c_status.can_commit);
+        assert!(c_status.has_pending_changes);
+        assert!(c_status.primary_has_pending_changes);
+        assert!(!c_status.passkeys_have_pending_changes);
+        assert!(!c_status.sshkeys_have_pending_changes);
+        assert!(c_status.should_auto_commit_first_cred);
+        // Not a passkey enrolment.
+        assert!(!c_status.should_auto_commit_passkey);
+
+        // The proto status carries the flags through to the UI.
+        let proto_status: CUStatus = c_status.into();
+        assert!(proto_status.has_pending_changes);
+        assert!(proto_status.primary_has_pending_changes);
+        assert!(proto_status.should_auto_commit_first_cred);
+        assert!(!proto_status.should_auto_commit_passkey);
+
+        // Undoing the change within the session returns to "no pending changes", even
+        // though the session has been touched.
+        let c_status = cutxn
+            .credential_primary_delete(&cust, ct)
+            .expect("Failed to remove the primary credential");
+        assert!(c_status.dirty);
+        assert_no_pending_changes(&c_status);
+        assert!(!c_status.should_auto_commit_first_cred);
+
+        let c_status = cutxn
+            .credential_primary_set_password(&cust, ct, &test_pw)
+            .expect("Failed to update the primary cred password");
+        assert!(c_status.has_pending_changes);
+
+        drop(cutxn);
+        commit_session(idms, ct, cust).await;
+
+        // A new session starts from the committed state - nothing pending, and since the
+        // account now has a credential the first credential auto commit no longer applies.
+        let (cust, c_status) = renew_test_session(idms, ct).await;
+        assert!(c_status.primary.is_some());
+        assert_no_pending_changes(&c_status);
+        assert!(!c_status.should_auto_commit_first_cred);
+
+        let cutxn = idms.cred_update_transaction().await.unwrap();
+        let new_pw = readable_password_from_random();
+        let c_status = cutxn
+            .credential_primary_set_password(&cust, ct, &new_pw)
+            .expect("Failed to update the primary cred password");
+        assert!(c_status.has_pending_changes);
+        assert!(c_status.primary_has_pending_changes);
+        assert!(!c_status.should_auto_commit_first_cred);
+        assert!(!c_status.should_auto_commit_passkey);
+        drop(cutxn);
+
+        // Discard the session.
+        {
+            let mut idms_prox_write = idms.proxy_write(ct).await.unwrap();
+            idms_prox_write
+                .cancel_credential_update(&cust, ct)
+                .expect("Failed to cancel credential update");
+            idms_prox_write.commit().expect("Failed to commit txn");
+        }
+
+        // After discarding, a new session has no pending changes.
+        let (_cust, c_status) = renew_test_session(idms, ct).await;
+        assert!(c_status.primary.is_some());
+        assert_no_pending_changes(&c_status);
+        assert!(!c_status.should_auto_commit_first_cred);
+    }
+
+    #[idm_test]
+    async fn credential_update_pending_changes_passkey(
+        idms: &IdmServer,
+        _idms_delayed: &mut IdmServerDelayed,
+    ) {
+        let ct = Duration::from_secs(TEST_CURRENT_TIME);
+        let sshkey_valid_1 =
+            SshPublicKey::from_string(SSHKEY_VALID_1).expect("Invalid SSHKEY_VALID_1");
+
+        let (cust, _) = setup_test_session(idms, ct).await;
+        let cutxn = idms.cred_update_transaction().await.unwrap();
+        let origin = cutxn.get_origin().clone();
+
+        // First credential is a passkey - both auto commit conditions apply.
+        let mut wa_1 = SoftPasskey::new(true);
+        let c_status = create_new_passkey(ct, &origin, &cutxn, &cust, &mut wa_1).await;
+        assert!(c_status.has_pending_changes);
+        assert!(c_status.passkeys_have_pending_changes);
+        assert!(!c_status.primary_has_pending_changes);
+        assert!(c_status.should_auto_commit_first_cred);
+        assert!(c_status.should_auto_commit_passkey);
+        let pk_uuid_1 = c_status
+            .passkeys
+            .first()
+            .map(|pkd| pkd.uuid)
+            .expect("No passkey present");
+
+        drop(cutxn);
+        commit_session(idms, ct, cust).await;
+
+        // New session with an existing passkey.
+        let (cust, c_status) = renew_test_session(idms, ct).await;
+        assert_no_pending_changes(&c_status);
+        assert!(!c_status.should_auto_commit_first_cred);
+
+        let cutxn = idms.cred_update_transaction().await.unwrap();
+
+        // An unrelated pending edit (ssh key) ...
+        let c_status = cutxn
+            .credential_sshkey_add(&cust, ct, "key1".to_string(), sshkey_valid_1)
+            .expect("Failed to add sshkey_valid_1");
+        assert!(c_status.has_pending_changes);
+        assert!(c_status.sshkeys_have_pending_changes);
+        assert!(!c_status.passkeys_have_pending_changes);
+        assert!(!c_status.should_auto_commit_passkey);
+
+        // ... must block passkey auto commit, so we don't silently save it.
+        let mut wa_2 = SoftPasskey::new(true);
+        let c_status = register_passkey(ct, &origin, &cutxn, &cust, &mut wa_2, "second").await;
+        assert_eq!(c_status.passkeys.len(), 2);
+        assert!(c_status.passkeys_have_pending_changes);
+        assert!(c_status.sshkeys_have_pending_changes);
+        assert!(c_status.can_commit);
+        assert!(!c_status.should_auto_commit_first_cred);
+        assert!(!c_status.should_auto_commit_passkey);
+
+        // Once the only pending change is the new passkey, auto commit is allowed.
+        let c_status = cutxn
+            .credential_sshkey_remove(&cust, ct, "key1")
+            .expect("Failed to remove sshkey");
+        assert!(!c_status.sshkeys_have_pending_changes);
+        assert!(c_status.passkeys_have_pending_changes);
+        assert!(c_status.should_auto_commit_passkey);
+
+        // Removing a pre-existing passkey is a pending removal - never auto committed,
+        // even though a new passkey was also added.
+        let c_status = cutxn
+            .credential_passkey_remove(&cust, ct, pk_uuid_1)
+            .expect("Failed to remove the passkey");
+        assert_eq!(c_status.passkeys.len(), 1);
+        assert!(c_status.passkeys_have_pending_changes);
+        assert!(c_status.can_commit);
+        assert!(!c_status.should_auto_commit_passkey);
+
+        drop(cutxn);
+    }
+
+    #[idm_test]
+    async fn credential_update_first_cred_auto_commit_requires_no_unrelated_changes(
+        idms: &IdmServer,
+        _idms_delayed: &mut IdmServerDelayed,
+    ) {
+        let ct = Duration::from_secs(TEST_CURRENT_TIME);
+        let test_pw = readable_password_from_random();
+        let sshkey_valid_1 =
+            SshPublicKey::from_string(SSHKEY_VALID_1).expect("Invalid SSHKEY_VALID_1");
+
+        let (cust, _) = setup_test_session(idms, ct).await;
+        let cutxn = idms.cred_update_transaction().await.unwrap();
+        let origin = cutxn.get_origin().clone();
+
+        // A pending ssh key edit made before the first credential ...
+        let c_status = cutxn
+            .credential_sshkey_add(&cust, ct, "key1".to_string(), sshkey_valid_1)
+            .expect("Failed to add sshkey_valid_1");
+        assert!(c_status.sshkeys_have_pending_changes);
+
+        // ... is not silently saved when the first passkey is enrolled.
+        let mut wa = SoftPasskey::new(true);
+        let c_status = create_new_passkey(ct, &origin, &cutxn, &cust, &mut wa).await;
+        assert!(c_status.can_commit);
+        assert!(c_status.passkeys_have_pending_changes);
+        assert!(c_status.sshkeys_have_pending_changes);
+        assert!(!c_status.should_auto_commit_first_cred);
+        assert!(!c_status.should_auto_commit_passkey);
+
+        // Once the passkey is the only pending change, the first credential auto commit applies.
+        let c_status = cutxn
+            .credential_sshkey_remove(&cust, ct, "key1")
+            .expect("Failed to remove sshkey");
+        assert!(c_status.should_auto_commit_first_cred);
+
+        // A pending unix password blocks it as well.
+        let c_status = cutxn
+            .credential_unix_set_password(&cust, ct, &test_pw)
+            .expect("Failed to update the unix cred password");
+        assert!(c_status.unixcred_has_pending_changes);
+        assert!(c_status.can_commit);
+        assert!(!c_status.should_auto_commit_first_cred);
+        assert!(!c_status.should_auto_commit_passkey);
+
+        drop(cutxn);
     }
 }

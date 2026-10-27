@@ -78,12 +78,34 @@ impl Default for MaintenanceCapabilities {
     }
 }
 
+/// Full node-local maintenance status, including the active operation id and the last
+/// error. Only served on the privileged admin socket.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct MaintenancePublicStatus {
     pub state: MaintenanceState,
     pub active_operation_id: Option<Uuid>,
     pub last_error: Option<String>,
     pub capabilities: MaintenanceCapabilities,
+}
+
+/// Maintenance status served on the unauthenticated `GET /maintenance` endpoint.
+///
+/// It deliberately omits the active operation id (a handle the privileged control
+/// protocol keys on) and the last error (which can carry internal error details). Use
+/// the admin socket `MaintenanceStatus` request for those.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct MaintenanceHttpStatus {
+    pub state: MaintenanceState,
+    pub capabilities: MaintenanceCapabilities,
+}
+
+impl From<MaintenancePublicStatus> for MaintenanceHttpStatus {
+    fn from(status: MaintenancePublicStatus) -> Self {
+        Self {
+            state: status.state,
+            capabilities: status.capabilities,
+        }
+    }
 }
 
 static MAINTENANCE_STATE: AtomicU8 = AtomicU8::new(MaintenanceState::Serving as u8);
@@ -197,36 +219,33 @@ impl ReplicationFence {
         }
     }
 
-    /// Return whether `current` has observed at least every per-replica maximum
-    /// represented by this fence.
+    /// Return whether `current` (a fence captured from the local replication state)
+    /// has observed at least every per-replica maximum represented by this fence.
     ///
     /// `ts_min` is deliberately not required to move backwards. A node may have
     /// legitimately trimmed old replication history after applying it; the maximum
     /// CID per supplier identity is the handoff proof we need here.
-    pub fn satisfaction(&self, current: ReplRuvRange) -> FenceSatisfaction {
-        if self.version != 1 {
+    pub fn satisfaction(&self, current: &ReplicationFence) -> FenceSatisfaction {
+        // Only version 1 fences are understood, on both sides.
+        if self.version != 1 || current.version != 1 {
             return FenceSatisfaction::Unsatisfied;
         }
 
-        let (domain_uuid, current_ranges) = match current {
-            ReplRuvRange::V1 {
-                domain_uuid,
-                ranges,
-            } => (domain_uuid, ranges),
-        };
-
-        if self.domain_uuid != domain_uuid {
+        if self.domain_uuid != current.domain_uuid {
             return FenceSatisfaction::DomainMismatch;
         }
 
-        // Generation support is not implemented in the replication protocol yet.
-        // A non-None fence therefore cannot safely be accepted by this version.
-        if self.generation.is_some() {
+        // Generation support is not implemented in the replication protocol yet, so
+        // a generation can never actually be verified. Any non-None generation, on
+        // either side, is rejected rather than compared for equality: two equal but
+        // unverifiable generations are not proof that the histories are related.
+        if self.generation.is_some() || current.generation.is_some() {
             return FenceSatisfaction::GenerationMismatch;
         }
 
         let satisfied = self.ranges.iter().all(|(server_uuid, fence_range)| {
-            current_ranges
+            current
+                .ranges
                 .get(server_uuid)
                 .is_some_and(|current_range| current_range.ts_max >= fence_range.ts_max)
         });
@@ -281,19 +300,23 @@ mod tests {
         }
     }
 
+    fn fence(domain_uuid: Uuid, entries: &[(Uuid, u64, u64)]) -> ReplicationFence {
+        ReplicationFence::from_ruv_range(ruv(domain_uuid, entries))
+    }
+
     #[test]
     fn fence_is_satisfied_by_identical_or_newer_ranges() {
         let domain = Uuid::new_v4();
         let a = Uuid::new_v4();
         let b = Uuid::new_v4();
-        let fence = ReplicationFence::from_ruv_range(ruv(domain, &[(a, 1, 10), (b, 2, 20)]));
+        let target = fence(domain, &[(a, 1, 10), (b, 2, 20)]);
 
         assert_eq!(
-            fence.satisfaction(ruv(domain, &[(a, 1, 10), (b, 2, 20)])),
+            target.satisfaction(&fence(domain, &[(a, 1, 10), (b, 2, 20)])),
             FenceSatisfaction::Satisfied
         );
         assert_eq!(
-            fence.satisfaction(ruv(domain, &[(a, 5, 11), (b, 10, 30)])),
+            target.satisfaction(&fence(domain, &[(a, 5, 11), (b, 10, 30)])),
             FenceSatisfaction::Satisfied
         );
     }
@@ -303,14 +326,14 @@ mod tests {
         let domain = Uuid::new_v4();
         let a = Uuid::new_v4();
         let b = Uuid::new_v4();
-        let fence = ReplicationFence::from_ruv_range(ruv(domain, &[(a, 1, 10), (b, 2, 20)]));
+        let target = fence(domain, &[(a, 1, 10), (b, 2, 20)]);
 
         assert_eq!(
-            fence.satisfaction(ruv(domain, &[(a, 1, 10)])),
+            target.satisfaction(&fence(domain, &[(a, 1, 10)])),
             FenceSatisfaction::Unsatisfied
         );
         assert_eq!(
-            fence.satisfaction(ruv(domain, &[(a, 1, 9), (b, 2, 20)])),
+            target.satisfaction(&fence(domain, &[(a, 1, 9), (b, 2, 20)])),
             FenceSatisfaction::Unsatisfied
         );
     }
@@ -337,17 +360,95 @@ mod tests {
     fn fence_rejects_domain_or_generation_mismatch() {
         let domain = Uuid::new_v4();
         let a = Uuid::new_v4();
-        let mut fence = ReplicationFence::from_ruv_range(ruv(domain, &[(a, 1, 10)]));
+        let mut target = fence(domain, &[(a, 1, 10)]);
 
         assert_eq!(
-            fence.satisfaction(ruv(Uuid::new_v4(), &[(a, 1, 10)])),
+            target.satisfaction(&fence(Uuid::new_v4(), &[(a, 1, 10)])),
             FenceSatisfaction::DomainMismatch
         );
 
-        fence.generation = Some(Uuid::new_v4());
+        target.generation = Some(Uuid::new_v4());
         assert_eq!(
-            fence.satisfaction(ruv(domain, &[(a, 1, 10)])),
+            target.satisfaction(&fence(domain, &[(a, 1, 10)])),
             FenceSatisfaction::GenerationMismatch
         );
+    }
+
+    #[test]
+    fn fence_rejects_unverifiable_generation_even_when_equal() {
+        let domain = Uuid::new_v4();
+        let a = Uuid::new_v4();
+        let generation = Some(Uuid::new_v4());
+
+        let mut target = fence(domain, &[(a, 1, 10)]);
+        let mut current = fence(domain, &[(a, 1, 10)]);
+
+        // A generation present only on the current side is rejected too.
+        current.generation = generation;
+        assert_eq!(
+            target.satisfaction(&current),
+            FenceSatisfaction::GenerationMismatch
+        );
+
+        // Equal generations can not be verified by this protocol version either.
+        target.generation = generation;
+        assert_eq!(
+            target.satisfaction(&current),
+            FenceSatisfaction::GenerationMismatch
+        );
+    }
+
+    #[test]
+    fn fence_with_unknown_version_is_never_satisfied() {
+        let domain = Uuid::new_v4();
+        let a = Uuid::new_v4();
+
+        let mut target = fence(domain, &[(a, 1, 10)]);
+        target.version = 2;
+        assert_eq!(
+            target.satisfaction(&fence(domain, &[(a, 1, 10)])),
+            FenceSatisfaction::Unsatisfied
+        );
+
+        let target = fence(domain, &[(a, 1, 10)]);
+        let mut current = fence(domain, &[(a, 1, 20)]);
+        current.version = 2;
+        assert_eq!(
+            target.satisfaction(&current),
+            FenceSatisfaction::Unsatisfied
+        );
+    }
+
+    #[test]
+    fn empty_fence_is_satisfied_by_any_history_of_the_domain() {
+        let domain = Uuid::new_v4();
+        let a = Uuid::new_v4();
+        let target = fence(domain, &[]);
+
+        assert_eq!(
+            target.satisfaction(&fence(domain, &[])),
+            FenceSatisfaction::Satisfied
+        );
+        assert_eq!(
+            target.satisfaction(&fence(domain, &[(a, 1, 10)])),
+            FenceSatisfaction::Satisfied
+        );
+    }
+
+    #[test]
+    fn http_status_omits_operation_id_and_error() {
+        let status = MaintenancePublicStatus {
+            state: MaintenanceState::Failed,
+            active_operation_id: Some(Uuid::new_v4()),
+            last_error: Some("internal detail".to_string()),
+            capabilities: MaintenanceCapabilities::default(),
+        };
+        let http: MaintenanceHttpStatus = status.into();
+        assert_eq!(http.state, MaintenanceState::Failed);
+
+        let value = serde_json::to_value(&http).expect("http status should serialize");
+        assert!(value.get("active_operation_id").is_none());
+        assert!(value.get("last_error").is_none());
+        assert_eq!(value["state"], "failed");
     }
 }

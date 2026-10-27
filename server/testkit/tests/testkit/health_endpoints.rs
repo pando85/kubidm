@@ -32,7 +32,9 @@ async fn test_maintenance_endpoint_after_startup(rsclient: &kubidm_client::Kubid
 
     let body: serde_json::Value = res.json().await.expect("Failed to parse JSON");
     assert_eq!(body["state"], "serving");
-    assert!(body["active_operation_id"].is_null());
+    // The unauthenticated endpoint never exposes the operation id or internal errors.
+    assert!(body.get("active_operation_id").is_none());
+    assert!(body.get("last_error").is_none());
     assert_eq!(body["capabilities"]["api_version"], "v1");
     assert_eq!(body["capabilities"]["drain"], true);
     assert_eq!(body["capabilities"]["replication_fence"], true);
@@ -61,6 +63,8 @@ async fn test_readyz_endpoint_after_startup(rsclient: &kubidm_client::KubidmClie
     assert_eq!(body["server_phase"], "running");
     assert_eq!(body["database_health"], "healthy");
     assert_eq!(body["message"], "Ready to serve traffic");
+    // Without replication there is no peer summary.
+    assert!(body["peers"].is_null());
 }
 
 #[kubidmd_testkit::test]
