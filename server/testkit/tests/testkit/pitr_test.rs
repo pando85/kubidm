@@ -321,6 +321,8 @@ fn test_pitr_unclean_stop_loses_nothing_with_the_journal() {
             .await
             .expect("Failed to create the journaled person");
         // No shutdown: the runtime goes away under the server, as in a crash.
+        // The process would die with it, and the operating system release its locks.
+        env.core_handle.release_wal_archive_lock();
         std::mem::forget(env);
     });
 
@@ -380,6 +382,8 @@ fn test_pitr_recover_after_an_unclean_stop_includes_the_journal_without_a_start(
             .await
             .expect("Failed to create the journaled person");
         // No shutdown: the runtime goes away under the server, as in a crash.
+        // The process would die with it, and the operating system release its locks.
+        env.core_handle.release_wal_archive_lock();
         std::mem::forget(env);
     });
 
@@ -475,6 +479,8 @@ fn test_pitr_unclean_stop_leaves_a_gap_recovery_does_not_cross() {
             .await
             .expect("Failed to create the unarchived person");
         // No shutdown: the runtime goes away under the server, as in a crash.
+        // The process would die with it, and the operating system release its locks.
+        env.core_handle.release_wal_archive_lock();
         std::mem::forget(env);
     });
 
@@ -522,6 +528,173 @@ fn test_pitr_unclean_stop_leaves_a_gap_recovery_does_not_cross() {
         assert!(!person_exists(&env.rsclient, PITR_USER_LOST).await);
         assert!(!person_exists(&env.rsclient, PITR_USER_AFTER).await);
         env.core_handle.shutdown().await;
+    });
+}
+
+/// `config` with WAL archiving turned on or off.
+fn with_wal_enabled(mut config: Configuration, enabled: bool) -> Configuration {
+    if let Some(wal) = config
+        .online_backup
+        .as_mut()
+        .and_then(|backup| backup.wal_archive.as_mut())
+    {
+        wal.enabled = enabled;
+    }
+    config
+}
+
+/// Created while WAL archiving was disabled.
+const PITR_USER_UNARCHIVED: &str = "pitr_user_unarchived";
+
+/// A server that ran a while with WAL archiving disabled committed history the archive
+/// never saw. The next start with archiving compares its database with how far the WAL
+/// directory covers it and records the difference as a gap, so that recovery refuses to
+/// replay across it instead of silently skipping it.
+#[test]
+fn test_pitr_history_written_without_archiving_is_a_gap_recovery_does_not_cross() {
+    let workdir = tempfile::tempdir().expect("Failed to create workdir");
+    let backup_dir = workdir.path().join("backups");
+    let wal_dir = workdir.path().join("wal");
+    std::fs::create_dir(&backup_dir).expect("Failed to create backup directory");
+    let config = pitr_config(
+        &workdir.path().join("source.db"),
+        &backup_dir,
+        &wal_dir,
+        None,
+    );
+
+    let target = run(async {
+        // Archived: a base backup, and a person after it.
+        let mut env = setup_async_test(config.clone()).await;
+        populate(&env).await;
+        env.core_handle
+            .trigger_online_backup(&backup_dir, 7, BackupCompression::Gzip, &Default::default())
+            .await
+            .expect("Online backup failed");
+        env.rsclient
+            .idm_person_account_create(PITR_USER_BEFORE, "Before")
+            .await
+            .expect("Failed to create the archived person");
+        env.core_handle.shutdown().await;
+
+        // Not archived: the same database, WAL archiving disabled.
+        let mut env = setup_async_test(with_wal_enabled(config.clone(), false)).await;
+        login_put_admin_idm_admins(&env.rsclient).await;
+        env.rsclient
+            .idm_person_account_create(PITR_USER_UNARCHIVED, "Unarchived")
+            .await
+            .expect("Failed to create the unarchived person");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let target = now_rfc3339();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        env.core_handle.shutdown().await;
+
+        // Archived again.
+        let mut env = setup_async_test(config.clone()).await;
+        login_put_admin_idm_admins(&env.rsclient).await;
+        env.rsclient
+            .idm_person_account_create(PITR_USER_AFTER, "After")
+            .await
+            .expect("Failed to create the person after archiving resumed");
+        env.core_handle.shutdown().await;
+        target
+    });
+
+    run(async {
+        let manifest = read_manifest(&wal_dir.join(PITR_MANIFEST_KEY));
+        assert_eq!(manifest.gaps.len(), 1, "{:?}", manifest.gaps);
+        assert!(
+            manifest.gaps[0].reason.contains("not running"),
+            "{:?}",
+            manifest.gaps
+        );
+
+        // A target after the unarchived write is refused, and the database untouched.
+        let refused_db = workdir.path().join("refused.db");
+        let refused = pitr_recover_server_core(
+            &pitr_config(&refused_db, &backup_dir, &wal_dir, None),
+            &RecoveryTargetSpec::Time(target),
+            false,
+            None,
+        )
+        .await;
+        assert!(
+            matches!(&refused, Err(PitrError::NotRecoverable(msg)) if msg.contains("not running")),
+            "{refused:?}"
+        );
+        assert!(!refused_db.exists());
+
+        // The latest recoverable point stops before the history archiving never saw.
+        let latest_db = workdir.path().join("latest.db");
+        let latest_config = pitr_config(&latest_db, &backup_dir, &wal_dir, None);
+        pitr_recover_server_core(&latest_config, &RecoveryTargetSpec::Latest, false, None)
+            .await
+            .expect("Recovery to the latest point before the gap failed");
+        let mut env = setup_async_test(latest_config).await;
+        login_put_admin_idm_admins(&env.rsclient).await;
+        assert!(person_exists(&env.rsclient, PITR_USER_BEFORE).await);
+        assert!(!person_exists(&env.rsclient, PITR_USER_UNARCHIVED).await);
+        assert!(!person_exists(&env.rsclient, PITR_USER_AFTER).await);
+        env.core_handle.shutdown().await;
+    });
+}
+
+/// `recover` and `restore` replace the database: they refuse while a server archives into
+/// the WAL directory, and run once it stopped.
+#[test]
+fn test_pitr_recover_and_restore_refuse_while_the_server_runs() {
+    let workdir = tempfile::tempdir().expect("Failed to create workdir");
+    let backup_dir = workdir.path().join("backups");
+    let wal_dir = workdir.path().join("wal");
+    std::fs::create_dir(&backup_dir).expect("Failed to create backup directory");
+    let config = pitr_config(
+        &workdir.path().join("source.db"),
+        &backup_dir,
+        &wal_dir,
+        None,
+    );
+
+    run(async {
+        let mut env = setup_async_test(config.clone()).await;
+        populate(&env).await;
+        let base = backup_via_production_path(
+            &env,
+            &backup_dir,
+            BackupCompression::Gzip,
+            &Default::default(),
+        )
+        .await;
+
+        // Running: a dry run and the listing work, recover and restore refuse.
+        let recovered_db = workdir.path().join("recovered.db");
+        let recovered_config = pitr_config(&recovered_db, &backup_dir, &wal_dir, None);
+        pitr_recover_server_core(&recovered_config, &RecoveryTargetSpec::Latest, true, None)
+            .await
+            .expect("A dry run runs next to the server");
+        assert!(pitr_list_server_core(&recovered_config, None).await);
+        let refused =
+            pitr_recover_server_core(&recovered_config, &RecoveryTargetSpec::Latest, false, None)
+                .await;
+        assert!(
+            matches!(&refused, Err(PitrError::Wal(err)) if err.to_string().contains("Stop the server")),
+            "{refused:?}"
+        );
+        assert!(!recovered_db.exists());
+        assert!(restore_server_core(&recovered_config, &base).await.is_err());
+        assert!(!recovered_db.exists());
+
+        // Stopped: the recovery runs.
+        env.core_handle.shutdown().await;
+        pitr_recover_server_core(&recovered_config, &RecoveryTargetSpec::Latest, false, None)
+            .await
+            .expect("Recovery once the server stopped failed");
+        let mut env = setup_async_test(recovered_config).await;
+        login_put_admin_idm_admins(&env.rsclient).await;
+        assert_directory_state_restored(&env.rsclient).await;
+        env.core_handle.shutdown().await;
+        // The recovered server started without reporting the recovery's own commits.
+        let manifest = read_manifest(&wal_dir.join(PITR_MANIFEST_KEY));
+        assert!(manifest.gaps.is_empty(), "{:?}", manifest.gaps);
     });
 }
 

@@ -173,8 +173,9 @@ impl Drop for OfflineWalGuard {
                      reports its transactions as a gap in the archive"
                 );
             }
-            // Gaps are recorded in the archive index by the running server.
-            if let Err(err) = archiver.persist_pending_events() {
+            // Gaps are recorded in the archive index by the running server, which also
+            // learns how far this command's commits are archived.
+            if let Err(err) = archiver.close() {
                 error!(%err, "Unable to hand the WAL archive gaps to the next server start");
             }
         }
@@ -1083,13 +1084,23 @@ impl CoreHandle {
                     archive.settings().local_dir.display()
                 ),
             }
-            archive.persist_pending_events();
+            archive.close().await;
         }
         // The metrics task wrote the state file when it stopped; this keeps the outcome of
         // the final synchronisation.
         self.backup_metrics.save_state_file().await;
 
         self.clean_shutdown = true;
+    }
+
+    /// Release the lock the WAL archiver holds on its WAL directory, as the operating system
+    /// does when the process dies. This exists so tests can simulate a crash by leaking a
+    /// running server and then run `recover`, or start another server, on its WAL directory.
+    #[doc(hidden)]
+    pub fn release_wal_archive_lock(&self) {
+        if let Some(archive) = &self.pitr_archive {
+            archive.release_lock();
+        }
     }
 
     /// Close the open WAL segment and archive every closed one now, as the periodic WAL
@@ -1778,7 +1789,16 @@ async fn launch_server_tasks(
                     .await
                     .map_err(|err| error!(%err, "online_backup.metrics_token_file"))?,
                 ),
-                None => None,
+                None => {
+                    warn!(
+                        "online_backup.metrics_endpoint is enabled without \
+                         online_backup.metrics_token_file: anyone who can reach the HTTPS \
+                         listener can read /metrics, which reveals when backups run, where \
+                         they are stored and whether they fail. Set metrics_token_file, or block \
+                         /metrics on the reverse proxy."
+                    );
+                    None
+                }
             };
             Some(https::generic::MetricsEndpoint::new(backup_metrics, token))
         }

@@ -75,6 +75,24 @@ pub(crate) async fn verify_booted_database_on_thread(
     on_database_thread(move || async move { crate::verify_booted_database(&config).await }).await
 }
 
+/// The last committed transaction and the server uuid of the database described by
+/// `config`, read on the database thread without changing it: the write transaction that
+/// reads them is never committed.
+pub(crate) async fn read_database_identity(
+    config: &Configuration,
+) -> Result<(Duration, Uuid), OperationError> {
+    let config = config.clone();
+    on_database_thread(move || async move {
+        let schema = Schema::new()?;
+        let be = setup_backend(&config, &schema)?;
+        let mut be_txn = be.write()?;
+        let db_ts_max = be_txn.get_db_ts_max(Duration::ZERO)?;
+        let server_uuid = be_txn.get_db_s_uuid()?;
+        Ok((db_ts_max, server_uuid))
+    })
+    .await
+}
+
 /// The encryption settings of the server configuration, if any. Backups made from this
 /// configuration are encrypted when they are enabled, and encrypted artifacts are opened
 /// with the key they name.

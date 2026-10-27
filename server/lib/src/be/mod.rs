@@ -5083,6 +5083,129 @@ mod tests {
         );
     }
 
+    /// Records archived by a server that stored uuid, iname and iutf8 values as multi value
+    /// sets (`UU`, `N8`, `I8`, before the single value sets `US`, `N8S`, `I8S`) replay like
+    /// the records of the current encoding: the archive may hold both, and a recovery
+    /// replays them alike.
+    #[test]
+    fn test_be_wal_apply_replays_legacy_and_current_value_set_encodings() {
+        sketching::test_init();
+        let legacy_uuid = uuid!("6a1c8b8e-6a0c-4d0c-9a53-6a1c8b8e6a0c");
+        let current_uuid = uuid!("0d6f3f0e-2b7a-4d3b-8a9e-0d6f3f0e2b7a");
+
+        // The serialised entry `name`, in the legacy or in the current encoding.
+        let record = |uuid: Uuid, name: &str, legacy: bool, secs: u64| -> WalEntryRecord {
+            let mut e: Entry<EntryInit, EntryNew> = Entry::new();
+            e.add_ava(Attribute::Uuid, Value::Uuid(uuid));
+            e.add_ava(Attribute::Name, Value::new_iname(name));
+            e.add_ava(
+                Attribute::Description,
+                Value::new_iutf8(&format!("{name} mail")),
+            );
+            let mut db_e = e.into_sealed_committed().to_dbentry();
+            let DbEntryVers::V3 { attrs, .. } = &mut db_e.ent;
+            let encoded = if legacy {
+                [
+                    (Attribute::Uuid, DbValueSetV2::Uuid(vec![uuid])),
+                    (Attribute::Name, DbValueSetV2::Iname(vec![name.to_string()])),
+                    (
+                        Attribute::Description,
+                        DbValueSetV2::Iutf8(vec![format!("{name} mail")]),
+                    ),
+                ]
+            } else {
+                [
+                    (Attribute::Uuid, DbValueSetV2::UuidSingle(uuid)),
+                    (Attribute::Name, DbValueSetV2::InameSingle(name.to_string())),
+                    (
+                        Attribute::Description,
+                        DbValueSetV2::Iutf8Single(format!("{name} mail")),
+                    ),
+                ]
+            };
+            attrs.extend(encoded);
+            let entry_data = serde_json::to_vec(&db_e).unwrap();
+            let tag = if legacy { "\"UU\"" } else { "\"US\"" };
+            assert!(
+                String::from_utf8_lossy(&entry_data).contains(tag),
+                "the record holds the {tag} encoding"
+            );
+            WalEntryRecord {
+                cid_ts: Duration::from_secs(secs).as_nanos() as u64,
+                cid_server: CID_ZERO.s_uuid,
+                entry_id: secs,
+                entry_uuid: uuid,
+                operation: WalOperationRecord::Create { entry_data },
+            }
+        };
+
+        let be = Backend::new(BackendConfig::new_test("main"), wal_test_idxmeta(), false).unwrap();
+        let mut be_txn = be.write().unwrap();
+        be_txn.reset_db_s_uuid().unwrap();
+        be_txn.reset_db_d_uuid().unwrap();
+        let report = be_txn
+            .wal_apply(vec![
+                record(legacy_uuid, "legacy", true, 10),
+                record(current_uuid, "current", false, 11),
+            ])
+            .unwrap();
+        assert_eq!(report.applied, 2);
+        assert_eq!(report.created, 2);
+        be_txn.reindex(false).unwrap();
+        be_txn.commit().unwrap();
+
+        let mut be_txn = be.write().unwrap();
+        let lims = Limits::unlimited();
+        for (uuid, name) in [(legacy_uuid, "legacy"), (current_uuid, "current")] {
+            let by_uuid = be_txn
+                .search(
+                    &lims,
+                    &filter_resolved!(f_eq(Attribute::Uuid, PartialValue::Uuid(uuid))),
+                )
+                .unwrap();
+            assert_eq!(by_uuid.len(), 1, "{name}");
+            let by_name = be_txn
+                .search(
+                    &lims,
+                    &filter_resolved!(f_eq(Attribute::Name, PartialValue::new_iname(name))),
+                )
+                .unwrap();
+            assert_eq!(by_name.len(), 1, "{name}");
+            assert_eq!(by_name[0].get_uuid(), uuid);
+            assert!(by_name[0].attribute_equality(
+                Attribute::Description,
+                &PartialValue::new_iutf8(&format!("{name} mail"))
+            ));
+        }
+        assert!(be_txn.verify().is_empty());
+
+        // A legacy record of an entry over its current state, and the other way round:
+        // the last record wins whatever its encoding.
+        let report = be_txn
+            .wal_apply(vec![
+                record(current_uuid, "current-renamed", true, 20),
+                record(legacy_uuid, "legacy-renamed", false, 21),
+            ])
+            .unwrap();
+        assert_eq!(report.modified + report.created, 2);
+        be_txn.reindex(false).unwrap();
+        for (uuid, name) in [
+            (legacy_uuid, "legacy-renamed"),
+            (current_uuid, "current-renamed"),
+        ] {
+            let found = be_txn
+                .search(
+                    &lims,
+                    &filter_resolved!(f_eq(Attribute::Name, PartialValue::new_iname(name))),
+                )
+                .unwrap();
+            assert_eq!(found.len(), 1, "{name}");
+            assert_eq!(found[0].get_uuid(), uuid);
+        }
+        assert!(be_txn.verify().is_empty());
+        be_txn.commit().unwrap();
+    }
+
     #[test]
     fn test_be_wal_apply_replays_state_by_uuid() {
         let dir = tempfile::tempdir().unwrap();

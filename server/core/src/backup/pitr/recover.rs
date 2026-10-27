@@ -14,9 +14,9 @@ use kubidmd_lib::be::WalApplyReport;
 use kubidmd_lib::prelude::duration_from_epoch_now;
 use kubidmd_lib::repl::wal::{
     clear_local_events, close_left_segments_offline, defer_restore, format_ts_rfc3339,
-    list_segments, parse_recovery_target_cid, parse_recovery_target_time, parse_segment,
-    read_left_segments, read_local_events, scan_segments, WalEntryRecord, WalOperationRecord,
-    WalPendingEvents, WalRestore,
+    list_segments, note_database_replaced, parse_recovery_target_cid, parse_recovery_target_time,
+    parse_segment, read_left_segments, read_local_events, scan_segments, try_lock_wal_dir,
+    WalDirLock, WalEntryRecord, WalOperationRecord, WalPendingEvents, WalRestore,
 };
 use uuid::Uuid;
 
@@ -111,16 +111,95 @@ pub fn plan_recovery(
     manifest: &PitrManifest,
     target: &RecoveryTargetSpec,
 ) -> Result<RecoveryPlan, PitrError> {
+    plan_recovery_for_version(manifest, target, env!("KUBIDM_PKG_SERIES"))
+}
+
+/// [`plan_recovery`] for a server of the version series `server_version`, which only
+/// restores the base backups and replays the segments of its own series: after an upgrade,
+/// the newest base at or before the target may be one it can not restore, and an older one
+/// of its series (if any) is used instead. A plan this version could not carry out (no base
+/// of its series, or a segment of another series to replay) is refused here, before the
+/// recovery changes anything, with the targets and the version that can recover it.
+pub fn plan_recovery_for_version(
+    manifest: &PitrManifest,
+    target: &RecoveryTargetSpec,
+    server_version: &str,
+) -> Result<RecoveryPlan, PitrError> {
     let resolved = resolve_target(manifest, target)?;
-    let base = manifest
-        .base_backup_for(resolved.ts)
-        .cloned()
-        .ok_or_else(|| {
-            PitrError::NotRecoverable(format!(
-                "no base backup at or before {}",
-                format_ts_rfc3339(resolved.ts)
-            ))
-        })?;
+    // Where this version can recover from, for the advice of the errors below.
+    let own_targets = || {
+        first_base_of_version(manifest, server_version)
+            .map(|base| {
+                format!(
+                    "choose a target at or after {}, the watermark of {}, the first base backup \
+                     taken by version {server_version}",
+                    format_ts_rfc3339(base.watermark_ts),
+                    base.key
+                )
+            })
+            .unwrap_or_else(|| {
+                format!(
+                    "take an online backup with version {server_version}: the archive holds no \
+                     base backup of it yet"
+                )
+            })
+    };
+    // The version that wrote every base and segment a replay from `base` up to the target
+    // needs, when there is one.
+    let single_version = |base: &PitrBaseBackup| {
+        let version = &base.server_version;
+        manifest
+            .segments_between(base.watermark_ts, resolved.ts)
+            .iter()
+            .all(|segment| &segment.server_version == version)
+            .then(|| version.clone())
+    };
+    let base = match manifest.base_backup_for_version(resolved.ts, server_version) {
+        Some(base) => base.clone(),
+        None => {
+            return Err(PitrError::NotRecoverable(
+                match manifest.base_backup_for(resolved.ts) {
+                    Some(newest) => format!(
+                        "no base backup at or before {} was written by server version \
+                         {server_version}: the newest, {}, was written by version {}, which this \
+                         version can not restore. {}; {}",
+                        format_ts_rfc3339(resolved.ts),
+                        newest.key,
+                        newest.server_version,
+                        match single_version(newest) {
+                            Some(version) =>
+                                format!("Recover it with a server of version {version}"),
+                            None => "No single version can recover this target: the base and the \
+                                     segments after it were written by different versions"
+                                .to_string(),
+                        },
+                        own_targets(),
+                    ),
+                    None => format!(
+                        "no base backup at or before {}",
+                        format_ts_rfc3339(resolved.ts)
+                    ),
+                },
+            ));
+        }
+    };
+    if let Some(segment) = manifest
+        .segments_between(base.watermark_ts, resolved.ts)
+        .into_iter()
+        .find(|segment| segment.server_version != server_version)
+    {
+        return Err(PitrError::NotRecoverable(format!(
+            "segment {} was written by server version {} and can not be replayed by version \
+             {server_version}, which a recovery from base backup {} up to {} needs. Choose a \
+             target before {}, or {}",
+            segment.segment_id,
+            segment.server_version,
+            base.key,
+            format_ts_rfc3339(resolved.ts),
+            format_ts_rfc3339(segment.start_ts),
+            own_targets(),
+        )));
+    }
     if let Some(gap) = manifest.gap_blocking(base.watermark_ts, resolved.ts) {
         let latest = manifest
             .latest_recoverable_ts()
@@ -164,6 +243,73 @@ pub fn plan_recovery(
         base,
         segments,
     })
+}
+
+/// The oldest base backup of `manifest` written by `server_version` that does not belong to
+/// abandoned history.
+fn first_base_of_version<'a>(
+    manifest: &'a PitrManifest,
+    server_version: &str,
+) -> Option<&'a PitrBaseBackup> {
+    manifest.base_backups.iter().find(|base| {
+        base.server_version == server_version && !manifest.is_abandoned(base.watermark_ts)
+    })
+}
+
+/// Take the lock of the WAL directory `config` archives into, for a command about to
+/// replace the database (`recover`, `restore`, `restore-s3`): it fails while a server, or
+/// an offline command that archives, runs on that directory, since replacing the database
+/// under it, or taking over its journals, would corrupt both. Hold it until the command is
+/// done. None without WAL archiving, or when the directory does not exist.
+pub(crate) async fn lock_wal_dir(config: &Configuration) -> Result<Option<WalDirLock>, PitrError> {
+    let Some(settings) = PitrSettings::from_config(config)? else {
+        return Ok(None);
+    };
+    let dir = settings.local_dir;
+    blocking(move || Ok(try_lock_wal_dir(&dir)?)).await
+}
+
+/// After a restore or recovery is done with the database (`archive` says whether the
+/// history it abandoned was recorded or handed over): record in the WAL directory that it
+/// accounts for the database as it is now, so that the next start does not report what
+/// the command itself committed (the reindex and the verification boot the database) as
+/// history the archive never saw. When the abandoned history was recorded nowhere, the
+/// next start reports it as such a gap instead, which is the only record of it left.
+pub(crate) async fn note_database_replaced_in_wal(config: &Configuration, archive: RestoreStatus) {
+    if archive == RestoreStatus::AbandonedHistoryNotRecorded {
+        return;
+    }
+    let settings = match PitrSettings::from_config(config) {
+        Ok(Some(settings)) => settings,
+        Ok(None) => return,
+        Err(err) => {
+            warn!(%err, "Unable to read the WAL archive settings");
+            return;
+        }
+    };
+    // The database as the command leaves it, after its reindex and verification.
+    let (db_ts_max, server_uuid) =
+        match crate::backup::restore::read_database_identity(config).await {
+            Ok(identity) => identity,
+            Err(err) => {
+                warn!(
+                    ?err,
+                    "Unable to read the replaced database; the next start reports the \
+                     transactions of this command as a gap in the archive"
+                );
+                return;
+            }
+        };
+    let dir = settings.local_dir;
+    if let Err(err) =
+        blocking(move || Ok(note_database_replaced(&dir, db_ts_max, server_uuid)?)).await
+    {
+        warn!(
+            %err,
+            "Unable to record the replaced database in the WAL directory; the next start \
+             reports the transactions of this command as a gap in the archive"
+        );
+    }
 }
 
 /// Whether a recovery to `plan` replays `record`: it lies after the base watermark, at or
@@ -453,13 +599,18 @@ pub async fn pitr_list_server_core(config: &Configuration, region: Option<&str>)
         );
         for base in &manifest.base_backups {
             println!(
-                "  {:<key_width$}  {:<35}  {:<35}  {}{}",
+                "  {:<key_width$}  {:<35}  {:<35}  {}{}{}",
                 base.key,
                 base.timestamp,
                 format_ts_rfc3339(base.watermark_ts),
                 base.server_version,
                 if is_encrypted_backup_name(&base.key) {
                     "  (encrypted)"
+                } else {
+                    ""
+                },
+                if base.server_version != env!("KUBIDM_PKG_SERIES") {
+                    "  (another version, not restorable by this one)"
                 } else {
                     ""
                 }
@@ -539,6 +690,31 @@ pub async fn pitr_list_server_core(config: &Configuration, region: Option<&str>)
                 format_ts_rfc3339(earliest),
                 format_ts_rfc3339(latest)
             );
+            let series = env!("KUBIDM_PKG_SERIES");
+            if let Some(other) = manifest
+                .base_backups
+                .iter()
+                .find(|base| base.server_version != series)
+            {
+                match first_base_of_version(&manifest, series) {
+                    Some(own) => println!(
+                        "  This server (version {series}) only restores the base backups and \
+                         replays the segments of its own version: it recovers targets at or \
+                         after {}. An earlier target needs a server of the version that wrote \
+                         the base backup and the segments up to it (such as {})",
+                        format_ts_rfc3339(own.watermark_ts.max(earliest)),
+                        other.server_version
+                    ),
+                    None => println!(
+                        "  This server (version {series}) only restores the base backups and \
+                         replays the segments of its own version, and the archive holds no base \
+                         backup of it yet: take an online backup with this version. Earlier \
+                         targets need a server of the version that wrote the base backup and \
+                         the segments up to them (such as {})",
+                        other.server_version
+                    ),
+                }
+            }
             true
         }
         None => {
@@ -713,6 +889,15 @@ pub async fn pitr_recover_server_core(
     dry_run: bool,
     region: Option<&str>,
 ) -> Result<RecoveryOutcome, PitrError> {
+    // A recovery replaces the database and takes over the journals of the WAL directory: it
+    // never runs next to a server archiving into it, and nothing archives into it while it
+    // reads the archive. A dry run changes nothing and does not need the lock.
+    let _wal_lock = if dry_run {
+        None
+    } else {
+        lock_wal_dir(config).await?
+    };
+
     // Planning changes nothing: a dry run may run next to the server, and a recovery that
     // is refused leaves the WAL directory as it was.
     let opened = open_archive(config, region).await?;
@@ -814,6 +999,7 @@ pub async fn pitr_recover_server_core(
     };
 
     finish_recovery(config, committed, &db_path, recovered_ts).await?;
+    note_database_replaced_in_wal(config, archive).await;
 
     eprintln!(
         "Recovered {db_path} to {} ({} records replayed on {})",
@@ -1092,6 +1278,159 @@ mod tests {
     use super::super::test_util::*;
     use super::super::{BaseLocation, PitrArchive, PitrLocation};
     use crate::backup::{is_encrypted_artifact, read_encryption_header};
+
+    /// After an upgrade to another version series, the bases taken before it can not be
+    /// restored: the planner uses the newest base of this series, and says so clearly when
+    /// there is none, rather than planning a recovery that fails once it runs.
+    #[test]
+    fn test_plan_recovery_skips_bases_of_another_version() {
+        // Version "old" took backup-1 and wrote s1 and s2; then the server was upgraded to
+        // "new", which wrote s3, took backup-2 and wrote s4.
+        let of = |version: &str, mut segment: WalSegment| {
+            segment.server_version = version.to_string();
+            segment
+        };
+        let mut m = PitrManifest::new(Uuid::nil());
+        m.add_base_backup(PitrBaseBackup {
+            server_version: "old".to_string(),
+            ..base("backup-1", 100)
+        });
+        m.add_segment(of("old", segment("s1", 110, 200)));
+        m.add_segment(of("old", segment("s2", 210, 300)));
+        m.add_segment(of("new", segment("s3", 310, 400)));
+        m.add_base_backup(PitrBaseBackup {
+            server_version: "new".to_string(),
+            ..base("backup-2", 450)
+        });
+        m.add_segment(of("new", segment("s4", 460, 600)));
+        let at = |secs: u64| RecoveryTargetSpec::Time(format_ts_rfc3339(Duration::from_secs(secs)));
+
+        // The new version recovers from its own base.
+        let plan = plan_recovery_for_version(&m, &at(500), "new").unwrap();
+        assert_eq!(plan.base.key, "backup-2");
+        // Before it, nothing it can restore: the advice names the targets it can recover,
+        // and the version that can recover this one.
+        let msg = plan_recovery_for_version(&m, &at(250), "new")
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("backup-1"), "{msg}");
+        assert!(
+            msg.contains("Recover it with a server of version old"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains(&format!(
+                "at or after {}",
+                format_ts_rfc3339(Duration::from_secs(450))
+            )),
+            "{msg}"
+        );
+        // Between the upgrade and the first new base no single version can.
+        let msg = plan_recovery_for_version(&m, &at(350), "new")
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("No single version"), "{msg}");
+
+        // The old version restores backup-1, but refuses to replay what the new one wrote,
+        // while planning.
+        let plan = plan_recovery_for_version(&m, &at(250), "old").unwrap();
+        assert_eq!(plan.base.key, "backup-1");
+        let msg = plan_recovery_for_version(&m, &at(350), "old")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("segment s3") && msg.contains("version new"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains(&format!(
+                "before {}",
+                format_ts_rfc3339(Duration::from_secs(310))
+            )),
+            "{msg}"
+        );
+
+        // No base of this series at all.
+        let msg = plan_recovery_for_version(&m, &at(500), "9.9-newer")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("take an online backup with version 9.9-newer"),
+            "{msg}"
+        );
+    }
+
+    /// `recover` and `restore` replace the database: they refuse while a server archives
+    /// into the WAL directory, whose lock it holds. The dry run and `pitr-list` change
+    /// nothing and run next to it.
+    #[tokio::test]
+    async fn test_recover_and_restore_refuse_while_a_server_archives() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("wal");
+        let backup_dir = dir.path().join("backups");
+        fs::create_dir_all(&wal_dir).unwrap();
+        fs::create_dir_all(&backup_dir).unwrap();
+        let db_path = dir.path().join("recovered.db");
+        let wal_cfg = WalArchiveConfig {
+            enabled: true,
+            local_path: Some(wal_dir.clone()),
+            ..WalArchiveConfig::default()
+        };
+        let mut config = Configuration::new_for_test();
+        config.db_path = Some(db_path.clone());
+        config.online_backup = Some(crate::config::OnlineBackup {
+            path: Some(backup_dir.clone()),
+            enabled: true,
+            wal_archive: Some(wal_cfg.clone()),
+            ..crate::config::OnlineBackup::default()
+        });
+
+        // An archive with one base and nothing to replay after it. The base is not a
+        // backup: a recovery that gets as far as restoring it fails there.
+        let key = "backup-2024-01-01T00:00:00Z.json";
+        fs::write(backup_dir.join(key), b"{}").unwrap();
+        let mut archived = PitrManifest::new(Uuid::nil());
+        archived.add_base_backup(base(key, 100));
+        PitrStore::open(&PitrLocation::Local(wal_dir.clone()))
+            .await
+            .unwrap()
+            .save_manifest(&mut archived, Duration::from_secs(200))
+            .await
+            .unwrap();
+
+        let server = WalArchiver::open(wal_cfg, Uuid::nil(), wal_dir.clone(), None).unwrap();
+        assert!(matches!(
+            lock_wal_dir(&config).await,
+            Err(PitrError::Wal(kubidmd_lib::repl::wal::WalError::Locked(_)))
+        ));
+        let dry = pitr_recover_server_core(&config, &RecoveryTargetSpec::Latest, true, None)
+            .await
+            .unwrap();
+        assert!(dry.dry_run);
+        assert!(pitr_list_server_core(&config, None).await);
+
+        let refused =
+            pitr_recover_server_core(&config, &RecoveryTargetSpec::Latest, false, None).await;
+        assert!(
+            matches!(&refused, Err(PitrError::Wal(err)) if err.to_string().contains("Stop the server")),
+            "{refused:?}"
+        );
+        assert!(!db_path.exists());
+        let refused = crate::backup::cli::restore_server_core(&config, &backup_dir.join(key)).await;
+        assert_eq!(refused, Err(OperationError::InvalidState));
+        assert!(!db_path.exists());
+
+        // Once the server stopped, the recovery runs, up to the base that is not one.
+        drop(server);
+        let failed =
+            pitr_recover_server_core(&config, &RecoveryTargetSpec::Latest, false, None).await;
+        assert!(
+            matches!(&failed, Err(err) if !matches!(err, PitrError::Wal(_))),
+            "{failed:?}"
+        );
+        // It held the lock while it ran, and released it.
+        assert!(lock_wal_dir(&config).await.unwrap().is_some());
+    }
 
     #[test]
     fn test_resolve_target() {

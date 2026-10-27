@@ -77,14 +77,14 @@ bucket = "kubidm-backups"
 region = "us-east-1"
 # Optional: Custom endpoint for MinIO or other S3-compatible services
 # endpoint = "https://minio.example.com"
-# Optional: Path prefix for organizing backups
+# Optional: Path prefix for organizing backups, relative to the bucket (no leading "/", no "..")
 # path_prefix = "production"
 # Optional: Storage class: STANDARD (default), REDUCED_REDUNDANCY, STANDARD_IA, ONEZONE_IA,
 # INTELLIGENT_TIERING or GLACIER_IR. GLACIER and DEEP_ARCHIVE are refused: their objects
 # can only be read after a restore request.
 # storage_class = "STANDARD"
 
-# For static credentials (not recommended for production)
+# For static credentials (not recommended for production; use an https:// endpoint with them)
 [online_backup.s3.credentials]
 access_key_id = "your-access-key"
 secret_access_key = "your-secret-key"
@@ -492,7 +492,7 @@ versions = 7
 enabled = true
 # Close the open segment at least this often (also the upload period). Default 300.
 # segment_interval_seconds = 300
-# Close a segment once its records reach this size. Default 16 MiB.
+# Close a segment once its records reach this size. Default 16 MiB, at most 1 GiB.
 # segment_size_bytes = 16777216
 # Keep archived segments at least this long. Default 7.
 # retention_days = 7
@@ -500,7 +500,7 @@ enabled = true
 # local_path = "/var/lib/kubidm/wal"
 # How the open segment survives an unclean stop: "Commit" (default), "Interval" or "Off".
 # open_segment_journal = "Commit"
-# With "Interval": sync the journal at most this often. Default 1000.
+# With "Interval": sync the journal at most this often. Default 1000, at least 1.
 # journal_sync_interval_ms = 1000
 # Archive in another S3 location than [online_backup.s3]:
 # [online_backup.wal_archive.s3]
@@ -583,6 +583,47 @@ whose replay would cross one, and `--latest` stops right before it. A base backu
 recoverable again; take one after any `WAL ARCHIVE HOLE`. With S3, segments that were closed but not yet uploaded are
 lost with the host, which only shortens the recoverable window.
 
+> [!WARNING]
+>
+> Disabling WAL archiving, running the server with another WAL directory, or losing the WAL directory (`local_path`)
+> creates a **gap** that `recover` refuses to cross. Recovery to any point after it needs a base backup taken after it:
+> take an online backup right after re-enabling archiving or replacing the WAL directory. Keep the WAL directory on
+> persistent storage, next to the database.
+
+The WAL directory records how far it accounts for the database, in `.covered.json`: the server it belongs to and the
+last transaction the archiver saw, including those that archived no change but not those whose records still only live
+in memory. It is written whenever a segment is written, at every archive run and at a clean shutdown, and `restore` and
+`recover` write the one of the database they put in place. Every start compares it with the last transaction the
+database committed:
+
+- A database ahead of it committed transactions no archiver saw (archiving was disabled for a while, or the server ran
+  on another WAL directory): the server logs `WAL ARCHIVE HOLE` and records a gap with the reason
+  `the database committed transactions while WAL archiving was not running`.
+- A database behind it was put back to an earlier state outside `restore` and `recover`, for example from a volume
+  snapshot of the database alone: what the archive holds after that point belongs to the state it left, and the same gap
+  covers it.
+- When the record is missing or belongs to another server, because the WAL directory is new, was recreated, was lost or
+  was reused, the server compares the database with the segments the WAL directory held when it started, and at its
+  first archive run with the manifest, which records how far the archive covered the server at the last run that
+  archived everything. Base backups do not count as archived history, since one is indexed before the segments up to its
+  watermark reach the archive. A database with no archive yet has nothing to miss.
+- A database and WAL directory put back together, from one volume snapshot, agree with each other, but the archive holds
+  history after them. The first archive run after the start notices it and records that history as abandoned, as a
+  restore would, so that no recovery replays it.
+
+Independently of these records, a recovery never replays across the history between the last archived segment and a
+newer base backup: until those segments reach the archive, a target there is refused, and the newest base backup itself
+is the latest point.
+
+Only one process archives into a WAL directory: the server holds an exclusive lock on `.archiver.lock` in it for as long
+as it runs (released at a clean shutdown, or by the operating system when the process dies), and a second server on the
+same directory fails to start. `recover`, `restore` and `restore-s3` take the same lock before they read the archive or
+change the database, and refuse with an error naming the directory while a server, or an offline command that archives,
+runs on it. `recover --dry-run` and `pitr-list` do not take it. The lock is an advisory file lock: it only excludes
+processes on other hosts when the file system shares locks between them. Network file systems may not (NFS needs working
+lock support, and some setups lock per host only), and a file system without lock support makes the lock a no-op with a
+warning. Make sure only one server runs on a WAL directory.
+
 `recover` does not need the stopped server to start first, which a damaged database may not allow: it closes the open
 segment from its journal itself, as the next start would, and replays it. Without the database it can not tell whether
 the server committed anything after the last commit the journal holds, so `--latest` stops there; the next start of a
@@ -652,6 +693,12 @@ segments still only in the local WAL directory, and the key identifier of encryp
 history, and the recoverable window. It does not open the database, so it can run while the server is running, and it
 needs no encryption key, since the manifest is not encrypted. It exits non-zero when nothing is recoverable yet.
 `--region <name>` lists a replication region's copy instead.
+
+A server only restores base backups written by its own version series. After an upgrade, the bases taken before it are
+marked `(another version, not restorable by this one)`, and the listing says from which point on this version can
+recover. `recover` picks the newest base of its own version at or before the target, and when there is none it says so
+before changing anything: recover with a server of the older version, or choose a target after the first online backup
+taken since the upgrade. Take one right after upgrading.
 
 #### Recovering
 
@@ -961,6 +1008,12 @@ With `metrics_endpoint = true` the server serves its backup metrics in the Prome
 `GET /metrics`, on its HTTPS listeners. It is off by default: the metrics reveal when backups run, where they are stored
 (the names of the replication regions) and whether they fail, which tells an attacker whether a destructive attack could
 be recovered from. Without it, `/metrics` answers 404 like any other unknown path.
+
+> [!WARNING]
+>
+> Without `metrics_token_file`, `/metrics` is **unauthenticated**: anyone who can reach the HTTPS listener reads the
+> backup destinations and their health. The server logs a warning at startup when the endpoint is enabled without a
+> token file.
 
 Restrict who can read it, in one or both of these ways:
 
