@@ -99,7 +99,6 @@ utoipa = { workspace = true, features = [
     "uuid",
 ] }
 utoipa-swagger-ui = { workspace = true, default-features = false, features = ["axum"] }
-x509-cert = { workspace = true }
 
 webauthn-rs = { workspace = true, features = [
     "resident-key-support",

@@ -4718,7 +4718,6 @@ dependencies = [
  "uuid",
  "walkdir",
  "webauthn-rs",
- "x509-cert 0.3.0",
 ]
 
 [[package]]
@@ -4779,7 +4778,6 @@ dependencies = [
  "webauthn-rs",
  "webauthn-rs-core",
  "whoami",
- "x509-cert 0.3.0",
  "zxcvbn",
 ]
 
