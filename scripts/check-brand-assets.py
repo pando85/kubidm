@@ -40,6 +40,9 @@ def main() -> None:
     ]:
         assert png_size("server/core/static/img/" + name) == (size, size), name
     assert png_size("book/theme/favicon.png") == (32, 32)
+    assert png_size("artwork/brand/social-preview.png") == (1280, 640)
+    assert (ROOT / "server/core/static/img/logo.svg.br").exists()
+    assert (ROOT / "server/core/static/img/logo-square.svg.br").exists()
     assert read("server/core/templates/base_icons.html").find("/pkg/img/favicon.svg") != -1
     manifest = read("server/core/src/https/manifest.rs")
     assert "256x156" not in manifest

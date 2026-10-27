@@ -8,6 +8,7 @@ from pathlib import Path
 import io
 from PIL import Image
 import cairosvg
+import brotli
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "artwork/brand/app-icon.svg"
@@ -37,3 +38,19 @@ for size in (192, 512):
 render(SOURCE, 32).save(OUT / "favicon.ico", format="ICO",
                         sizes=[(16, 16), (32, 32)])
 print("T1.1 raster assets regenerated")
+
+# Keep the precompressed static SVGs aligned with the canonical mark.
+for name in ("logo.svg", "logo-square.svg"):
+    svg_path = OUT / name
+    (OUT / (name + ".br")).write_bytes(
+        brotli.compress(svg_path.read_bytes(), quality=11)
+    )
+
+# Social preview: SVG is authoritative; generated PNG can be uploaded in
+# GitHub repository settings as the social preview.
+preview = ROOT / "artwork/brand/social-preview.svg"
+preview_bytes = cairosvg.svg2png(
+    bytestring=preview.read_bytes(), output_width=1280, output_height=640
+)
+preview_image = Image.open(io.BytesIO(preview_bytes)).convert("RGBA")
+write_png(preview_image, ROOT / "artwork/brand/social-preview.png")
