@@ -32,5 +32,6 @@ jobs:
           git add artwork/brand/social-preview.png server/core/static/img/favicon.ico server/core/static/img/favicon.png server/core/static/img/logo-32.png server/core/static/img/logo-180.png server/core/static/img/logo-192.png server/core/static/img/logo-256.png server/core/static/img/logo-512.png server/core/static/img/logo-192-maskable.png server/core/static/img/logo-512-maskable.png server/core/static/img/logo.svg.br server/core/static/img/logo-square.svg.br book/theme/favicon.png
           if ! git diff --cached --quiet; then
             git commit -m "assets(brand): render approved T1.1 web and PWA icons"
+            git pull --rebase origin "${GITHUB_REF_NAME}"
             git push
           fi
