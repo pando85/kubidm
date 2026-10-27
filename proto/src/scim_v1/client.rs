@@ -162,7 +162,7 @@ pub struct ScimEntryApplication {
     pub name: String,
     pub displayname: String,
 
-    pub linked_group: Vec<super::ScimReference>,
+    pub linked_group: super::ScimReference,
 
     #[serde(flatten)]
     pub attrs: BTreeMap<Attribute, JsonValue>,
@@ -552,12 +552,12 @@ mod tests {
             "id": uuid.to_string(),
             "name": "testapp",
             "displayname": "Test App",
-            "linked_group": [{"uuid": group_uuid.to_string(), "value": "group1"}]
+            "linked_group": {"uuid": group_uuid.to_string(), "value": "group1"}
         });
         let app: ScimEntryApplication = serde_json::from_value(json).unwrap();
         assert_eq!(app.name, "testapp");
         assert_eq!(app.displayname, "Test App");
-        assert_eq!(app.linked_group.len(), 1);
+        assert_eq!(app.linked_group.uuid, group_uuid);
     }
 
     #[test]

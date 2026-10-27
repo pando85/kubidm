@@ -225,10 +225,18 @@ impl SchemaAttribute {
             SyntaxType::Boolean => matches!(v, PartialValue::Bool(_)),
             SyntaxType::SyntaxId => matches!(v, PartialValue::Syntax(_)),
             SyntaxType::IndexId => matches!(v, PartialValue::Index(_)),
-            SyntaxType::Uuid => matches!(v, PartialValue::Uuid(_)),
-            SyntaxType::ReferenceUuid => matches!(v, PartialValue::Refer(_)),
-            SyntaxType::Utf8StringInsensitive => matches!(v, PartialValue::Iutf8(_)),
-            SyntaxType::Utf8StringIname => matches!(v, PartialValue::Iname(_)),
+            SyntaxType::Uuid | SyntaxType::UuidN => {
+                matches!(v, PartialValue::Uuid(_))
+            }
+            SyntaxType::ReferenceUuidN | SyntaxType::ReferenceUuid => {
+                matches!(v, PartialValue::Refer(_))
+            }
+            SyntaxType::Utf8StringInsensitiveN | SyntaxType::Utf8StringInsensitive => {
+                matches!(v, PartialValue::Iutf8(_))
+            }
+            SyntaxType::Utf8StringInameN | SyntaxType::Utf8StringIname => {
+                matches!(v, PartialValue::Iname(_))
+            }
             SyntaxType::Utf8String => matches!(v, PartialValue::Utf8(_)),
             SyntaxType::JsonFilter => matches!(v, PartialValue::JsonFilt(_)),
             SyntaxType::Credential => matches!(v, PartialValue::Cred(_)),
@@ -242,7 +250,7 @@ impl SchemaAttribute {
             SyntaxType::NsUniqueId => matches!(v, PartialValue::Nsuniqueid(_)),
             SyntaxType::DateTime => matches!(v, PartialValue::DateTime(_)),
             SyntaxType::EmailAddress => matches!(v, PartialValue::EmailAddress(_)),
-            SyntaxType::Url => matches!(v, PartialValue::Url(_)),
+            SyntaxType::UrlN | SyntaxType::Url => matches!(v, PartialValue::Url(_)),
             SyntaxType::OauthScope => matches!(v, PartialValue::OauthScope(_)),
             SyntaxType::OauthScopeMap => matches!(v, PartialValue::Refer(_)),
             SyntaxType::OauthClaimMap => {
@@ -304,9 +312,29 @@ impl SchemaAttribute {
                 SyntaxType::SyntaxId => matches!(v, Value::Syntax(_)),
                 SyntaxType::IndexId => matches!(v, Value::Index(_)),
                 SyntaxType::Uuid => matches!(v, Value::Uuid(_)),
-                SyntaxType::ReferenceUuid => matches!(v, Value::Refer(_)),
-                SyntaxType::Utf8StringInsensitive => matches!(v, Value::Iutf8(_)),
-                SyntaxType::Utf8StringIname => matches!(v, Value::Iname(_)),
+                SyntaxType::ReferenceUuidN => {
+                    matches!(v, Value::ReferN(_))
+                }
+                SyntaxType::ReferenceUuid => {
+                    matches!(v, Value::Refer(_))
+                }
+                SyntaxType::Utf8StringInsensitiveN => {
+                    matches!(v, Value::Iutf8N(_))
+                    /*
+                    let x = matches!(v, Value::Iutf8N(_));
+                    assert!(x);
+                    x
+                    */
+                }
+                SyntaxType::Utf8StringInsensitive => {
+                    matches!(v, Value::Iutf8(_))
+                }
+                SyntaxType::Utf8StringInameN => {
+                    matches!(v, Value::InameN(_))
+                }
+                SyntaxType::Utf8StringIname => {
+                    matches!(v, Value::Iname(_))
+                }
                 SyntaxType::Utf8String => matches!(v, Value::Utf8(_)),
                 SyntaxType::JsonFilter => matches!(v, Value::JsonFilt(_)),
                 SyntaxType::Credential => matches!(v, Value::Cred(_, _)),
@@ -320,6 +348,7 @@ impl SchemaAttribute {
                 SyntaxType::NsUniqueId => matches!(v, Value::Nsuniqueid(_)),
                 SyntaxType::DateTime => matches!(v, Value::DateTime(_)),
                 SyntaxType::EmailAddress => matches!(v, Value::EmailAddress(_, _)),
+                SyntaxType::UrlN => matches!(v, Value::UrlN(_)),
                 SyntaxType::Url => matches!(v, Value::Url(_)),
                 SyntaxType::OauthScope => matches!(v, Value::OauthScope(_)),
                 SyntaxType::OauthScopeMap => matches!(v, Value::OauthScopeMap(_, _)),
@@ -351,7 +380,7 @@ impl SchemaAttribute {
                 SyntaxType::Json => matches!(v, Value::Json(_)),
                 SyntaxType::Sha256 => matches!(v, Value::Sha256(_)),
                 SyntaxType::EcKeyPrivate => matches!(v, Value::SecretValue(_)),
-                SyntaxType::Message => false,
+                SyntaxType::UuidN | SyntaxType::Message => false,
                 SyntaxType::TimeBoundedMember => matches!(v, Value::TimeBoundedMember(_)),
             };
         if r {
@@ -372,11 +401,39 @@ impl SchemaAttribute {
         // Check multivalue
         if !self.multivalue && ava.len() > 1 {
             // lrequest_error!("Ava len > 1 on single value attribute!");
-            admin_error!("Ava len > 1 on single value attribute!");
+            error!("Ava len > 1 on single value attribute!");
             return Err(SchemaError::InvalidAttributeSyntax(a.to_string()));
         };
         // If syntax, check the type is correct
+
+        // This exists to allow transition between the former syntax types and the
+        // new single/multivalue types.
+        /*
+        let valid = match self.syntax {
+            // Allow the single value variant to temporarily deserialise into
+            // the multi value variant before it's converted.
+            SyntaxType::Uuid => {
+                SyntaxType::UuidN == ava.syntax() || SyntaxType::Uuid == ava.syntax()
+            }
+            SyntaxType::Utf8StringInsensitive => {
+                SyntaxType::Utf8StringInsensitiveN == ava.syntax()
+                    || SyntaxType::Utf8StringInsensitive == ava.syntax()
+            }
+            SyntaxType::ReferenceUuid => {
+                SyntaxType::ReferenceUuidN == ava.syntax()
+                    || SyntaxType::ReferenceUuid == ava.syntax()
+            }
+            SyntaxType::Utf8StringIname => {
+                SyntaxType::Utf8StringInameN == ava.syntax()
+                    || SyntaxType::Utf8StringIname == ava.syntax()
+            }
+            SyntaxType::Url => SyntaxType::UrlN == ava.syntax() || SyntaxType::Url == ava.syntax(),
+            _ => self.syntax == ava.syntax(),
+        };
+            */
+
         let valid = self.syntax == ava.syntax();
+
         if valid && ava.validate(self) {
             Ok(())
         } else {
@@ -679,6 +736,229 @@ pub trait SchemaTransaction {
     }
 }
 
+/// Kubidm fork-only schema attributes (delegation, step-up reauth and ACP time
+/// restrictions). These are part of the in-memory schema at every domain level, so
+/// they are returned here for `generate_in_memory` and the DL >= 1.11 schema setup.
+pub(crate) fn kubidm_schema_attributes() -> Vec<SchemaAttribute> {
+    vec![
+        SchemaAttribute {
+            name: Attribute::AcpReceiverDelegated,
+            uuid: UUID_SCHEMA_ATTR_ACP_RECEIVER_DELEGATED,
+            description: String::from(
+                "The delegated role that receives this access control to allow access",
+            ),
+            multivalue: false,
+            unique: false,
+            phantom: false,
+            sync_allowed: false,
+            replicated: Replicated::True,
+            indexed: true,
+            syntax: SyntaxType::ReferenceUuid,
+        },
+        SchemaAttribute {
+            name: Attribute::AcpTargetDelegatedScope,
+            uuid: UUID_SCHEMA_ATTR_ACP_TARGET_DELEGATED_SCOPE,
+            description: String::from("The delegated scope filter for target definition"),
+            multivalue: false,
+            unique: false,
+            phantom: false,
+            sync_allowed: false,
+            replicated: Replicated::True,
+            indexed: false,
+            syntax: SyntaxType::JsonFilter,
+        },
+        SchemaAttribute {
+            name: Attribute::DelegatedScopeFilter,
+            uuid: UUID_SCHEMA_ATTR_DELEGATED_SCOPE_FILTER,
+            description: String::from(
+                "A filter defining the scope of delegated administration",
+            ),
+            multivalue: false,
+            unique: false,
+            phantom: false,
+            sync_allowed: false,
+            replicated: Replicated::True,
+            indexed: false,
+            syntax: SyntaxType::JsonFilter,
+        },
+        SchemaAttribute {
+            name: Attribute::DelegatedScopeGroup,
+            uuid: UUID_SCHEMA_ATTR_DELEGATED_SCOPE_GROUP,
+            description: String::from("A group defining the scope of delegated administration"),
+            multivalue: false,
+            unique: false,
+            phantom: false,
+            sync_allowed: false,
+            replicated: Replicated::True,
+            indexed: true,
+            syntax: SyntaxType::ReferenceUuid,
+        },
+        SchemaAttribute {
+            name: Attribute::DelegatedBy,
+            uuid: UUID_SCHEMA_ATTR_DELEGATED_BY,
+            description: String::from("The UUID of the user who delegated this role"),
+            multivalue: false,
+            unique: false,
+            phantom: false,
+            sync_allowed: false,
+            replicated: Replicated::True,
+            indexed: true,
+            syntax: SyntaxType::ReferenceUuid,
+        },
+        SchemaAttribute {
+            name: Attribute::DelegatedRoleTemplate,
+            uuid: UUID_SCHEMA_ATTR_DELEGATED_ROLE_TEMPLATE,
+            description: String::from("The template UUID for this delegated role"),
+            multivalue: false,
+            unique: false,
+            phantom: false,
+            sync_allowed: false,
+            replicated: Replicated::True,
+            indexed: true,
+            syntax: SyntaxType::ReferenceUuid,
+        },
+        SchemaAttribute {
+            name: Attribute::AcpRequireReauth,
+            uuid: UUID_SCHEMA_ATTR_ACP_REQUIRE_REAUTH,
+            description: String::from(
+                "A flag to determine if this ACP requires step-up authentication for operations.",
+            ),
+            multivalue: false,
+            unique: false,
+            phantom: false,
+            sync_allowed: false,
+            replicated: Replicated::True,
+            indexed: false,
+            syntax: SyntaxType::Boolean,
+        },
+        SchemaAttribute {
+            name: Attribute::AcpReauthMaxAge,
+            uuid: UUID_SCHEMA_ATTR_ACP_REAUTH_MAX_AGE,
+            description: String::from(
+                "The maximum age in seconds since last authentication before step-up is required.",
+            ),
+            multivalue: false,
+            unique: false,
+            phantom: false,
+            sync_allowed: false,
+            replicated: Replicated::True,
+            indexed: false,
+            syntax: SyntaxType::Uint32,
+        },
+        SchemaAttribute {
+            name: Attribute::AcpTimeRestrictionStart,
+            uuid: UUID_SCHEMA_ATTR_ACP_TIME_RESTRICTION_START,
+            description: String::from(
+                "The start time for time-based access restrictions on this ACP.",
+            ),
+            multivalue: false,
+            unique: false,
+            phantom: false,
+            sync_allowed: false,
+            replicated: Replicated::True,
+            indexed: false,
+            syntax: SyntaxType::DateTime,
+        },
+        SchemaAttribute {
+            name: Attribute::AcpTimeRestrictionEnd,
+            uuid: UUID_SCHEMA_ATTR_ACP_TIME_RESTRICTION_END,
+            description: String::from(
+                "The end time for time-based access restrictions on this ACP.",
+            ),
+            multivalue: false,
+            unique: false,
+            phantom: false,
+            sync_allowed: false,
+            replicated: Replicated::True,
+            indexed: false,
+            syntax: SyntaxType::DateTime,
+        },
+        SchemaAttribute {
+            name: Attribute::AcpScopeFilter,
+            uuid: UUID_SCHEMA_ATTR_ACP_SCOPE_FILTER,
+            description: String::from(
+                "A filter defining the scope of targets this ACP applies to within the target scope.",
+            ),
+            multivalue: false,
+            unique: false,
+            phantom: false,
+            sync_allowed: false,
+            replicated: Replicated::True,
+            indexed: false,
+            syntax: SyntaxType::JsonFilter,
+        },
+    ]
+}
+
+/// Kubidm fork-only schema classes. `AccessControlProfile` is included because the fork
+/// extends its `systemmay` with the step-up reauth attributes, so it must override the
+/// upstream system definition.
+pub(crate) fn kubidm_schema_classes() -> Vec<SchemaClass> {
+    vec![
+        SchemaClass {
+            name: EntryClass::AccessControlProfile.into(),
+            uuid: UUID_SCHEMA_CLASS_ACCESS_CONTROL_PROFILE,
+            description: String::from("System Access Control Profile Class"),
+            systemmay: vec![
+                Attribute::AcpEnable,
+                Attribute::Description,
+                Attribute::AcpRequireReauth,
+                Attribute::AcpReauthMaxAge,
+            ],
+            systemmust: vec![Attribute::Name],
+            systemsupplements: vec![
+                EntryClass::AccessControlSearch.into(),
+                EntryClass::AccessControlDelete.into(),
+                EntryClass::AccessControlModify.into(),
+                EntryClass::AccessControlCreate.into(),
+            ],
+            ..Default::default()
+        },
+        SchemaClass {
+            name: EntryClass::AccessControlReceiverDelegated.into(),
+            uuid: UUID_SCHEMA_CLASS_ACCESS_CONTROL_RECEIVER_DELEGATED,
+            description: String::from("System Access Control Profile Receiver - Delegated"),
+            systemmust: vec![],
+            systemmay: vec![
+                Attribute::AcpReceiverDelegated,
+                Attribute::DelegatedScopeGroup,
+                Attribute::DelegatedScopeFilter,
+            ],
+            systemsupplements: vec![EntryClass::AccessControlProfile.into()],
+            systemexcludes: vec![
+                EntryClass::AccessControlReceiverGroup.into(),
+                EntryClass::AccessControlReceiverEntryManager.into(),
+            ],
+            ..Default::default()
+        },
+        SchemaClass {
+            name: EntryClass::AccessControlTargetDelegatedScope.into(),
+            uuid: UUID_SCHEMA_CLASS_ACCESS_CONTROL_TARGET_DELEGATED_SCOPE,
+            description: String::from("System Access Control Profile Target - Delegated Scope"),
+            systemmust: vec![],
+            systemmay: vec![
+                Attribute::DelegatedScopeGroup,
+                Attribute::DelegatedScopeFilter,
+            ],
+            systemsupplements: vec![EntryClass::AccessControlProfile.into()],
+            systemexcludes: vec![EntryClass::AccessControlTargetScope.into()],
+            ..Default::default()
+        },
+        SchemaClass {
+            name: EntryClass::DelegatedRole.into(),
+            uuid: UUID_SCHEMA_CLASS_DELEGATED_ROLE,
+            description: String::from("A delegated administration role template"),
+            systemmust: vec![Attribute::Name],
+            systemmay: vec![
+                Attribute::Description,
+                Attribute::DelegatedBy,
+                Attribute::DelegatedRoleTemplate,
+            ],
+            ..Default::default()
+        },
+    ]
+}
+
 impl SchemaWriteTransaction<'_> {
     // Schema probably needs to be part of the backend, so that commits are wholly atomic
     // but in the current design, we need to open be first, then schema, but we have to commit be
@@ -715,6 +995,7 @@ impl SchemaWriteTransaction<'_> {
         attributetypes.for_each(|a| {
             // Update the unique and ref caches.
             if a.syntax == SyntaxType::ReferenceUuid ||
+                a.syntax == SyntaxType::ReferenceUuidN ||
                 a.syntax == SyntaxType::OauthScopeMap ||
                 a.syntax == SyntaxType::OauthClaimMap ||
                 // So that when an rs is removed we trigger removal of the sessions.
@@ -806,7 +1087,7 @@ impl SchemaWriteTransaction<'_> {
                 sync_allowed: false,
                 replicated: Replicated::True,
                 indexed: true,
-                syntax: SyntaxType::Utf8StringInsensitive,
+                syntax: SyntaxType::Utf8StringInsensitiveN,
             },
         );
         self.attributes.insert(
@@ -842,7 +1123,7 @@ impl SchemaWriteTransaction<'_> {
                 sync_allowed: false,
                 replicated: Replicated::True,
                 indexed: true,
-                syntax: SyntaxType::Uuid,
+                syntax: SyntaxType::UuidN,
             },
         );
         self.attributes.insert(
@@ -1086,7 +1367,7 @@ impl SchemaWriteTransaction<'_> {
                 sync_allowed: false,
                 replicated: Replicated::True,
                 indexed: false,
-                syntax: SyntaxType::Utf8StringInsensitive,
+                syntax: SyntaxType::Utf8StringInsensitiveN,
             },
         );
         self.attributes.insert(
@@ -1103,7 +1384,7 @@ impl SchemaWriteTransaction<'_> {
                 sync_allowed: false,
                 replicated: Replicated::True,
                 indexed: false,
-                syntax: SyntaxType::Utf8StringInsensitive,
+                syntax: SyntaxType::Utf8StringInsensitiveN,
             },
         );
         self.attributes.insert(
@@ -1120,7 +1401,7 @@ impl SchemaWriteTransaction<'_> {
                 sync_allowed: false,
                 replicated: Replicated::True,
                 indexed: false,
-                syntax: SyntaxType::Utf8StringInsensitive,
+                syntax: SyntaxType::Utf8StringInsensitiveN,
             },
         );
         self.attributes.insert(
@@ -1137,7 +1418,7 @@ impl SchemaWriteTransaction<'_> {
                 sync_allowed: false,
                 replicated: Replicated::True,
                 indexed: false,
-                syntax: SyntaxType::Utf8StringInsensitive,
+                syntax: SyntaxType::Utf8StringInsensitiveN,
             },
         );
         self.attributes.insert(
@@ -1154,7 +1435,7 @@ impl SchemaWriteTransaction<'_> {
                 sync_allowed: false,
                 replicated: Replicated::True,
                 indexed: false,
-                syntax: SyntaxType::Utf8StringInsensitive,
+                syntax: SyntaxType::Utf8StringInsensitiveN,
             },
         );
         self.attributes.insert(
@@ -1171,7 +1452,7 @@ impl SchemaWriteTransaction<'_> {
                 sync_allowed: false,
                 replicated: Replicated::True,
                 indexed: false,
-                syntax: SyntaxType::Utf8StringInsensitive,
+                syntax: SyntaxType::Utf8StringInsensitiveN,
             },
         );
         self.attributes.insert(
@@ -1188,7 +1469,7 @@ impl SchemaWriteTransaction<'_> {
                 sync_allowed: false,
                 replicated: Replicated::True,
                 indexed: false,
-                syntax: SyntaxType::Utf8StringInsensitive,
+                syntax: SyntaxType::Utf8StringInsensitiveN,
             },
         );
         self.attributes.insert(
@@ -1205,7 +1486,7 @@ impl SchemaWriteTransaction<'_> {
                 sync_allowed: false,
                 replicated: Replicated::True,
                 indexed: false,
-                syntax: SyntaxType::Utf8StringInsensitive,
+                syntax: SyntaxType::Utf8StringInsensitiveN,
             },
         );
 
@@ -1258,107 +1539,7 @@ impl SchemaWriteTransaction<'_> {
                 sync_allowed: false,
                 replicated: Replicated::True,
                 indexed: true,
-                syntax: SyntaxType::ReferenceUuid,
-            },
-        );
-
-        self.attributes.insert(
-            Attribute::AcpReceiverDelegated,
-            SchemaAttribute {
-                name: Attribute::AcpReceiverDelegated,
-                uuid: UUID_SCHEMA_ATTR_ACP_RECEIVER_DELEGATED,
-                description: String::from(
-                    "The delegated role that receives this access control to allow access",
-                ),
-                multivalue: false,
-                unique: false,
-                phantom: false,
-                sync_allowed: false,
-                replicated: Replicated::True,
-                indexed: true,
-                syntax: SyntaxType::ReferenceUuid,
-            },
-        );
-
-        self.attributes.insert(
-            Attribute::AcpTargetDelegatedScope,
-            SchemaAttribute {
-                name: Attribute::AcpTargetDelegatedScope,
-                uuid: UUID_SCHEMA_ATTR_ACP_TARGET_DELEGATED_SCOPE,
-                description: String::from("The delegated scope filter for target definition"),
-                multivalue: false,
-                unique: false,
-                phantom: false,
-                sync_allowed: false,
-                replicated: Replicated::True,
-                indexed: false,
-                syntax: SyntaxType::JsonFilter,
-            },
-        );
-
-        self.attributes.insert(
-            Attribute::DelegatedScopeFilter,
-            SchemaAttribute {
-                name: Attribute::DelegatedScopeFilter,
-                uuid: UUID_SCHEMA_ATTR_DELEGATED_SCOPE_FILTER,
-                description: String::from(
-                    "A filter defining the scope of delegated administration",
-                ),
-                multivalue: false,
-                unique: false,
-                phantom: false,
-                sync_allowed: false,
-                replicated: Replicated::True,
-                indexed: false,
-                syntax: SyntaxType::JsonFilter,
-            },
-        );
-
-        self.attributes.insert(
-            Attribute::DelegatedScopeGroup,
-            SchemaAttribute {
-                name: Attribute::DelegatedScopeGroup,
-                uuid: UUID_SCHEMA_ATTR_DELEGATED_SCOPE_GROUP,
-                description: String::from("A group defining the scope of delegated administration"),
-                multivalue: false,
-                unique: false,
-                phantom: false,
-                sync_allowed: false,
-                replicated: Replicated::True,
-                indexed: true,
-                syntax: SyntaxType::ReferenceUuid,
-            },
-        );
-
-        self.attributes.insert(
-            Attribute::DelegatedBy,
-            SchemaAttribute {
-                name: Attribute::DelegatedBy,
-                uuid: UUID_SCHEMA_ATTR_DELEGATED_BY,
-                description: String::from("The UUID of the user who delegated this role"),
-                multivalue: false,
-                unique: false,
-                phantom: false,
-                sync_allowed: false,
-                replicated: Replicated::True,
-                indexed: true,
-                syntax: SyntaxType::ReferenceUuid,
-            },
-        );
-
-        self.attributes.insert(
-            Attribute::DelegatedRoleTemplate,
-            SchemaAttribute {
-                name: Attribute::DelegatedRoleTemplate,
-                uuid: UUID_SCHEMA_ATTR_DELEGATED_ROLE_TEMPLATE,
-                description: String::from("The template UUID for this delegated role"),
-                multivalue: false,
-                unique: false,
-                phantom: false,
-                sync_allowed: false,
-                replicated: Replicated::True,
-                indexed: true,
-                syntax: SyntaxType::ReferenceUuid,
+                syntax: SyntaxType::ReferenceUuidN,
             },
         );
 
@@ -1393,7 +1574,7 @@ impl SchemaWriteTransaction<'_> {
                 sync_allowed: false,
                 replicated: Replicated::True,
                 indexed: true,
-                syntax: SyntaxType::Utf8StringInsensitive,
+                syntax: SyntaxType::Utf8StringInsensitiveN,
             },
         );
         self.attributes.insert(
@@ -1408,7 +1589,7 @@ impl SchemaWriteTransaction<'_> {
                 sync_allowed: false,
                 replicated: Replicated::True,
                 indexed: true,
-                syntax: SyntaxType::Utf8StringInsensitive,
+                syntax: SyntaxType::Utf8StringInsensitiveN,
             },
         );
         self.attributes.insert(
@@ -1425,7 +1606,7 @@ impl SchemaWriteTransaction<'_> {
                 sync_allowed: false,
                 replicated: Replicated::True,
                 indexed: true,
-                syntax: SyntaxType::Utf8StringInsensitive,
+                syntax: SyntaxType::Utf8StringInsensitiveN,
             },
         );
 
@@ -1443,7 +1624,7 @@ impl SchemaWriteTransaction<'_> {
                 sync_allowed: false,
                 replicated: Replicated::True,
                 indexed: true,
-                syntax: SyntaxType::Utf8StringInsensitive,
+                syntax: SyntaxType::Utf8StringInsensitiveN,
             },
         );
         self.attributes.insert(
@@ -1460,7 +1641,7 @@ impl SchemaWriteTransaction<'_> {
                 sync_allowed: false,
                 replicated: Replicated::True,
                 indexed: true,
-                syntax: SyntaxType::Utf8StringInsensitive,
+                syntax: SyntaxType::Utf8StringInsensitiveN,
             },
         );
         self.attributes.insert(
@@ -1475,7 +1656,7 @@ impl SchemaWriteTransaction<'_> {
                 sync_allowed: false,
                 replicated: Replicated::True,
                 indexed: true,
-                syntax: SyntaxType::Utf8StringInsensitive,
+                syntax: SyntaxType::Utf8StringInsensitiveN,
             },
         );
         self.attributes.insert(
@@ -1490,7 +1671,7 @@ impl SchemaWriteTransaction<'_> {
                     sync_allowed: false,
                     replicated: Replicated::True,
                     indexed: false,
-                    syntax: SyntaxType::Utf8StringInsensitive,
+                    syntax: SyntaxType::Utf8StringInsensitiveN,
                 },
             );
         self.attributes.insert(
@@ -1505,95 +1686,10 @@ impl SchemaWriteTransaction<'_> {
                     sync_allowed: false,
                     replicated: Replicated::True,
                     indexed: false,
-                    syntax: SyntaxType::Utf8StringInsensitive,
+                    syntax: SyntaxType::Utf8StringInsensitiveN,
                 },
             );
-        self.attributes.insert(
-            Attribute::AcpRequireReauth,
-            SchemaAttribute {
-                name: Attribute::AcpRequireReauth,
-                uuid: UUID_SCHEMA_ATTR_ACP_REQUIRE_REAUTH,
-                description: String::from(
-                    "A flag to determine if this ACP requires step-up authentication for operations.",
-                ),
-                multivalue: false,
-                unique: false,
-                phantom: false,
-                sync_allowed: false,
-                replicated: Replicated::True,
-                indexed: false,
-                syntax: SyntaxType::Boolean,
-            },
-        );
-        self.attributes.insert(
-            Attribute::AcpReauthMaxAge,
-            SchemaAttribute {
-                name: Attribute::AcpReauthMaxAge,
-                uuid: UUID_SCHEMA_ATTR_ACP_REAUTH_MAX_AGE,
-                description: String::from(
-                    "The maximum age in seconds since last authentication before step-up is required.",
-                ),
-                multivalue: false,
-                unique: false,
-                phantom: false,
-                sync_allowed: false,
-                replicated: Replicated::True,
-                indexed: false,
-                syntax: SyntaxType::Uint32,
-            },
-        );
         // Fine-Grained Permission Scoping Attributes
-        self.attributes.insert(
-            Attribute::AcpTimeRestrictionStart,
-            SchemaAttribute {
-                name: Attribute::AcpTimeRestrictionStart,
-                uuid: UUID_SCHEMA_ATTR_ACP_TIME_RESTRICTION_START,
-                description: String::from(
-                    "The start time for time-based access restrictions on this ACP.",
-                ),
-                multivalue: false,
-                unique: false,
-                phantom: false,
-                sync_allowed: false,
-                replicated: Replicated::True,
-                indexed: false,
-                syntax: SyntaxType::DateTime,
-            },
-        );
-        self.attributes.insert(
-            Attribute::AcpTimeRestrictionEnd,
-            SchemaAttribute {
-                name: Attribute::AcpTimeRestrictionEnd,
-                uuid: UUID_SCHEMA_ATTR_ACP_TIME_RESTRICTION_END,
-                description: String::from(
-                    "The end time for time-based access restrictions on this ACP.",
-                ),
-                multivalue: false,
-                unique: false,
-                phantom: false,
-                sync_allowed: false,
-                replicated: Replicated::True,
-                indexed: false,
-                syntax: SyntaxType::DateTime,
-            },
-        );
-        self.attributes.insert(
-            Attribute::AcpScopeFilter,
-            SchemaAttribute {
-                name: Attribute::AcpScopeFilter,
-                uuid: UUID_SCHEMA_ATTR_ACP_SCOPE_FILTER,
-                description: String::from(
-                    "A filter defining the scope of targets this ACP applies to within the target scope.",
-                ),
-                multivalue: false,
-                unique: false,
-                phantom: false,
-                sync_allowed: false,
-                replicated: Replicated::True,
-                indexed: false,
-                syntax: SyntaxType::JsonFilter,
-            },
-        );
         self.attributes.insert(
             Attribute::EntryManagedBy,
             SchemaAttribute {
@@ -1624,7 +1720,7 @@ impl SchemaWriteTransaction<'_> {
                 sync_allowed: false,
                 replicated: Replicated::False,
                 indexed: true,
-                syntax: SyntaxType::ReferenceUuid,
+                syntax: SyntaxType::ReferenceUuidN,
             },
         );
         self.attributes.insert(
@@ -1639,7 +1735,7 @@ impl SchemaWriteTransaction<'_> {
                 sync_allowed: false,
                 replicated: Replicated::False,
                 indexed: true,
-                syntax: SyntaxType::ReferenceUuid,
+                syntax: SyntaxType::ReferenceUuidN,
             },
         );
         self.attributes.insert(
@@ -1658,7 +1754,7 @@ impl SchemaWriteTransaction<'_> {
                 // and their group memberships as a best effort.
                 replicated: Replicated::True,
                 indexed: true,
-                syntax: SyntaxType::ReferenceUuid,
+                syntax: SyntaxType::ReferenceUuidN,
             },
         );
         self.attributes.insert(
@@ -1673,7 +1769,7 @@ impl SchemaWriteTransaction<'_> {
                 sync_allowed: true,
                 replicated: Replicated::True,
                 indexed: true,
-                syntax: SyntaxType::ReferenceUuid,
+                syntax: SyntaxType::ReferenceUuidN,
             },
         );
         self.attributes.insert(
@@ -1688,7 +1784,7 @@ impl SchemaWriteTransaction<'_> {
                 sync_allowed: true,
                 replicated: Replicated::False,
                 indexed: true,
-                syntax: SyntaxType::ReferenceUuid,
+                syntax: SyntaxType::ReferenceUuidN,
             },
         );
 
@@ -1751,7 +1847,7 @@ impl SchemaWriteTransaction<'_> {
                 name: Attribute::Domain,
                 uuid: UUID_SCHEMA_ATTR_DOMAIN,
                 description: String::from("A DNS Domain name entry."),
-                multivalue: true,
+                multivalue: false,
                 unique: false,
                 phantom: false,
                 sync_allowed: false,
@@ -1842,7 +1938,7 @@ impl SchemaWriteTransaction<'_> {
                 sync_allowed: false,
                 replicated: Replicated::True,
                 indexed: false,
-                syntax: SyntaxType::Utf8StringInsensitive,
+                syntax: SyntaxType::Utf8StringInsensitiveN,
             },
         );
 
@@ -2341,28 +2437,6 @@ impl SchemaWriteTransaction<'_> {
             },
         );
         self.classes.insert(
-            EntryClass::AccessControlProfile.into(),
-            SchemaClass {
-                name: EntryClass::AccessControlProfile.into(),
-                uuid: UUID_SCHEMA_CLASS_ACCESS_CONTROL_PROFILE,
-                description: String::from("System Access Control Profile Class"),
-                systemmay: vec![
-                    Attribute::AcpEnable,
-                    Attribute::Description,
-                    Attribute::AcpRequireReauth,
-                    Attribute::AcpReauthMaxAge,
-                ],
-                systemmust: vec![Attribute::Name],
-                systemsupplements: vec![
-                    EntryClass::AccessControlSearch.into(),
-                    EntryClass::AccessControlDelete.into(),
-                    EntryClass::AccessControlModify.into(),
-                    EntryClass::AccessControlCreate.into(),
-                ],
-                ..Default::default()
-            },
-        );
-        self.classes.insert(
             EntryClass::AccessControlReceiverEntryManager.into(),
             SchemaClass {
                 name: EntryClass::AccessControlReceiverEntryManager.into(),
@@ -2397,57 +2471,6 @@ impl SchemaWriteTransaction<'_> {
                 ..Default::default()
             },
         );
-        self.classes.insert(
-            EntryClass::AccessControlReceiverDelegated.into(),
-            SchemaClass {
-                name: EntryClass::AccessControlReceiverDelegated.into(),
-                uuid: UUID_SCHEMA_CLASS_ACCESS_CONTROL_RECEIVER_DELEGATED,
-                description: String::from("System Access Control Profile Receiver - Delegated"),
-                systemmust: vec![],
-                systemmay: vec![
-                    Attribute::AcpReceiverDelegated,
-                    Attribute::DelegatedScopeGroup,
-                    Attribute::DelegatedScopeFilter,
-                ],
-                systemsupplements: vec![EntryClass::AccessControlProfile.into()],
-                systemexcludes: vec![
-                    EntryClass::AccessControlReceiverGroup.into(),
-                    EntryClass::AccessControlReceiverEntryManager.into(),
-                ],
-                ..Default::default()
-            },
-        );
-        self.classes.insert(
-            EntryClass::AccessControlTargetDelegatedScope.into(),
-            SchemaClass {
-                name: EntryClass::AccessControlTargetDelegatedScope.into(),
-                uuid: UUID_SCHEMA_CLASS_ACCESS_CONTROL_TARGET_DELEGATED_SCOPE,
-                description: String::from("System Access Control Profile Target - Delegated Scope"),
-                systemmust: vec![],
-                systemmay: vec![
-                    Attribute::DelegatedScopeGroup,
-                    Attribute::DelegatedScopeFilter,
-                ],
-                systemsupplements: vec![EntryClass::AccessControlProfile.into()],
-                systemexcludes: vec![EntryClass::AccessControlTargetScope.into()],
-                ..Default::default()
-            },
-        );
-        self.classes.insert(
-            EntryClass::DelegatedRole.into(),
-            SchemaClass {
-                name: EntryClass::DelegatedRole.into(),
-                uuid: UUID_SCHEMA_CLASS_DELEGATED_ROLE,
-                description: String::from("A delegated administration role template"),
-                systemmust: vec![Attribute::Name],
-                systemmay: vec![
-                    Attribute::Description,
-                    Attribute::DelegatedBy,
-                    Attribute::DelegatedRoleTemplate,
-                ],
-                ..Default::default()
-            },
-        );
 
         // System attrs
         self.classes.insert(
@@ -2475,6 +2498,14 @@ impl SchemaWriteTransaction<'_> {
                 .. Default::default()
             },
         );
+
+        // Kubidm fork-only schema (delegation, step-up reauth, ACP time restrictions).
+        for attr in kubidm_schema_attributes() {
+            self.attributes.insert(attr.name.clone(), attr);
+        }
+        for class in kubidm_schema_classes() {
+            self.classes.insert(class.name.clone(), class);
+        }
 
         let r = self.validate();
         if r.is_empty() {
@@ -2600,9 +2631,8 @@ mod tests {
         prelude::*,
         schema::{Schema, SchemaAttribute, SchemaClass, SchemaTransaction, SyntaxType},
     };
+    use std::collections::BTreeMap;
     use uuid::Uuid;
-
-    // use crate::proto_v1::Filter as ProtoFilter;
 
     macro_rules! validate_schema {
         ($sch:ident) => {{
@@ -2835,7 +2865,7 @@ mod tests {
                     Attribute::Description,
                     Value::Utf8("class test".to_string())
                 ),
-                (Attribute::SystemMust, Value::new_iutf8("a"))
+                (Attribute::SystemMust, Value::new_iutf8n("a"))
             ),
             SchemaClass
         );
@@ -2853,7 +2883,7 @@ mod tests {
                     Attribute::Description,
                     Value::Utf8("class test".to_string())
                 ),
-                (Attribute::SystemMay, Value::new_iutf8("a"))
+                (Attribute::SystemMay, Value::new_iutf8n("a"))
             ),
             SchemaClass
         );
@@ -2871,8 +2901,8 @@ mod tests {
                     Attribute::Description,
                     Value::Utf8("class test".to_string())
                 ),
-                (Attribute::May, Value::new_iutf8("a")),
-                (Attribute::Must, Value::new_iutf8("b"))
+                (Attribute::May, Value::new_iutf8n("a")),
+                (Attribute::Must, Value::new_iutf8n("b"))
             ),
             SchemaClass
         );
@@ -2890,10 +2920,10 @@ mod tests {
                     Attribute::Description,
                     Value::Utf8("class test".to_string())
                 ),
-                (Attribute::May, Value::new_iutf8("a")),
-                (Attribute::Must, Value::new_iutf8("b")),
-                (Attribute::SystemMay, Value::new_iutf8("c")),
-                (Attribute::SystemMust, Value::new_iutf8("d"))
+                (Attribute::May, Value::new_iutf8n("a")),
+                (Attribute::Must, Value::new_iutf8n("b")),
+                (Attribute::SystemMay, Value::new_iutf8n("c")),
+                (Attribute::SystemMust, Value::new_iutf8n("d"))
             ),
             SchemaClass
         );
@@ -2916,7 +2946,7 @@ mod tests {
             .validate_ava(&Attribute::from("single_value"), &(vs_iutf8!["test"] as _));
         assert_eq!(r1, Ok(()));
 
-        let rvs = vs_iutf8!["test1", "test2"] as _;
+        let rvs = ValueSetIutf8N::from_iter(["test1", "test2"]).unwrap() as _;
         let r2 = single_value_string.validate_ava(&Attribute::from("single_value"), &rvs);
         assert_eq!(
             r2,
@@ -3040,7 +3070,7 @@ mod tests {
                 Attribute::Uuid,
                 Value::Uuid(uuid::uuid!("db237e8a-0079-4b8c-8a56-593b22aa44d1"))
             ),
-            (Attribute::Class, Value::new_iutf8("zzzzzz"))
+            (Attribute::Class, Value::new_iutf8n("zzzzzz"))
         )
         .into_invalid_new();
         assert_eq!(
@@ -3406,5 +3436,61 @@ mod tests {
         .into_invalid_new();
 
         assert!(e_person_valid.validate(&schema).is_ok());
+    }
+
+    #[qs_test]
+    async fn test_schema_syntax_multivalue_unique(server: &QueryServer) {
+        #[derive(Default)]
+        struct X {
+            multi: Vec<Attribute>,
+            single: Vec<Attribute>,
+        }
+
+        // Get the schema.
+        let read_txn = server
+            .read()
+            .await
+            .expect("Failed to start read transaction");
+
+        let schema_txn = read_txn.get_schema();
+        let schema_attrs_txn = schema_txn.get_attributes();
+
+        let mut attr_set: BTreeMap<SyntaxType, X> = BTreeMap::new();
+
+        // Build up a set containing the syntaxes + multivalue.
+        for schema_attr in schema_attrs_txn.values() {
+            if schema_attr.phantom {
+                continue;
+            }
+
+            let s = attr_set.entry(schema_attr.syntax).or_default();
+
+            if schema_attr.multivalue {
+                s.multi.push(schema_attr.name.clone())
+            } else {
+                s.single.push(schema_attr.name.clone())
+            }
+        }
+
+        let mut pass = true;
+
+        for (syntax, x) in attr_set {
+            if x.multi.is_empty() && x.single.is_empty() {
+                error!("{} NOT USED", syntax);
+                pass = false;
+            } else if x.multi.is_empty() || x.single.is_empty() {
+                // One is empty, move on.
+                continue;
+            } else {
+                pass = false;
+            }
+
+            warn!("{}", syntax);
+            warn!("multi:  {:?}", x.multi);
+            warn!("single: {:?}", x.single);
+        }
+
+        // Assert that no syntax type has both single or multivalue types! Yay!
+        assert!(pass);
     }
 }

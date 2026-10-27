@@ -2982,7 +2982,7 @@ mod tests {
             (Attribute::Description, Value::new_utf8s("testgroup")),
             (
                 Attribute::Member,
-                Value::Refer(uuid::uuid!("00000000-0000-0000-0000-000000000000"))
+                Value::ReferN(uuid::uuid!("00000000-0000-0000-0000-000000000000"))
             )
         );
 
