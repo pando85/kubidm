@@ -638,6 +638,10 @@ pub const UUID_INTERNAL_MESSAGE_QUEUE: Uuid = uuid!("00000000-0000-0000-0000-fff
 
 pub const UUID_IDM_ACP_FEATURE_MANAGE: Uuid = uuid!("00000000-0000-0000-0000-ffffff000086");
 
+// Kubidm fork access controls (fork custom - use reserved range ffffff0003xx)
+pub const UUID_IDM_ACP_OAUTH2_FEDERATION_ADMIN: Uuid =
+    uuid!("00000000-0000-0000-0000-ffffff000300");
+
 // End of system ranges
 pub const UUID_DOES_NOT_EXIST: Uuid = uuid!("00000000-0000-0000-0000-fffffffffffe");
 pub const UUID_ANONYMOUS: Uuid = uuid!("00000000-0000-0000-0000-ffffffffffff");

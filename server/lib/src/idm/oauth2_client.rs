@@ -304,8 +304,10 @@ impl IdmServerProxyWriteTransaction<'_> {
                 .map(|s| s.map(str::to_string).collect())
                 .unwrap_or_default();
 
+            // OAuth2LinkPolicy is Utf8StringInsensitive and OAuth2FederationId is
+            // Utf8StringIname, so they must be read with the matching accessors.
             let link_policy = provider_entry
-                .get_ava_single_utf8(Attribute::OAuth2LinkPolicy)
+                .get_ava_single_iutf8(Attribute::OAuth2LinkPolicy)
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(AccountLinkPolicy::Manual);
 
@@ -314,7 +316,7 @@ impl IdmServerProxyWriteTransaction<'_> {
                 .unwrap_or(false);
 
             let federation_id = provider_entry
-                .get_ava_single_utf8(Attribute::OAuth2FederationId)
+                .get_ava_single_iname(Attribute::OAuth2FederationId)
                 .map(str::to_string);
 
             let auto_discovery = provider_entry
@@ -377,5 +379,100 @@ impl IdmServerProxyWriteTransaction<'_> {
             .extend(oauth2_client_provider_structs);
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AccountLinkPolicy;
+    use crate::prelude::*;
+
+    /// Kubidm: OAuth2 federation entries are valid at the target domain level, and every
+    /// federation attribute is parsed by `reload_oauth2_client_providers` with the
+    /// accessor matching its syntax.
+    #[idm_test]
+    async fn test_idm_oauth2_federation_provider_reload(
+        idms: &IdmServer,
+        _idms_delayed: &mut IdmServerDelayed,
+    ) {
+        let ct = duration_from_epoch_now();
+        let mut idms_prox_write = idms.proxy_write(ct).await.unwrap();
+
+        let fed_uuid = Uuid::new_v4();
+        let e_fed: EntryInitNew = entry_init!(
+            (Attribute::Class, EntryClass::Object.to_value()),
+            (Attribute::Class, EntryClass::OAuth2Federation.to_value()),
+            (Attribute::Uuid, Value::Uuid(fed_uuid)),
+            (Attribute::Name, Value::new_iname("test_federation")),
+            (Attribute::OAuth2ClientId, Value::new_utf8s("client_id")),
+            (Attribute::OAuth2ClientSecret, Value::new_utf8s("secret")),
+            (
+                Attribute::OAuth2Issuer,
+                Value::Url(Url::parse("https://idp.example.com").unwrap())
+            ),
+            (
+                Attribute::OAuth2JwksUri,
+                Value::Url(Url::parse("https://idp.example.com/jwks").unwrap())
+            ),
+            (
+                Attribute::OAuth2UserinfoEndpoint,
+                Value::Url(Url::parse("https://idp.example.com/userinfo").unwrap())
+            ),
+            (
+                Attribute::OAuth2EmailDomain,
+                Value::new_iutf8n("example.com")
+            ),
+            (
+                Attribute::OAuth2EmailDomain,
+                Value::new_iutf8n("example.org")
+            ),
+            (
+                Attribute::OAuth2DisplayName,
+                Value::new_utf8s("Example IdP")
+            ),
+            (Attribute::OAuth2LinkPolicy, Value::new_iutf8("auto")),
+            (
+                Attribute::OAuth2FederationId,
+                Value::new_iname("example_fed")
+            ),
+            (Attribute::OAuth2IdpInitiatedEnabled, Value::Bool(true)),
+            (Attribute::OAuth2AutoDiscovery, Value::Bool(false))
+        );
+
+        idms_prox_write
+            .qs_write
+            .internal_create(vec![e_fed])
+            .expect("failed to create oauth2 federation entry");
+
+        idms_prox_write
+            .reload_oauth2_client_providers()
+            .expect("failed to reload oauth2 client providers");
+
+        let provider = idms_prox_write
+            .oauth2_client_providers
+            .get(&fed_uuid)
+            .expect("federation provider not loaded");
+
+        assert_eq!(provider.name, "test_federation");
+        assert_eq!(
+            provider.issuer.as_ref().map(Url::as_str),
+            Some("https://idp.example.com/")
+        );
+        assert_eq!(
+            provider.jwks_uri.as_ref().map(Url::as_str),
+            Some("https://idp.example.com/jwks")
+        );
+        assert_eq!(provider.email_domains.len(), 2);
+        assert_eq!(provider.display_name.as_deref(), Some("Example IdP"));
+        assert_eq!(provider.link_policy, AccountLinkPolicy::Auto);
+        assert_eq!(provider.federation_id.as_deref(), Some("example_fed"));
+        assert!(provider.idp_initiated_enabled);
+        // Endpoints are derived from the issuer when not set explicitly.
+        assert_eq!(
+            provider.authorisation_endpoint.as_str(),
+            "https://idp.example.com/oauth2/authorize"
+        );
+
+        idms_prox_write.commit().expect("failed to commit");
     }
 }

@@ -484,3 +484,18 @@ pub static BUILTIN_GROUP_APPLICATION_ADMINS_DL8: LazyLock<BuiltinGroup> =
         members: vec![UUID_IDM_ADMINS],
         ..Default::default()
     });
+
+// =========================================
+// Kubidm: approval workflows
+
+/// Members may manage approval policies and view or cancel approval requests. The approval
+/// operations run as internal operations, so this membership is checked explicitly in
+/// `server/approval.rs` rather than through access control profiles.
+pub static BUILTIN_GROUP_APPROVAL_ADMINS: LazyLock<BuiltinGroup> = LazyLock::new(|| BuiltinGroup {
+    name: "idm_approval_admins",
+    description: "Builtin Approval Workflow Administration Group.",
+    uuid: UUID_IDM_APPROVAL_ADMINS,
+    entry_managed_by: Some(UUID_IDM_ADMINS),
+    members: vec![UUID_IDM_ADMINS],
+    ..Default::default()
+});

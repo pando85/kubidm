@@ -1727,7 +1727,6 @@ pub static SCHEMA_CLASS_OAUTH2_FEDERATION: LazyLock<SchemaClass> = LazyLock::new
 }
 });
 
-#[allow(dead_code)]
 pub static SCHEMA_CLASS_OAUTH2_LINKED_ACCOUNT: LazyLock<SchemaClass> =
     LazyLock::new(|| SchemaClass {
         uuid: UUID_SCHEMA_CLASS_OAUTH2_LINKED_ACCOUNT,
@@ -1740,11 +1739,9 @@ pub static SCHEMA_CLASS_OAUTH2_LINKED_ACCOUNT: LazyLock<SchemaClass> =
 
 // =========================================
 // Approval Workflows
-// Note: These schema definitions are foundational infrastructure for approval workflows.
-// They will be used in future work for implementing approval request creation, decision handling,
-// and approval queue API endpoints.
+// Note: these are not part of the DL14 phase lists. They are registered at every domain
+// level through `crate::schema::kubidm_schema_attributes` / `kubidm_schema_classes`.
 
-#[allow(dead_code)]
 pub static SCHEMA_ATTR_APPROVAL_POLICY_NAME: LazyLock<SchemaAttribute> =
     LazyLock::new(|| SchemaAttribute {
         uuid: UUID_SCHEMA_ATTR_APPROVAL_POLICY_NAME,
@@ -1756,7 +1753,6 @@ pub static SCHEMA_ATTR_APPROVAL_POLICY_NAME: LazyLock<SchemaAttribute> =
         ..Default::default()
     });
 
-#[allow(dead_code)]
 pub static SCHEMA_ATTR_APPROVAL_OPERATION_TYPE: LazyLock<SchemaAttribute> =
     LazyLock::new(|| SchemaAttribute {
         uuid: UUID_SCHEMA_ATTR_APPROVAL_OPERATION_TYPE,
@@ -1768,7 +1764,6 @@ pub static SCHEMA_ATTR_APPROVAL_OPERATION_TYPE: LazyLock<SchemaAttribute> =
         ..Default::default()
     });
 
-#[allow(dead_code)]
 pub static SCHEMA_ATTR_APPROVAL_PATTERN: LazyLock<SchemaAttribute> =
     LazyLock::new(|| SchemaAttribute {
         uuid: UUID_SCHEMA_ATTR_APPROVAL_PATTERN,
@@ -1778,7 +1773,6 @@ pub static SCHEMA_ATTR_APPROVAL_PATTERN: LazyLock<SchemaAttribute> =
         ..Default::default()
     });
 
-#[allow(dead_code)]
 pub static SCHEMA_ATTR_APPROVER: LazyLock<SchemaAttribute> = LazyLock::new(|| SchemaAttribute {
     uuid: UUID_SCHEMA_ATTR_APPROVER,
     name: Attribute::Approver,
@@ -1789,7 +1783,6 @@ pub static SCHEMA_ATTR_APPROVER: LazyLock<SchemaAttribute> = LazyLock::new(|| Sc
     ..Default::default()
 });
 
-#[allow(dead_code)]
 pub static SCHEMA_ATTR_BACKUP_APPROVER: LazyLock<SchemaAttribute> =
     LazyLock::new(|| SchemaAttribute {
         uuid: UUID_SCHEMA_ATTR_BACKUP_APPROVER,
@@ -1801,7 +1794,6 @@ pub static SCHEMA_ATTR_BACKUP_APPROVER: LazyLock<SchemaAttribute> =
         ..Default::default()
     });
 
-#[allow(dead_code)]
 pub static SCHEMA_ATTR_APPROVAL_TIMEOUT: LazyLock<SchemaAttribute> =
     LazyLock::new(|| SchemaAttribute {
         uuid: UUID_SCHEMA_ATTR_APPROVAL_TIMEOUT,
@@ -1811,7 +1803,6 @@ pub static SCHEMA_ATTR_APPROVAL_TIMEOUT: LazyLock<SchemaAttribute> =
         ..Default::default()
     });
 
-#[allow(dead_code)]
 pub static SCHEMA_ATTR_ESCALATION_TIMEOUT: LazyLock<SchemaAttribute> =
     LazyLock::new(|| SchemaAttribute {
         uuid: UUID_SCHEMA_ATTR_ESCALATION_TIMEOUT,
@@ -1821,7 +1812,6 @@ pub static SCHEMA_ATTR_ESCALATION_TIMEOUT: LazyLock<SchemaAttribute> =
         ..Default::default()
     });
 
-#[allow(dead_code)]
 pub static SCHEMA_ATTR_APPROVAL_POLICY_ENABLED: LazyLock<SchemaAttribute> =
     LazyLock::new(|| SchemaAttribute {
         uuid: UUID_SCHEMA_ATTR_APPROVAL_POLICY_ENABLED,
@@ -1831,7 +1821,6 @@ pub static SCHEMA_ATTR_APPROVAL_POLICY_ENABLED: LazyLock<SchemaAttribute> =
         ..Default::default()
     });
 
-#[allow(dead_code)]
 pub static SCHEMA_CLASS_APPROVAL_POLICY: LazyLock<SchemaClass> = LazyLock::new(|| SchemaClass {
     uuid: UUID_SCHEMA_CLASS_APPROVAL_POLICY,
     name: EntryClass::ApprovalPolicy.into(),
@@ -1852,7 +1841,6 @@ pub static SCHEMA_CLASS_APPROVAL_POLICY: LazyLock<SchemaClass> = LazyLock::new(|
     ..Default::default()
 });
 
-#[allow(dead_code)]
 pub static SCHEMA_ATTR_APPROVAL_REQUEST_POLICY: LazyLock<SchemaAttribute> =
     LazyLock::new(|| SchemaAttribute {
         uuid: UUID_SCHEMA_ATTR_APPROVAL_REQUEST_POLICY,
@@ -1863,7 +1851,6 @@ pub static SCHEMA_ATTR_APPROVAL_REQUEST_POLICY: LazyLock<SchemaAttribute> =
         ..Default::default()
     });
 
-#[allow(dead_code)]
 pub static SCHEMA_ATTR_APPROVAL_TARGET: LazyLock<SchemaAttribute> =
     LazyLock::new(|| SchemaAttribute {
         uuid: UUID_SCHEMA_ATTR_APPROVAL_TARGET,
@@ -1875,7 +1862,6 @@ pub static SCHEMA_ATTR_APPROVAL_TARGET: LazyLock<SchemaAttribute> =
         ..Default::default()
     });
 
-#[allow(dead_code)]
 pub static SCHEMA_ATTR_APPROVAL_REQUESTOR: LazyLock<SchemaAttribute> =
     LazyLock::new(|| SchemaAttribute {
         uuid: UUID_SCHEMA_ATTR_APPROVAL_REQUESTOR,
@@ -1886,7 +1872,6 @@ pub static SCHEMA_ATTR_APPROVAL_REQUESTOR: LazyLock<SchemaAttribute> =
         ..Default::default()
     });
 
-#[allow(dead_code)]
 pub static SCHEMA_ATTR_APPROVAL_STATE: LazyLock<SchemaAttribute> = LazyLock::new(|| {
     SchemaAttribute {
         uuid: UUID_SCHEMA_ATTR_APPROVAL_STATE,
@@ -1898,7 +1883,6 @@ pub static SCHEMA_ATTR_APPROVAL_STATE: LazyLock<SchemaAttribute> = LazyLock::new
     }
 });
 
-#[allow(dead_code)]
 pub static SCHEMA_ATTR_APPROVAL_DECISION: LazyLock<SchemaAttribute> =
     LazyLock::new(|| SchemaAttribute {
         uuid: UUID_SCHEMA_ATTR_APPROVAL_DECISION,
@@ -1911,7 +1895,6 @@ pub static SCHEMA_ATTR_APPROVAL_DECISION: LazyLock<SchemaAttribute> =
         ..Default::default()
     });
 
-#[allow(dead_code)]
 pub static SCHEMA_ATTR_APPROVAL_ESCALATION_LEVEL: LazyLock<SchemaAttribute> =
     LazyLock::new(|| SchemaAttribute {
         uuid: UUID_SCHEMA_ATTR_APPROVAL_ESCALATION_LEVEL,
@@ -1921,7 +1904,6 @@ pub static SCHEMA_ATTR_APPROVAL_ESCALATION_LEVEL: LazyLock<SchemaAttribute> =
         ..Default::default()
     });
 
-#[allow(dead_code)]
 pub static SCHEMA_ATTR_APPROVAL_EXPIRES: LazyLock<SchemaAttribute> =
     LazyLock::new(|| SchemaAttribute {
         uuid: UUID_SCHEMA_ATTR_APPROVAL_EXPIRES,
@@ -1932,7 +1914,6 @@ pub static SCHEMA_ATTR_APPROVAL_EXPIRES: LazyLock<SchemaAttribute> =
         ..Default::default()
     });
 
-#[allow(dead_code)]
 pub static SCHEMA_ATTR_APPROVAL_OPERATION_DETAILS: LazyLock<SchemaAttribute> =
     LazyLock::new(|| SchemaAttribute {
         uuid: UUID_SCHEMA_ATTR_APPROVAL_OPERATION_DETAILS,
@@ -1942,7 +1923,6 @@ pub static SCHEMA_ATTR_APPROVAL_OPERATION_DETAILS: LazyLock<SchemaAttribute> =
         ..Default::default()
     });
 
-#[allow(dead_code)]
 pub static SCHEMA_CLASS_APPROVAL_REQUEST: LazyLock<SchemaClass> = LazyLock::new(|| SchemaClass {
     uuid: UUID_SCHEMA_CLASS_APPROVAL_REQUEST,
     name: EntryClass::ApprovalRequest.into(),

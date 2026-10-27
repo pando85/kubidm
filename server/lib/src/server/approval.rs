@@ -4,15 +4,49 @@ use kubidm_proto::v1::{
     ApprovalPattern, ApprovalPolicy, ApprovalPolicyCreateRequest, ApprovalRequest,
     ApprovalRequestState,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 use time::OffsetDateTime;
+
+/// Kubidm: the approval operations below use internal (ACP bypassing) searches and
+/// writes, so the caller has to be authorised explicitly. Approval policies and requests
+/// are administered by members of `idm_approval_admins`.
+fn approval_check_admin(ident: &Identity, write: bool) -> Result<(), OperationError> {
+    if ident.is_internal() {
+        return Ok(());
+    }
+
+    if write && ident.access_scope() != AccessScope::ReadWrite {
+        security_access!("approval write requires a read-write (privileged) session");
+        return Err(OperationError::AccessDenied);
+    }
+
+    if ident.is_memberof(UUID_IDM_APPROVAL_ADMINS) {
+        Ok(())
+    } else {
+        security_access!(ident = %ident, "denied - not a member of idm_approval_admins");
+        Err(OperationError::AccessDenied)
+    }
+}
+
+/// Is `ident` one of `approvers`, either directly or through group membership?
+fn approval_ident_in(ident: &Identity, approvers: Option<&BTreeSet<Uuid>>) -> bool {
+    let ident_uuid = ident.get_uuid();
+    approvers
+        .map(|set| {
+            set.iter()
+                .any(|approver| *approver == ident_uuid || ident.is_memberof(*approver))
+        })
+        .unwrap_or(false)
+}
 
 impl QueryServerReadTransaction<'_> {
     pub fn approval_policy_list(
         &mut self,
-        _ident: &Identity,
+        ident: &Identity,
     ) -> Result<Vec<ApprovalPolicy>, OperationError> {
+        approval_check_admin(ident, false)?;
+
         let filter = filter!(f_eq(Attribute::Class, EntryClass::ApprovalPolicy.into()));
         let entries = self.internal_search(filter)?;
 
@@ -24,9 +58,11 @@ impl QueryServerReadTransaction<'_> {
 
     pub fn approval_policy_get(
         &mut self,
-        _ident: &Identity,
+        ident: &Identity,
         name: &str,
     ) -> Result<ApprovalPolicy, OperationError> {
+        approval_check_admin(ident, false)?;
+
         let filter = filter!(f_and!([
             f_eq(Attribute::Class, EntryClass::ApprovalPolicy.into()),
             f_eq(Attribute::ApprovalPolicyName, PartialValue::new_iname(name))
@@ -41,9 +77,11 @@ impl QueryServerReadTransaction<'_> {
 
     pub fn approval_request_list(
         &mut self,
-        _ident: &Identity,
+        ident: &Identity,
         state: Option<ApprovalRequestState>,
     ) -> Result<Vec<ApprovalRequest>, OperationError> {
+        approval_check_admin(ident, false)?;
+
         let filter = match state {
             Some(s) => filter!(f_and!([
                 f_eq(Attribute::Class, EntryClass::ApprovalRequest.into()),
@@ -64,9 +102,11 @@ impl QueryServerReadTransaction<'_> {
 
     pub fn approval_request_get(
         &mut self,
-        _ident: &Identity,
+        ident: &Identity,
         uuid: Uuid,
     ) -> Result<ApprovalRequest, OperationError> {
+        approval_check_admin(ident, false)?;
+
         let filter = filter!(f_and!([
             f_eq(Attribute::Class, EntryClass::ApprovalRequest.into()),
             f_eq(Attribute::Uuid, PartialValue::Uuid(uuid))
@@ -83,9 +123,11 @@ impl QueryServerReadTransaction<'_> {
 impl QueryServerWriteTransaction<'_> {
     pub fn approval_policy_create(
         &mut self,
-        _ident: &Identity,
+        ident: &Identity,
         request: &ApprovalPolicyCreateRequest,
     ) -> Result<(), OperationError> {
+        approval_check_admin(ident, true)?;
+
         let uuid = Uuid::new_v4();
 
         let approvers: Vec<Value> = request
@@ -150,9 +192,11 @@ impl QueryServerWriteTransaction<'_> {
 
     pub fn approval_policy_delete(
         &mut self,
-        _ident: &Identity,
+        ident: &Identity,
         name: &str,
     ) -> Result<(), OperationError> {
+        approval_check_admin(ident, true)?;
+
         let filter = filter!(f_and!([
             f_eq(Attribute::Class, EntryClass::ApprovalPolicy.into()),
             f_eq(Attribute::ApprovalPolicyName, PartialValue::new_iname(name))
@@ -162,10 +206,12 @@ impl QueryServerWriteTransaction<'_> {
 
     pub fn approval_policy_enable(
         &mut self,
-        _ident: &Identity,
+        ident: &Identity,
         name: &str,
         enable: bool,
     ) -> Result<(), OperationError> {
+        approval_check_admin(ident, true)?;
+
         let filter = filter!(f_and!([
             f_eq(Attribute::Class, EntryClass::ApprovalPolicy.into()),
             f_eq(Attribute::ApprovalPolicyName, PartialValue::new_iname(name))
@@ -192,6 +238,29 @@ impl QueryServerWriteTransaction<'_> {
 
         let entry = entries.first().ok_or(OperationError::NoMatchingEntries)?;
 
+        // Kubidm: only an approver (or backup approver) of the request's policy may
+        // decide on it, from a read-write session.
+        if !ident.is_internal() {
+            if ident.access_scope() != AccessScope::ReadWrite {
+                security_access!("approval decision requires a read-write (privileged) session");
+                return Err(OperationError::AccessDenied);
+            }
+
+            let policy_uuid = entry
+                .get_ava_single_refer(Attribute::ApprovalRequestPolicy)
+                .ok_or(OperationError::MissingAttribute(
+                    Attribute::ApprovalRequestPolicy,
+                ))?;
+            let policy = self.internal_search_uuid(policy_uuid)?;
+
+            if !(approval_ident_in(ident, policy.get_ava_refer(Attribute::Approver))
+                || approval_ident_in(ident, policy.get_ava_refer(Attribute::BackupApprover)))
+            {
+                security_access!(ident = %ident, "denied - not an approver of this policy");
+                return Err(OperationError::AccessDenied);
+            }
+        }
+
         let current_state: ApprovalRequestState = entry
             .get_ava_single_iutf8(Attribute::ApprovalState)
             .and_then(|s| match s {
@@ -213,7 +282,7 @@ impl QueryServerWriteTransaction<'_> {
             approver_uuid: ident.get_uuid(),
             approver_spn: ident
                 .get_user_entry()
-                .and_then(|e| e.get_ava_single_utf8(Attribute::Spn).map(|s| s.to_string()))
+                .and_then(|e| e.get_ava_single_proto_string(Attribute::Spn))
                 .unwrap_or_default(),
             decision_time: current_time,
             action: match request.action {
@@ -253,13 +322,25 @@ impl QueryServerWriteTransaction<'_> {
 
     pub fn approval_request_cancel(
         &mut self,
-        _ident: &Identity,
+        ident: &Identity,
         request_uuid: Uuid,
     ) -> Result<(), OperationError> {
         let filter = filter!(f_and!([
             f_eq(Attribute::Class, EntryClass::ApprovalRequest.into()),
             f_eq(Attribute::Uuid, PartialValue::Uuid(request_uuid))
         ]));
+
+        // Kubidm: the requestor may cancel their own request, otherwise this needs
+        // approval admin rights.
+        let is_requestor = self
+            .internal_search(filter.clone())?
+            .first()
+            .and_then(|e| e.get_ava_single_refer(Attribute::ApprovalRequestor))
+            .is_some_and(|requestor| requestor == ident.get_uuid());
+        if !(is_requestor && ident.access_scope() == AccessScope::ReadWrite) {
+            approval_check_admin(ident, true)?;
+        }
+
         let modlist = ModifyList::new_list(vec![
             Modify::Purged(Attribute::ApprovalState),
             Modify::Present(Attribute::ApprovalState, Value::new_iutf8("cancelled")),
@@ -483,6 +564,10 @@ mod tests {
     };
     use crate::prelude::*;
     use crate::schema::SchemaAttribute;
+    use kubidm_proto::v1::{
+        ApprovalDecisionAction, ApprovalDecisionRequest, ApprovalOperationType, ApprovalPattern,
+        ApprovalPolicyCreateRequest,
+    };
 
     fn check(schema: &SchemaAttribute, attr: &Attribute, vals: Vec<Value>, expected_len: usize) {
         let mut entry: Entry<EntryInit, EntryNew> = Entry::new();
@@ -534,5 +619,262 @@ mod tests {
             vec![Value::new_iutf8("majority")],
             1,
         );
+    }
+
+    fn two_approver_policy(name: &str) -> ApprovalPolicyCreateRequest {
+        ApprovalPolicyCreateRequest {
+            name: name.to_string(),
+            description: Some("Two approver policy".to_string()),
+            operation_types: vec![
+                ApprovalOperationType::CreateHighPrivilegeEntry,
+                ApprovalOperationType::SchemaModify,
+            ],
+            approvers: vec![UUID_ADMIN, UUID_IDM_ADMIN],
+            backup_approvers: vec![UUID_SYSTEM_ADMINS],
+            pattern: ApprovalPattern::Majority,
+            timeout_seconds: 3600,
+            escalation_timeout_seconds: Some(600),
+        }
+    }
+
+    /// End to end: the approval schema and the approval admins group exist at the target
+    /// domain level, and a policy with two approvers is stored and read back intact.
+    #[qs_test]
+    async fn test_approval_policy_create_and_read_back(server: &QueryServer) {
+        let mut write_txn = server.write(duration_from_epoch_now()).await.unwrap();
+
+        // Created by the domain migrations.
+        let approval_admins = write_txn
+            .internal_search_uuid(UUID_IDM_APPROVAL_ADMINS)
+            .expect("idm_approval_admins must exist");
+        assert!(approval_admins
+            .attribute_equality(Attribute::Member, &PartialValue::Refer(UUID_IDM_ADMINS)));
+
+        // idm_admin is an approval admin through idm_admins.
+        let idm_admin_entry = write_txn.internal_search_uuid(UUID_IDM_ADMIN).unwrap();
+        let idm_admin = Identity::from_impersonate_entry_readwrite(idm_admin_entry);
+
+        write_txn
+            .approval_policy_create(&idm_admin, &two_approver_policy("two_approvers"))
+            .expect("failed to create approval policy");
+
+        // ApprovalPolicyName is unique.
+        assert!(write_txn
+            .approval_policy_create(&idm_admin, &two_approver_policy("two_approvers"))
+            .is_err());
+
+        write_txn.commit().expect("failed to commit");
+
+        let mut read_txn = server.read().await.unwrap();
+
+        let policy = read_txn
+            .approval_policy_get(&idm_admin, "two_approvers")
+            .expect("failed to read back approval policy");
+
+        assert_eq!(policy.name, "two_approvers");
+        assert_eq!(policy.description.as_deref(), Some("Two approver policy"));
+        assert_eq!(policy.approvers.len(), 2);
+        assert!(policy.approvers.contains(&UUID_ADMIN));
+        assert!(policy.approvers.contains(&UUID_IDM_ADMIN));
+        assert_eq!(policy.backup_approvers, vec![UUID_SYSTEM_ADMINS]);
+        assert_eq!(policy.operation_types.len(), 2);
+        assert!(policy
+            .operation_types
+            .contains(&ApprovalOperationType::CreateHighPrivilegeEntry));
+        assert!(policy
+            .operation_types
+            .contains(&ApprovalOperationType::SchemaModify));
+        assert_eq!(policy.pattern, ApprovalPattern::Majority);
+        assert_eq!(policy.timeout_seconds, 3600);
+        assert_eq!(policy.escalation_timeout_seconds, Some(600));
+        assert!(policy.enabled);
+
+        let policies = read_txn
+            .approval_policy_list(&idm_admin)
+            .expect("failed to list approval policies");
+        assert_eq!(policies.len(), 1);
+        assert_eq!(policies[0].approvers.len(), 2);
+
+        drop(read_txn);
+
+        let mut write_txn = server.write(duration_from_epoch_now()).await.unwrap();
+        write_txn
+            .approval_policy_enable(&idm_admin, "two_approvers", false)
+            .expect("failed to disable approval policy");
+        write_txn
+            .approval_policy_delete(&idm_admin, "two_approvers")
+            .expect("failed to delete approval policy");
+        write_txn.commit().expect("failed to commit");
+
+        let mut read_txn = server.read().await.unwrap();
+        assert!(matches!(
+            read_txn.approval_policy_get(&idm_admin, "two_approvers"),
+            Err(OperationError::NoMatchingEntries)
+        ));
+    }
+
+    /// The approval operations bypass access control profiles, so they must reject callers
+    /// that are not approval admins, and writes from read-only sessions.
+    #[qs_test]
+    async fn test_approval_policy_access_denied(server: &QueryServer) {
+        let mut write_txn = server.write(duration_from_epoch_now()).await.unwrap();
+
+        let anon_entry = write_txn.internal_search_uuid(UUID_ANONYMOUS).unwrap();
+        let anon = Identity::from_impersonate_entry_readwrite(anon_entry);
+
+        assert_eq!(
+            write_txn.approval_policy_create(&anon, &two_approver_policy("denied")),
+            Err(OperationError::AccessDenied)
+        );
+
+        // An approval admin with a read-only session can not write.
+        let idm_admin_entry = write_txn.internal_search_uuid(UUID_IDM_ADMIN).unwrap();
+        let idm_admin_ro = Identity::from_impersonate_entry_readonly(idm_admin_entry);
+        assert_eq!(
+            write_txn.approval_policy_create(&idm_admin_ro, &two_approver_policy("denied")),
+            Err(OperationError::AccessDenied)
+        );
+        assert_eq!(
+            write_txn.approval_policy_delete(&anon, "denied"),
+            Err(OperationError::AccessDenied)
+        );
+
+        write_txn.commit().expect("failed to commit");
+
+        let mut read_txn = server.read().await.unwrap();
+        assert!(matches!(
+            read_txn.approval_policy_list(&anon),
+            Err(OperationError::AccessDenied)
+        ));
+        // ... but can read.
+        assert!(read_txn
+            .approval_policy_list(&idm_admin_ro)
+            .expect("approval admin list")
+            .is_empty());
+    }
+
+    /// Only approvers (or backup approvers) of the request's policy may decide on it, and the
+    /// requestor may cancel their own request (but nobody else's).
+    #[qs_test]
+    async fn test_approval_request_decision_access(server: &QueryServer) {
+        let ct = duration_from_epoch_now();
+        let mut write_txn = server.write(ct).await.unwrap();
+
+        let idm_admin_entry = write_txn.internal_search_uuid(UUID_IDM_ADMIN).unwrap();
+        let idm_admin = Identity::from_impersonate_entry_readwrite(idm_admin_entry);
+        let admin_entry = write_txn.internal_search_uuid(UUID_ADMIN).unwrap();
+        let admin = Identity::from_impersonate_entry_readwrite(admin_entry);
+        let anon_entry = write_txn.internal_search_uuid(UUID_ANONYMOUS).unwrap();
+        let anon = Identity::from_impersonate_entry_readwrite(anon_entry);
+
+        // Approvers are idm_admin (direct) and system_admins (backup, by group).
+        let mut request = two_approver_policy("decision_policy");
+        request.approvers = vec![UUID_IDM_ADMIN];
+        write_txn
+            .approval_policy_create(&idm_admin, &request)
+            .expect("failed to create approval policy");
+        let policy_uuid = write_txn
+            .internal_search(filter!(f_eq(
+                Attribute::ApprovalPolicyName,
+                PartialValue::new_iname("decision_policy")
+            )))
+            .expect("policy search")
+            .first()
+            .expect("policy missing")
+            .get_uuid();
+
+        let mk_request = |uuid: Uuid| {
+            entry_init!(
+                (Attribute::Class, EntryClass::Object.to_value()),
+                (Attribute::Class, EntryClass::ApprovalRequest.to_value()),
+                (Attribute::Uuid, Value::Uuid(uuid)),
+                (Attribute::ApprovalRequestPolicy, Value::Refer(policy_uuid)),
+                (
+                    Attribute::ApprovalOperationType,
+                    Value::new_iutf8n("schema_modify")
+                ),
+                (Attribute::ApprovalTarget, Value::Refer(UUID_IDM_ADMINS)),
+                (Attribute::ApprovalRequestor, Value::Refer(UUID_ANONYMOUS)),
+                (Attribute::ApprovalState, Value::new_iutf8("pending"))
+            )
+        };
+        let request_a = Uuid::new_v4();
+        let request_b = Uuid::new_v4();
+        write_txn
+            .internal_create(vec![mk_request(request_a), mk_request(request_b)])
+            .expect("failed to create approval requests");
+
+        let approve = || ApprovalDecisionRequest {
+            action: ApprovalDecisionAction::Approve,
+            comment: None,
+        };
+
+        // Neither a direct nor a backup approver of the policy.
+        assert_eq!(
+            write_txn.approval_request_decision(&anon, request_a, approve(), ct),
+            Err(OperationError::AccessDenied)
+        );
+        // An approval admin is not implicitly an approver.
+        let mut other_policy = two_approver_policy("other_policy");
+        other_policy.approvers = vec![UUID_ANONYMOUS];
+        other_policy.backup_approvers = vec![];
+        write_txn
+            .approval_policy_create(&idm_admin, &other_policy)
+            .expect("failed to create approval policy");
+        let other_policy_uuid = write_txn
+            .internal_search(filter!(f_eq(
+                Attribute::ApprovalPolicyName,
+                PartialValue::new_iname("other_policy")
+            )))
+            .expect("policy search")
+            .first()
+            .expect("policy missing")
+            .get_uuid();
+        write_txn
+            .internal_modify_uuid(
+                request_b,
+                &ModifyList::new_purge_and_set(
+                    Attribute::ApprovalRequestPolicy,
+                    Value::Refer(other_policy_uuid),
+                ),
+            )
+            .expect("failed to repoint request");
+        assert_eq!(
+            write_txn.approval_request_decision(&idm_admin, request_b, approve(), ct),
+            Err(OperationError::AccessDenied)
+        );
+        // NOTE: the approver success path is not exercised here: recording a decision
+        // writes a `Value::Json` to `ApprovalDecision`, and there is no valueset for the
+        // Json syntax yet, so the decision write itself is not implemented.
+
+        let state_of = |txn: &mut QueryServerWriteTransaction<'_>, uuid: Uuid| {
+            txn.internal_search_uuid(uuid)
+                .unwrap()
+                .get_ava_single_iutf8(Attribute::ApprovalState)
+                .map(str::to_string)
+        };
+        assert_eq!(
+            state_of(&mut write_txn, request_a).as_deref(),
+            Some("pending")
+        );
+
+        // The requestor may cancel their own request, others may not unless approval admin.
+        let request_c = Uuid::new_v4();
+        write_txn
+            .internal_create(vec![mk_request(request_c)])
+            .expect("failed to create approval request");
+        assert_eq!(
+            write_txn.approval_request_cancel(&admin, request_c),
+            Err(OperationError::AccessDenied)
+        );
+        write_txn
+            .approval_request_cancel(&anon, request_c)
+            .expect("requestor must be able to cancel");
+        assert_eq!(
+            state_of(&mut write_txn, request_c).as_deref(),
+            Some("cancelled")
+        );
+
+        write_txn.commit().expect("failed to commit");
     }
 }

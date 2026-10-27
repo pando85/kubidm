@@ -272,10 +272,25 @@ pub fn phase_6_builtin_non_admin_entries() -> Result<Vec<EntryInitNew>, Operatio
         // other things
         IDM_UI_ENABLE_EXPERIMENTAL_FEATURES.clone().try_into()?,
         IDM_ACCOUNT_MAIL_READ.clone().try_into()?,
+    ]
+    .into_iter()
+    // Kubidm builtin entries (delegated roles, approval admins)
+    .chain(kubidm_builtin_entries()?)
+    .collect())
+}
+
+/// Kubidm fork-only builtin entries. These are created at DL14 by
+/// `phase_6_builtin_non_admin_entries`, and at DL >= 1.11 the domain migrations create
+/// them after the upstream phase 6 entries, since the upstream entry lists do not contain
+/// them.
+pub(crate) fn kubidm_builtin_entries() -> Result<Vec<EntryInitNew>, OperationError> {
+    Ok(vec![
         // Delegated roles
         BUILTIN_DELEGATED_ROLE_HELPDESK.clone().into(),
         BUILTIN_DELEGATED_ROLE_USER_ADMIN.clone().into(),
         BUILTIN_DELEGATED_ROLE_GROUP_ADMIN.clone().into(),
+        // Approval workflows
+        BUILTIN_GROUP_APPROVAL_ADMINS.clone().try_into()?,
     ])
 }
 
@@ -347,6 +362,17 @@ pub fn phase_7_builtin_access_control_profiles() -> Vec<EntryInitNew> {
         // DL13
         IDM_ACP_OAUTH2_MANAGE_BASIC.clone().into(),
     ]
+    .into_iter()
+    // Kubidm builtin access controls
+    .chain(kubidm_builtin_access_control_profiles())
+    .collect()
+}
+
+/// Kubidm fork-only builtin access control profiles. Created at DL14 by
+/// `phase_7_builtin_access_control_profiles`, and at DL >= 1.11 by the domain migrations
+/// after the upstream phase 7 entries.
+pub(crate) fn kubidm_builtin_access_control_profiles() -> Vec<EntryInitNew> {
+    vec![IDM_ACP_OAUTH2_FEDERATION_ADMIN.clone().into()]
 }
 
 pub fn phase_8_delete_uuids() -> Vec<Uuid> {

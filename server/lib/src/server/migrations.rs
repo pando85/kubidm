@@ -748,24 +748,12 @@ impl QueryServerWriteTransaction<'_> {
         // schema is in memory only, the on-disk triggers won't fire now.
         self.force_schema_reload();
 
-        // Include all time-bounded grant schema from DL14 for complete schema coverage
-        let mut all_attrs = vec![
-            (*migration_data::dl14::schema::SCHEMA_ATTR_MEMBER_VALID_FROM).clone(),
-            (*migration_data::dl14::schema::SCHEMA_ATTR_MEMBER_VALID_UNTIL).clone(),
-            (*migration_data::dl14::schema::SCHEMA_ATTR_MAX_GRANT_DURATION).clone(),
-            (*migration_data::dl14::schema::SCHEMA_ATTR_TIME_BOUNDED_MEMBER).clone(),
-        ];
+        let mut all_attrs = migration_data::dl15::phase_1_schema_attrs();
+        let mut all_classes = migration_data::dl15::phase_2_schema_classes();
 
-        // Add DL15 attributes
-        all_attrs.extend(migration_data::dl15::phase_1_schema_attrs());
-
-        let mut all_classes =
-            vec![(*migration_data::dl14::schema::SCHEMA_CLASS_TIME_BOUNDED_GRANT).clone()];
-
-        // Add DL15 classes
-        all_classes.extend(migration_data::dl15::phase_2_schema_classes());
-
-        // Kubidm fork-only schema (delegation, step-up reauth, ACP time restrictions).
+        // Kubidm fork-only schema (delegation, step-up reauth, ACP time restrictions,
+        // time-bounded grants, OAuth2 federation, approvals). Chained last so the fork's
+        // overrides win.
         all_attrs.extend(crate::schema::kubidm_schema_attributes());
         all_classes.extend(crate::schema::kubidm_schema_classes());
 
@@ -830,9 +818,21 @@ impl QueryServerWriteTransaction<'_> {
             migration_data::dl15::phase_6_builtin_non_admin_entries()?,
         )?;
 
+        // Kubidm fork builtin entries (delegated roles, approval admins group). The
+        // upstream entry lists for this level do not contain them.
+        self.internal_migrate_or_create_batch(
+            "phase 6 - kubidm builtin entries",
+            migration_data::dl14::kubidm_builtin_entries()?,
+        )?;
+
         self.internal_migrate_or_create_batch(
             "phase 7 - builtin access control profiles",
             migration_data::dl15::phase_7_builtin_access_control_profiles(),
+        )?;
+
+        self.internal_migrate_or_create_batch(
+            "phase 7 - kubidm builtin access control profiles",
+            migration_data::dl14::kubidm_builtin_access_control_profiles(),
         )?;
 
         self.internal_delete_batch(
@@ -880,22 +880,12 @@ impl QueryServerWriteTransaction<'_> {
         // schema is in memory only, the on-disk triggers won't fire now.
         self.force_schema_reload();
 
-        // Include time-bounded grant schema from DL14
-        let mut all_attrs = vec![
-            (*migration_data::dl14::schema::SCHEMA_ATTR_MEMBER_VALID_FROM).clone(),
-            (*migration_data::dl14::schema::SCHEMA_ATTR_MEMBER_VALID_UNTIL).clone(),
-            (*migration_data::dl14::schema::SCHEMA_ATTR_MAX_GRANT_DURATION).clone(),
-            (*migration_data::dl14::schema::SCHEMA_ATTR_TIME_BOUNDED_MEMBER).clone(),
-        ];
+        let mut all_attrs = migration_data::dl_1_12::phase_1_schema_attrs();
+        let mut all_classes = migration_data::dl_1_12::phase_2_schema_classes();
 
-        all_attrs.extend(migration_data::dl_1_12::phase_1_schema_attrs());
-
-        let mut all_classes =
-            vec![(*migration_data::dl14::schema::SCHEMA_CLASS_TIME_BOUNDED_GRANT).clone()];
-
-        all_classes.extend(migration_data::dl_1_12::phase_2_schema_classes());
-
-        // Kubidm fork-only schema (delegation, step-up reauth, ACP time restrictions).
+        // Kubidm fork-only schema (delegation, step-up reauth, ACP time restrictions,
+        // time-bounded grants, OAuth2 federation, approvals). Chained last so the fork's
+        // overrides win.
         all_attrs.extend(crate::schema::kubidm_schema_attributes());
         all_classes.extend(crate::schema::kubidm_schema_classes());
 
@@ -933,6 +923,12 @@ impl QueryServerWriteTransaction<'_> {
                 f_pres(Attribute::DelegatedScopeGroup),
                 f_pres(Attribute::DelegatedBy),
                 f_pres(Attribute::DelegatedRoleTemplate),
+                // kubidm single value Url / Iutf8 / Iname (OAuth2 federation, DL14)
+                f_pres(Attribute::OAuth2Issuer),
+                f_pres(Attribute::OAuth2JwksUri),
+                f_pres(Attribute::OAuth2UserinfoEndpoint),
+                f_pres(Attribute::OAuth2LinkPolicy),
+                f_pres(Attribute::OAuth2FederationId),
                 // Iutf8
                 f_pres(Attribute::LoginShell),
                 f_pres(Attribute::DomainLdapBasedn),
@@ -975,6 +971,12 @@ impl QueryServerWriteTransaction<'_> {
                     Attribute::DelegatedScopeGroup,
                     Attribute::DelegatedBy,
                     Attribute::DelegatedRoleTemplate,
+                    // kubidm single value Url / Iutf8 / Iname (OAuth2 federation, DL14)
+                    Attribute::OAuth2Issuer,
+                    Attribute::OAuth2JwksUri,
+                    Attribute::OAuth2UserinfoEndpoint,
+                    Attribute::OAuth2LinkPolicy,
+                    Attribute::OAuth2FederationId,
                     // Iutf8
                     Attribute::LoginShell,
                     Attribute::DomainLdapBasedn,
@@ -1051,9 +1053,21 @@ impl QueryServerWriteTransaction<'_> {
             dl_target::phase_6_builtin_non_admin_entries()?,
         )?;
 
+        // Kubidm fork builtin entries (delegated roles, approval admins group). The
+        // upstream entry lists for this level do not contain them.
+        self.internal_migrate_or_create_batch(
+            "phase 6 - kubidm builtin entries",
+            migration_data::dl14::kubidm_builtin_entries()?,
+        )?;
+
         self.internal_migrate_or_create_batch(
             "phase 7 - builtin access control profiles",
             dl_target::phase_7_builtin_access_control_profiles(),
+        )?;
+
+        self.internal_migrate_or_create_batch(
+            "phase 7 - kubidm builtin access control profiles",
+            migration_data::dl14::kubidm_builtin_access_control_profiles(),
         )?;
 
         self.internal_delete_batch("phase 8 - delete UUIDS", dl_target::phase_8_delete_uuids())?;
@@ -1299,6 +1313,73 @@ mod tests {
             all_persons_entry.get_ava_single_credential_type(Attribute::CredentialTypeMinimum),
             Some(CredentialType::Any)
         );
+
+        write_txn.commit().expect("Unable to commit");
+    }
+
+    /// Kubidm: fork schema and builtin entries survive the previous -> target domain
+    /// migration. The 1.11 -> 1.12 on-disk rewrite filters on fork attributes, which must
+    /// therefore exist in the 1.11 schema, and the fork builtin entries are created by the
+    /// migration although they are not in the upstream entry lists.
+    #[qs_test(domain_level=DOMAIN_PREVIOUS_TGT_LEVEL)]
+    async fn test_migrations_dl_previous_to_dl_target_kubidm(server: &QueryServer) {
+        let mut write_txn = server.write(duration_from_epoch_now()).await.unwrap();
+
+        let fed_uuid = Uuid::new_v4();
+        write_txn
+            .internal_create(vec![entry_init!(
+                (Attribute::Class, EntryClass::Object.to_value()),
+                (Attribute::Class, EntryClass::OAuth2Federation.to_value()),
+                (Attribute::Uuid, Value::Uuid(fed_uuid)),
+                (Attribute::Name, Value::new_iname("migrated_federation")),
+                (Attribute::OAuth2ClientId, Value::new_utf8s("client_id")),
+                (Attribute::OAuth2ClientSecret, Value::new_utf8s("secret")),
+                (
+                    Attribute::OAuth2Issuer,
+                    Value::Url(Url::parse("https://idp.example.com").unwrap())
+                ),
+                (Attribute::OAuth2LinkPolicy, Value::new_iutf8("manual")),
+                (
+                    Attribute::OAuth2FederationId,
+                    Value::new_iname("migrated_fed")
+                )
+            )])
+            .expect("oauth2 federation must be valid at the previous domain level");
+        write_txn.commit().expect("Unable to commit");
+
+        let mut write_txn = server.write(duration_from_epoch_now()).await.unwrap();
+        write_txn
+            .internal_apply_domain_migration(DOMAIN_TGT_LEVEL)
+            .expect("Unable to set domain level");
+
+        let fed = write_txn
+            .internal_search_uuid(fed_uuid)
+            .expect("federation entry lost");
+        assert_eq!(
+            fed.get_ava_single_url(Attribute::OAuth2Issuer)
+                .map(Url::as_str),
+            Some("https://idp.example.com/")
+        );
+        assert_eq!(
+            fed.get_ava_single_iutf8(Attribute::OAuth2LinkPolicy),
+            Some("manual")
+        );
+        assert_eq!(
+            fed.get_ava_single_iname(Attribute::OAuth2FederationId),
+            Some("migrated_fed")
+        );
+
+        for uuid in [
+            UUID_IDM_APPROVAL_ADMINS,
+            UUID_IDM_DELEGATED_HELPDESK,
+            UUID_IDM_DELEGATED_USER_ADMIN,
+            UUID_IDM_DELEGATED_GROUP_ADMIN,
+            UUID_IDM_ACP_OAUTH2_FEDERATION_ADMIN,
+        ] {
+            write_txn
+                .internal_search_uuid(uuid)
+                .unwrap_or_else(|err| panic!("kubidm builtin entry {uuid} missing: {err:?}"));
+        }
 
         write_txn.commit().expect("Unable to commit");
     }

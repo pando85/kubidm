@@ -1571,6 +1571,135 @@ mod tests {
         );
     }
 
+    /// Kubidm: `AcpTimeRestrictionStart` / `AcpTimeRestrictionEnd` are allowed on access
+    /// control profiles by schema, and are honoured once the profile is loaded from the
+    /// database.
+    #[qs_test]
+    async fn test_access_acp_time_restriction_end_to_end(qs: &QueryServer) {
+        let ct = duration_from_epoch_now();
+        let now = time::OffsetDateTime::UNIX_EPOCH + ct;
+        let day = time::Duration::days(1);
+
+        let reader_uuid = Uuid::new_v4();
+        let group_uuid = Uuid::new_v4();
+        let target_uuid = Uuid::new_v4();
+        let acp_uuid = Uuid::new_v4();
+
+        let mut qs_write = qs.write(ct).await.unwrap();
+        qs_write
+            .internal_create(vec![
+                entry_init!(
+                    (Attribute::Class, EntryClass::Object.to_value()),
+                    (Attribute::Class, EntryClass::Account.to_value()),
+                    (Attribute::Class, EntryClass::Person.to_value()),
+                    (Attribute::Name, Value::new_iname("tr_reader")),
+                    (Attribute::DisplayName, Value::new_utf8s("tr_reader")),
+                    (Attribute::Uuid, Value::Uuid(reader_uuid))
+                ),
+                entry_init!(
+                    (Attribute::Class, EntryClass::Object.to_value()),
+                    (Attribute::Class, EntryClass::Account.to_value()),
+                    (Attribute::Class, EntryClass::Person.to_value()),
+                    (Attribute::Name, Value::new_iname("tr_target")),
+                    (Attribute::DisplayName, Value::new_utf8s("tr_target")),
+                    (Attribute::Uuid, Value::Uuid(target_uuid))
+                ),
+                entry_init!(
+                    (Attribute::Class, EntryClass::Object.to_value()),
+                    (Attribute::Class, EntryClass::Group.to_value()),
+                    (Attribute::Name, Value::new_iname("tr_readers")),
+                    (Attribute::Uuid, Value::Uuid(group_uuid)),
+                    (Attribute::Member, Value::ReferN(reader_uuid))
+                ),
+                entry_init!(
+                    (Attribute::Class, EntryClass::Object.to_value()),
+                    (
+                        Attribute::Class,
+                        EntryClass::AccessControlProfile.to_value()
+                    ),
+                    (
+                        Attribute::Class,
+                        EntryClass::AccessControlReceiverGroup.to_value()
+                    ),
+                    (
+                        Attribute::Class,
+                        EntryClass::AccessControlTargetScope.to_value()
+                    ),
+                    (Attribute::Class, EntryClass::AccessControlSearch.to_value()),
+                    (Attribute::Name, Value::new_iname("acp_time_restricted")),
+                    (Attribute::Uuid, Value::Uuid(acp_uuid)),
+                    (Attribute::AcpReceiverGroup, Value::ReferN(group_uuid)),
+                    (
+                        Attribute::AcpTargetScope,
+                        Value::new_json_filter_s("{\"eq\":[\"name\",\"tr_target\"]}")
+                            .expect("filter")
+                    ),
+                    (
+                        Attribute::AcpSearchAttr,
+                        Value::new_iutf8n(Attribute::Name.as_str())
+                    ),
+                    (
+                        Attribute::AcpSearchAttr,
+                        Value::new_iutf8n(Attribute::Class.as_str())
+                    ),
+                    // The window has not opened yet.
+                    (
+                        Attribute::AcpTimeRestrictionStart,
+                        Value::DateTime(now + day)
+                    ),
+                    (
+                        Attribute::AcpTimeRestrictionEnd,
+                        Value::DateTime(now + day + day)
+                    )
+                ),
+            ])
+            .expect("failed to create entries");
+
+        // The restriction was stored and is parsed onto the profile ...
+        let acp_entry = qs_write.internal_search_uuid(acp_uuid).unwrap();
+        let acp = AccessControlProfile::try_from(&mut qs_write, &acp_entry).expect("acp parse");
+        assert_eq!(acp.time_restriction_start, Some(now + day));
+        assert_eq!(acp.time_restriction_end, Some(now + day + day));
+
+        qs_write.commit().expect("commit");
+
+        let search_as_reader = |qs_read: &mut QueryServerReadTransaction<'_>| {
+            let reader = qs_read.internal_search_uuid(reader_uuid).unwrap();
+            let ident = Identity::from_impersonate_entry_readonly(reader);
+            let filter = filter!(f_eq(Attribute::Name, PartialValue::new_iname("tr_target")));
+            qs_read
+                .impersonate_search(filter.clone(), filter, &ident)
+                .expect("search failed")
+                .len()
+        };
+
+        // ... and is enforced: outside of the window nothing is granted.
+        let mut qs_read = qs.read().await.unwrap();
+        assert_eq!(search_as_reader(&mut qs_read), 0);
+        drop(qs_read);
+
+        // Open the window.
+        let mut qs_write = qs.write(ct).await.unwrap();
+        qs_write
+            .internal_modify_uuid(
+                acp_uuid,
+                &ModifyList::new_list(vec![
+                    Modify::Purged(Attribute::AcpTimeRestrictionStart),
+                    Modify::Present(
+                        Attribute::AcpTimeRestrictionStart,
+                        Value::DateTime(now - day),
+                    ),
+                    Modify::Purged(Attribute::AcpTimeRestrictionEnd),
+                    Modify::Present(Attribute::AcpTimeRestrictionEnd, Value::DateTime(now + day)),
+                ]),
+            )
+            .expect("failed to modify acp");
+        qs_write.commit().expect("commit");
+
+        let mut qs_read = qs.read().await.unwrap();
+        assert_eq!(search_as_reader(&mut qs_read), 1);
+    }
+
     #[qs_test]
     async fn test_access_acp_delete_parser(qs: &QueryServer) {
         let mut qs_write = qs.write(duration_from_epoch_now()).await.unwrap();
