@@ -202,15 +202,23 @@ pub struct CUStatus {
     pub sshkeys_state: CUCredState,
 
     // Pending changes tracking for UI
+    #[serde(default)]
     pub has_pending_changes: bool,
+    #[serde(default)]
     pub primary_has_pending_changes: bool,
+    #[serde(default)]
     pub passkeys_have_pending_changes: bool,
+    #[serde(default)]
     pub attested_passkeys_have_pending_changes: bool,
+    #[serde(default)]
     pub unixcred_has_pending_changes: bool,
+    #[serde(default)]
     pub sshkeys_have_pending_changes: bool,
 
     // Auto-commit indicators for first credential and passkey scenarios
+    #[serde(default)]
     pub should_auto_commit_first_cred: bool,
+    #[serde(default)]
     pub should_auto_commit_passkey: bool,
 }
 

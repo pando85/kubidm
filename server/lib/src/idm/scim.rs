@@ -1174,7 +1174,7 @@ impl IdmServerProxyWriteTransaction<'_> {
             ) => {
                 OffsetDateTime::parse(value, &Rfc3339)
                     .ok()
-                    .map(|odt| odt.to_offset(time::UtcOffset::UTC))
+                    .and_then(|odt| odt.checked_to_offset(time::UtcOffset::UTC))
                     .map(ValueSetDateTime::new)
                     .map(|vs| vs as ValueSet)
                     .ok_or_else(|| {
@@ -2147,6 +2147,30 @@ mod tests {
         )
         .await
         .is_err());
+    }
+
+    /// Kubidm: a datetime that can not be expressed in UTC is refused, rather than making
+    /// the conversion to UTC panic.
+    #[idm_test]
+    async fn test_idm_scim_sync_phase_3_datetime_out_of_range(
+        idms: &IdmServer,
+        _idms_delayed: &mut IdmServerDelayed,
+    ) {
+        let person: ScimEntry = ScimSyncPerson::builder(
+            Uuid::new_v4(),
+            "cn=testperson_dt".to_string(),
+            "testperson_dt".to_string(),
+            "Test Person".to_string(),
+        )
+        .set_account_expire(Some("9999-12-31T23:59:59-23:59".to_string()))
+        .build()
+        .try_into()
+        .expect("scim entry");
+
+        assert!(matches!(
+            apply_phase_3_test(idms, vec![person]).await,
+            Err(OperationError::InvalidAttribute(_))
+        ));
     }
 
     // Phase 4

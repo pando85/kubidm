@@ -1205,6 +1205,78 @@ impl QueryServerWriteV1 {
             .await
     }
 
+    /// Kubidm: grant a time-bounded membership of a group.
+    #[instrument(
+        level = "info",
+        name = "group_time_bounded_member_grant",
+        skip_all,
+        fields(uuid = ?eventid)
+    )]
+    pub async fn handle_group_time_bounded_member_grant(
+        &self,
+        client_auth_info: ClientAuthInfo,
+        group: String,
+        request: kubidm_proto::v1::TimeBoundedMemberGrantRequest,
+        eventid: Uuid,
+    ) -> Result<(), OperationError> {
+        let ct = duration_from_epoch_now();
+        let mut idms_prox_write = self.idms.proxy_write(ct).await?;
+        let ident = idms_prox_write
+            .validate_client_auth_info_to_ident(client_auth_info, ct)
+            .map_err(|e| {
+                error!(?e, "Invalid identity");
+                e
+            })?;
+
+        let group_uuid = idms_prox_write.qs_write.name_to_uuid(group.as_str())?;
+        let member_uuid = idms_prox_write
+            .qs_write
+            .name_to_uuid(request.member.as_str())?;
+
+        idms_prox_write
+            .qs_write
+            .grant_time_bounded_member(
+                &ident,
+                group_uuid,
+                member_uuid,
+                request.valid_from,
+                request.valid_until,
+            )
+            .and_then(|_| idms_prox_write.commit())
+    }
+
+    /// Kubidm: revoke a time-bounded membership of a group.
+    #[instrument(
+        level = "info",
+        name = "group_time_bounded_member_revoke",
+        skip_all,
+        fields(uuid = ?eventid)
+    )]
+    pub async fn handle_group_time_bounded_member_revoke(
+        &self,
+        client_auth_info: ClientAuthInfo,
+        group: String,
+        member: String,
+        eventid: Uuid,
+    ) -> Result<(), OperationError> {
+        let ct = duration_from_epoch_now();
+        let mut idms_prox_write = self.idms.proxy_write(ct).await?;
+        let ident = idms_prox_write
+            .validate_client_auth_info_to_ident(client_auth_info, ct)
+            .map_err(|e| {
+                error!(?e, "Invalid identity");
+                e
+            })?;
+
+        let group_uuid = idms_prox_write.qs_write.name_to_uuid(group.as_str())?;
+        let member_uuid = idms_prox_write.qs_write.name_to_uuid(member.as_str())?;
+
+        idms_prox_write
+            .qs_write
+            .revoke_time_bounded_member(&ident, group_uuid, member_uuid)
+            .and_then(|_| idms_prox_write.commit())
+    }
+
     #[instrument(
         level = "info",
         skip_all,
@@ -1887,6 +1959,48 @@ impl QueryServerWriteV1 {
             .qs_write
             .approval_policy_enable(&ident, &name, enable)
             .and_then(|_| idms_prox_write.commit())
+    }
+
+    #[instrument(
+        level = "info",
+        name = "approval_request_create",
+        skip_all,
+        fields(uuid = ?eventid)
+    )]
+    pub async fn handle_approval_request_create(
+        &self,
+        client_auth_info: ClientAuthInfo,
+        request: kubidm_proto::v1::ApprovalRequestCreateRequest,
+        eventid: Uuid,
+    ) -> Result<Uuid, OperationError> {
+        let ct = duration_from_epoch_now();
+        let mut idms_prox_write = self.idms.proxy_write(ct).await?;
+        let ident = idms_prox_write
+            .validate_client_auth_info_to_ident(client_auth_info, ct)
+            .map_err(|e| {
+                error!(?e, "Invalid identity");
+                e
+            })?;
+
+        let target_uuid = idms_prox_write
+            .qs_write
+            .approval_request_target_resolve(&ident, request.target.as_str())
+            .map_err(|e| {
+                error!(err = ?e, "Error resolving id to target");
+                e
+            })?;
+
+        idms_prox_write
+            .qs_write
+            .approval_request_create(
+                &ident,
+                &request.policy_name,
+                &request.operation_type,
+                target_uuid,
+                &request.operation_details,
+                ct,
+            )
+            .and_then(|uuid| idms_prox_write.commit().map(|_| uuid))
     }
 
     #[instrument(

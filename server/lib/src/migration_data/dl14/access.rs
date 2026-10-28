@@ -2170,3 +2170,99 @@ pub static IDM_ACP_OAUTH2_ACCOUNT_ENROL: LazyLock<BuiltinAcp> = LazyLock::new(||
     modify_classes: vec![EntryClass::OAuth2Account],
     ..Default::default()
 });
+
+// =========================================
+// Kubidm: OAuth2 / OIDC federation
+
+/// The OAuth2 federation attributes an admin may read, create and modify.
+fn oauth2_federation_admin_attrs() -> Vec<Attribute> {
+    vec![
+        Attribute::Name,
+        Attribute::Description,
+        Attribute::OAuth2ClientId,
+        Attribute::OAuth2ClientSecret,
+        Attribute::OAuth2AuthorisationEndpoint,
+        Attribute::OAuth2TokenEndpoint,
+        Attribute::OAuth2TokenIntrospectEndpoint,
+        Attribute::OAuth2RequestScopes,
+        Attribute::OAuth2Issuer,
+        Attribute::OAuth2JwksUri,
+        Attribute::OAuth2UserinfoEndpoint,
+        Attribute::OAuth2EmailDomain,
+        Attribute::OAuth2DisplayName,
+        Attribute::OAuth2AutoDiscovery,
+        Attribute::OAuth2LinkPolicy,
+        Attribute::OAuth2IdpInitiatedEnabled,
+        Attribute::OAuth2FederationId,
+    ]
+}
+
+/// Manage federated OAuth2/OIDC identity providers. This is a separate profile from
+/// `IDM_ACP_OAUTH2_CLIENT_ADMIN` so that from DL 1.11 (where upstream's definition of
+/// that profile, without federation, is applied) the federation rights are kept, and so
+/// that delete is only granted on federation entries.
+pub static IDM_ACP_OAUTH2_FEDERATION_ADMIN: LazyLock<BuiltinAcp> = LazyLock::new(|| BuiltinAcp {
+    classes: vec![
+        EntryClass::Object,
+        EntryClass::AccessControlProfile,
+        EntryClass::AccessControlCreate,
+        EntryClass::AccessControlModify,
+        EntryClass::AccessControlSearch,
+        EntryClass::AccessControlDelete,
+    ],
+    name: "idm_acp_oauth2_federation_admin",
+    uuid: UUID_IDM_ACP_OAUTH2_FEDERATION_ADMIN,
+    description:
+        "Builtin IDM Control for granting OAuth2 federation (upstream IdP) administration rights.",
+    receiver: BuiltinAcpReceiver::Group(vec![UUID_IDM_OAUTH2_CLIENT_ADMINS]),
+    target: BuiltinAcpTarget::Filter(ProtoFilter::And(vec![
+        match_class_filter!(EntryClass::OAuth2Federation),
+        FILTER_ANDNOT_TOMBSTONE_OR_RECYCLED.clone(),
+    ])),
+    search_attrs: [Attribute::Class, Attribute::Uuid, Attribute::Spn]
+        .into_iter()
+        .chain(oauth2_federation_admin_attrs())
+        .collect(),
+    modify_present_attrs: oauth2_federation_admin_attrs(),
+    modify_removed_attrs: oauth2_federation_admin_attrs(),
+    create_attrs: [Attribute::Class]
+        .into_iter()
+        .chain(oauth2_federation_admin_attrs())
+        .collect(),
+    create_classes: vec![EntryClass::Object, EntryClass::OAuth2Federation],
+    ..Default::default()
+});
+
+/// Kubidm: enable time-bounded membership on groups and set their cap. Granting and revoking
+/// is authorised by the right to change `member` (see `server::time_bounded`), but the cap
+/// is set by group administrators only, so that a group's entry managers can not raise it.
+/// Like `idm_acp_group_manage`, high privilege groups are excluded.
+pub static IDM_ACP_GROUP_TIME_BOUNDED_MANAGE: LazyLock<BuiltinAcp> = LazyLock::new(|| {
+    BuiltinAcp {
+    classes: vec![
+        EntryClass::Object,
+        EntryClass::AccessControlProfile,
+        EntryClass::AccessControlModify,
+        EntryClass::AccessControlSearch,
+    ],
+    name: "idm_acp_group_time_bounded_manage",
+    uuid: UUID_IDM_ACP_GROUP_TIME_BOUNDED_MANAGE,
+    description: "Builtin IDM Control for enabling time-bounded membership on groups and setting its maximum grant duration",
+    receiver: BuiltinAcpReceiver::Group(vec![UUID_IDM_GROUP_ADMINS]),
+    target: BuiltinAcpTarget::Filter(ProtoFilter::And(vec![
+        match_class_filter!(EntryClass::Group),
+        FILTER_ANDNOT_HP_OR_RECYCLED_OR_TOMBSTONE.clone(),
+    ])),
+    search_attrs: vec![
+        Attribute::Class,
+        Attribute::Name,
+        Attribute::Uuid,
+        Attribute::Spn,
+        Attribute::MaxGrantDuration,
+    ],
+    modify_present_attrs: vec![Attribute::Class, Attribute::MaxGrantDuration],
+    modify_removed_attrs: vec![Attribute::Class, Attribute::MaxGrantDuration],
+    modify_classes: vec![EntryClass::TimeBoundedGrant],
+    ..Default::default()
+}
+});

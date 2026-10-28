@@ -31,7 +31,10 @@ use std::time::Duration;
 
 use flate2::write::GzEncoder;
 use flate2::Compression;
-use kubidm_proto::backup::{BackupCompression, WalArchiveConfig, WalJournalMode, WalSegment};
+use kubidm_proto::backup::{
+    BackupCompression, PitrManifest, WalArchiveConfig, WalJournalMode, WalSegment,
+    PITR_MANIFEST_KEY,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use time::format_description::well_known::Rfc3339;
@@ -67,6 +70,15 @@ pub const WAL_HANDED_OVER_GAPS_DIR: &str = ".handed-over-gaps";
 /// Suffix of a gap handed over in [`WAL_HANDED_OVER_GAPS_DIR`] whose change is not
 /// confirmed yet: see [`HandedOverGap`].
 pub const WAL_HANDED_OVER_PENDING_SUFFIX: &str = ".pending";
+/// How far the WAL directory accounts for the transactions the database committed: see
+/// [`WalCoverage`]. Compared with the database at every start, so that a stretch of history
+/// the archive never saw (archiving disabled for a while, the WAL directory lost or
+/// recreated, the database reverted) is recorded as a gap instead of being skipped.
+pub const WAL_COVERAGE_FILE: &str = ".covered.json";
+/// The file the process that archives into a WAL directory holds an exclusive lock on for
+/// as long as it runs (see [`try_lock_wal_dir`]), so that `recover` and `restore` refuse to
+/// replace the database of a running server.
+pub const WAL_ARCHIVER_LOCK_FILE: &str = ".archiver.lock";
 /// Fixed per record overhead assumed when measuring a segment against `segment_size_bytes`.
 const RECORD_OVERHEAD_BYTES: u64 = 96;
 /// How many closed segments that could not be written yet are kept in memory. When the
@@ -151,6 +163,8 @@ pub enum WalError {
     ConfigError(String),
     /// A recovery target that is not a valid time or CID.
     InvalidTarget(String),
+    /// Another process holds the lock of the WAL directory: a server archives into it.
+    Locked(String),
 }
 
 impl std::fmt::Display for WalError {
@@ -161,6 +175,7 @@ impl std::fmt::Display for WalError {
             WalError::InvalidSegment(msg) => write!(f, "Invalid WAL segment: {}", msg),
             WalError::ConfigError(msg) => write!(f, "WAL config error: {}", msg),
             WalError::InvalidTarget(msg) => write!(f, "{msg}"),
+            WalError::Locked(msg) => write!(f, "{msg}"),
         }
     }
 }
@@ -204,6 +219,10 @@ pub enum WalGapReason {
     /// An offline repair command (`db-scan quarantine-id2entry`, `restore-quarantined`)
     /// changed the database without a transaction the archive could record.
     OfflineChange,
+    /// The database committed transactions the WAL directory never saw: WAL archiving was
+    /// disabled for a while, the WAL directory was lost or recreated, or the database was
+    /// put back to another state (a volume snapshot) behind the archive's back.
+    ArchiveNotRunning,
 }
 
 impl std::fmt::Display for WalGapReason {
@@ -222,6 +241,11 @@ impl std::fmt::Display for WalGapReason {
                     "an offline repair command (db-scan) changed the database outside the archive"
                 )
             }
+            WalGapReason::ArchiveNotRunning => write!(
+                f,
+                "the database committed transactions while WAL archiving was not running \
+                 (archiving disabled, WAL directory lost or recreated, or database reverted)"
+            ),
         }
     }
 }
@@ -317,6 +341,141 @@ struct OpenSegmentMarker {
     start_ts: Duration,
 }
 
+/// Content of [`WAL_COVERAGE_FILE`]: how far the WAL directory accounts for the
+/// transactions the database committed.
+///
+/// A transaction is accounted for once its records are in a written segment, in the open
+/// segment the marker and the journal cover, or in a gap, or once it committed with nothing
+/// to archive. The archiver keeps `covered_ts` at the last transaction it saw and writes it
+/// when it writes a segment, at every archive run and at a clean shutdown, so that the next
+/// start can tell whether the database committed anything the archive never saw.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WalCoverage {
+    /// Every transaction the database committed up to this CID timestamp is accounted for.
+    pub covered_ts: Duration,
+    /// The server whose database the coverage describes. A coverage of another server (a
+    /// WAL directory reused for another database) counts as missing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_uuid: Option<Uuid>,
+    /// Set when an archiver started without this file: whether the archive holds the
+    /// history up to the database it started on is unknown until the archive task compared
+    /// it with the manifest (see [`WalArchiver::unverified_coverage`]). Until then every
+    /// start keeps it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unverified: Option<WalUnverified>,
+}
+
+/// See [`WalCoverage::unverified`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WalUnverified {
+    /// The last transaction of the database when the archiver started without coverage.
+    pub db_ts_max: Duration,
+    /// How far the WAL directory held the history at that start: the end of its newest
+    /// closed segment, or what a manifest kept in it covered. Segments written since do
+    /// not count: they all end after `db_ts_max`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_end: Option<Duration>,
+}
+
+/// The coverage recorded in `dir`, None when there is none. A file that can not be read
+/// counts as missing, which is checked against the archive rather than trusted.
+pub fn read_coverage(dir: &Path) -> Option<WalCoverage> {
+    let path = dir.join(WAL_COVERAGE_FILE);
+    let data = match fs::read(&path) {
+        Ok(data) => data,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(err) => {
+            error!(%err, path = %path.display(), "Unable to read the WAL archive coverage");
+            return None;
+        }
+    };
+    serde_json::from_slice(&data)
+        .inspect_err(|err| {
+            error!(%err, path = %path.display(), "Unable to parse the WAL archive coverage");
+        })
+        .ok()
+}
+
+/// Write `coverage` to [`WAL_COVERAGE_FILE`] in `dir`, durably.
+pub fn write_coverage(dir: &Path, coverage: &WalCoverage) -> Result<(), WalError> {
+    write_file_durably(dir, WAL_COVERAGE_FILE, &serde_json::to_vec(coverage)?)
+}
+
+/// After an offline restore or recovery put another database in place, once it is done
+/// with the database (reindexed, verified): record in `dir` that the WAL directory accounts
+/// for that database, of server `server_uuid`, up to `db_ts_max`, its last transaction,
+/// since the command recorded (or handed over) the history it abandoned. The next start
+/// then reports nothing for the transactions the command itself committed. A coverage of
+/// the same server not verified against the archive yet stays so. `dir` is created when it
+/// does not exist (a recovery on a new host), so that the first start there does not
+/// compare the recovered database with the archive as one of unknown origin.
+pub fn note_database_replaced(
+    dir: &Path,
+    db_ts_max: Duration,
+    server_uuid: Uuid,
+) -> Result<(), WalError> {
+    fs::create_dir_all(dir)?;
+    let unverified = read_coverage(dir)
+        .filter(|coverage| {
+            coverage
+                .server_uuid
+                .is_none_or(|known| known == server_uuid)
+        })
+        .and_then(|coverage| coverage.unverified);
+    write_coverage(
+        dir,
+        &WalCoverage {
+            covered_ts: db_ts_max,
+            server_uuid: Some(server_uuid),
+            unverified,
+        },
+    )
+}
+
+/// An exclusive lock on a WAL directory, see [`try_lock_wal_dir`]. Released when dropped,
+/// and by the operating system when the process exits, however it exits.
+#[derive(Debug)]
+pub struct WalDirLock {
+    _file: fs::File,
+}
+
+/// Take the exclusive lock of the WAL directory `dir` ([`WAL_ARCHIVER_LOCK_FILE`]). The
+/// archiver holds it for as long as it runs; `recover`, `restore` and `restore-s3` take it
+/// before they change the database, so that they never replace the database of a running
+/// server nor take over its journals.
+///
+/// Fails with [`WalError::Locked`] when another process holds it. None when `dir` does not
+/// exist (nothing archives into it), or when the file system does not support locks, which
+/// is logged: the lock is a safety net, not a requirement.
+pub fn try_lock_wal_dir(dir: &Path) -> Result<Option<WalDirLock>, WalError> {
+    if !dir.is_dir() {
+        return Ok(None);
+    }
+    let path = dir.join(WAL_ARCHIVER_LOCK_FILE);
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(WalDirLock { _file: file })),
+        Err(fs::TryLockError::WouldBlock) => Err(WalError::Locked(format!(
+            "another process holds the lock of the WAL directory {} ({WAL_ARCHIVER_LOCK_FILE}): \
+             a server, or an offline command, is archiving into it. Stop the server before \
+             running recover or restore",
+            dir.display()
+        ))),
+        Err(fs::TryLockError::Error(err)) => {
+            warn!(
+                %err,
+                path = %path.display(),
+                "Unable to lock the WAL directory; make sure no server runs on it"
+            );
+            Ok(None)
+        }
+    }
+}
+
 /// What the archiver did since it started, for tests. Every failure counted here is also
 /// logged when it happens, with the running count.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -369,6 +528,18 @@ pub struct WalArchiver {
     /// covers it, so that an unclean stop between the database commit and its archiving is
     /// noticed.
     committing: Option<Duration>,
+    /// The CID time of the last transaction the archiver accounted for, see
+    /// [`WalCoverage`].
+    covered: Option<Duration>,
+    /// See [`WalCoverage::unverified`].
+    unverified: Option<WalUnverified>,
+    /// The last transaction of the database when the archiver started, until the archive
+    /// task compared it with the manifest, see [`Self::revert_check`].
+    revert_check: Option<Duration>,
+    /// The coverage last written to [`WAL_COVERAGE_FILE`].
+    persisted_coverage: Option<WalCoverage>,
+    /// The lock of the WAL directory, held for as long as the archiver runs.
+    lock: Option<WalDirLock>,
 }
 
 struct WalSegmentBuilder {
@@ -639,6 +810,10 @@ struct LeftHistory {
     journals: Vec<PathBuf>,
     /// Where the history the WAL directory misses starts, if it misses any.
     missing_from: Option<Duration>,
+    /// Whether a run stopped with records it did not write: the history from then on was
+    /// compared with the last transaction of the database, so `missing_from` accounts for
+    /// everything up to it.
+    settled: bool,
 }
 
 impl LeftHistory {
@@ -680,6 +855,7 @@ fn plan_left_history(dir: &Path, db_ts_max: Option<Duration>) -> Result<LeftHist
             .map(|journal| journal.path.clone())
             .collect(),
         missing_from: None,
+        settled: false,
     };
     let start = read_marker_gap(dir).map(|gap| gap.from_ts).or_else(|| {
         journals
@@ -691,6 +867,7 @@ fn plan_left_history(dir: &Path, db_ts_max: Option<Duration>) -> Result<LeftHist
     let Some(start) = start else {
         return Ok(history);
     };
+    history.settled = true;
 
     // What holds the history from `start` on, oldest first: the segments written before
     // the first journal, then the journals. Each item: start, end, complete.
@@ -778,7 +955,7 @@ pub fn close_left_segments(
     dir: &Path,
     db_ts_max: Option<Duration>,
 ) -> Result<Option<WalGap>, WalError> {
-    close_left_history(dir, db_ts_max, false)
+    close_left_history(dir, db_ts_max, false).map(|(gap, _)| gap)
 }
 
 /// [`close_left_segments`] for an offline command that takes over the WAL directory of a
@@ -788,14 +965,16 @@ pub fn close_left_segments(
 /// where the gap starts, so that the next start settles it against the database, and
 /// [`read_local_events`] reports the gap meanwhile.
 pub fn close_left_segments_offline(dir: &Path) -> Result<Option<WalGap>, WalError> {
-    close_left_history(dir, None, true)
+    close_left_history(dir, None, true).map(|(gap, _)| gap)
 }
 
+/// See [`close_left_segments`]. Also returns whether a run stopped with records it did not
+/// write, in which case the gap, if any, accounts for everything up to `db_ts_max`.
 fn close_left_history(
     dir: &Path,
     db_ts_max: Option<Duration>,
     offline: bool,
-) -> Result<Option<WalGap>, WalError> {
+) -> Result<(Option<WalGap>, bool), WalError> {
     let history = plan_left_history(dir, db_ts_max)?;
     for file in &history.segments {
         write_segment_file(dir, file)?;
@@ -835,7 +1014,7 @@ fn close_left_history(
             Err(err) => return Err(err.into()),
         }
     }
-    Ok(gap)
+    Ok((gap, history.settled))
 }
 
 /// What a stopped run left in `dir` that no written segment holds, read without changing
@@ -857,6 +1036,103 @@ pub fn read_left_segments(dir: &Path) -> Result<LeftSegments, WalError> {
         .extend(read_handed_over_gaps(dir).into_iter().map(|(_, gap)| gap));
     events.gaps.extend(history.gap(None));
     Ok(LeftSegments { segments, events })
+}
+
+/// What [`check_coverage`] found.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CoverageCheck {
+    /// The history the database holds and the WAL directory never saw.
+    gap: Option<WalGap>,
+    /// See [`WalCoverage::unverified`].
+    unverified: Option<WalUnverified>,
+}
+
+/// At the start of an archiver of server `server_uuid` on `dir`: compare `db_ts_max`, the
+/// last transaction the database committed, with `coverage`, how far the WAL directory
+/// accounts for it.
+///
+/// - A database ahead of the coverage committed transactions no archiver saw: a gap from
+///   just after the coverage up to `db_ts_max`.
+/// - A database behind the coverage was put back to an earlier state behind the archive's
+///   back (a volume snapshot of the database alone): what the archive holds after it
+///   belongs to the state it left, so a gap covers it up to the coverage. A restore or
+///   recovery writes the coverage of the database it put in place, or hands over a restore
+///   when it could not record it (`pending`), and is not reported.
+/// - Without a coverage, or with one of another server, the segments in `dir`, and the
+///   manifest when the archive is kept in `dir`, are compared with the database instead,
+///   and the coverage stays unverified until the archive task compared it with the
+///   manifest wherever it is.
+///
+/// When a run stopped with records it did not write (`settled`), the history from then on
+/// was already compared with the database. A database that committed nothing has nothing
+/// to miss.
+fn check_coverage(
+    dir: &Path,
+    server_uuid: Uuid,
+    coverage: Option<WalCoverage>,
+    db_ts_max: Option<Duration>,
+    settled: bool,
+    pending: &WalPendingEvents,
+) -> Result<CoverageCheck, WalError> {
+    let coverage = coverage.filter(|coverage| {
+        let ours = coverage
+            .server_uuid
+            .is_none_or(|known| known == server_uuid);
+        if !ours {
+            warn!(
+                path = %dir.join(WAL_COVERAGE_FILE).display(),
+                "The WAL archive coverage belongs to another server; it is not used"
+            );
+        }
+        ours
+    });
+    let unverified = coverage.and_then(|coverage| coverage.unverified);
+    let Some(db_ts_max) = db_ts_max else {
+        return Ok(CoverageCheck {
+            gap: None,
+            unverified,
+        });
+    };
+    let gap = |from: Duration, until: Duration| WalGap {
+        from_ts: from + Duration::from_nanos(1),
+        until_ts: Some(until),
+        reason: WalGapReason::ArchiveNotRunning,
+    };
+    let Some(coverage) = coverage else {
+        // The closed segments, and the manifest when the archive is the WAL directory.
+        let local_manifest = fs::read(dir.join(PITR_MANIFEST_KEY))
+            .ok()
+            .and_then(|data| serde_json::from_slice::<PitrManifest>(&data).ok());
+        let local_end = scan_segments(dir)?
+            .segments
+            .iter()
+            .map(|segment| segment.end_ts)
+            .chain(local_manifest.and_then(|manifest| manifest.covered_until()))
+            .max();
+        return Ok(CoverageCheck {
+            gap: local_end
+                .filter(|end| !settled && db_ts_max > *end)
+                .map(|end| gap(end, db_ts_max)),
+            unverified: Some(WalUnverified {
+                db_ts_max,
+                local_end,
+            }),
+        });
+    };
+    if settled {
+        return Ok(CoverageCheck {
+            gap: None,
+            unverified,
+        });
+    }
+    let gap = if db_ts_max > coverage.covered_ts {
+        Some(gap(coverage.covered_ts, db_ts_max))
+    } else if db_ts_max < coverage.covered_ts && pending.restores.is_empty() {
+        Some(gap(db_ts_max, coverage.covered_ts))
+    } else {
+        None
+    };
+    Ok(CoverageCheck { gap, unverified })
 }
 
 /// See [`read_left_segments`].
@@ -962,13 +1238,18 @@ impl WalArchiver {
         })?;
         let _ = fs::remove_file(&probe);
 
+        // Only one process archives into a WAL directory, and recover and restore refuse to
+        // run while one does.
+        let lock = try_lock_wal_dir(&segments_path)?;
+
         // A marker or a journal left behind means the previous run stopped with records
         // that were never written to a segment. The journals close its segments, and only
         // what they miss, if anything, is a gap. The gap is made durable before the
         // marker and the journals go, so that a crash before the next synchronisation
         // still reports it.
         let left_marker = segments_path.join(WAL_OPEN_SEGMENT_MARKER).exists();
-        match close_left_segments(&segments_path, db_ts_max)? {
+        let (left_gap, settled) = close_left_history(&segments_path, db_ts_max, false)?;
+        match left_gap {
             Some(gap) => error!(
                 from = %format_ts_rfc3339(gap.from_ts),
                 "WAL ARCHIVE HOLE: the previous run stopped without archiving its open \
@@ -987,6 +1268,30 @@ impl WalArchiver {
         let mut pending = read_pending_events(&segments_path);
         adopt_handed_over_gaps(&segments_path, &mut pending);
 
+        // Whether the database committed anything this WAL directory never saw.
+        let coverage = read_coverage(&segments_path);
+        let checked = check_coverage(
+            &segments_path,
+            server_uuid,
+            coverage,
+            db_ts_max,
+            settled,
+            &pending,
+        )?;
+        if let Some(gap) = checked.gap {
+            error!(
+                from = %format_ts_rfc3339(gap.from_ts),
+                until = %gap.until_ts.map(format_ts_rfc3339).unwrap_or_default(),
+                "WAL ARCHIVE HOLE: the database committed transactions the WAL archive never \
+                 saw (archiving was disabled, the WAL directory was lost or recreated, or the \
+                 database was reverted). Point-in-time recovery can not replay across them \
+                 until a new base backup is taken."
+            );
+            pending.gaps.push(gap);
+            // On disk before the coverage moves past it.
+            write_pending_events(&segments_path, &pending)?;
+        }
+
         info!(
             path = %segments_path.display(),
             segment_size_bytes = config.segment_size_bytes,
@@ -994,7 +1299,7 @@ impl WalArchiver {
             "WAL archiving enabled"
         );
 
-        Ok(Self {
+        let mut archiver = Self {
             server_uuid,
             segments_path,
             current_segment: None,
@@ -1007,8 +1312,22 @@ impl WalArchiver {
             last_ts: None,
             journaling: config.open_segment_journal != WalJournalMode::Off,
             committing: None,
+            covered: db_ts_max.or(coverage
+                .filter(|coverage| {
+                    coverage
+                        .server_uuid
+                        .is_none_or(|known| known == server_uuid)
+                })
+                .map(|coverage| coverage.covered_ts)),
+            unverified: checked.unverified,
+            revert_check: db_ts_max,
+            persisted_coverage: coverage,
+            lock,
             config,
-        })
+        };
+        // From here on the WAL directory accounts for everything the database committed.
+        archiver.persist_coverage();
+        Ok(archiver)
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -1087,6 +1406,9 @@ impl WalArchiver {
     /// the transaction, when it is known.
     pub fn note_failure(&mut self, cid_ts: Option<Duration>) {
         self.stats.failures += 1;
+        if let Some(cid_ts) = cid_ts {
+            self.cover(cid_ts);
+        }
         self.add_gap(WalGap {
             from_ts: cid_ts.or(self.last_ts).unwrap_or(Duration::ZERO),
             until_ts: cid_ts,
@@ -1169,6 +1491,101 @@ impl WalArchiver {
     /// the last flush.
     pub fn persist_pending_events(&mut self) -> Result<(), WalError> {
         write_pending_events(&self.segments_path, &self.pending)
+    }
+
+    /// At a clean shutdown, after the last flush: write the pending events and the coverage
+    /// to disk, and release the lock of the WAL directory, so that `recover` and `restore`
+    /// may run while this process lingers. Nothing may be archived after this.
+    pub fn close(&mut self) -> Result<(), WalError> {
+        let result = self.persist_pending_events();
+        self.persist_coverage();
+        self.release_lock();
+        result
+    }
+
+    /// Release the lock of the WAL directory, as the end of the process does. For a clean
+    /// shutdown ([`Self::close`]), and for tests that simulate a crash by leaking a running
+    /// server: the operating system releases the lock of a process that dies.
+    pub fn release_lock(&mut self) {
+        self.lock = None;
+    }
+
+    /// The transaction at `cid_ts` is accounted for.
+    fn cover(&mut self, cid_ts: Duration) {
+        self.covered = self.covered.max(Some(cid_ts));
+    }
+
+    /// Write how far the WAL directory accounts for the database to [`WAL_COVERAGE_FILE`],
+    /// when it moved. A failure is logged and retried with the next call: the next start
+    /// may then report a gap that is not one, never miss one.
+    pub fn persist_coverage(&mut self) {
+        // Records that only live in memory are not accounted for on disk: the marker covers
+        // them only as long as it could be written.
+        let covered = match self.in_memory_start() {
+            Some(start) => self.covered.min(start.checked_sub(Duration::from_nanos(1))),
+            None => self.covered,
+        };
+        let Some(covered_ts) = covered else {
+            return;
+        };
+        let coverage = WalCoverage {
+            covered_ts,
+            server_uuid: Some(self.server_uuid),
+            unverified: self.unverified,
+        };
+        if self.persisted_coverage == Some(coverage) {
+            return;
+        }
+        match write_coverage(&self.segments_path, &coverage) {
+            Ok(()) => self.persisted_coverage = Some(coverage),
+            Err(err) => warn!(
+                %err,
+                "Unable to record how far the WAL archive covers the database; the next start \
+                 may report a gap that is not one"
+            ),
+        }
+    }
+
+    /// The database this archiver started on, when it did not know whether the archive
+    /// holds the history up to it (see [`WalCoverage::unverified`]). The archive task
+    /// compares it with the manifest, records a gap for what the manifest misses, and hands
+    /// it to [`Self::confirm_coverage`] once the manifest is saved.
+    pub fn unverified_coverage(&self) -> Option<WalUnverified> {
+        self.unverified
+    }
+
+    /// The archive was compared with the database as `checked` describes, the value
+    /// [`Self::unverified_coverage`] returned.
+    pub fn confirm_coverage(&mut self, checked: WalUnverified) {
+        if self.unverified == Some(checked) {
+            self.unverified = None;
+            self.persist_coverage();
+        }
+    }
+
+    /// The last transaction of the database when this archiver started, until
+    /// [`Self::confirm_revert_check`]. The archive task compares it with the manifest at its
+    /// first synchronisation: an archive that holds history of this server after it, that
+    /// no restore abandoned, belongs to a state the database was put back from (the
+    /// database and its WAL directory reverted together, from one volume snapshot).
+    pub fn revert_check(&self) -> Option<Duration> {
+        self.revert_check
+    }
+
+    /// The archive was compared with the database the archiver started on.
+    pub fn confirm_revert_check(&mut self) {
+        self.revert_check = None;
+    }
+
+    /// How far the archive accounts for the database once the closed segments in the WAL
+    /// directory are archived: the last transaction accounted for, when no record lives
+    /// only in memory. None otherwise.
+    pub fn archived_coverage(&self) -> Option<Duration> {
+        if self.has_pending_records() {
+            None
+        } else {
+            self.covered
+        }
     }
 
     /// Make the open segment marker match the records that only live in memory: present
@@ -1286,6 +1703,7 @@ impl WalArchiver {
         if !self.is_enabled() {
             return;
         }
+        self.cover(cid.ts);
         self.seal_if_stale(cid.ts);
 
         let mut records: Vec<WalEntryRecord> = Vec::new();
@@ -1370,6 +1788,7 @@ impl WalArchiver {
         if !self.is_enabled() {
             return;
         }
+        self.cover(cid_ts);
         self.journal_frame(cid_ts, &JournalFrameRef::Commit(cid_ts));
     }
 
@@ -1579,6 +1998,9 @@ impl WalArchiver {
             self.retry_after = None;
         }
         self.sync_marker();
+        if last.is_some() {
+            self.persist_coverage();
+        }
         match first_err {
             Some(err) => Err(err),
             None => Ok(last),
@@ -3714,5 +4136,437 @@ mod tests {
             .unwrap_err()
             .into();
         assert!(matches!(wal_error, WalError::SerializationError(_)));
+    }
+
+    fn not_running(from: Duration, until: Duration) -> WalGap {
+        WalGap {
+            from_ts: from + Duration::from_nanos(1),
+            until_ts: Some(until),
+            reason: WalGapReason::ArchiveNotRunning,
+        }
+    }
+
+    /// An archiver that archived one record at `secs` in its own segment, then stopped
+    /// cleanly. Returns the WAL directory.
+    fn archived_once(dir: &Path, server: Uuid, secs: u64) -> PathBuf {
+        let wal_dir = dir.join("wal");
+        let mut archiver = WalArchiver::open(test_config(), server, wal_dir.clone(), None).unwrap();
+        archiver
+            .record_create(&cid(server, secs), 1, Uuid::new_v4(), vec![1])
+            .unwrap();
+        archiver.flush_current_segment().unwrap().unwrap();
+        archiver.close().unwrap();
+        wal_dir
+    }
+
+    /// A first start, on a new database or on one that never archived, finds no history
+    /// that could be missing.
+    #[test]
+    fn test_a_fresh_start_records_no_coverage_gap() {
+        let server = Uuid::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let archiver =
+            WalArchiver::open(test_config(), server, dir.path().join("a"), None).unwrap();
+        assert!(archiver.pending_events().is_empty());
+        assert_eq!(archiver.unverified_coverage(), None);
+
+        // A database that committed before archiving was enabled: nothing in the WAL
+        // directory to compare with, so the archive task compares the manifest instead.
+        let wal_dir = dir.path().join("b");
+        let archiver = WalArchiver::open(
+            test_config(),
+            server,
+            wal_dir.clone(),
+            Some(Duration::from_secs(100)),
+        )
+        .unwrap();
+        assert!(archiver.pending_events().is_empty());
+        let unverified = WalUnverified {
+            db_ts_max: Duration::from_secs(100),
+            local_end: None,
+        };
+        assert_eq!(archiver.unverified_coverage(), Some(unverified));
+        // Kept until the archive task confirms it, by every start.
+        drop(archiver);
+        let mut archiver = WalArchiver::open(
+            test_config(),
+            server,
+            wal_dir.clone(),
+            Some(Duration::from_secs(100)),
+        )
+        .unwrap();
+        assert!(archiver.pending_events().is_empty());
+        assert_eq!(archiver.unverified_coverage(), Some(unverified));
+        archiver.confirm_coverage(WalUnverified {
+            db_ts_max: Duration::from_secs(99),
+            local_end: None,
+        });
+        assert!(archiver.unverified_coverage().is_some());
+        archiver.confirm_coverage(unverified);
+        assert_eq!(archiver.unverified_coverage(), None);
+        assert_eq!(
+            read_coverage(&wal_dir),
+            Some(WalCoverage {
+                covered_ts: Duration::from_secs(100),
+                server_uuid: Some(server),
+                unverified: None,
+            })
+        );
+    }
+
+    /// A database whose last transaction is the last one the archive saw misses nothing,
+    /// including transactions that archived no record.
+    #[test]
+    fn test_a_database_the_archive_covers_records_no_gap() {
+        let server = Uuid::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = archived_once(dir.path(), server, 10);
+        assert_eq!(
+            read_coverage(&wal_dir).map(|coverage| coverage.covered_ts),
+            Some(Duration::from_secs(10))
+        );
+
+        let mut archiver = WalArchiver::open(
+            test_config(),
+            server,
+            wal_dir.clone(),
+            Some(Duration::from_secs(10)),
+        )
+        .unwrap();
+        assert!(archiver.pending_events().is_empty());
+        assert_eq!(archiver.unverified_coverage(), None);
+
+        // A commit with nothing to archive moves the coverage too, written at shutdown.
+        archiver.note_commit(Duration::from_secs(20));
+        archiver.close().unwrap();
+        drop(archiver);
+        let archiver = WalArchiver::open(
+            test_config(),
+            server,
+            wal_dir,
+            Some(Duration::from_secs(20)),
+        )
+        .unwrap();
+        assert!(archiver.pending_events().is_empty());
+    }
+
+    /// The database committed while no archiver ran (archiving disabled, or another WAL
+    /// directory): the transactions after the coverage are a gap, kept on disk.
+    #[test]
+    fn test_a_database_ahead_of_the_archive_is_a_gap() {
+        let server = Uuid::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = archived_once(dir.path(), server, 10);
+
+        let archiver = WalArchiver::open(
+            test_config(),
+            server,
+            wal_dir.clone(),
+            Some(Duration::from_secs(50)),
+        )
+        .unwrap();
+        let gap = not_running(Duration::from_secs(10), Duration::from_secs(50));
+        assert_eq!(archiver.pending_events().gaps, vec![gap]);
+        assert_eq!(read_pending_events(&wal_dir).gaps, vec![gap]);
+        // The coverage moved to the database: the next start reports nothing new.
+        assert_eq!(
+            read_coverage(&wal_dir).map(|coverage| coverage.covered_ts),
+            Some(Duration::from_secs(50))
+        );
+        drop(archiver);
+        let archiver = WalArchiver::open(
+            test_config(),
+            server,
+            wal_dir,
+            Some(Duration::from_secs(50)),
+        )
+        .unwrap();
+        assert_eq!(archiver.pending_events().gaps, vec![gap]);
+    }
+
+    /// Without the record of the coverage (the WAL directory was recreated, or the file
+    /// lost), the history the WAL directory holds is compared with the database.
+    #[test]
+    fn test_a_missing_coverage_with_history_is_a_gap() {
+        let server = Uuid::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = archived_once(dir.path(), server, 10);
+        fs::remove_file(wal_dir.join(WAL_COVERAGE_FILE)).unwrap();
+
+        let archiver = WalArchiver::open(
+            test_config(),
+            server,
+            wal_dir.clone(),
+            Some(Duration::from_secs(50)),
+        )
+        .unwrap();
+        assert_eq!(
+            archiver.pending_events().gaps,
+            vec![not_running(
+                Duration::from_secs(10),
+                Duration::from_secs(50)
+            )]
+        );
+        // Whether the archive holds more than the WAL directory is left to the manifest,
+        // with how far the WAL directory held the history at this start.
+        assert_eq!(
+            archiver.unverified_coverage(),
+            Some(WalUnverified {
+                db_ts_max: Duration::from_secs(50),
+                local_end: Some(Duration::from_secs(10)),
+            })
+        );
+
+        // A database the history in the WAL directory covers misses nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = archived_once(dir.path(), server, 10);
+        fs::remove_file(wal_dir.join(WAL_COVERAGE_FILE)).unwrap();
+        let archiver = WalArchiver::open(
+            test_config(),
+            server,
+            wal_dir.clone(),
+            Some(Duration::from_secs(10)),
+        )
+        .unwrap();
+        assert!(archiver.pending_events().is_empty());
+        drop(archiver);
+
+        // Nor one a manifest in the WAL directory (the local archive) records as covered,
+        // commits that archived nothing included.
+        fs::remove_file(wal_dir.join(WAL_COVERAGE_FILE)).unwrap();
+        let mut manifest = PitrManifest::new(server);
+        manifest.covered_until_ts = Some(Duration::from_secs(30));
+        fs::write(
+            wal_dir.join(PITR_MANIFEST_KEY),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let archiver = WalArchiver::open(
+            test_config(),
+            server,
+            wal_dir,
+            Some(Duration::from_secs(30)),
+        )
+        .unwrap();
+        assert!(archiver.pending_events().is_empty());
+    }
+
+    /// A coverage of another server (a WAL directory reused for another database) counts as
+    /// missing: the WAL directory's history is compared with the database instead.
+    #[test]
+    fn test_a_coverage_of_another_server_counts_as_missing() {
+        let server = Uuid::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = archived_once(dir.path(), server, 10);
+        let other = Uuid::new_v4();
+        let mut coverage = read_coverage(&wal_dir).unwrap();
+        assert_eq!(coverage.server_uuid, Some(server));
+        coverage.covered_ts = Duration::from_secs(500);
+        coverage.server_uuid = Some(other);
+        write_coverage(&wal_dir, &coverage).unwrap();
+
+        // Taken at face value, the coverage of 500 would hide the history from 10 to 50.
+        let archiver = WalArchiver::open(
+            test_config(),
+            server,
+            wal_dir.clone(),
+            Some(Duration::from_secs(50)),
+        )
+        .unwrap();
+        assert_eq!(
+            archiver.pending_events().gaps,
+            vec![not_running(
+                Duration::from_secs(10),
+                Duration::from_secs(50)
+            )]
+        );
+        assert!(archiver.unverified_coverage().is_some());
+        assert_eq!(
+            read_coverage(&wal_dir).and_then(|coverage| coverage.server_uuid),
+            Some(server)
+        );
+    }
+
+    /// What only lives in memory is not recorded as covered: a crash whose marker did not
+    /// reach the disk is then still noticed.
+    #[test]
+    fn test_the_coverage_never_claims_records_held_in_memory() {
+        let server = Uuid::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = archived_once(dir.path(), server, 10);
+        let mut archiver = WalArchiver::open(
+            test_config(),
+            server,
+            wal_dir.clone(),
+            Some(Duration::from_secs(10)),
+        )
+        .unwrap();
+        archiver
+            .record_create(&cid(server, 20), 2, Uuid::new_v4(), vec![2])
+            .unwrap();
+        archiver.note_commit(Duration::from_secs(30));
+        archiver.persist_coverage();
+        assert_eq!(
+            read_coverage(&wal_dir).map(|coverage| coverage.covered_ts),
+            Some(Duration::from_secs(20) - Duration::from_nanos(1))
+        );
+        // Once written, everything is.
+        archiver.flush_current_segment().unwrap().unwrap();
+        assert_eq!(
+            read_coverage(&wal_dir).map(|coverage| coverage.covered_ts),
+            Some(Duration::from_secs(30))
+        );
+    }
+
+    /// A database put back behind what the archive saw (a volume snapshot) is a gap up to
+    /// the coverage; a restore or recovery that recorded what it abandoned is not.
+    #[test]
+    fn test_a_reverted_database_is_a_gap_unless_restored() {
+        let server = Uuid::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = archived_once(dir.path(), server, 50);
+        let archiver = WalArchiver::open(
+            test_config(),
+            server,
+            wal_dir,
+            Some(Duration::from_secs(30)),
+        )
+        .unwrap();
+        assert_eq!(
+            archiver.pending_events().gaps,
+            vec![not_running(
+                Duration::from_secs(30),
+                Duration::from_secs(50)
+            )]
+        );
+
+        // A restore to 30 records the database it put in place, under its identity.
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = archived_once(dir.path(), server, 50);
+        let restored = Uuid::new_v4();
+        note_database_replaced(&wal_dir, Duration::from_secs(30), restored).unwrap();
+        let archiver = WalArchiver::open(
+            test_config(),
+            restored,
+            wal_dir.clone(),
+            Some(Duration::from_secs(30)),
+        )
+        .unwrap();
+        assert!(archiver.pending_events().is_empty());
+        assert_eq!(
+            read_coverage(&wal_dir),
+            Some(WalCoverage {
+                covered_ts: Duration::from_secs(30),
+                server_uuid: Some(restored),
+                unverified: None,
+            })
+        );
+        // A restore that could not record what it abandoned hands it over instead.
+        drop(archiver);
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = archived_once(dir.path(), server, 50);
+        write_pending_events(
+            &wal_dir,
+            &WalPendingEvents {
+                restores: vec![WalRestore {
+                    after_ts: Duration::from_secs(30),
+                    until_ts: Duration::from_secs(60),
+                    server_uuid: server,
+                    local_server_uuid: None,
+                    at: Duration::from_secs(60),
+                    reason: "restore".to_string(),
+                    abandoned: WalPendingEvents::default(),
+                }],
+                ..WalPendingEvents::default()
+            },
+        )
+        .unwrap();
+        let archiver = WalArchiver::open(
+            test_config(),
+            server,
+            wal_dir,
+            Some(Duration::from_secs(30)),
+        )
+        .unwrap();
+        assert!(archiver.pending_events().gaps.is_empty());
+
+        // A recovery on a new host creates the WAL directory, so that the first start
+        // there takes the recovered database as accounted for.
+        let new_host = dir.path().join("new-host");
+        note_database_replaced(&new_host, Duration::from_secs(75), server).unwrap();
+        let archiver = WalArchiver::open(
+            test_config(),
+            server,
+            new_host,
+            Some(Duration::from_secs(75)),
+        )
+        .unwrap();
+        assert!(archiver.pending_events().is_empty());
+        assert_eq!(archiver.unverified_coverage(), None);
+    }
+
+    /// Only one process archives into a WAL directory, and offline commands that replace
+    /// the database refuse to run next to it; the lock goes with a clean shutdown or the
+    /// end of the archiver.
+    #[test]
+    fn test_the_archiver_holds_the_lock_of_its_wal_directory() {
+        let server = Uuid::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("wal");
+        assert!(try_lock_wal_dir(&wal_dir).unwrap().is_none());
+
+        let mut archiver = WalArchiver::open(test_config(), server, wal_dir.clone(), None).unwrap();
+        assert!(matches!(
+            try_lock_wal_dir(&wal_dir),
+            Err(WalError::Locked(msg)) if msg.contains("Stop the server")
+        ));
+        assert!(matches!(
+            WalArchiver::open(test_config(), server, wal_dir.clone(), None),
+            Err(WalError::Locked(_))
+        ));
+        archiver.close().unwrap();
+        let lock = try_lock_wal_dir(&wal_dir).unwrap();
+        assert!(lock.is_some());
+        assert!(matches!(
+            WalArchiver::open(test_config(), server, wal_dir.clone(), None),
+            Err(WalError::Locked(_))
+        ));
+        drop(lock);
+        drop(archiver);
+
+        let archiver = WalArchiver::open(test_config(), server, wal_dir.clone(), None).unwrap();
+        assert!(try_lock_wal_dir(&wal_dir).is_err());
+        drop(archiver);
+        assert!(try_lock_wal_dir(&wal_dir).unwrap().is_some());
+    }
+
+    #[test]
+    fn test_coverage_reads_back_and_tolerates_old_files() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(read_coverage(dir.path()), None);
+        fs::write(dir.path().join(WAL_COVERAGE_FILE), b"{ torn").unwrap();
+        assert_eq!(read_coverage(dir.path()), None);
+        // Only the timestamp is required.
+        fs::write(
+            dir.path().join(WAL_COVERAGE_FILE),
+            br#"{"covered_ts":{"secs":5,"nanos":0}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_coverage(dir.path()),
+            Some(WalCoverage {
+                covered_ts: Duration::from_secs(5),
+                server_uuid: None,
+                unverified: None,
+            })
+        );
+        let gap = WalGap {
+            from_ts: Duration::from_secs(1),
+            until_ts: None,
+            reason: WalGapReason::ArchiveNotRunning,
+        };
+        let json = serde_json::to_string(&gap).unwrap();
+        assert_eq!(serde_json::from_str::<WalGap>(&json).unwrap(), gap);
+        assert!(gap.reason.to_string().contains("not running"));
     }
 }

@@ -4,7 +4,7 @@ use crate::{
     prelude::*,
     repl::{
         entry::State,
-        proto::{ConsumerState, ReplIncrementalContext},
+        proto::{ConsumerState, ReplIncrementalContext, ReplRuvRange},
         ruv::{RangeDiffStatus, ReplicationUpdateVector, ReplicationUpdateVectorTransaction},
     },
     value::{AuthType, Session, SessionState},
@@ -194,6 +194,94 @@ async fn test_repl_refresh_basic(server_a: &QueryServer, server_b: &QueryServer)
 }
 
 // Test that adding an entry to one side replicates correctly.
+// Kubidm: a fresh server has created its own domain and has only its own changes in its
+// RUV. A refreshed server holds a domain created elsewhere, a server that applied an
+// incremental has its supplier's changes in its RUV. Startup readiness relies on this.
+#[qs_pair_test]
+async fn test_repl_has_synced_after_refresh_and_incremental(
+    server_a: &QueryServer,
+    server_b: &QueryServer,
+) {
+    assert_eq!(server_a.replication_has_synced().await, Ok(false));
+    assert_eq!(server_b.replication_has_synced().await, Ok(false));
+
+    // Refresh a from b.
+    let mut server_a_txn = server_a.write(duration_from_epoch_now()).await.unwrap();
+    let mut server_b_txn = server_b.read().await.unwrap();
+    assert!(repl_initialise(&mut server_b_txn, &mut server_a_txn)
+        .and_then(|_| server_a_txn.commit())
+        .is_ok());
+    drop(server_b_txn);
+
+    assert_eq!(server_a.replication_has_synced().await, Ok(true));
+    // b created the domain and has not pulled anything: its database can not tell it from
+    // a fresh replica. That is why a node without automatic_refresh is never treated as
+    // fresh.
+    assert_eq!(server_b.replication_has_synced().await, Ok(false));
+
+    // A change made on a reaches b with an incremental.
+    let mut server_a_txn = server_a.write(duration_from_epoch_now()).await.unwrap();
+    assert!(server_a_txn
+        .internal_create(vec![entry_init!(
+            (Attribute::Class, EntryClass::Object.to_value()),
+            (Attribute::Class, EntryClass::Account.to_value()),
+            (Attribute::Class, EntryClass::Person.to_value()),
+            (Attribute::Name, Value::new_iname("testperson1")),
+            (Attribute::Uuid, Value::Uuid(Uuid::new_v4())),
+            (Attribute::DisplayName, Value::new_utf8s("testperson1"))
+        ),])
+        .is_ok());
+    server_a_txn.commit().expect("Failed to commit");
+
+    let mut server_b_txn = server_b.write(duration_from_epoch_now()).await.unwrap();
+    let mut server_a_txn = server_a.read().await.unwrap();
+    repl_incremental(&mut server_a_txn, &mut server_b_txn);
+    server_b_txn.commit().expect("Failed to commit");
+    drop(server_a_txn);
+
+    assert_eq!(server_b.replication_has_synced().await, Ok(true));
+}
+
+// Kubidm: a refreshed server whose supplier has been gone longer than the changelog loses
+// the supplier from its RUV, but still knows it has synced: it must stay ready on restart.
+#[qs_pair_test]
+async fn test_repl_has_synced_survives_ruv_trim(server_a: &QueryServer, server_b: &QueryServer) {
+    let ct = duration_from_epoch_now();
+
+    let mut server_b_txn = server_b.read().await.unwrap();
+    let ReplRuvRange::V1 {
+        ranges: b_ranges, ..
+    } = server_b_txn
+        .consumer_get_state()
+        .expect("Unable to access RUV range");
+    let b_servers: Vec<Uuid> = b_ranges.keys().copied().collect();
+    assert!(!b_servers.is_empty());
+
+    // Refresh a from b.
+    let mut server_a_txn = server_a.write(ct).await.unwrap();
+    assert!(repl_initialise(&mut server_b_txn, &mut server_a_txn)
+        .and_then(|_| server_a_txn.commit())
+        .is_ok());
+    drop(server_b_txn);
+
+    // b is gone for longer than the changelog: trimming removes it from a's RUV.
+    let ct = ct + Duration::from_secs(CHANGELOG_MAX_AGE * 4);
+    let mut server_a_txn = server_a.write(ct).await.unwrap();
+    assert!(server_a_txn.purge_tombstones().is_ok());
+    server_a_txn.commit().expect("Failed to commit");
+
+    let mut server_a_txn = server_a.read().await.unwrap();
+    let ReplRuvRange::V1 {
+        ranges: a_ranges, ..
+    } = server_a_txn
+        .consumer_get_state()
+        .expect("Unable to access RUV range");
+    drop(server_a_txn);
+    assert!(b_servers.iter().all(|b| !a_ranges.contains_key(b)));
+
+    assert_eq!(server_a.replication_has_synced().await, Ok(true));
+}
+
 #[qs_pair_test]
 async fn test_repl_increment_basic_entry_add(server_a: &QueryServer, server_b: &QueryServer) {
     let mut server_a_txn = server_a.write(duration_from_epoch_now()).await.unwrap();
@@ -4297,4 +4385,457 @@ async fn test_repl_refresh_with_wal_archive_changes_the_archive_identity() {
         .map(|segment| segment.server_uuid)
         .collect();
     assert_eq!(owners, vec![old_uuid, new_uuid]);
+}
+
+// Kubidm: OAuth2 federation providers over replication.
+
+fn repl_federation_entry(uuid: Uuid, name: &str, link_policy: &str) -> EntryInitNew {
+    entry_init!(
+        (Attribute::Class, EntryClass::Object.to_value()),
+        (Attribute::Class, EntryClass::OAuth2Federation.to_value()),
+        (Attribute::Uuid, Value::Uuid(uuid)),
+        (Attribute::Name, Value::new_iname(name)),
+        (Attribute::OAuth2ClientId, Value::new_utf8s("client_id")),
+        (Attribute::OAuth2ClientSecret, Value::new_utf8s("secret")),
+        (
+            Attribute::OAuth2Issuer,
+            Value::Url(Url::parse("https://idp.example.com").unwrap())
+        ),
+        (
+            Attribute::OAuth2AuthorisationEndpoint,
+            Value::Url(Url::parse("https://idp.example.com/authorise").unwrap())
+        ),
+        (
+            Attribute::OAuth2TokenEndpoint,
+            Value::Url(Url::parse("https://idp.example.com/token").unwrap())
+        ),
+        (
+            Attribute::OAuth2TokenIntrospectEndpoint,
+            Value::Url(Url::parse("https://idp.example.com/introspect").unwrap())
+        ),
+        // Only "manual" is valid, so any other value makes the provider invalid while
+        // the entry stays schema valid.
+        (Attribute::OAuth2LinkPolicy, Value::new_iutf8(link_policy))
+    )
+}
+
+/// Write to `server` directly (no IDM layer reload), as an older version or another
+/// node would have.
+async fn repl_qs_write<F>(server: &QueryServer, ct: Duration, f: F)
+where
+    F: FnOnce(&mut QueryServerWriteTransaction<'_>),
+{
+    let mut txn = server.write(ct).await.unwrap();
+    f(&mut txn);
+    txn.commit().expect("failed to commit");
+}
+
+/// Apply the changes of `from` to the IDM server `to` and commit through the IDM
+/// layer, so that the post commit reloads run as on a real consumer.
+async fn repl_incremental_idm(from: &QueryServer, to: &IdmServer, ct: Duration) {
+    let mut from_txn = from.read().await.unwrap();
+    let mut to_txn = to.proxy_write(ct).await.unwrap();
+    repl_incremental(&mut from_txn, &mut to_txn.qs_write);
+    to_txn
+        .commit()
+        .expect("failed to commit replicated changes");
+}
+
+/// Kubidm: incremental replication of an OAuth2 federation create, modify and delete
+/// reloads the client providers on the consumer, without a restart.
+#[qs_pair_test]
+async fn test_repl_increment_oauth2_federation_reload(
+    server_a: &QueryServer,
+    server_b: &QueryServer,
+) {
+    let ct = duration_from_epoch_now();
+
+    let mut server_a_txn = server_a.write(ct).await.unwrap();
+    let mut server_b_txn = server_b.read().await.unwrap();
+    assert!(repl_initialise(&mut server_b_txn, &mut server_a_txn)
+        .and_then(|_| server_a_txn.commit())
+        .is_ok());
+    drop(server_b_txn);
+
+    let (idms_a, _idms_a_delayed, _idms_a_audit) = IdmServer::new(
+        server_a.clone(),
+        &Url::parse("https://idm.example.com").unwrap(),
+        true,
+        ct,
+    )
+    .await
+    .expect("failed to start the consumer idm server");
+
+    let fed_uuid = Uuid::new_v4();
+    repl_qs_write(server_b, ct, |txn| {
+        txn.internal_create(vec![repl_federation_entry(
+            fed_uuid,
+            "repl_federation",
+            "manual",
+        )])
+        .expect("failed to create federation");
+    })
+    .await;
+
+    repl_incremental_idm(server_b, &idms_a, ct).await;
+    {
+        let idms_prox_read = idms_a.proxy_write(ct).await.unwrap();
+        let provider = idms_prox_read
+            .oauth2_client_providers
+            .get(&fed_uuid)
+            .expect("replicated federation not loaded on the consumer");
+        assert_eq!(provider.client_basic_secret, "secret");
+    }
+
+    // Rotate the secret.
+    repl_qs_write(server_b, ct, |txn| {
+        txn.internal_modify_uuid(
+            fed_uuid,
+            &ModifyList::new_purge_and_set(
+                Attribute::OAuth2ClientSecret,
+                Value::new_utf8s("rotated"),
+            ),
+        )
+        .expect("failed to rotate the federation secret");
+    })
+    .await;
+
+    repl_incremental_idm(server_b, &idms_a, ct).await;
+    {
+        let idms_prox_read = idms_a.proxy_write(ct).await.unwrap();
+        assert_eq!(
+            idms_prox_read
+                .oauth2_client_providers
+                .get(&fed_uuid)
+                .map(|p| p.client_basic_secret.as_str()),
+            Some("rotated")
+        );
+    }
+
+    // Delete it.
+    repl_qs_write(server_b, ct, |txn| {
+        txn.internal_delete_uuid(fed_uuid)
+            .expect("failed to delete the federation");
+    })
+    .await;
+
+    repl_incremental_idm(server_b, &idms_a, ct).await;
+    {
+        let idms_prox_read = idms_a.proxy_write(ct).await.unwrap();
+        assert!(idms_prox_read
+            .oauth2_client_providers
+            .get(&fed_uuid)
+            .is_none());
+    }
+}
+
+/// Kubidm: an invalid OAuth2 provider stored on the supplier does not block a refresh
+/// or incremental replication. The consumer skips it and loads the valid ones.
+#[qs_pair_test]
+async fn test_repl_oauth2_federation_invalid_does_not_block(
+    server_a: &QueryServer,
+    server_b: &QueryServer,
+) {
+    let ct = duration_from_epoch_now();
+    let good_uuid = Uuid::new_v4();
+    let bad_uuid = Uuid::new_v4();
+
+    repl_qs_write(server_b, ct, |txn| {
+        txn.internal_create(vec![
+            repl_federation_entry(good_uuid, "good_federation", "manual"),
+            repl_federation_entry(bad_uuid, "bad_federation", "auto"),
+        ])
+        .expect("the entries are schema valid");
+    })
+    .await;
+
+    let (idms_a, _idms_a_delayed, _idms_a_audit) = IdmServer::new(
+        server_a.clone(),
+        &Url::parse("https://idm.example.com").unwrap(),
+        true,
+        ct,
+    )
+    .await
+    .expect("failed to start the consumer idm server");
+
+    // A refresh marks every entry as changed, including the invalid provider.
+    {
+        let mut server_b_txn = server_b.read().await.unwrap();
+        let mut idms_prox_write = idms_a.proxy_write(ct).await.unwrap();
+        repl_initialise(&mut server_b_txn, &mut idms_prox_write.qs_write)
+            .expect("failed to apply the refresh");
+        idms_prox_write
+            .commit()
+            .expect("an invalid replicated provider must not block a refresh");
+    }
+
+    {
+        let idms_prox_read = idms_a.proxy_write(ct).await.unwrap();
+        assert!(idms_prox_read
+            .oauth2_client_providers
+            .get(&good_uuid)
+            .is_some());
+        assert!(idms_prox_read
+            .oauth2_client_providers
+            .get(&bad_uuid)
+            .is_none());
+    }
+
+    // Incremental replication of a newly invalid provider is skipped as well.
+    repl_qs_write(server_b, ct, |txn| {
+        txn.internal_modify_uuid(
+            good_uuid,
+            &ModifyList::new_purge_and_set(
+                Attribute::OAuth2LinkPolicy,
+                Value::new_iutf8("admin_approval"),
+            ),
+        )
+        .expect("the entry is schema valid");
+    })
+    .await;
+
+    repl_incremental_idm(server_b, &idms_a, ct).await;
+    {
+        let idms_prox_read = idms_a.proxy_write(ct).await.unwrap();
+        assert!(idms_prox_read
+            .oauth2_client_providers
+            .get(&good_uuid)
+            .is_none());
+    }
+}
+
+/// Kubidm: released versions accepted a `max_grant_duration` of 0. A group that holds it
+/// must replicate (incrementally and through a refresh) like any other, and stay modifiable
+/// on the consumer: only writing 0 anew is rejected.
+#[qs_pair_test]
+async fn test_repl_max_grant_duration_zero_replicates(
+    server_a: &QueryServer,
+    server_b: &QueryServer,
+) {
+    let ct = duration_from_epoch_now();
+    let mut server_a_txn = server_a.write(ct).await.unwrap();
+    let mut server_b_txn = server_b.read().await.unwrap();
+    assert!(repl_initialise(&mut server_b_txn, &mut server_a_txn)
+        .and_then(|_| server_a_txn.commit())
+        .is_ok());
+    drop(server_b_txn);
+
+    // On B, a group with a cap of 0 as a released version stored it.
+    let g_uuid = Uuid::new_v4();
+    let m_uuid = Uuid::new_v4();
+    let mut server_b_txn = server_b.write(ct).await.unwrap();
+    server_b_txn
+        .internal_create(vec![
+            entry_init!(
+                (Attribute::Class, EntryClass::Object.to_value()),
+                (Attribute::Class, EntryClass::Group.to_value()),
+                (Attribute::Class, EntryClass::TimeBoundedGrant.to_value()),
+                (Attribute::Name, Value::new_iname("testgroup_zero_cap")),
+                (Attribute::Uuid, Value::Uuid(g_uuid))
+            ),
+            entry_init!(
+                (Attribute::Class, EntryClass::Object.to_value()),
+                (Attribute::Class, EntryClass::Group.to_value()),
+                (
+                    Attribute::Name,
+                    Value::new_iname("testgroup_zero_cap_member")
+                ),
+                (Attribute::Uuid, Value::Uuid(m_uuid))
+            ),
+        ])
+        .expect("create");
+    let filt = filter!(f_eq(Attribute::Uuid, PartialValue::Uuid(g_uuid)));
+    let mut work_set = server_b_txn.internal_search_writeable(&filt).unwrap();
+    for (_, entry) in work_set.iter_mut() {
+        entry.set_ava(&Attribute::MaxGrantDuration, [Value::Uint32(0)]);
+    }
+    server_b_txn
+        .internal_apply_writable(work_set)
+        .expect("plant 0");
+    server_b_txn.commit().expect("commit");
+
+    // Incremental B -> A: the group arrives as is, not as a conflict.
+    let ct = duration_from_epoch_now();
+    let mut server_a_txn = server_a.write(ct).await.unwrap();
+    let mut server_b_txn = server_b.read().await.unwrap();
+    repl_incremental(&mut server_b_txn, &mut server_a_txn);
+    let group = server_a_txn
+        .internal_search_uuid(g_uuid)
+        .expect("group on A");
+    assert!(!group.attribute_equality(Attribute::Class, &EntryClass::Conflict.into()));
+    assert_eq!(
+        group.get_ava_single_uint32(Attribute::MaxGrantDuration),
+        Some(0)
+    );
+
+    // It can be modified on A.
+    server_a_txn
+        .internal_modify_uuid(
+            g_uuid,
+            &ModifyList::new_append(Attribute::Member, Value::ReferN(m_uuid)),
+        )
+        .expect("add a member on A");
+    server_a_txn.commit().expect("commit");
+    drop(server_b_txn);
+
+    // A refresh of A from B carries it too.
+    let ct = duration_from_epoch_now();
+    let mut server_a_txn = server_a.write(ct).await.unwrap();
+    let mut server_b_txn = server_b.read().await.unwrap();
+    assert!(repl_initialise(&mut server_b_txn, &mut server_a_txn).is_ok());
+    assert_eq!(
+        server_a_txn
+            .internal_search_uuid(g_uuid)
+            .expect("group on A")
+            .get_ava_single_uint32(Attribute::MaxGrantDuration),
+        Some(0)
+    );
+    server_a_txn.commit().expect("commit");
+}
+
+/// Kubidm: two approvers decide on the same approval request on different replicas within
+/// one replication interval. Both decisions reach both replicas (whichever direction
+/// replicates first), and the state recomputed from them is the same on both replicas,
+/// although neither replica stored it.
+#[qs_pair_test]
+async fn test_repl_increment_approval_decisions_union(
+    server_a: &QueryServer,
+    server_b: &QueryServer,
+) {
+    use kubidm_proto::v1::{
+        ApprovalDecisionAction, ApprovalDecisionRequest, ApprovalOperationType, ApprovalPattern,
+        ApprovalPolicyCreateRequest, ApprovalRequestState,
+    };
+
+    let ct = duration_from_epoch_now();
+    let mut server_a_txn = server_a.write(ct).await.unwrap();
+    let mut server_b_txn = server_b.read().await.unwrap();
+    assert!(repl_initialise(&mut server_b_txn, &mut server_a_txn)
+        .and_then(|_| server_a_txn.commit())
+        .is_ok());
+    drop(server_b_txn);
+
+    // A policy needing both of two persons, and a request from anonymous.
+    let mut server_a_txn = server_a.write(ct).await.unwrap();
+    let idm_admin = Identity::from_impersonate_entry_readwrite(
+        server_a_txn.internal_search_uuid(UUID_IDM_ADMIN).unwrap(),
+    );
+    let approver_one = Uuid::new_v4();
+    let approver_two = Uuid::new_v4();
+    for (uuid, name) in [
+        (approver_one, "approver_one"),
+        (approver_two, "approver_two"),
+    ] {
+        server_a_txn
+            .internal_create(vec![entry_init!(
+                (Attribute::Class, EntryClass::Object.to_value()),
+                (Attribute::Class, EntryClass::Account.to_value()),
+                (Attribute::Class, EntryClass::Person.to_value()),
+                (Attribute::Name, Value::new_iname(name)),
+                (Attribute::DisplayName, Value::new_utf8s(name)),
+                (Attribute::Uuid, Value::Uuid(uuid))
+            )])
+            .expect("failed to create approver");
+    }
+    let anon = Identity::from_impersonate_entry_readwrite(
+        server_a_txn.internal_search_uuid(UUID_ANONYMOUS).unwrap(),
+    );
+    server_a_txn
+        .approval_policy_create(
+            &idm_admin,
+            &ApprovalPolicyCreateRequest {
+                name: "repl_policy".to_string(),
+                description: None,
+                operation_types: vec![ApprovalOperationType::SchemaModify],
+                approvers: vec![approver_one, approver_two],
+                backup_approvers: vec![],
+                pattern: ApprovalPattern::All,
+                timeout_seconds: 3600,
+                escalation_timeout_seconds: None,
+            },
+        )
+        .expect("failed to create approval policy");
+    let request_uuid = server_a_txn
+        .approval_request_create(
+            &anon,
+            "repl_policy",
+            &ApprovalOperationType::SchemaModify,
+            UUID_IDM_ADMINS,
+            &BTreeMap::new(),
+            ct,
+        )
+        .expect("failed to create approval request");
+    server_a_txn.commit().expect("Failed to commit");
+
+    let mut server_a_txn = server_a.read().await.unwrap();
+    let mut server_b_txn = server_b.write(duration_from_epoch_now()).await.unwrap();
+    repl_incremental(&mut server_a_txn, &mut server_b_txn);
+    server_b_txn.commit().expect("Failed to commit");
+    drop(server_a_txn);
+
+    let approve = || ApprovalDecisionRequest {
+        action: ApprovalDecisionAction::Approve,
+        comment: None,
+    };
+
+    // One approves on A, the other on B, before either replicates.
+    let mut server_a_txn = server_a.write(duration_from_epoch_now()).await.unwrap();
+    let one = Identity::from_impersonate_entry_readwrite(
+        server_a_txn.internal_search_uuid(approver_one).unwrap(),
+    );
+    server_a_txn
+        .approval_request_decision(&one, request_uuid, approve(), ct)
+        .expect("failed to approve on A");
+    server_a_txn.commit().expect("Failed to commit");
+
+    let mut server_b_txn = server_b.write(duration_from_epoch_now()).await.unwrap();
+    let two = Identity::from_impersonate_entry_readwrite(
+        server_b_txn.internal_search_uuid(approver_two).unwrap(),
+    );
+    server_b_txn
+        .approval_request_decision(&two, request_uuid, approve(), ct)
+        .expect("failed to approve on B");
+    server_b_txn.commit().expect("Failed to commit");
+
+    // B -> A, then A -> B.
+    let mut server_a_txn = server_a.write(duration_from_epoch_now()).await.unwrap();
+    let mut server_b_txn = server_b.read().await.unwrap();
+    repl_incremental(&mut server_b_txn, &mut server_a_txn);
+    server_a_txn.commit().expect("Failed to commit");
+    drop(server_b_txn);
+
+    let mut server_a_txn = server_a.read().await.unwrap();
+    let mut server_b_txn = server_b.write(duration_from_epoch_now()).await.unwrap();
+    repl_incremental(&mut server_a_txn, &mut server_b_txn);
+    server_b_txn.commit().expect("Failed to commit");
+    drop(server_a_txn);
+
+    for (name, server) in [("A", server_a), ("B", server_b)] {
+        let mut txn = server.read().await.unwrap();
+        let records = txn
+            .internal_search(filter!(f_and!([
+                f_eq(Attribute::Class, EntryClass::ApprovalDecisionRecord.into()),
+                f_eq(
+                    Attribute::ApprovalRecordRequest,
+                    PartialValue::Refer(request_uuid)
+                )
+            ])))
+            .expect("failed to search decision records");
+        assert_eq!(
+            records.len(),
+            2,
+            "a concurrent decision was lost in replication on {name}"
+        );
+        let entry = txn.internal_search_uuid(request_uuid).unwrap();
+        // Neither replica saw both decisions when deciding, so neither stored "approved".
+        assert_eq!(
+            entry.get_ava_single_iutf8(Attribute::ApprovalState),
+            Some("pending")
+        );
+        let request = txn
+            .approval_request_get(&Identity::from_internal(), request_uuid)
+            .expect("failed to read approval request");
+        assert_eq!(request.state, ApprovalRequestState::Approved);
+        assert_eq!(request.decisions.len(), 2);
+    }
 }

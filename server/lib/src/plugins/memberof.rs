@@ -27,16 +27,38 @@ use time::OffsetDateTime;
 
 pub struct MemberOf;
 
+/// Tolerance applied by verify to time bounded grant boundaries, to absorb clock
+/// differences between when memberof was applied and when verify runs.
+const TIME_BOUNDED_VERIFY_GRACE: u64 = PURGE_FREQUENCY;
+
 fn has_time_bounded_member_attr(qs: &QueryServerWriteTransaction) -> bool {
     qs.get_schema()
         .get_attributes()
         .contains_key(&Attribute::TimeBoundedMemberAttr)
 }
 
+/// Kubidm: whether the time-bounded grants of `group` grant nothing because the group is
+/// high privilege: `idm_high_privilege` itself, or a group nested in it. Grants on such
+/// groups are refused when written (see `server::time_bounded`), but a group can become
+/// high privilege after grants on it were written, including grants that start later.
+/// Those are treated as inactive for as long as the group is high privilege, so that they
+/// can not bypass the approvals that high privilege membership is meant to require. They
+/// can still be revoked.
+pub(crate) fn time_bounded_grants_suppressed(group: &EntrySealedCommitted) -> bool {
+    group.get_uuid() == UUID_IDM_HIGH_PRIVILEGE
+        || group.attribute_equality(
+            Attribute::MemberOf,
+            &PartialValue::Refer(UUID_IDM_HIGH_PRIVILEGE),
+        )
+}
+
 fn get_valid_time_bounded_members(
     entry: &Arc<Entry<EntrySealed, EntryCommitted>>,
     now: OffsetDateTime,
 ) -> BTreeSet<Uuid> {
+    if time_bounded_grants_suppressed(entry) {
+        return BTreeSet::new();
+    }
     entry
         .get_ava_set(Attribute::TimeBoundedMemberAttr)
         .and_then(|vs| vs.as_time_bounded_member_set())
@@ -47,6 +69,30 @@ fn get_valid_time_bounded_members(
                 .collect()
         })
         .unwrap_or_default()
+}
+
+type TimeBoundedGrantKey = (Uuid, Option<OffsetDateTime>, OffsetDateTime);
+
+fn time_bounded_grants(entry: &EntrySealedCommitted) -> BTreeSet<TimeBoundedGrantKey> {
+    entry
+        .get_ava_set(Attribute::TimeBoundedMemberAttr)
+        .and_then(|vs| vs.as_time_bounded_member_set())
+        .map(|map| {
+            map.values()
+                .map(|m| (m.uuid, m.valid_from, m.valid_until))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn time_bounded_member_uuids<VALID, STATE>(
+    entry: &Entry<VALID, STATE>,
+) -> impl Iterator<Item = Uuid> + '_ {
+    entry
+        .get_ava_set(Attribute::TimeBoundedMemberAttr)
+        .and_then(|vs| vs.as_time_bounded_member_set())
+        .into_iter()
+        .flat_map(|map| map.keys().copied())
 }
 
 fn do_group_memberof(
@@ -82,6 +128,7 @@ fn do_group_memberof(
 
     let groups_with_valid_time_bounded: BTreeSet<Uuid> = groups
         .iter()
+        .filter(|g| !time_bounded_grants_suppressed(g))
         .filter_map(|g| {
             let time_bounded = g
                 .get_ava_set(Attribute::TimeBoundedMemberAttr)
@@ -479,6 +526,12 @@ fn apply_memberof(
                     (None, None) => {}
                 };
 
+                // Time bounded members inherit our memberof while their grant is
+                // valid. Validity is re-evaluated when the leaf/group is processed,
+                // so we include every grant here.
+                affected_uuids.extend(time_bounded_member_uuids(&pre));
+                affected_uuids.extend(time_bounded_member_uuids(&tgte));
+
                 // push the entries to pre/cand
                 changes.push((pre, tgte));
             } else {
@@ -515,6 +568,179 @@ fn apply_memberof(
 
     // ALL GROUP MOS + DMOS ARE NOW STABLE. We can update oul leaf entries as required.
     do_leaf_memberof(qs, all_affected_uuids)
+}
+
+/// For each candidate, the groups where it is a member *only* through a time bounded
+/// grant - that is, the group has a grant for it but does not list it in member or
+/// dynmember.
+fn time_bounded_only_memberships(
+    qs: &mut QueryServerWriteTransaction,
+    cand: &[EntryInvalidCommitted],
+) -> Result<BTreeMap<Uuid, BTreeSet<Uuid>>, OperationError> {
+    let mut time_bounded_only: BTreeMap<Uuid, BTreeSet<Uuid>> = BTreeMap::new();
+
+    if !has_time_bounded_member_attr(qs) {
+        return Ok(time_bounded_only);
+    }
+
+    let cand_uuids: BTreeSet<Uuid> = cand.iter().filter_map(|e| e.get_uuid()).collect();
+
+    if cand_uuids.is_empty() {
+        return Ok(time_bounded_only);
+    }
+
+    let groups = qs
+        .internal_search(filter!(f_and!([
+            f_eq(Attribute::Class, EntryClass::Group.into()),
+            FC::Or(
+                cand_uuids
+                    .iter()
+                    .map(|u| f_eq(
+                        Attribute::TimeBoundedMemberAttr,
+                        PartialValue::TimeBoundedMember(*u)
+                    ))
+                    .collect()
+            )
+        ])))
+        .inspect_err(|err| {
+            error!(?err, "internal search failure");
+        })?;
+
+    for group in groups.iter() {
+        let member_ref = group.get_ava_refer(Attribute::Member);
+        let dynmember_ref = group.get_ava_refer(Attribute::DynMember);
+
+        for member_uuid in time_bounded_member_uuids(group) {
+            let is_permanent = member_ref.is_some_and(|set| set.contains(&member_uuid))
+                || dynmember_ref.is_some_and(|set| set.contains(&member_uuid));
+
+            if !is_permanent && cand_uuids.contains(&member_uuid) {
+                time_bounded_only
+                    .entry(member_uuid)
+                    .or_default()
+                    .insert(group.get_uuid());
+            }
+        }
+    }
+
+    Ok(time_bounded_only)
+}
+
+/// Time bounded grants are only evaluated when memberof is applied, so a grant that
+/// expires or becomes active needs memberof to be recomputed at that point in time.
+/// This finds every time bounded member whose reflected direct membership disagrees
+/// with the validity of its grant at the transaction's current time, and recomputes
+/// memberof for those members. Returns the number of members that were recomputed.
+pub(crate) fn refresh_time_bounded_memberships(
+    qs: &mut QueryServerWriteTransaction,
+) -> Result<usize, OperationError> {
+    if !has_time_bounded_member_attr(qs) {
+        // Schema does not yet provide time bounded members, nothing to do.
+        return Ok(0);
+    }
+
+    let now = qs.get_curtime_odt();
+
+    let groups = qs
+        .internal_search(filter!(f_and!([
+            f_eq(Attribute::Class, EntryClass::Group.into()),
+            f_pres(Attribute::TimeBoundedMemberAttr)
+        ])))
+        .inspect_err(|err| {
+            error!(?err, "internal search failure");
+        })?;
+
+    // member uuid -> (group uuid -> should the member currently have this group as dmo)
+    let mut expected: BTreeMap<Uuid, BTreeMap<Uuid, bool>> = BTreeMap::new();
+
+    for group in groups.iter() {
+        let group_uuid = group.get_uuid();
+        let Some(grants) = group
+            .get_ava_set(Attribute::TimeBoundedMemberAttr)
+            .and_then(|vs| vs.as_time_bounded_member_set())
+        else {
+            continue;
+        };
+
+        let member_ref = group.get_ava_refer(Attribute::Member);
+        let dynmember_ref = group.get_ava_refer(Attribute::DynMember);
+        let suppressed = time_bounded_grants_suppressed(group);
+
+        for grant in grants.values() {
+            // A permanent membership in the same group always takes precedence.
+            let is_member = (grant.is_valid_at(now) && !suppressed)
+                || member_ref.is_some_and(|set| set.contains(&grant.uuid))
+                || dynmember_ref.is_some_and(|set| set.contains(&grant.uuid));
+
+            expected
+                .entry(grant.uuid)
+                .or_default()
+                .insert(group_uuid, is_member);
+        }
+    }
+
+    if expected.is_empty() {
+        return Ok(0);
+    }
+
+    // Only load the members that could be stale. A member that should be in a group
+    // must be checked for the group being absent, so it is always loaded. A member that
+    // should not be in a group can only be stale if it still has that group as a direct
+    // memberof, which the index can answer for us. This keeps grants that expired long
+    // ago (or are far in the future) from loading their members on every refresh.
+    let member_filter: Vec<_> = expected
+        .iter()
+        .flat_map(|(member_uuid, groups)| {
+            let member_uuid = *member_uuid;
+            if groups.values().any(|is_member| *is_member) {
+                vec![f_eq(Attribute::Uuid, PartialValue::Uuid(member_uuid))]
+            } else {
+                groups
+                    .keys()
+                    .map(|group_uuid| {
+                        f_and(vec![
+                            f_eq(Attribute::Uuid, PartialValue::Uuid(member_uuid)),
+                            f_eq(Attribute::DirectMemberOf, PartialValue::Refer(*group_uuid)),
+                        ])
+                    })
+                    .collect()
+            }
+        })
+        .collect();
+
+    let members = qs
+        .internal_search(filter!(f_or(member_filter)))
+        .inspect_err(|err| {
+            error!(?err, "internal search failure");
+        })?;
+
+    let affected_uuids: BTreeSet<Uuid> = members
+        .iter()
+        .filter_map(|member| {
+            let member_uuid = member.get_uuid();
+            let groups = expected.get(&member_uuid)?;
+            let dmo = member.get_ava_refer(Attribute::DirectMemberOf);
+
+            let stale = groups.iter().any(|(group_uuid, is_member)| {
+                let reflected = dmo.is_some_and(|set| set.contains(group_uuid));
+                reflected != *is_member
+            });
+
+            stale.then_some(member_uuid)
+        })
+        .collect();
+
+    if affected_uuids.is_empty() {
+        trace!("time bounded memberships are up to date");
+        return Ok(0);
+    }
+
+    let changed = affected_uuids.len();
+    debug!(?affected_uuids, "refreshing time bounded memberships");
+
+    apply_memberof(qs, affected_uuids)?;
+
+    Ok(changed)
 }
 
 impl Plugin for MemberOf {
@@ -589,16 +815,32 @@ impl Plugin for MemberOf {
 
     #[instrument(level = "debug", name = "memberof_pre_delete", skip_all)]
     fn pre_delete(
-        _qs: &mut QueryServerWriteTransaction,
+        qs: &mut QueryServerWriteTransaction,
         cand: &mut Vec<EntryInvalidCommitted>,
         _de: &DeleteEvent,
     ) -> Result<(), OperationError> {
         // Ensure that when an entry is deleted, that we remove its memberof values,
         // and convert direct memberof to recycled direct memberof.
 
+        // Revive restores recycled direct memberships as permanent members, so any
+        // membership that only exists due to a time bounded grant must not be recorded,
+        // else a revive would turn a temporary grant into a permanent membership.
+        let time_bounded_only = time_bounded_only_memberships(qs, cand)?;
+
         for entry in cand.iter_mut() {
-            if let Some(direct_mo_vs) = entry.pop_ava(Attribute::DirectMemberOf) {
-                entry.set_ava_set(&Attribute::RecycledDirectMemberOf, direct_mo_vs);
+            if let Some(mut direct_mo_vs) = entry.pop_ava(Attribute::DirectMemberOf) {
+                let exclude = entry
+                    .get_uuid()
+                    .and_then(|uuid| time_bounded_only.get(&uuid));
+                if let (Some(exclude), Some(dmo_set)) = (exclude, direct_mo_vs.as_refer_set_mut()) {
+                    dmo_set.retain(|g| !exclude.contains(g));
+                }
+
+                if direct_mo_vs.is_empty() {
+                    entry.purge_ava(Attribute::RecycledDirectMemberOf);
+                } else {
+                    entry.set_ava_set(&Attribute::RecycledDirectMemberOf, direct_mo_vs);
+                }
             } else {
                 // Ensure it's empty
                 entry.purge_ava(Attribute::RecycledDirectMemberOf);
@@ -671,6 +913,28 @@ impl Plugin for MemberOf {
         // from the all_cand search.
         let mut direct_membership_map: BTreeMap<Uuid, BTreeSet<Uuid>> = Default::default();
 
+        // Time bounded grants are reflected according to their validity at the time
+        // memberof was last applied (a write, or the periodic refresh). That time is not
+        // the time of verification: refresh lags by up to PURGE_FREQUENCY, the server may
+        // have been stopped, and verify also runs on restored backups (backup verification
+        // and offline database verify) where no refresh happens at all. Checking that an
+        // expired grant is absent, or that a grant which became active is present, would
+        // falsely fail on all of these.
+        //
+        // What *is* sound is that memberof is never applied at a time after now. So:
+        // - a grant with no start that ends after now was valid at every point memberof
+        //   could have been applied, and the membership must be present.
+        // - a grant that starts after now can never have been valid when memberof was
+        //   applied, and the membership must be absent.
+        // Any other grant may legitimately be in either state. A grace period derived from
+        // the refresh interval absorbs clock adjustments between the writer and verify.
+        let now = OffsetDateTime::UNIX_EPOCH + duration_from_epoch_now();
+        let grace = std::time::Duration::from_secs(TIME_BOUNDED_VERIFY_GRACE);
+        let required_after = now + grace;
+
+        // Memberships that may be present or absent.
+        let mut time_bounded_membership_map: BTreeMap<Uuid, BTreeSet<Uuid>> = Default::default();
+
         let pv_class: PartialValue = EntryClass::Group.into();
 
         for entry in all_cand.iter() {
@@ -690,18 +954,47 @@ impl Plugin for MemberOf {
                         .get_ava_refer(Attribute::DynMember)
                         .into_iter()
                         .flat_map(|set| set.iter()),
-                )
-                .chain(
-                    entry
-                        .get_ava_set(Attribute::TimeBoundedMemberAttr)
-                        .and_then(|vs| vs.as_time_bounded_member_set())
-                        .into_iter()
-                        .flat_map(|map| map.keys()),
                 );
 
             for member_uuid in member_iter {
                 let member_groups = direct_membership_map.entry(*member_uuid).or_default();
                 member_groups.insert(group_uuid);
+            }
+
+            let grants = entry
+                .get_ava_set(Attribute::TimeBoundedMemberAttr)
+                .and_then(|vs| vs.as_time_bounded_member_set())
+                .into_iter()
+                .flat_map(|map| map.values());
+            // Kubidm: the grants of a high privilege group are inactive. A database written
+            // before they were may still reflect them, so they may be in either state.
+            let suppressed = time_bounded_grants_suppressed(entry);
+
+            for grant in grants {
+                match grant.valid_from {
+                    _ if suppressed => {
+                        time_bounded_membership_map
+                            .entry(grant.uuid)
+                            .or_default()
+                            .insert(group_uuid);
+                    }
+                    None if grant.valid_until > required_after => {
+                        // Must be present.
+                        direct_membership_map
+                            .entry(grant.uuid)
+                            .or_default()
+                            .insert(group_uuid);
+                    }
+                    Some(valid_from) if valid_from > required_after => {
+                        // Must be absent (unless a permanent membership requires it).
+                    }
+                    _ => {
+                        time_bounded_membership_map
+                            .entry(grant.uuid)
+                            .or_default()
+                            .insert(group_uuid);
+                    }
+                }
             }
         }
 
@@ -710,21 +1003,41 @@ impl Plugin for MemberOf {
             let uuid = e.get_uuid();
 
             let d_groups_set: Option<&BTreeSet<Uuid>> = direct_membership_map.get(&uuid);
+            let tb_groups_set: Option<&BTreeSet<Uuid>> = time_bounded_membership_map.get(&uuid);
 
             trace!(
-                "DMO search groups {:?} -> {:?}",
+                "DMO search groups {:?} -> {:?} (time bounded {:?})",
                 e.get_display_id(),
-                d_groups_set
+                d_groups_set,
+                tb_groups_set
             );
 
             // Remember, we only need to check direct memberships, because when memberof
             // it applies it clones dmo -> mo, so validation of all dmo sets implies mo is
             // valid (and a subset) of dmo.
 
-            match (e.get_ava_set(Attribute::DirectMemberOf), d_groups_set) {
+            // Disregard optional time bounded memberships in the entry's dmo that are not
+            // also required. What remains must exactly match the expected set.
+            let edmos = e.get_ava_set(Attribute::DirectMemberOf).map(|edmos| {
+                edmos.as_refer_set().map(|a| {
+                    a.iter()
+                        .filter(|g| {
+                            d_groups_set.is_some_and(|b| b.contains(g))
+                                || !tb_groups_set.is_some_and(|t| t.contains(g))
+                        })
+                        .copied()
+                        .collect::<BTreeSet<Uuid>>()
+                })
+            });
+            let edmos = match edmos {
+                Some(Some(a)) if a.is_empty() => None,
+                other => other,
+            };
+
+            match (edmos, d_groups_set) {
                 (Some(edmos), Some(b)) => {
                     // Can they both be reference sets?
-                    match edmos.as_refer_set() {
+                    match edmos {
                         Some(a) => {
                             let diff: Vec<_> = a.symmetric_difference(b).collect();
                             if !diff.is_empty() {
@@ -855,19 +1168,16 @@ impl MemberOf {
                 (None, None) => {}
             };
 
-            let pre_time_bounded: BTreeSet<Uuid> = pre
-                .get_ava_set(Attribute::TimeBoundedMemberAttr)
-                .and_then(|vs| vs.as_time_bounded_member_set())
-                .map(|map| map.keys().copied().collect())
-                .unwrap_or_default();
+            // Compare the full grant, not just the member uuid, so that a change to
+            // the validity window of an existing grant also recomputes memberof.
+            let pre_time_bounded = time_bounded_grants(pre);
+            let post_time_bounded = time_bounded_grants(post);
 
-            let post_time_bounded: BTreeSet<Uuid> = post
-                .get_ava_set(Attribute::TimeBoundedMemberAttr)
-                .and_then(|vs| vs.as_time_bounded_member_set())
-                .map(|map| map.keys().copied().collect())
-                .unwrap_or_default();
-
-            affected_uuids.extend(pre_time_bounded.symmetric_difference(&post_time_bounded));
+            affected_uuids.extend(
+                pre_time_bounded
+                    .symmetric_difference(&post_time_bounded)
+                    .map(|(uuid, _, _)| *uuid),
+            );
         }
 
         apply_memberof(qs, affected_uuids)
@@ -2407,6 +2717,526 @@ mod tests {
                     assert_eq!(members.len(), 1);
                 }
             );
+        }
+
+        const UUID_TB_USER: Uuid = uuid::uuid!("eeeeeeee-5b6e-4c4b-9b8e-6f6a3ad2c4a1");
+        const UUID_TB_D: Uuid = uuid::uuid!("dddddddd-2ab3-48e3-938d-1b4754cd2984");
+
+        fn tb_user() -> EntryInitNew {
+            entry_init!(
+                (Attribute::Class, EntryClass::Object.to_value()),
+                (Attribute::Class, EntryClass::Account.to_value()),
+                (Attribute::Class, EntryClass::Person.to_value()),
+                (Attribute::Name, Value::new_iname("testperson_tb")),
+                (Attribute::Uuid, Value::Uuid(UUID_TB_USER)),
+                (Attribute::Description, Value::new_utf8s("testperson_tb")),
+                (Attribute::DisplayName, Value::new_utf8s("testperson_tb"))
+            )
+        }
+
+        fn tb_grant(uuid: Uuid, valid_from: Option<Duration>, valid_until: Duration) -> Value {
+            Value::TimeBoundedMember(TimeBoundedMember::new(
+                uuid,
+                valid_from.map(|vf| OffsetDateTime::UNIX_EPOCH + vf),
+                OffsetDateTime::UNIX_EPOCH + valid_until,
+            ))
+        }
+
+        /// These tests move the transaction clock forward. The verify run at the end
+        /// of every qs_test uses the wall clock, and memberof is never applied after
+        /// "now", so the simulated clock must stay in the past of the wall clock.
+        fn past_base_time() -> Duration {
+            duration_from_epoch_now() - Duration::from_secs(86_400)
+        }
+
+        fn set_grant(
+            server_txn: &mut QueryServerWriteTransaction,
+            valid_from: Option<Duration>,
+            valid_until: Duration,
+        ) {
+            server_txn
+                .internal_modify(
+                    &filter!(f_eq(Attribute::Uuid, PartialValue::Uuid(UUID_TB_A))),
+                    &ModifyList::new_list(vec![
+                        Modify::Purged(Attribute::TimeBoundedMemberAttr),
+                        Modify::Present(
+                            Attribute::TimeBoundedMemberAttr,
+                            tb_grant(UUID_TB_USER, valid_from, valid_until),
+                        ),
+                    ]),
+                )
+                .unwrap();
+        }
+
+        /// Overwrite the user's direct memberof without running plugins, to simulate
+        /// a stale or corrupt memberof state.
+        fn force_user_dmo(server_txn: &mut QueryServerWriteTransaction, dmo: Option<Uuid>) {
+            let mut work_set = server_txn
+                .internal_search_writeable(&filter!(f_eq(
+                    Attribute::Uuid,
+                    PartialValue::Uuid(UUID_TB_USER)
+                )))
+                .unwrap();
+            for (_, entry) in work_set.iter_mut() {
+                entry.purge_ava(Attribute::MemberOf);
+                entry.purge_ava(Attribute::DirectMemberOf);
+                if let Some(g) = dmo {
+                    entry.add_ava(Attribute::MemberOf, Value::ReferN(g));
+                    entry.add_ava(Attribute::DirectMemberOf, Value::ReferN(g));
+                }
+            }
+            server_txn.internal_apply_writable(work_set).unwrap();
+        }
+
+        #[qs_test]
+        async fn test_refresh_time_bounded_grant_expires(server: &QueryServer) {
+            let ct = past_base_time();
+
+            let mut ea = EA_TB.clone();
+            ea.add_ava(
+                Attribute::TimeBoundedMemberAttr,
+                tb_grant(UUID_TB_USER, None, ct + Duration::from_secs(100)),
+            );
+
+            let mut server_txn = server.write(ct).await.unwrap();
+            server_txn.internal_create(vec![ea, tb_user()]).unwrap();
+            assert_memberof!(server_txn, UUID_TB_USER, UUID_TB_A);
+            assert_dirmemberof!(server_txn, UUID_TB_USER, UUID_TB_A);
+            // Still valid, nothing to refresh.
+            assert_eq!(server_txn.refresh_time_bounded_memberships(), Ok(0));
+            server_txn.commit().unwrap();
+
+            // The grant has expired, but until the refresh runs the membership is
+            // still reflected. Verify must tolerate this.
+            assert!(server.verify().await.is_empty());
+
+            let mut server_txn = server.write(ct + Duration::from_secs(200)).await.unwrap();
+            assert_memberof!(server_txn, UUID_TB_USER, UUID_TB_A);
+            assert_eq!(server_txn.refresh_time_bounded_memberships(), Ok(1));
+            assert_not_memberof!(server_txn, UUID_TB_USER, UUID_TB_A);
+            assert_not_dirmemberof!(server_txn, UUID_TB_USER, UUID_TB_A);
+            // Idempotent - a second refresh has nothing to do.
+            assert_eq!(server_txn.refresh_time_bounded_memberships(), Ok(0));
+            server_txn.commit().unwrap();
+        }
+
+        #[qs_test]
+        async fn test_refresh_time_bounded_grant_becomes_active(server: &QueryServer) {
+            let ct = past_base_time();
+
+            let mut ea = EA_TB.clone();
+            ea.add_ava(
+                Attribute::TimeBoundedMemberAttr,
+                tb_grant(
+                    UUID_TB_USER,
+                    Some(ct + Duration::from_secs(100)),
+                    ct + Duration::from_secs(1000),
+                ),
+            );
+
+            let mut server_txn = server.write(ct).await.unwrap();
+            server_txn.internal_create(vec![ea, tb_user()]).unwrap();
+            assert_not_memberof!(server_txn, UUID_TB_USER, UUID_TB_A);
+            server_txn.commit().unwrap();
+
+            // Not yet active.
+            let mut server_txn = server.write(ct + Duration::from_secs(50)).await.unwrap();
+            assert_eq!(server_txn.refresh_time_bounded_memberships(), Ok(0));
+            assert_not_memberof!(server_txn, UUID_TB_USER, UUID_TB_A);
+            server_txn.commit().unwrap();
+
+            let mut server_txn = server.write(ct + Duration::from_secs(200)).await.unwrap();
+            assert_eq!(server_txn.refresh_time_bounded_memberships(), Ok(1));
+            assert_memberof!(server_txn, UUID_TB_USER, UUID_TB_A);
+            assert_dirmemberof!(server_txn, UUID_TB_USER, UUID_TB_A);
+            assert_eq!(server_txn.refresh_time_bounded_memberships(), Ok(0));
+            server_txn.commit().unwrap();
+        }
+
+        #[qs_test]
+        async fn test_refresh_time_bounded_permanent_member_kept(server: &QueryServer) {
+            let ct = past_base_time();
+
+            // A permanent membership in the same group must survive grant expiry.
+            let mut ea = EA_TB.clone();
+            ea.add_ava(Attribute::Member, Value::ReferN(UUID_TB_USER));
+            ea.add_ava(
+                Attribute::TimeBoundedMemberAttr,
+                tb_grant(UUID_TB_USER, None, ct + Duration::from_secs(100)),
+            );
+
+            let mut server_txn = server.write(ct).await.unwrap();
+            server_txn.internal_create(vec![ea, tb_user()]).unwrap();
+            server_txn.commit().unwrap();
+
+            let mut server_txn = server.write(ct + Duration::from_secs(200)).await.unwrap();
+            assert_eq!(server_txn.refresh_time_bounded_memberships(), Ok(0));
+            assert_memberof!(server_txn, UUID_TB_USER, UUID_TB_A);
+            assert_dirmemberof!(server_txn, UUID_TB_USER, UUID_TB_A);
+            server_txn.commit().unwrap();
+        }
+
+        #[qs_test]
+        async fn test_modify_time_bounded_grant_window_recomputes(server: &QueryServer) {
+            let ct = past_base_time();
+
+            let mut ea = EA_TB.clone();
+            ea.add_ava(
+                Attribute::TimeBoundedMemberAttr,
+                tb_grant(UUID_TB_USER, None, ct + Duration::from_secs(1000)),
+            );
+
+            let mut server_txn = server.write(ct).await.unwrap();
+            server_txn.internal_create(vec![ea, tb_user()]).unwrap();
+            assert_memberof!(server_txn, UUID_TB_USER, UUID_TB_A);
+            server_txn.commit().unwrap();
+
+            let mut server_txn = server.write(ct + Duration::from_secs(20)).await.unwrap();
+
+            // Change only the end of the existing grant so it is already expired.
+            set_grant(&mut server_txn, None, ct + Duration::from_secs(10));
+            assert_not_memberof!(server_txn, UUID_TB_USER, UUID_TB_A);
+            assert_not_dirmemberof!(server_txn, UUID_TB_USER, UUID_TB_A);
+
+            // Extending the end restores the membership.
+            set_grant(&mut server_txn, None, ct + Duration::from_secs(5000));
+            assert_memberof!(server_txn, UUID_TB_USER, UUID_TB_A);
+            assert_dirmemberof!(server_txn, UUID_TB_USER, UUID_TB_A);
+
+            // Moving the start into the future removes it again.
+            set_grant(
+                &mut server_txn,
+                Some(ct + Duration::from_secs(100)),
+                ct + Duration::from_secs(5000),
+            );
+            assert_not_memberof!(server_txn, UUID_TB_USER, UUID_TB_A);
+            assert_not_dirmemberof!(server_txn, UUID_TB_USER, UUID_TB_A);
+
+            // And moving the start back into the past restores it.
+            set_grant(
+                &mut server_txn,
+                Some(ct + Duration::from_secs(10)),
+                ct + Duration::from_secs(5000),
+            );
+            assert_memberof!(server_txn, UUID_TB_USER, UUID_TB_A);
+            assert_dirmemberof!(server_txn, UUID_TB_USER, UUID_TB_A);
+            server_txn.commit().unwrap();
+        }
+
+        #[qs_test]
+        async fn test_time_bounded_grant_remove_and_readd(server: &QueryServer) {
+            let ct = past_base_time();
+
+            let mut ea = EA_TB.clone();
+            ea.add_ava(
+                Attribute::TimeBoundedMemberAttr,
+                tb_grant(UUID_TB_USER, None, ct + Duration::from_secs(1000)),
+            );
+
+            let mut server_txn = server.write(ct).await.unwrap();
+            server_txn.internal_create(vec![ea, tb_user()]).unwrap();
+            assert_memberof!(server_txn, UUID_TB_USER, UUID_TB_A);
+            server_txn.commit().unwrap();
+
+            let mut server_txn = server.write(ct + Duration::from_secs(10)).await.unwrap();
+            server_txn
+                .internal_modify(
+                    &filter!(f_eq(Attribute::Uuid, PartialValue::Uuid(UUID_TB_A))),
+                    &ModifyList::new_list(vec![Modify::Removed(
+                        Attribute::TimeBoundedMemberAttr,
+                        PartialValue::TimeBoundedMember(UUID_TB_USER),
+                    )]),
+                )
+                .unwrap();
+            assert_not_memberof!(server_txn, UUID_TB_USER, UUID_TB_A);
+            assert_not_dirmemberof!(server_txn, UUID_TB_USER, UUID_TB_A);
+            server_txn.commit().unwrap();
+
+            let mut server_txn = server.write(ct + Duration::from_secs(20)).await.unwrap();
+            server_txn
+                .internal_modify(
+                    &filter!(f_eq(Attribute::Uuid, PartialValue::Uuid(UUID_TB_A))),
+                    &ModifyList::new_list(vec![Modify::Present(
+                        Attribute::TimeBoundedMemberAttr,
+                        tb_grant(UUID_TB_USER, None, ct + Duration::from_secs(1000)),
+                    )]),
+                )
+                .unwrap();
+            assert_memberof!(server_txn, UUID_TB_USER, UUID_TB_A);
+            assert_dirmemberof!(server_txn, UUID_TB_USER, UUID_TB_A);
+            assert_eq!(server_txn.refresh_time_bounded_memberships(), Ok(0));
+            server_txn.commit().unwrap();
+        }
+
+        #[qs_test]
+        async fn test_revive_does_not_make_time_bounded_grant_permanent(server: &QueryServer) {
+            let ct = past_base_time();
+
+            // The user is a time bounded member of A and a permanent member of B.
+            let mut ea = EA_TB.clone();
+            ea.add_ava(
+                Attribute::TimeBoundedMemberAttr,
+                tb_grant(UUID_TB_USER, None, ct + Duration::from_secs(1000)),
+            );
+            let mut eb = EB_TB.clone();
+            eb.add_ava(Attribute::Member, Value::ReferN(UUID_TB_USER));
+
+            let mut server_txn = server.write(ct).await.unwrap();
+            server_txn.internal_create(vec![ea, eb, tb_user()]).unwrap();
+            assert_dirmemberof!(server_txn, UUID_TB_USER, UUID_TB_A);
+            assert_dirmemberof!(server_txn, UUID_TB_USER, UUID_TB_B);
+
+            server_txn
+                .internal_delete(&filter!(f_eq(
+                    Attribute::Uuid,
+                    PartialValue::Uuid(UUID_TB_USER)
+                )))
+                .unwrap();
+
+            let recycled = server_txn.internal_search_all_uuid(UUID_TB_USER).unwrap();
+            let rdmo = recycled
+                .get_ava_refer(Attribute::RecycledDirectMemberOf)
+                .expect("permanent membership was not recorded");
+            assert!(rdmo.contains(&UUID_TB_B));
+            assert!(!rdmo.contains(&UUID_TB_A));
+
+            server_txn.internal_revive_uuid(UUID_TB_USER).unwrap();
+
+            // The permanent membership is restored ...
+            assert_dirmemberof!(server_txn, UUID_TB_USER, UUID_TB_B);
+            // ... but the grant is neither restored nor converted to a membership.
+            assert_not_memberof!(server_txn, UUID_TB_USER, UUID_TB_A);
+            assert_not_dirmemberof!(server_txn, UUID_TB_USER, UUID_TB_A);
+            let group = server_txn.internal_search_uuid(UUID_TB_A).unwrap();
+            assert!(!group
+                .get_ava_refer(Attribute::Member)
+                .is_some_and(|set| set.contains(&UUID_TB_USER)));
+            assert!(group
+                .get_ava_set(Attribute::TimeBoundedMemberAttr)
+                .is_none());
+            server_txn.commit().unwrap();
+        }
+
+        #[qs_test]
+        async fn test_verify_time_bounded_required_membership(server: &QueryServer) {
+            let ct = past_base_time();
+            // A grant with no start that ends well after now must be reflected.
+            let far_future = duration_from_epoch_now() + Duration::from_secs(86_400 * 30);
+
+            let mut ea = EA_TB.clone();
+            ea.add_ava(
+                Attribute::TimeBoundedMemberAttr,
+                tb_grant(UUID_TB_USER, None, far_future),
+            );
+
+            let mut server_txn = server.write(ct).await.unwrap();
+            server_txn.internal_create(vec![ea, tb_user()]).unwrap();
+            assert_dirmemberof!(server_txn, UUID_TB_USER, UUID_TB_A);
+            force_user_dmo(&mut server_txn, None);
+            server_txn.commit().unwrap();
+
+            let errs = server.verify().await;
+            assert!(errs
+                .iter()
+                .any(|e| matches!(e, Err(ConsistencyError::MemberOfInvalid(_)))));
+
+            // The refresh repairs the missing membership.
+            let mut server_txn = server.write(ct + Duration::from_secs(1)).await.unwrap();
+            assert_eq!(server_txn.refresh_time_bounded_memberships(), Ok(1));
+            assert_dirmemberof!(server_txn, UUID_TB_USER, UUID_TB_A);
+            server_txn.commit().unwrap();
+
+            assert!(server.verify().await.is_empty());
+        }
+
+        #[qs_test]
+        async fn test_verify_time_bounded_forbidden_membership(server: &QueryServer) {
+            let ct = past_base_time();
+            // A grant that starts well after now can not be reflected.
+            let start = duration_from_epoch_now() + Duration::from_secs(86_400 * 30);
+
+            let mut ea = EA_TB.clone();
+            ea.add_ava(
+                Attribute::TimeBoundedMemberAttr,
+                tb_grant(
+                    UUID_TB_USER,
+                    Some(start),
+                    start + Duration::from_secs(86_400),
+                ),
+            );
+
+            let mut server_txn = server.write(ct).await.unwrap();
+            server_txn.internal_create(vec![ea, tb_user()]).unwrap();
+            assert_not_dirmemberof!(server_txn, UUID_TB_USER, UUID_TB_A);
+            force_user_dmo(&mut server_txn, Some(UUID_TB_A));
+            server_txn.commit().unwrap();
+
+            let errs = server.verify().await;
+            assert!(errs
+                .iter()
+                .any(|e| matches!(e, Err(ConsistencyError::MemberOfInvalid(_)))));
+
+            // The refresh removes the premature membership.
+            let mut server_txn = server.write(ct + Duration::from_secs(1)).await.unwrap();
+            assert_eq!(server_txn.refresh_time_bounded_memberships(), Ok(1));
+            assert_not_dirmemberof!(server_txn, UUID_TB_USER, UUID_TB_A);
+            server_txn.commit().unwrap();
+
+            assert!(server.verify().await.is_empty());
+        }
+
+        #[qs_test]
+        async fn test_refresh_skips_long_expired_grants(server: &QueryServer) {
+            let ct = past_base_time();
+
+            let mut ea = EA_TB.clone();
+            ea.add_ava(
+                Attribute::TimeBoundedMemberAttr,
+                tb_grant(UUID_TB_USER, None, ct + Duration::from_secs(100)),
+            );
+
+            let mut server_txn = server.write(ct).await.unwrap();
+            server_txn.internal_create(vec![ea, tb_user()]).unwrap();
+            server_txn.commit().unwrap();
+
+            // Expire, refresh, then refresh again much later - the expired grant has
+            // nothing left to do.
+            let mut server_txn = server.write(ct + Duration::from_secs(200)).await.unwrap();
+            assert_eq!(server_txn.refresh_time_bounded_memberships(), Ok(1));
+            server_txn.commit().unwrap();
+
+            let mut server_txn = server.write(ct + Duration::from_secs(5000)).await.unwrap();
+            assert_eq!(server_txn.refresh_time_bounded_memberships(), Ok(0));
+            assert_not_dirmemberof!(server_txn, UUID_TB_USER, UUID_TB_A);
+
+            // But a stale membership for a long expired grant is still repaired.
+            force_user_dmo(&mut server_txn, Some(UUID_TB_A));
+            assert_eq!(server_txn.refresh_time_bounded_memberships(), Ok(1));
+            assert_not_dirmemberof!(server_txn, UUID_TB_USER, UUID_TB_A);
+            server_txn.commit().unwrap();
+        }
+
+        #[qs_test]
+        async fn test_delete_member_removes_time_bounded_grant(server: &QueryServer) {
+            let ct = past_base_time();
+
+            let mut ea = EA_TB.clone();
+            ea.add_ava(
+                Attribute::TimeBoundedMemberAttr,
+                tb_grant(UUID_TB_USER, None, ct + Duration::from_secs(1000)),
+            );
+            ea.add_ava(
+                Attribute::TimeBoundedMemberAttr,
+                tb_grant(UUID_TB_B, None, ct + Duration::from_secs(1000)),
+            );
+
+            let mut server_txn = server.write(ct).await.unwrap();
+            server_txn
+                .internal_create(vec![ea, EB_TB.clone(), tb_user()])
+                .unwrap();
+            assert_memberof!(server_txn, UUID_TB_USER, UUID_TB_A);
+
+            server_txn
+                .internal_delete(&filter!(f_eq(
+                    Attribute::Uuid,
+                    PartialValue::Uuid(UUID_TB_USER)
+                )))
+                .unwrap();
+
+            let group = server_txn.internal_search_uuid(UUID_TB_A).unwrap();
+            let grants = group
+                .get_ava_as_time_bounded_member(Attribute::TimeBoundedMemberAttr)
+                .expect("remaining grant was removed");
+            assert!(!grants.contains_key(&UUID_TB_USER));
+            assert!(grants.contains_key(&UUID_TB_B));
+
+            server_txn
+                .internal_delete(&filter!(f_eq(
+                    Attribute::Uuid,
+                    PartialValue::Uuid(UUID_TB_B)
+                )))
+                .unwrap();
+
+            let group = server_txn.internal_search_uuid(UUID_TB_A).unwrap();
+            assert!(group
+                .get_ava_set(Attribute::TimeBoundedMemberAttr)
+                .is_none());
+            server_txn.commit().unwrap();
+        }
+
+        #[qs_test]
+        async fn test_create_time_bounded_grant_missing_member(server: &QueryServer) {
+            let ct = past_base_time();
+
+            let mut ea = EA_TB.clone();
+            ea.add_ava(
+                Attribute::TimeBoundedMemberAttr,
+                tb_grant(UUID_TB_USER, None, ct + Duration::from_secs(1000)),
+            );
+
+            let mut server_txn = server.write(ct).await.unwrap();
+            assert_eq!(
+                server_txn.internal_create(vec![ea]),
+                Err(OperationError::Plugin(PluginError::ReferentialIntegrity(
+                    "Uuid referenced not found in database".to_string()
+                )))
+            );
+        }
+
+        #[qs_test]
+        async fn test_time_bounded_child_inherits_parent_memberof(server: &QueryServer) {
+            let ct = past_base_time();
+
+            // D -member-> A -time bounded-> C -member-> user
+            let mut ea = EA_TB.clone();
+            ea.add_ava(
+                Attribute::TimeBoundedMemberAttr,
+                tb_grant(UUID_TB_C, None, ct + Duration::from_secs(100)),
+            );
+            let mut ec = EC_TB.clone();
+            ec.add_ava(Attribute::Member, Value::ReferN(UUID_TB_USER));
+            let ed = entry_init_fn([
+                (Attribute::Class, EntryClass::Group.to_value()),
+                (Attribute::Class, EntryClass::MemberOf.to_value()),
+                (Attribute::Name, Value::new_iname("testgroup_tb_d")),
+                (Attribute::Uuid, Value::Uuid(UUID_TB_D)),
+            ]);
+
+            let mut server_txn = server.write(ct).await.unwrap();
+            server_txn
+                .internal_create(vec![ea, ec, ed, tb_user()])
+                .unwrap();
+            assert_memberof!(server_txn, UUID_TB_C, UUID_TB_A);
+            assert_memberof!(server_txn, UUID_TB_USER, UUID_TB_A);
+            assert_not_memberof!(server_txn, UUID_TB_C, UUID_TB_D);
+
+            // A's memberof changes, which must propagate to its time bounded members.
+            server_txn
+                .internal_modify(
+                    &filter!(f_eq(Attribute::Uuid, PartialValue::Uuid(UUID_TB_D))),
+                    &ModifyList::new_list(vec![Modify::Present(
+                        Attribute::Member,
+                        Value::ReferN(UUID_TB_A),
+                    )]),
+                )
+                .unwrap();
+            assert_memberof!(server_txn, UUID_TB_A, UUID_TB_D);
+            assert_memberof!(server_txn, UUID_TB_C, UUID_TB_D);
+            assert_not_dirmemberof!(server_txn, UUID_TB_C, UUID_TB_D);
+            assert_memberof!(server_txn, UUID_TB_USER, UUID_TB_D);
+            server_txn.commit().unwrap();
+
+            // Once the grant expires, the child group and its members lose the
+            // parent's memberships.
+            let mut server_txn = server.write(ct + Duration::from_secs(200)).await.unwrap();
+            assert_eq!(server_txn.refresh_time_bounded_memberships(), Ok(1));
+            assert_not_memberof!(server_txn, UUID_TB_C, UUID_TB_A);
+            assert_not_memberof!(server_txn, UUID_TB_C, UUID_TB_D);
+            assert_not_memberof!(server_txn, UUID_TB_USER, UUID_TB_A);
+            assert_not_memberof!(server_txn, UUID_TB_USER, UUID_TB_D);
+            assert_memberof!(server_txn, UUID_TB_USER, UUID_TB_C);
+            assert_eq!(server_txn.refresh_time_bounded_memberships(), Ok(0));
+            server_txn.commit().unwrap();
         }
     }
 }

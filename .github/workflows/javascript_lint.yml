@@ -72,7 +72,7 @@ jobs:
         run: pnpm exec playwright install --with-deps chromium firefox webkit
       - name: Start debug UI Lab server
         run: |
-          ./server/daemon/run_insecure_dev_server.sh \
+          ./scripts/run_insecure_dev_server.sh \
             > /tmp/kubidm-guide-server.log 2>&1 &
           echo $! > /tmp/kubidm-guide-server.pid
           for attempt in $(seq 1 300); do

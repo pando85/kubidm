@@ -8,6 +8,7 @@ use super::{
 };
 use crate::prelude::*;
 use std::{collections::BTreeSet, ops::Sub};
+use time::OffsetDateTime;
 
 pub enum CreateResult<'a> {
     Deny,
@@ -15,10 +16,6 @@ pub enum CreateResult<'a> {
     Allow {
         pres: BTreeSet<Attribute>,
         pres_cls: BTreeSet<&'a str>,
-    },
-    #[allow(dead_code)]
-    ReauthRequired {
-        reason: String,
     },
 }
 
@@ -36,6 +33,7 @@ pub(super) fn apply_create_access<'a>(
     ident: &Identity,
     related_acp: &'a [AccessControlCreateResolved],
     entry: &'a Entry<EntryInit, EntryNew>,
+    current_time: OffsetDateTime,
 ) -> CreateResult<'a> {
     let mut denied = false;
     let mut grant = false;
@@ -78,7 +76,7 @@ pub(super) fn apply_create_access<'a>(
         }
     }
 
-    match create_filter_entry(ident, related_acp, entry) {
+    match create_filter_entry(ident, related_acp, entry, current_time) {
         IResult::Deny => denied = true,
         IResult::Grant => grant = true,
         IResult::Ignore => {}
@@ -127,6 +125,7 @@ fn create_filter_entry<'a>(
     ident: &Identity,
     related_acp: &'a [AccessControlCreateResolved],
     entry: &'a Entry<EntryInit, EntryNew>,
+    current_time: OffsetDateTime,
 ) -> IResult<'a> {
     match &ident.origin {
         IdentType::Internal(InternalRole::System) => {
@@ -225,9 +224,6 @@ fn create_filter_entry<'a>(
                 // Currently, this is unsatisfiable for creates.
                 return false;
             }
-            AccessControlReceiverCondition::Delegated { .. } => {
-                // Delegated access is handled at filter resolution time
-            }
         };
 
         match &accr.target_condition {
@@ -238,15 +234,13 @@ fn create_filter_entry<'a>(
                     return false;
                 }
             }
-            AccessControlTargetCondition::DelegatedScope { .. } => {
-                // Delegated scope is handled at filter resolution time
-            }
         };
 
         // Check time restrictions
         if !check_time_restriction(
             accr.acp.acp.time_restriction_start,
             accr.acp.acp.time_restriction_end,
+            current_time,
         ) {
             debug!(entry = ?entry.get_display_id(), accr = %accr.acp.acp.name, "time restriction not satisfied");
             return false;
@@ -566,7 +560,12 @@ mod tests {
         let ident = Identity::from_internal();
         let entry = make_entry_with_class("account");
         let acps: Vec<AccessControlCreateResolved> = vec![];
-        let result = create_filter_entry(&ident, &acps, &entry);
+        let result = create_filter_entry(
+            &ident,
+            &acps,
+            &entry,
+            OffsetDateTime::UNIX_EPOCH + duration_from_epoch_now(),
+        );
         match result {
             IResult::Grant => {}
             _ => panic!("Expected Grant for internal system"),
@@ -578,7 +577,12 @@ mod tests {
         let ident = make_user_ident_ro();
         let entry = make_entry_with_class("account");
         let acps: Vec<AccessControlCreateResolved> = vec![];
-        let result = create_filter_entry(&ident, &acps, &entry);
+        let result = create_filter_entry(
+            &ident,
+            &acps,
+            &entry,
+            OffsetDateTime::UNIX_EPOCH + duration_from_epoch_now(),
+        );
         match result {
             IResult::Deny => {}
             _ => panic!("Expected Deny for read-only identity"),
@@ -590,7 +594,12 @@ mod tests {
         let ident = make_user_ident_rw();
         let entry = make_entry_with_class("account");
         let acps: Vec<AccessControlCreateResolved> = vec![];
-        let result = create_filter_entry(&ident, &acps, &entry);
+        let result = create_filter_entry(
+            &ident,
+            &acps,
+            &entry,
+            OffsetDateTime::UNIX_EPOCH + duration_from_epoch_now(),
+        );
         match result {
             IResult::Ignore => {}
             _ => panic!("Expected Ignore for user with no ACPs"),
@@ -602,7 +611,12 @@ mod tests {
         let ident = Identity::from_internal();
         let entry = make_entry_with_class("account");
         let acps: Vec<AccessControlCreateResolved> = vec![];
-        let result = apply_create_access(&ident, &acps, &entry);
+        let result = apply_create_access(
+            &ident,
+            &acps,
+            &entry,
+            OffsetDateTime::UNIX_EPOCH + duration_from_epoch_now(),
+        );
         match result {
             CreateResult::Grant => {}
             _ => panic!("Expected Grant for internal system"),
@@ -614,7 +628,12 @@ mod tests {
         let ident = make_user_ident_rw();
         let entry = make_entry_with_class("account");
         let acps: Vec<AccessControlCreateResolved> = vec![];
-        let result = apply_create_access(&ident, &acps, &entry);
+        let result = apply_create_access(
+            &ident,
+            &acps,
+            &entry,
+            OffsetDateTime::UNIX_EPOCH + duration_from_epoch_now(),
+        );
         match result {
             CreateResult::Allow { pres, pres_cls } => {
                 assert!(pres.is_empty());
@@ -629,7 +648,12 @@ mod tests {
         let ident = make_user_ident_rw();
         let entry = make_entry_with_class("system");
         let acps: Vec<AccessControlCreateResolved> = vec![];
-        let result = apply_create_access(&ident, &acps, &entry);
+        let result = apply_create_access(
+            &ident,
+            &acps,
+            &entry,
+            OffsetDateTime::UNIX_EPOCH + duration_from_epoch_now(),
+        );
         match result {
             CreateResult::Deny => {}
             _ => panic!("Expected Deny for protected class"),
@@ -641,7 +665,12 @@ mod tests {
         let ident = make_user_ident_rw();
         let entry = make_entry_with_class_and_uuid("account", UUID_ANONYMOUS);
         let acps: Vec<AccessControlCreateResolved> = vec![];
-        let result = apply_create_access(&ident, &acps, &entry);
+        let result = apply_create_access(
+            &ident,
+            &acps,
+            &entry,
+            OffsetDateTime::UNIX_EPOCH + duration_from_epoch_now(),
+        );
         match result {
             CreateResult::Deny => {}
             _ => panic!("Expected Deny for system UUID"),
@@ -653,7 +682,12 @@ mod tests {
         let ident = Identity::migration();
         let entry = make_entry_with_class("account");
         let acps: Vec<AccessControlCreateResolved> = vec![];
-        let result = apply_create_access(&ident, &acps, &entry);
+        let result = apply_create_access(
+            &ident,
+            &acps,
+            &entry,
+            OffsetDateTime::UNIX_EPOCH + duration_from_epoch_now(),
+        );
         match result {
             CreateResult::Allow { pres, .. } => {
                 assert!(!pres.is_empty());

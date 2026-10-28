@@ -32,9 +32,10 @@ use kubidm_proto::{
     },
     v1::{
         AccountUnixExtend, ApiTokenGenerate, ApprovalDecisionRequest, ApprovalPolicy,
-        ApprovalPolicyCreateRequest, ApprovalRequest, AuthIssueSession, AuthRequest, AuthResponse,
-        AuthState as ProtoAuthState, Entry as ProtoEntry, GroupUnixExtend, SingleStringRequest,
-        UatStatus, UnixGroupToken, UnixUserToken, WhoamiResponse,
+        ApprovalPolicyCreateRequest, ApprovalRequest, ApprovalRequestCreateRequest,
+        AuthIssueSession, AuthRequest, AuthResponse, AuthState as ProtoAuthState,
+        Entry as ProtoEntry, GroupUnixExtend, SingleStringRequest, TimeBoundedMemberGrant,
+        TimeBoundedMemberGrantRequest, UatStatus, UnixGroupToken, UnixUserToken, WhoamiResponse,
     },
 };
 use kubidmd_lib::{
@@ -2452,6 +2453,86 @@ pub async fn group_id_unix_token_get(
         .map_err(WebError::from)
 }
 
+/// Kubidm: grant a time-bounded membership of a group, replacing any existing grant of the
+/// same member. The group must have the `time_bounded_grant` class, and the caller must be
+/// allowed to modify the members of the group.
+#[utoipa::path(
+    post,
+    path = "/v1/group/{id}/_time_bounded_member",
+    request_body = TimeBoundedMemberGrantRequest,
+    responses(
+        DefaultApiResponse,
+    ),
+    security(("token_jwt" = [])),
+    tag = "group",
+    operation_id = "group_id_time_bounded_member_post",
+)]
+pub async fn group_id_time_bounded_member_post(
+    State(state): State<ServerState>,
+    Path(id): Path<String>,
+    Extension(kopid): Extension<KOpId>,
+    VerifiedClientInformation(client_auth_info): VerifiedClientInformation,
+    Json(request): Json<TimeBoundedMemberGrantRequest>,
+) -> Result<Json<()>, WebError> {
+    state
+        .qe_w_ref
+        .handle_group_time_bounded_member_grant(client_auth_info, id, request, kopid.eventid)
+        .await
+        .map(Json::from)
+        .map_err(WebError::from)
+}
+
+/// Kubidm: list the time-bounded membership grants of a group.
+#[utoipa::path(
+    get,
+    path = "/v1/group/{id}/_time_bounded_member",
+    responses(
+        (status=200, body=Vec<TimeBoundedMemberGrant>, content_type=APPLICATION_JSON),
+        ApiResponseWithout200,
+    ),
+    security(("token_jwt" = [])),
+    tag = "group",
+    operation_id = "group_id_time_bounded_member_get",
+)]
+pub async fn group_id_time_bounded_member_get(
+    State(state): State<ServerState>,
+    Path(id): Path<String>,
+    Extension(kopid): Extension<KOpId>,
+    VerifiedClientInformation(client_auth_info): VerifiedClientInformation,
+) -> Result<Json<Vec<TimeBoundedMemberGrant>>, WebError> {
+    state
+        .qe_r_ref
+        .handle_group_time_bounded_member_list(client_auth_info, id, kopid.eventid)
+        .await
+        .map(Json::from)
+        .map_err(WebError::from)
+}
+
+/// Kubidm: revoke the time-bounded membership grant of a member of a group.
+#[utoipa::path(
+    delete,
+    path = "/v1/group/{id}/_time_bounded_member/{member}",
+    responses(
+        DefaultApiResponse,
+    ),
+    security(("token_jwt" = [])),
+    tag = "group",
+    operation_id = "group_id_time_bounded_member_delete",
+)]
+pub async fn group_id_time_bounded_member_delete(
+    State(state): State<ServerState>,
+    Path((id, member)): Path<(String, String)>,
+    Extension(kopid): Extension<KOpId>,
+    VerifiedClientInformation(client_auth_info): VerifiedClientInformation,
+) -> Result<Json<()>, WebError> {
+    state
+        .qe_w_ref
+        .handle_group_time_bounded_member_revoke(client_auth_info, id, member, kopid.eventid)
+        .await
+        .map(Json::from)
+        .map_err(WebError::from)
+}
+
 #[utoipa::path(
     get,
     path = "/v1/domain",
@@ -3135,17 +3216,18 @@ pub(crate) fn route_setup(state: ServerState) -> Router<ServerState> {
             "/v1/oauth2/{rs_name}/_claimmap/{claim_name}",
             post(super::v1_oauth2::oauth2_id_claimmap_join_post),
         )
+        // Kubidm: OAuth2 federation. Not under /v1/oauth2, where it would shadow an
+        // OAuth2 resource server named "federation".
         .route(
-            "/v1/oauth2/federation",
-            get(super::v1_oauth2_federation::oauth2_federation_get),
+            "/v1/federation/oauth2",
+            get(super::v1_oauth2_federation::oauth2_federation_get)
+                .post(super::v1_oauth2_federation::oauth2_federation_post),
         )
         .route(
-            "/v1/oauth2/federation/_create",
-            post(super::v1_oauth2_federation::oauth2_federation_post),
-        )
-        .route(
-            "/v1/oauth2/federation/{name}",
-            get(super::v1_oauth2_federation::oauth2_federation_id_get),
+            "/v1/federation/oauth2/{name}",
+            get(super::v1_oauth2_federation::oauth2_federation_id_get)
+                .patch(super::v1_oauth2_federation::oauth2_federation_id_patch)
+                .delete(super::v1_oauth2_federation::oauth2_federation_id_delete),
         )
         .route("/v1/raw/create", post(raw_create))
         .route("/v1/raw/modify", post(raw_modify))
@@ -3326,6 +3408,15 @@ pub(crate) fn route_setup(state: ServerState) -> Router<ServerState> {
         )
         .route("/v1/group/{id}/_unix/_token", get(group_id_unix_token_get))
         .route("/v1/group/{id}/_unix", post(group_id_unix_post))
+        // Kubidm: time-bounded membership grants.
+        .route(
+            "/v1/group/{id}/_time_bounded_member",
+            get(group_id_time_bounded_member_get).post(group_id_time_bounded_member_post),
+        )
+        .route(
+            "/v1/group/{id}/_time_bounded_member/{member}",
+            delete(group_id_time_bounded_member_delete),
+        )
         .route("/v1/group", get(group_get).post(group_post))
         .route("/v1/group/_search/{id}", get(group_search_id))
         .route(
@@ -3372,7 +3463,10 @@ pub(crate) fn route_setup(state: ServerState) -> Router<ServerState> {
             "/v1/approval/policy/{name}/_disable",
             post(approval_policy_disable),
         )
-        .route("/v1/approval/request", get(approval_request_list))
+        .route(
+            "/v1/approval/request",
+            get(approval_request_list).post(approval_request_create),
+        )
         .route(
             "/v1/approval/request/{uuid}",
             get(approval_request_get).delete(approval_request_cancel),
@@ -3581,6 +3675,35 @@ pub async fn approval_request_get(
     state
         .qe_r_ref
         .handle_approval_request_get(client_auth_info, uuid, kopid.eventid)
+        .await
+        .map(Json::from)
+        .map_err(WebError::from)
+}
+
+/// Create an approval request as the calling identity. Returns the uuid of the request.
+#[utoipa::path(
+    post,
+    path = "/v1/approval/request",
+    responses(
+        (status = 200, body=Uuid, content_type=APPLICATION_JSON),
+        (status = 404, description = "Unknown approval policy or target"),
+        (status = 422, description = "The policy can never be satisfied for this requester"),
+        ApiResponseWithout200,
+    ),
+    request_body=ApprovalRequestCreateRequest,
+    security(("token_jwt" = [])),
+    tag = "approval",
+    operation_id="approval_request_create"
+)]
+pub async fn approval_request_create(
+    State(state): State<ServerState>,
+    Extension(kopid): Extension<KOpId>,
+    VerifiedClientInformation(client_auth_info): VerifiedClientInformation,
+    Json(request): Json<kubidm_proto::v1::ApprovalRequestCreateRequest>,
+) -> Result<Json<Uuid>, WebError> {
+    state
+        .qe_w_ref
+        .handle_approval_request_create(client_auth_info, request, kopid.eventid)
         .await
         .map(Json::from)
         .map_err(WebError::from)

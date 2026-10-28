@@ -602,6 +602,9 @@ pub struct ServerConfig {
     otel_grpc_endpoint: Option<String>,
     /// Policy Information Point (PIP) configuration for external attribute retrieval.
     /// See [kubidmd_lib::idm::pip::config::PipConfig] for details.
+    ///
+    /// NOTE: PIP is not yet integrated into access decisions; this is parsed but
+    /// ignored (a warning is logged at startup).
     #[serde(default)]
     pip_config: Option<kubidmd_lib::idm::pip::config::PipConfig>,
 }
@@ -693,6 +696,9 @@ pub struct ServerConfigV2 {
     repl_config: Option<ReplicationConfiguration>,
     otel_grpc_endpoint: Option<String>,
     /// Policy Information Point (PIP) configuration for external attribute retrieval.
+    ///
+    /// NOTE: PIP is not yet integrated into access decisions; this is parsed but
+    /// ignored (a warning is logged at startup).
     #[serde(default)]
     pip_config: Option<kubidmd_lib::idm::pip::config::PipConfig>,
 }
@@ -746,10 +752,21 @@ pub struct Configuration {
     pub integration_repl_config: Option<Box<IntegrationReplConfig>>,
     pub otel_grpc_endpoint: Option<String>,
     /// Policy Information Point (PIP) configuration for external attribute retrieval.
+    /// Not yet used: see [`Configuration::pip_config_ignored_warning`].
     pub pip_config: Option<kubidmd_lib::idm::pip::config::PipConfig>,
 }
 
 impl Configuration {
+    /// Warning to log at startup when `pip_config` is set: the Policy Information
+    /// Point framework is not yet wired into access decisions, so the
+    /// configuration has no effect.
+    pub fn pip_config_ignored_warning(&self) -> Option<&'static str> {
+        self.pip_config.as_ref().map(|_| {
+            "pip_config is set, but the Policy Information Point (PIP) framework is not yet \
+             integrated into access decisions: this configuration is ignored"
+        })
+    }
+
     pub fn build() -> ConfigurationBuilder {
         ConfigurationBuilder {
             bindaddress: None,
@@ -1437,6 +1454,19 @@ tls_key = "/etc/kubidm/key.pem"
 path = "/var/lib/kubidm/backups/"
 schedule = "@daily"
 "#;
+
+    #[test]
+    fn pip_config_is_parsed_but_flagged_as_ignored() {
+        let without = build_from_toml(BASE_V2_CONFIG).expect("config must build");
+        assert!(without.pip_config_ignored_warning().is_none());
+
+        let with = build_from_toml(&format!("{BASE_V2_CONFIG}\n[pip_config]\nenabled = true\n"))
+            .expect("pip_config must not fail startup");
+        assert!(with.pip_config.is_some());
+        assert!(with
+            .pip_config_ignored_warning()
+            .is_some_and(|w| w.contains("ignored")));
+    }
 
     fn build_from_toml(contents: &str) -> Option<Configuration> {
         let values = toml::from_str::<ServerConfigV2>(contents).expect("config must parse");

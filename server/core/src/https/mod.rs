@@ -58,6 +58,7 @@ mod javascript;
 mod manifest;
 pub(crate) mod middleware;
 mod oauth2;
+mod oauth2_client_http;
 pub(crate) mod trace;
 mod v1;
 mod v1_domain;
@@ -87,6 +88,8 @@ pub struct ServerState {
     pub(crate) secure_cookies: bool,
     /// So that we can work out which ID to use for spans
     pub(crate) logging_pipeline: LoggerType,
+    /// Kubidm: shared HTTP client for OAuth2 client provider (federation) requests.
+    pub(crate) oauth2_client_http: oauth2_client_http::OAuth2ClientHttp,
 }
 
 impl ServerState {
@@ -289,6 +292,13 @@ pub async fn create_https_server(
         }
     };
 
+    let oauth2_client_http = oauth2_client_http::build_client().map_err(|err| {
+        error!(
+            ?err,
+            "Unable to setup the oauth2 client provider http client"
+        );
+    })?;
+
     let state = ServerState {
         status_ref,
         qe_w_ref,
@@ -301,6 +311,7 @@ pub async fn create_https_server(
         domain: config.domain.clone(),
         secure_cookies: config.integration_test_config.is_none(),
         logging_pipeline,
+        oauth2_client_http,
     };
 
     let static_routes = match config.role {

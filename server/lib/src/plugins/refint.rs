@@ -1512,7 +1512,9 @@ mod tests {
             .internal_search_uuid(group_uuid)
             .expect("Failed to access group");
 
-        assert!(group.get_ava_refer(Attribute::EntryManagedBy).is_none());
+        assert!(group
+            .get_ava_single_refer(Attribute::EntryManagedBy)
+            .is_none());
 
         assert!(server_txn.commit().is_ok());
     }

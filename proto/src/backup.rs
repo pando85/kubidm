@@ -1272,6 +1272,10 @@ fn default_wal_retention_days() -> u32 {
     7
 }
 
+/// The largest `segment_size_bytes` accepted: a segment lives in memory until it is
+/// closed, and recovery reads it whole.
+pub const MAX_WAL_SEGMENT_SIZE_BYTES: u64 = 1024 * 1024 * 1024;
+
 fn default_wal_segment_size() -> u64 {
     16 * 1024 * 1024
 }
@@ -1300,6 +1304,15 @@ impl WalArchiveConfig {
     pub fn validate(&self) -> Result<(), String> {
         if self.segment_size_bytes == 0 {
             return Err("segment_size_bytes must be greater than zero".to_string());
+        }
+        if self.segment_size_bytes > MAX_WAL_SEGMENT_SIZE_BYTES {
+            return Err(format!(
+                "segment_size_bytes must be at most {MAX_WAL_SEGMENT_SIZE_BYTES} (1 GiB): a \
+                 segment is held in memory until it is closed, and read whole by recovery"
+            ));
+        }
+        if self.journal_sync_interval_ms == 0 {
+            return Err("journal_sync_interval_ms must be greater than zero".to_string());
         }
         if self.retention_days == 0 {
             return Err("retention_days must be greater than zero".to_string());
@@ -1506,6 +1519,13 @@ pub struct PitrManifest {
     /// The identities the server had before `server_uuid`, in the order they changed.
     #[serde(default)]
     pub server_uuid_changes: Vec<PitrServerUuidChange>,
+    /// The CID timestamp up to which the archive accounts for every transaction the server
+    /// committed, including those that archived no change, as of the last synchronisation
+    /// that archived everything the server had recorded. A server that starts without the
+    /// record of its WAL directory compares its database with it (see
+    /// [`Self::covered_until`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub covered_until_ts: Option<Duration>,
     /// RFC3339 time of the last update, for display.
     pub updated_at: String,
 }
@@ -1520,8 +1540,52 @@ impl PitrManifest {
             timeline_breaks: Vec::new(),
             gaps: Vec::new(),
             server_uuid_changes: Vec::new(),
+            covered_until_ts: None,
             updated_at: String::new(),
         }
+    }
+
+    /// How far the archive holds the history of the server: the end of the newest segment,
+    /// gap or abandoned history, or [`Self::covered_until_ts`], whichever is newest. Base
+    /// backups do not count: a base is indexed when it is taken, before the segments up to
+    /// its watermark are archived. An archive that holds only base backups holds the history
+    /// from the oldest of them on. None for an archive that holds no history yet.
+    pub fn covered_until(&self) -> Option<Duration> {
+        self.archived_until()
+            .or_else(|| self.base_backups.iter().map(|base| base.watermark_ts).min())
+    }
+
+    /// [`Self::covered_until`] without the base backups.
+    fn archived_until(&self) -> Option<Duration> {
+        self.segments
+            .iter()
+            .map(|segment| segment.end_ts)
+            .chain(self.gaps.iter().map(|gap| gap.until_ts))
+            .chain(self.timeline_breaks.iter().map(|b| b.until_ts))
+            .chain(self.covered_until_ts)
+            .max()
+    }
+
+    /// The history between what the archive holds ([`Self::covered_until`]) and the newest
+    /// base backup, as a gap: the segments up to the watermark of that base are not
+    /// archived (yet). They may still be in the WAL directory of the server, or lost with
+    /// it; either way a replay from an older base across them would miss them. None when
+    /// the archive holds everything up to the newest base.
+    pub fn unarchived_range(&self) -> Option<PitrWalGap> {
+        let newest = self
+            .base_backups
+            .iter()
+            .map(|base| base.watermark_ts)
+            .filter(|ts| !self.is_abandoned(*ts))
+            .max()?;
+        let held = self.covered_until()?;
+        (held < newest).then(|| PitrWalGap {
+            from_ts: held + Duration::from_nanos(1),
+            until_ts: newest,
+            reason: "not archived: the segments up to the newest base backup are not in the \
+                     archive (still in the server's WAL directory, or lost with it)"
+                .to_string(),
+        })
     }
 
     /// Whether `server_uuid` is, or was, the identity of the server of this archive.
@@ -1627,8 +1691,11 @@ impl PitrManifest {
     /// `target_ts` incomplete: one that overlaps `(watermark_ts, target_ts]`. A gap that
     /// lies entirely in abandoned history is ignored, since that history is never
     /// replayed.
-    pub fn gap_blocking(&self, watermark_ts: Duration, target_ts: Duration) -> Option<&PitrWalGap> {
-        self.gaps.iter().find(|gap| {
+    ///
+    /// The history the archive does not hold up to the newest base backup
+    /// ([`Self::unarchived_range`]) counts as a gap.
+    pub fn gap_blocking(&self, watermark_ts: Duration, target_ts: Duration) -> Option<PitrWalGap> {
+        let blocks = |gap: &PitrWalGap| {
             target_ts > watermark_ts
                 && gap.from_ts <= target_ts
                 && gap.until_ts > watermark_ts
@@ -1636,7 +1703,12 @@ impl PitrManifest {
                     .timeline_breaks
                     .iter()
                     .any(|b| gap.from_ts > b.after_ts && gap.until_ts <= b.until_ts)
-        })
+        };
+        self.gaps
+            .iter()
+            .find(|gap| blocks(gap))
+            .cloned()
+            .or_else(|| self.unarchived_range().filter(blocks))
     }
 
     /// Whether the CID timestamp `ts` belongs to history a restore or recovery abandoned.
@@ -1763,6 +1835,21 @@ impl PitrManifest {
         self.base_backups
             .iter()
             .rfind(|base| base.watermark_ts <= target_ts && !self.is_abandoned(base.watermark_ts))
+    }
+
+    /// [`Self::base_backup_for`] among the base backups written by `server_version`: a
+    /// server only restores a base backup of its own version series, so after an upgrade
+    /// the bases taken before it can not start a recovery.
+    pub fn base_backup_for_version(
+        &self,
+        target_ts: Duration,
+        server_version: &str,
+    ) -> Option<&PitrBaseBackup> {
+        self.base_backups.iter().rfind(|base| {
+            base.watermark_ts <= target_ts
+                && base.server_version == server_version
+                && !self.is_abandoned(base.watermark_ts)
+        })
     }
 
     /// The segments that hold records after `watermark_ts` and up to `target_ts`, in CID
@@ -2043,6 +2130,128 @@ mod wal_tests {
             .validate()
             .unwrap_err()
             .contains("segment_interval_seconds"));
+
+        let zero_journal_interval = WalArchiveConfig {
+            journal_sync_interval_ms: 0,
+            ..WalArchiveConfig::default()
+        };
+        assert!(zero_journal_interval
+            .validate()
+            .unwrap_err()
+            .contains("journal_sync_interval_ms"));
+
+        let largest = WalArchiveConfig {
+            segment_size_bytes: MAX_WAL_SEGMENT_SIZE_BYTES,
+            ..WalArchiveConfig::default()
+        };
+        assert!(largest.validate().is_ok());
+        let too_large = WalArchiveConfig {
+            segment_size_bytes: MAX_WAL_SEGMENT_SIZE_BYTES + 1,
+            ..WalArchiveConfig::default()
+        };
+        assert!(too_large
+            .validate()
+            .unwrap_err()
+            .contains("segment_size_bytes must be at most"));
+    }
+
+    #[test]
+    fn test_pitr_manifest_base_selection_by_version() {
+        let mut manifest = PitrManifest::new(Uuid::nil());
+        manifest.add_base_backup(base("backup-1", 10));
+        manifest.add_base_backup(PitrBaseBackup {
+            server_version: "newer".to_string(),
+            ..base("backup-2", 40)
+        });
+        let at = Duration::from_secs(50);
+        assert_eq!(manifest.base_backup_for(at).unwrap().key, "backup-2");
+        assert_eq!(
+            manifest.base_backup_for_version(at, "test").unwrap().key,
+            "backup-1"
+        );
+        assert_eq!(
+            manifest.base_backup_for_version(at, "newer").unwrap().key,
+            "backup-2"
+        );
+        assert!(manifest
+            .base_backup_for_version(Duration::from_secs(39), "newer")
+            .is_none());
+        assert!(manifest.base_backup_for_version(at, "other").is_none());
+    }
+
+    /// A base registered at 700 while the segments only reach 600: the history between is
+    /// not in the archive, and a recovery from the older base across it is refused.
+    #[test]
+    fn test_pitr_manifest_unarchived_range_blocks_replay() {
+        let mut manifest = PitrManifest::new(Uuid::nil());
+        manifest.add_base_backup(base("backup-1", 100));
+        manifest.add_segment(segment("s1", 110, 600));
+        assert_eq!(manifest.unarchived_range(), None);
+        manifest.add_base_backup(base("backup-2", 700));
+        let range = manifest.unarchived_range().unwrap();
+        assert_eq!(
+            range.from_ts,
+            Duration::from_secs(600) + Duration::from_nanos(1)
+        );
+        assert_eq!(range.until_ts, Duration::from_secs(700));
+
+        let base_1 = Duration::from_secs(100);
+        assert!(manifest
+            .gap_blocking(base_1, Duration::from_secs(600))
+            .is_none());
+        assert_eq!(
+            manifest.gap_blocking(base_1, Duration::from_secs(650)),
+            Some(range.clone())
+        );
+        // From the base at 700 nothing is replayed across it.
+        let base_2 = Duration::from_secs(700);
+        assert!(manifest
+            .gap_blocking(base_2, Duration::from_secs(800))
+            .is_none());
+        // The latest point is the newest base itself; between 600 and 700 nothing is
+        // recoverable.
+        assert_eq!(
+            manifest.latest_recoverable_ts(),
+            Some(Duration::from_secs(700))
+        );
+
+        // Once archived (or recorded as archived), the range is gone.
+        manifest.covered_until_ts = Some(Duration::from_secs(700));
+        assert_eq!(manifest.unarchived_range(), None);
+        assert!(manifest
+            .gap_blocking(base_1, Duration::from_secs(650))
+            .is_none());
+    }
+
+    #[test]
+    fn test_pitr_manifest_covered_until() {
+        let mut manifest = PitrManifest::new(Uuid::nil());
+        assert_eq!(manifest.covered_until(), None);
+        // Only base backups: the history starts at the oldest of them.
+        manifest.add_base_backup(base("backup-0", 5));
+        manifest.add_base_backup(base("backup-1", 25));
+        assert_eq!(manifest.covered_until(), Some(Duration::from_secs(5)));
+        // A base backup is indexed before the segments up to its watermark are archived:
+        // only the segments count.
+        manifest.add_segment(segment("s1", 11, 20));
+        assert_eq!(manifest.covered_until(), Some(Duration::from_secs(20)));
+        manifest.add_gap(PitrWalGap {
+            from_ts: Duration::from_secs(26),
+            until_ts: Duration::from_secs(30),
+            reason: "test".to_string(),
+        });
+        assert_eq!(manifest.covered_until(), Some(Duration::from_secs(30)));
+        manifest.covered_until_ts = Some(Duration::from_secs(35));
+        assert_eq!(manifest.covered_until(), Some(Duration::from_secs(35)));
+
+        // Written only when known, and read back from manifests without it.
+        let json = serde_json::to_value(&manifest).unwrap();
+        assert!(json.get("covered_until_ts").is_some());
+        manifest.covered_until_ts = None;
+        let json = serde_json::to_string(&manifest).unwrap();
+        assert!(!json.contains("covered_until_ts"));
+        let read: PitrManifest = serde_json::from_str(&json).unwrap();
+        assert_eq!(read, manifest);
     }
 
     #[test]

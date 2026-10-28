@@ -2,7 +2,7 @@ use crate::be::dbvalue::DbValueTimeBoundedMemberV1;
 use crate::prelude::*;
 use crate::schema::SchemaAttribute;
 use crate::value::TimeBoundedMember;
-use crate::valueset::{DbValueSetV2, ScimResolveStatus, ValueSet};
+use crate::valueset::{parse_utc, DbValueSetV2, ScimResolveStatus, ValueSet};
 use std::collections::{BTreeMap, BTreeSet};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -24,18 +24,25 @@ impl ValueSetTimeBoundedMember {
     }
 
     pub fn from_dbvs2(data: Vec<DbValueTimeBoundedMemberV1>) -> Result<ValueSet, OperationError> {
+        // Any value that fails to parse is an error rather than being dropped, as
+        // silently discarding a grant would be data loss on the next write.
         let map = data
             .into_iter()
-            .filter_map(|dbv| {
-                let valid_from = dbv.valid_from.and_then(|vf| {
-                    OffsetDateTime::parse(&vf, &Rfc3339)
-                        .map(|odt| odt.to_offset(time::UtcOffset::UTC))
-                        .ok()
-                });
+            .map(|dbv| {
+                let valid_from = dbv
+                    .valid_from
+                    .map(|vf| {
+                        parse_utc(&vf).ok_or_else(|| {
+                            error!(uuid = %dbv.uuid, "invalid valid_from in time bounded member");
+                            OperationError::InvalidValueState
+                        })
+                    })
+                    .transpose()?;
 
-                let valid_until = OffsetDateTime::parse(&dbv.valid_until, &Rfc3339)
-                    .map(|odt| odt.to_offset(time::UtcOffset::UTC))
-                    .ok()?;
+                let valid_until = parse_utc(&dbv.valid_until).ok_or_else(|| {
+                    error!(uuid = %dbv.uuid, "invalid valid_until in time bounded member");
+                    OperationError::InvalidValueState
+                })?;
 
                 let member = TimeBoundedMember {
                     uuid: dbv.uuid,
@@ -43,9 +50,9 @@ impl ValueSetTimeBoundedMember {
                     valid_until,
                 };
 
-                Some((dbv.uuid, member))
+                Ok((dbv.uuid, member))
             })
-            .collect();
+            .collect::<Result<_, OperationError>>()?;
         Ok(Box::new(ValueSetTimeBoundedMember { map }))
     }
 
@@ -91,7 +98,9 @@ impl ValueSetT for ValueSetTimeBoundedMember {
 
     fn remove(&mut self, pv: &PartialValue, _cid: &Cid) -> bool {
         match pv {
-            PartialValue::TimeBoundedMember(uuid) => {
+            // Refer is accepted so that referential integrity can remove the grants
+            // of a member that has been deleted.
+            PartialValue::TimeBoundedMember(uuid) | PartialValue::Refer(uuid) => {
                 self.map.remove(uuid);
             }
             _ => {
@@ -103,7 +112,9 @@ impl ValueSetT for ValueSetTimeBoundedMember {
 
     fn contains(&self, pv: &PartialValue) -> bool {
         match pv {
-            PartialValue::TimeBoundedMember(uuid) => self.map.contains_key(uuid),
+            PartialValue::TimeBoundedMember(uuid) | PartialValue::Refer(uuid) => {
+                self.map.contains_key(uuid)
+            }
             _ => false,
         }
     }
@@ -140,7 +151,9 @@ impl ValueSetT for ValueSetTimeBoundedMember {
     }
 
     fn validate(&self, _schema_attr: &SchemaAttribute) -> bool {
-        true
+        self.map
+            .iter()
+            .all(|(uuid, m)| *uuid == m.uuid && m.has_valid_window())
     }
 
     fn to_proto_string_clone_iter(&self) -> Box<dyn Iterator<Item = String> + '_> {
@@ -166,7 +179,14 @@ impl ValueSetT for ValueSetTimeBoundedMember {
                 .values()
                 .map(|m| DbValueTimeBoundedMemberV1 {
                     uuid: m.uuid,
-                    valid_from: m.valid_from.and_then(|vf| vf.format(&Rfc3339).ok()),
+                    // validate rejects times that can not be formatted, so these
+                    // fallbacks are unreachable. If reached, they fail closed: the
+                    // loader refuses "invalid" rather than treating a dropped start
+                    // time as an immediately active grant.
+                    valid_from: m.valid_from.map(|vf| {
+                        vf.format(&Rfc3339)
+                            .unwrap_or_else(|_| "invalid".to_string())
+                    }),
                     valid_until: m
                         .valid_until
                         .format(&Rfc3339)
@@ -326,8 +346,117 @@ mod tests {
         }];
 
         let vs = ValueSetTimeBoundedMember::from_dbvs2(data);
-        assert!(vs.is_ok());
-        assert_eq!(vs.unwrap().len(), 0);
+        assert!(matches!(vs, Err(OperationError::InvalidValueState)));
+    }
+
+    #[test]
+    fn test_valueset_from_dbvs2_invalid_valid_from_only() {
+        let uuid = create_test_uuid();
+        let end = baseline_time() + Duration::from_secs(3600);
+
+        // A valid until with a corrupt valid from must not be silently widened
+        // to an immediately active grant.
+        let data = vec![DbValueTimeBoundedMemberV1 {
+            uuid,
+            valid_from: Some("invalid-date-format".to_string()),
+            valid_until: end.format(&Rfc3339).unwrap(),
+        }];
+
+        let vs = ValueSetTimeBoundedMember::from_dbvs2(data);
+        assert!(matches!(vs, Err(OperationError::InvalidValueState)));
+    }
+
+    #[test]
+    fn test_valueset_from_dbvs2_out_of_range_in_utc() {
+        // Valid RFC 3339, but in year 10000 once converted to UTC. This must be an error,
+        // not a panic in to_offset.
+        let data = vec![DbValueTimeBoundedMemberV1 {
+            uuid: create_test_uuid(),
+            valid_from: None,
+            valid_until: "9999-12-31T23:59:59-23:59".to_string(),
+        }];
+        let vs = ValueSetTimeBoundedMember::from_dbvs2(data);
+        assert!(matches!(vs, Err(OperationError::InvalidValueState)));
+
+        let data = vec![DbValueTimeBoundedMemberV1 {
+            uuid: create_test_uuid(),
+            valid_from: Some("9999-12-31T01:00:00-23:59".to_string()),
+            valid_until: (baseline_time() + Duration::from_secs(3600))
+                .format(&Rfc3339)
+                .unwrap(),
+        }];
+        let vs = ValueSetTimeBoundedMember::from_dbvs2(data);
+        assert!(matches!(vs, Err(OperationError::InvalidValueState)));
+    }
+
+    #[test]
+    fn test_valueset_validate_window() {
+        let schema_attr = SchemaAttribute::default();
+        let start = baseline_time();
+
+        let ok = ValueSetTimeBoundedMember::new(create_member(
+            create_test_uuid(),
+            Some(start),
+            start + Duration::from_secs(1),
+        ));
+        assert!(ok.validate(&schema_attr));
+
+        let no_start =
+            ValueSetTimeBoundedMember::new(create_member(create_test_uuid(), None, start));
+        assert!(no_start.validate(&schema_attr));
+
+        let empty_window =
+            ValueSetTimeBoundedMember::new(create_member(create_test_uuid(), Some(start), start));
+        assert!(!empty_window.validate(&schema_attr));
+
+        let inverted = ValueSetTimeBoundedMember::new(create_member(
+            create_test_uuid(),
+            Some(start + Duration::from_secs(10)),
+            start,
+        ));
+        assert!(!inverted.validate(&schema_attr));
+
+        // A time that can not be stored as RFC 3339 is rejected at write time.
+        let negative_year = time::Date::from_calendar_date(-1, time::Month::January, 1)
+            .unwrap()
+            .midnight()
+            .assume_utc();
+        let unstorable = ValueSetTimeBoundedMember::new(create_member(
+            create_test_uuid(),
+            Some(negative_year),
+            start,
+        ));
+        assert!(!unstorable.validate(&schema_attr));
+    }
+
+    #[test]
+    fn test_valueset_refer_contains_and_remove() {
+        let uuid1 = create_test_uuid();
+        let uuid2 = create_test_uuid();
+        let start = baseline_time();
+        let end = start + Duration::from_secs(3600);
+
+        let mut vs = ValueSetTimeBoundedMember::new_from_iter(vec![
+            create_member(uuid1, Some(start), end),
+            create_member(uuid2, None, end),
+        ])
+        .expect("Failed to create valueset");
+
+        assert!(vs.contains(&PartialValue::Refer(uuid1)));
+        assert!(!vs.contains(&PartialValue::Refer(create_test_uuid())));
+
+        assert!(!vs.remove(
+            &PartialValue::Refer(uuid1),
+            &crate::prelude::Cid::new_zero()
+        ));
+        assert!(!vs.contains(&PartialValue::Refer(uuid1)));
+        assert_eq!(vs.len(), 1);
+
+        assert!(vs.remove(
+            &PartialValue::Refer(uuid2),
+            &crate::prelude::Cid::new_zero()
+        ));
+        assert_eq!(vs.len(), 0);
     }
 
     #[test]

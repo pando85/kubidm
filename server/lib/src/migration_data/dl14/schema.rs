@@ -1543,6 +1543,10 @@ pub static SCHEMA_CLASS_ASSERTION_NONCE: LazyLock<SchemaClass> = LazyLock::new(|
 // =========================================
 // Time-Bounded Access
 
+// Kubidm: `member_valid_from` and `member_valid_until` are reserved and unused. Grants keep
+// their window in the `time_bounded_member` values instead (see
+// `server::time_bounded`). They stay in the schema because removing an attribute is a
+// migration of its own, and their names and uuids must not be reused.
 pub static SCHEMA_ATTR_MEMBER_VALID_FROM: LazyLock<SchemaAttribute> =
     LazyLock::new(|| SchemaAttribute {
         uuid: UUID_SCHEMA_ATTR_MEMBER_VALID_FROM,
@@ -1671,7 +1675,7 @@ pub static SCHEMA_ATTR_OAUTH2_LINK_POLICY: LazyLock<SchemaAttribute> =
         uuid: UUID_SCHEMA_ATTR_OAUTH2_LINK_POLICY,
         name: Attribute::OAuth2LinkPolicy,
         description:
-            "Policy for account linking: 'auto' (same email), 'manual', or 'admin_approval'"
+            "Policy for account linking. Only 'manual' (admin linked accounts) is implemented"
                 .to_string(),
         syntax: SyntaxType::Utf8StringInsensitive,
         ..Default::default()
@@ -1697,7 +1701,10 @@ pub static SCHEMA_ATTR_OAUTH2_FEDERATION_ID: LazyLock<SchemaAttribute> =
         ..Default::default()
     });
 
-pub static SCHEMA_CLASS_OAUTH2_FEDERATION: LazyLock<SchemaClass> = LazyLock::new(|| {
+/// The OAuth2 federation class as written to the on-disk schema at DL14. The DL14 schema
+/// has no `OAuth2TokenIntrospectEndpoint` attribute (upstream adds it at DL 1.11), so it
+/// can not be referenced here. See [SCHEMA_CLASS_OAUTH2_FEDERATION].
+pub static SCHEMA_CLASS_OAUTH2_FEDERATION_DL14: LazyLock<SchemaClass> = LazyLock::new(|| {
     SchemaClass {
     uuid: UUID_SCHEMA_CLASS_OAUTH2_FEDERATION,
     name: EntryClass::OAuth2Federation.into(),
@@ -1727,7 +1734,17 @@ pub static SCHEMA_CLASS_OAUTH2_FEDERATION: LazyLock<SchemaClass> = LazyLock::new
 }
 });
 
-#[allow(dead_code)]
+/// The OAuth2 federation class for DL >= 1.11, registered in memory by
+/// `crate::schema::kubidm_schema_classes`. It adds the RFC 7662 introspection endpoint,
+/// without which a federation login can never verify the subject.
+pub static SCHEMA_CLASS_OAUTH2_FEDERATION: LazyLock<SchemaClass> = LazyLock::new(|| {
+    let mut class = SCHEMA_CLASS_OAUTH2_FEDERATION_DL14.clone();
+    class
+        .systemmay
+        .push(Attribute::OAuth2TokenIntrospectEndpoint);
+    class
+});
+
 pub static SCHEMA_CLASS_OAUTH2_LINKED_ACCOUNT: LazyLock<SchemaClass> =
     LazyLock::new(|| SchemaClass {
         uuid: UUID_SCHEMA_CLASS_OAUTH2_LINKED_ACCOUNT,
@@ -1740,11 +1757,9 @@ pub static SCHEMA_CLASS_OAUTH2_LINKED_ACCOUNT: LazyLock<SchemaClass> =
 
 // =========================================
 // Approval Workflows
-// Note: These schema definitions are foundational infrastructure for approval workflows.
-// They will be used in future work for implementing approval request creation, decision handling,
-// and approval queue API endpoints.
+// Note: these are not part of the DL14 phase lists. They are registered at every domain
+// level through `crate::schema::kubidm_schema_attributes` / `kubidm_schema_classes`.
 
-#[allow(dead_code)]
 pub static SCHEMA_ATTR_APPROVAL_POLICY_NAME: LazyLock<SchemaAttribute> =
     LazyLock::new(|| SchemaAttribute {
         uuid: UUID_SCHEMA_ATTR_APPROVAL_POLICY_NAME,
@@ -1756,19 +1771,18 @@ pub static SCHEMA_ATTR_APPROVAL_POLICY_NAME: LazyLock<SchemaAttribute> =
         ..Default::default()
     });
 
-#[allow(dead_code)]
-pub static SCHEMA_ATTR_APPROVAL_OPERATION_TYPE: LazyLock<SchemaAttribute> =
-    LazyLock::new(|| SchemaAttribute {
+pub static SCHEMA_ATTR_APPROVAL_OPERATION_TYPE: LazyLock<SchemaAttribute> = LazyLock::new(|| {
+    SchemaAttribute {
         uuid: UUID_SCHEMA_ATTR_APPROVAL_OPERATION_TYPE,
         name: Attribute::ApprovalOperationType,
-        description: "The type of operation requiring approval".to_string(),
+        description: "The operation types an approval policy covers, or the single operation type of an approval request".to_string(),
         indexed: true,
         multivalue: true,
         syntax: SyntaxType::Utf8StringInsensitiveN,
         ..Default::default()
-    });
+    }
+});
 
-#[allow(dead_code)]
 pub static SCHEMA_ATTR_APPROVAL_PATTERN: LazyLock<SchemaAttribute> =
     LazyLock::new(|| SchemaAttribute {
         uuid: UUID_SCHEMA_ATTR_APPROVAL_PATTERN,
@@ -1778,7 +1792,6 @@ pub static SCHEMA_ATTR_APPROVAL_PATTERN: LazyLock<SchemaAttribute> =
         ..Default::default()
     });
 
-#[allow(dead_code)]
 pub static SCHEMA_ATTR_APPROVER: LazyLock<SchemaAttribute> = LazyLock::new(|| SchemaAttribute {
     uuid: UUID_SCHEMA_ATTR_APPROVER,
     name: Attribute::Approver,
@@ -1789,7 +1802,6 @@ pub static SCHEMA_ATTR_APPROVER: LazyLock<SchemaAttribute> = LazyLock::new(|| Sc
     ..Default::default()
 });
 
-#[allow(dead_code)]
 pub static SCHEMA_ATTR_BACKUP_APPROVER: LazyLock<SchemaAttribute> =
     LazyLock::new(|| SchemaAttribute {
         uuid: UUID_SCHEMA_ATTR_BACKUP_APPROVER,
@@ -1801,7 +1813,6 @@ pub static SCHEMA_ATTR_BACKUP_APPROVER: LazyLock<SchemaAttribute> =
         ..Default::default()
     });
 
-#[allow(dead_code)]
 pub static SCHEMA_ATTR_APPROVAL_TIMEOUT: LazyLock<SchemaAttribute> =
     LazyLock::new(|| SchemaAttribute {
         uuid: UUID_SCHEMA_ATTR_APPROVAL_TIMEOUT,
@@ -1811,7 +1822,6 @@ pub static SCHEMA_ATTR_APPROVAL_TIMEOUT: LazyLock<SchemaAttribute> =
         ..Default::default()
     });
 
-#[allow(dead_code)]
 pub static SCHEMA_ATTR_ESCALATION_TIMEOUT: LazyLock<SchemaAttribute> =
     LazyLock::new(|| SchemaAttribute {
         uuid: UUID_SCHEMA_ATTR_ESCALATION_TIMEOUT,
@@ -1821,7 +1831,6 @@ pub static SCHEMA_ATTR_ESCALATION_TIMEOUT: LazyLock<SchemaAttribute> =
         ..Default::default()
     });
 
-#[allow(dead_code)]
 pub static SCHEMA_ATTR_APPROVAL_POLICY_ENABLED: LazyLock<SchemaAttribute> =
     LazyLock::new(|| SchemaAttribute {
         uuid: UUID_SCHEMA_ATTR_APPROVAL_POLICY_ENABLED,
@@ -1831,7 +1840,6 @@ pub static SCHEMA_ATTR_APPROVAL_POLICY_ENABLED: LazyLock<SchemaAttribute> =
         ..Default::default()
     });
 
-#[allow(dead_code)]
 pub static SCHEMA_CLASS_APPROVAL_POLICY: LazyLock<SchemaClass> = LazyLock::new(|| SchemaClass {
     uuid: UUID_SCHEMA_CLASS_APPROVAL_POLICY,
     name: EntryClass::ApprovalPolicy.into(),
@@ -1852,7 +1860,6 @@ pub static SCHEMA_CLASS_APPROVAL_POLICY: LazyLock<SchemaClass> = LazyLock::new(|
     ..Default::default()
 });
 
-#[allow(dead_code)]
 pub static SCHEMA_ATTR_APPROVAL_REQUEST_POLICY: LazyLock<SchemaAttribute> =
     LazyLock::new(|| SchemaAttribute {
         uuid: UUID_SCHEMA_ATTR_APPROVAL_REQUEST_POLICY,
@@ -1863,7 +1870,6 @@ pub static SCHEMA_ATTR_APPROVAL_REQUEST_POLICY: LazyLock<SchemaAttribute> =
         ..Default::default()
     });
 
-#[allow(dead_code)]
 pub static SCHEMA_ATTR_APPROVAL_TARGET: LazyLock<SchemaAttribute> =
     LazyLock::new(|| SchemaAttribute {
         uuid: UUID_SCHEMA_ATTR_APPROVAL_TARGET,
@@ -1875,7 +1881,6 @@ pub static SCHEMA_ATTR_APPROVAL_TARGET: LazyLock<SchemaAttribute> =
         ..Default::default()
     });
 
-#[allow(dead_code)]
 pub static SCHEMA_ATTR_APPROVAL_REQUESTOR: LazyLock<SchemaAttribute> =
     LazyLock::new(|| SchemaAttribute {
         uuid: UUID_SCHEMA_ATTR_APPROVAL_REQUESTOR,
@@ -1886,7 +1891,6 @@ pub static SCHEMA_ATTR_APPROVAL_REQUESTOR: LazyLock<SchemaAttribute> =
         ..Default::default()
     });
 
-#[allow(dead_code)]
 pub static SCHEMA_ATTR_APPROVAL_STATE: LazyLock<SchemaAttribute> = LazyLock::new(|| {
     SchemaAttribute {
         uuid: UUID_SCHEMA_ATTR_APPROVAL_STATE,
@@ -1898,20 +1902,21 @@ pub static SCHEMA_ATTR_APPROVAL_STATE: LazyLock<SchemaAttribute> = LazyLock::new
     }
 });
 
-#[allow(dead_code)]
-pub static SCHEMA_ATTR_APPROVAL_DECISION: LazyLock<SchemaAttribute> =
-    LazyLock::new(|| SchemaAttribute {
+pub static SCHEMA_ATTR_APPROVAL_DECISION: LazyLock<SchemaAttribute> = LazyLock::new(|| {
+    SchemaAttribute {
         uuid: UUID_SCHEMA_ATTR_APPROVAL_DECISION,
         name: Attribute::ApprovalDecision,
         description:
-            "An approval decision record containing approver, action, time, and optional comment"
+            "One JSON-encoded approval decision (approver, action, time, comment and the approver slots it may fill) of an approval decision record"
                 .to_string(),
-        multivalue: true,
-        syntax: SyntaxType::Json,
+        // Kubidm: each decision is its own `approval_decision_record` entry, created once
+        // and never modified, see `SCHEMA_CLASS_APPROVAL_DECISION_RECORD`. The Json syntax
+        // has no value set constructor, so the record is a single-line JSON string.
+        syntax: SyntaxType::Utf8String,
         ..Default::default()
-    });
+    }
+});
 
-#[allow(dead_code)]
 pub static SCHEMA_ATTR_APPROVAL_ESCALATION_LEVEL: LazyLock<SchemaAttribute> =
     LazyLock::new(|| SchemaAttribute {
         uuid: UUID_SCHEMA_ATTR_APPROVAL_ESCALATION_LEVEL,
@@ -1921,7 +1926,6 @@ pub static SCHEMA_ATTR_APPROVAL_ESCALATION_LEVEL: LazyLock<SchemaAttribute> =
         ..Default::default()
     });
 
-#[allow(dead_code)]
 pub static SCHEMA_ATTR_APPROVAL_EXPIRES: LazyLock<SchemaAttribute> =
     LazyLock::new(|| SchemaAttribute {
         uuid: UUID_SCHEMA_ATTR_APPROVAL_EXPIRES,
@@ -1932,29 +1936,63 @@ pub static SCHEMA_ATTR_APPROVAL_EXPIRES: LazyLock<SchemaAttribute> =
         ..Default::default()
     });
 
-#[allow(dead_code)]
 pub static SCHEMA_ATTR_APPROVAL_OPERATION_DETAILS: LazyLock<SchemaAttribute> =
     LazyLock::new(|| SchemaAttribute {
         uuid: UUID_SCHEMA_ATTR_APPROVAL_OPERATION_DETAILS,
         name: Attribute::ApprovalOperationDetails,
         description: "JSON-encoded details about the operation requiring approval".to_string(),
-        syntax: SyntaxType::JsonFilter,
+        // Kubidm: a JSON object of string keys and values, stored as a single-line string.
+        syntax: SyntaxType::Utf8String,
         ..Default::default()
     });
 
-#[allow(dead_code)]
+/// Kubidm: what a request is decided against, fixed when it is created. A JSON object
+/// with the requester, the approver slots and backup approvers (each a person or a group),
+/// the pattern, the number of approved slots required and the escalation timeout.
+///
+/// The policy's `approver` and `backup_approver` are references, so referential integrity
+/// removes a deleted person or group from them. Counting decisions against the live policy
+/// would let deleting an approver change the outcome of a request (for example, deleting
+/// the only approver who rejected). The snapshot holds plain uuids that referential
+/// integrity does not touch, so the outcome is a function of the snapshot and the decision
+/// records only.
+pub static SCHEMA_ATTR_APPROVAL_QUORUM_SNAPSHOT: LazyLock<SchemaAttribute> = LazyLock::new(|| {
+    SchemaAttribute {
+        uuid: UUID_SCHEMA_ATTR_APPROVAL_QUORUM_SNAPSHOT,
+        name: Attribute::ApprovalQuorumSnapshot,
+        description: "The approvers, pattern and quorum an approval request is decided against, fixed at creation (JSON)".to_string(),
+        syntax: SyntaxType::Utf8String,
+        ..Default::default()
+    }
+});
+
+/// Kubidm: on an approval decision record, the request it decides.
+pub static SCHEMA_ATTR_APPROVAL_RECORD_REQUEST: LazyLock<SchemaAttribute> =
+    LazyLock::new(|| SchemaAttribute {
+        uuid: UUID_SCHEMA_ATTR_APPROVAL_RECORD_REQUEST,
+        name: Attribute::ApprovalRecordRequest,
+        description: "Reference to the approval request an approval decision record decides"
+            .to_string(),
+        indexed: true,
+        syntax: SyntaxType::ReferenceUuid,
+        ..Default::default()
+    });
+
 pub static SCHEMA_CLASS_APPROVAL_REQUEST: LazyLock<SchemaClass> = LazyLock::new(|| SchemaClass {
     uuid: UUID_SCHEMA_CLASS_APPROVAL_REQUEST,
     name: EntryClass::ApprovalRequest.into(),
     description: "A request for approval to perform a sensitive operation".to_string(),
-    systemmust: vec![
+    systemmust: vec![Attribute::ApprovalOperationType, Attribute::ApprovalState],
+    // Kubidm: the policy, target and requester are optional so that deleting one of them
+    // is not blocked by referential integrity. A pending request that lost one of them is
+    // invalid: it can not be decided, and the approval sweep expires it.
+    systemmay: vec![
         Attribute::ApprovalRequestPolicy,
-        Attribute::ApprovalOperationType,
         Attribute::ApprovalTarget,
         Attribute::ApprovalRequestor,
-        Attribute::ApprovalState,
-    ],
-    systemmay: vec![
+        // Written once at creation. A request without it is invalid.
+        Attribute::ApprovalQuorumSnapshot,
+        // Legacy, no longer written or read: decisions are approval decision records.
         Attribute::ApprovalDecision,
         Attribute::ApprovalEscalationLevel,
         Attribute::ApprovalExpires,
@@ -1962,3 +2000,26 @@ pub static SCHEMA_CLASS_APPROVAL_REQUEST: LazyLock<SchemaClass> = LazyLock::new(
     ],
     ..Default::default()
 });
+
+/// Kubidm: one decision on an approval request.
+///
+/// Decisions are separate entries rather than values of an attribute of the request. In
+/// replication, concurrent changes to the same attribute of an entry on two replicas are
+/// resolved by keeping the newer value set, so two approvers deciding on different replicas
+/// within one replication interval would lose one of the decisions, even with one value per
+/// decision. A merge that unions the values can not be propagated either, since it has no
+/// change id of its own. Creating an entry per decision has neither problem: entries with
+/// distinct uuids never conflict.
+pub static SCHEMA_CLASS_APPROVAL_DECISION_RECORD: LazyLock<SchemaClass> =
+    LazyLock::new(|| SchemaClass {
+        uuid: UUID_SCHEMA_CLASS_APPROVAL_DECISION_RECORD,
+        name: EntryClass::ApprovalDecisionRecord.into(),
+        description: "One decision on an approval request".to_string(),
+        systemmust: vec![Attribute::ApprovalDecision],
+        // The request it decides. Optional so that deleting the request is not blocked
+        // by referential integrity; a record without a request is ignored. Records
+        // written before `ApprovalRecordRequest` existed used `ApprovalTarget`; it is
+        // still allowed so that they stay valid, but no longer read.
+        systemmay: vec![Attribute::ApprovalRecordRequest, Attribute::ApprovalTarget],
+        ..Default::default()
+    });

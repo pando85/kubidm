@@ -12,9 +12,11 @@ use uuid::Uuid;
 
 mod auth;
 mod message;
+// Kubidm: time-bounded group membership.
+mod time_bounded;
 mod unix;
 
-pub use self::{auth::*, message::*, unix::*};
+pub use self::{auth::*, message::*, time_bounded::*, unix::*};
 
 /// The type of Account in use.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, ToSchema)]
@@ -275,6 +277,12 @@ pub enum ApprovalRequestState {
     Expired,
     Cancelled,
     Escalated,
+    /// Kubidm: the policy, target or requester of a pending request has been deleted, so
+    /// the request can no longer be decided. Never stored, only reported.
+    Invalid,
+    /// Kubidm: an approved request whose operation has been carried out. Final: an
+    /// approval authorises its operation once.
+    Consumed,
 }
 
 impl fmt::Display for ApprovalRequestState {
@@ -292,6 +300,8 @@ impl ApprovalRequestState {
             ApprovalRequestState::Expired => "expired",
             ApprovalRequestState::Cancelled => "cancelled",
             ApprovalRequestState::Escalated => "escalated",
+            ApprovalRequestState::Invalid => "invalid",
+            ApprovalRequestState::Consumed => "consumed",
         }
     }
 }
@@ -307,6 +317,8 @@ impl std::str::FromStr for ApprovalRequestState {
             "expired" => Ok(ApprovalRequestState::Expired),
             "cancelled" => Ok(ApprovalRequestState::Cancelled),
             "escalated" => Ok(ApprovalRequestState::Escalated),
+            "invalid" => Ok(ApprovalRequestState::Invalid),
+            "consumed" => Ok(ApprovalRequestState::Consumed),
             _ => Err("invalid approval request state"),
         }
     }
@@ -347,12 +359,15 @@ pub struct ApprovalDecision {
 #[derive(Debug, Serialize, Deserialize, Clone, ToSchema)]
 pub struct ApprovalRequest {
     pub uuid: Uuid,
-    pub policy_uuid: Uuid,
-    pub policy_name: String,
+    /// `None` once the policy has been deleted.
+    pub policy_uuid: Option<Uuid>,
+    pub policy_name: Option<String>,
     pub operation_type: ApprovalOperationType,
-    pub target_uuid: Uuid,
+    /// `None` once the target has been deleted.
+    pub target_uuid: Option<Uuid>,
     pub target_spn: String,
-    pub requestor_uuid: Uuid,
+    /// `None` once the requester has been deleted.
+    pub requestor_uuid: Option<Uuid>,
     pub requestor_spn: String,
     #[serde(with = "time::serde::timestamp")]
     pub created_at: time::OffsetDateTime,
@@ -389,6 +404,19 @@ pub struct ApprovalPolicyCreateRequest {
     pub pattern: ApprovalPattern,
     pub timeout_seconds: u32,
     pub escalation_timeout_seconds: Option<u32>,
+}
+
+/// Create an approval request. The requester is the calling identity.
+#[derive(Debug, Serialize, Deserialize, Clone, ToSchema)]
+pub struct ApprovalRequestCreateRequest {
+    /// Name of the (enabled) approval policy the request is filed under.
+    pub policy_name: String,
+    pub operation_type: ApprovalOperationType,
+    /// The entry the operation applies to, as a uuid, name or spn. It must be readable by the
+    /// requester: an unreadable entry is reported like one that does not exist.
+    pub target: String,
+    #[serde(default)]
+    pub operation_details: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -533,6 +561,8 @@ mod tests {
             ApprovalRequestState::Expired,
             ApprovalRequestState::Cancelled,
             ApprovalRequestState::Escalated,
+            ApprovalRequestState::Invalid,
+            ApprovalRequestState::Consumed,
         ];
         for variant in variants {
             let restored = round_trip(&variant);
@@ -567,7 +597,16 @@ mod tests {
             ApprovalRequestState::from_str("escalated"),
             Ok(ApprovalRequestState::Escalated)
         ));
-        assert!(ApprovalRequestState::from_str("invalid").is_err());
+        assert_eq!(
+            ApprovalRequestState::from_str("invalid"),
+            Ok(ApprovalRequestState::Invalid)
+        );
+        assert_eq!(
+            ApprovalRequestState::from_str("consumed"),
+            Ok(ApprovalRequestState::Consumed)
+        );
+        assert_eq!(ApprovalRequestState::Consumed.as_str(), "consumed");
+        assert!(ApprovalRequestState::from_str("bogus").is_err());
     }
 
     #[test]
@@ -625,12 +664,12 @@ mod tests {
         let ts = time::OffsetDateTime::UNIX_EPOCH;
         let original = ApprovalRequest {
             uuid: Uuid::new_v4(),
-            policy_uuid: Uuid::new_v4(),
-            policy_name: "high_priv_policy".to_string(),
+            policy_uuid: Some(Uuid::new_v4()),
+            policy_name: Some("high_priv_policy".to_string()),
             operation_type: ApprovalOperationType::SchemaModify,
-            target_uuid: Uuid::new_v4(),
+            target_uuid: Some(Uuid::new_v4()),
             target_spn: "target@example.com".to_string(),
-            requestor_uuid: Uuid::new_v4(),
+            requestor_uuid: None,
             requestor_spn: "requestor@example.com".to_string(),
             created_at: ts,
             expires_at: Some(ts),

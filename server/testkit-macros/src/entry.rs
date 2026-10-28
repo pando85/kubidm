@@ -16,6 +16,7 @@ const ALLOWED_ATTRIBUTES: &[&str] = &[
     "ldap",
     "with_test_env",
     "role",
+    "repl_config",
 ];
 
 #[derive(Default)]

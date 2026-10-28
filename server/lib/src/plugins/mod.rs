@@ -13,6 +13,7 @@ use std::{
     sync::Arc,
 };
 
+mod approval;
 mod attrunique;
 mod base;
 mod cred_import;
@@ -23,7 +24,8 @@ mod eckeygen;
 pub(crate) mod gidnumber;
 pub(crate) mod hmac_name_unique;
 mod keyobject;
-mod memberof;
+mod max_grant_duration;
+pub(crate) mod memberof;
 mod namehistory;
 mod oauth2;
 mod refint;
@@ -257,7 +259,9 @@ impl Plugins {
         ce: &CreateEvent,
     ) -> Result<(), OperationError> {
         base::Base::pre_create_transform(qs, cand, ce)?;
+        approval::ApprovalProtect::pre_create_transform(qs, cand, ce)?;
         valuedeny::ValueDeny::pre_create_transform(qs, cand, ce)?;
+        max_grant_duration::MaxGrantDuration::pre_create_transform(qs, cand, ce)?;
 
         oauth2::OAuth2::pre_create_transform(qs, cand, ce)?;
         eckeygen::EcdhKeyGen::pre_create_transform(qs, cand, ce)?;
@@ -310,7 +314,9 @@ impl Plugins {
         me: &ModifyEvent,
     ) -> Result<(), OperationError> {
         base::Base::pre_modify(qs, pre_cand, cand, me)?;
+        approval::ApprovalProtect::pre_modify(qs, pre_cand, cand, me)?;
         valuedeny::ValueDeny::pre_modify(qs, pre_cand, cand, me)?;
+        max_grant_duration::MaxGrantDuration::pre_modify(qs, pre_cand, cand, me)?;
 
         oauth2::OAuth2::pre_modify(qs, pre_cand, cand, me)?;
         eckeygen::EcdhKeyGen::pre_modify(qs, pre_cand, cand, me)?;
@@ -348,7 +354,9 @@ impl Plugins {
         me: &BatchModifyEvent,
     ) -> Result<(), OperationError> {
         base::Base::pre_batch_modify(qs, pre_cand, cand, me)?;
+        approval::ApprovalProtect::pre_batch_modify(qs, pre_cand, cand, me)?;
         valuedeny::ValueDeny::pre_batch_modify(qs, pre_cand, cand, me)?;
+        max_grant_duration::MaxGrantDuration::pre_batch_modify(qs, pre_cand, cand, me)?;
 
         oauth2::OAuth2::pre_batch_modify(qs, pre_cand, cand, me)?;
         eckeygen::EcdhKeyGen::pre_batch_modify(qs, pre_cand, cand, me)?;
@@ -394,6 +402,7 @@ impl Plugins {
         cand: &mut Vec<Entry<EntryInvalid, EntryCommitted>>,
         de: &DeleteEvent,
     ) -> Result<(), OperationError> {
+        approval::ApprovalProtect::pre_delete(qs, cand, de)?;
         memberof::MemberOf::pre_delete(qs, cand, de)
     }
 

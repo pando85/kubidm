@@ -200,7 +200,7 @@ pub fn phase_2_schema_classes() -> Vec<EntryInitNew> {
         // Time-bounded access
         SCHEMA_CLASS_TIME_BOUNDED_GRANT.clone().into(),
         // OAuth2 Federation (DL14+)
-        SCHEMA_CLASS_OAUTH2_FEDERATION.clone().into(),
+        SCHEMA_CLASS_OAUTH2_FEDERATION_DL14.clone().into(),
         SCHEMA_CLASS_OAUTH2_LINKED_ACCOUNT.clone().into(),
     ]
 }
@@ -272,11 +272,41 @@ pub fn phase_6_builtin_non_admin_entries() -> Result<Vec<EntryInitNew>, Operatio
         // other things
         IDM_UI_ENABLE_EXPERIMENTAL_FEATURES.clone().try_into()?,
         IDM_ACCOUNT_MAIL_READ.clone().try_into()?,
+    ]
+    .into_iter()
+    // Kubidm builtin entries (delegated roles, approval admins)
+    .chain(kubidm_builtin_entries()?)
+    .collect())
+}
+
+/// Kubidm fork-only builtin entries. These are created at DL14 by
+/// `phase_6_builtin_non_admin_entries`, and at DL >= 1.11 the domain migrations create
+/// them after the upstream phase 6 entries, since the upstream entry lists do not contain
+/// them.
+pub(crate) fn kubidm_builtin_entries() -> Result<Vec<EntryInitNew>, OperationError> {
+    Ok(vec![
         // Delegated roles
         BUILTIN_DELEGATED_ROLE_HELPDESK.clone().into(),
         BUILTIN_DELEGATED_ROLE_USER_ADMIN.clone().into(),
         BUILTIN_DELEGATED_ROLE_GROUP_ADMIN.clone().into(),
+        // Approval workflows
+        BUILTIN_GROUP_APPROVAL_ADMINS.clone().try_into()?,
+        // Must come after the fork's privileged groups (they have to exist) and after the
+        // upstream idm_high_privilege group (it has to exist, this only adds members).
+        kubidm_high_privilege_members(),
     ])
+}
+
+/// Kubidm fork-only privileged builtin groups that are members of `idm_high_privilege`, so
+/// that they are protected like the upstream privileged groups (for example, members of
+/// `idm_group_admins` can not modify them). The upstream group definitions do not contain
+/// them, so the membership is asserted as a partial entry: on migration, multi-value
+/// attributes are only added, so the upstream members are kept.
+fn kubidm_high_privilege_members() -> EntryInitNew {
+    entry_init!(
+        (Attribute::Uuid, Value::Uuid(UUID_IDM_HIGH_PRIVILEGE)),
+        (Attribute::Member, Value::ReferN(UUID_IDM_APPROVAL_ADMINS))
+    )
 }
 
 pub fn phase_7_builtin_access_control_profiles() -> Vec<EntryInitNew> {
@@ -346,6 +376,20 @@ pub fn phase_7_builtin_access_control_profiles() -> Vec<EntryInitNew> {
         IDM_ACP_OAUTH2_ACCOUNT_ENROL.clone().into(),
         // DL13
         IDM_ACP_OAUTH2_MANAGE_BASIC.clone().into(),
+    ]
+    .into_iter()
+    // Kubidm builtin access controls
+    .chain(kubidm_builtin_access_control_profiles())
+    .collect()
+}
+
+/// Kubidm fork-only builtin access control profiles. Created at DL14 by
+/// `phase_7_builtin_access_control_profiles`, and at DL >= 1.11 by the domain migrations
+/// after the upstream phase 7 entries.
+pub(crate) fn kubidm_builtin_access_control_profiles() -> Vec<EntryInitNew> {
+    vec![
+        IDM_ACP_OAUTH2_FEDERATION_ADMIN.clone().into(),
+        IDM_ACP_GROUP_TIME_BOUNDED_MANAGE.clone().into(),
     ]
 }
 

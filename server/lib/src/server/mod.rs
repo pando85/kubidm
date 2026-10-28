@@ -4,10 +4,11 @@
 use self::{
     access::{
         profiles::{
-            AccessControlCreate, AccessControlDelete, AccessControlModify, AccessControlSearch,
+            AccessControlCreate, AccessControlDelete, AccessControlModify, AccessControlProfile,
+            AccessControlSearch,
         },
         AccessControls, AccessControlsReadTransaction, AccessControlsTransaction,
-        AccessControlsWriteTransaction,
+        AccessControlsWriteTransaction, SkippedAcps,
     },
     keys::{
         KeyObject, KeyProvider, KeyProviders, KeyProvidersReadTransaction, KeyProvidersTransaction,
@@ -31,6 +32,7 @@ use crate::{
         Schema, SchemaAttribute, SchemaClass, SchemaReadTransaction, SchemaTransaction,
         SchemaWriteTransaction,
     },
+    status::{DatabaseCheck, ReplicationStateTracker},
     value::{CredentialType, EXTRACT_VAL_DN},
     valueset::*,
 };
@@ -70,6 +72,8 @@ pub(crate) mod migrations;
 pub mod modify;
 pub(crate) mod recycle;
 pub mod scim;
+// Kubidm: administration of time-bounded group memberships.
+pub mod time_bounded;
 pub(crate) mod utils;
 
 const RESOLVE_FILTER_CACHE_MAX: usize = 256;
@@ -185,6 +189,8 @@ pub struct QueryServer {
     dyngroup_cache: Arc<CowCell<DynGroupCache>>,
     cid_max: Arc<CowCell<Cid>>,
     key_providers: Arc<KeyProviders>,
+    // Kubidm: the health and readiness tracker, fed by commits and verifications.
+    health: ReplicationStateTracker,
 }
 
 pub struct QueryServerReadTransaction<'a> {
@@ -204,6 +210,7 @@ pub struct QueryServerReadTransaction<'a> {
     // cid_max: CowCellReadTxn<Cid>,
     trim_cid: Cid,
     txn_name_to_uuid: BTreeMap<String, Uuid>,
+    pub(crate) health: &'a ReplicationStateTracker,
 }
 
 unsafe impl Sync for QueryServerReadTransaction<'_> {}
@@ -246,6 +253,8 @@ pub struct QueryServerWriteTransaction<'a> {
 
     // Store the list of changed uuids for other invalidation needs?
     pub(super) changed_uuid: HashSet<Uuid>,
+    // Kubidm: this transaction applies replicated changes (incremental or refresh).
+    pub(crate) replication_apply: bool,
     _db_ticket: SemaphorePermit<'a>,
     _write_ticket: SemaphorePermit<'a>,
     resolve_filter_cache_clear: bool,
@@ -263,11 +272,33 @@ pub struct QueryServerWriteTransaction<'a> {
     >,
     dyngroup_cache: CowCellWriteTxn<'a, DynGroupCache>,
     txn_name_to_uuid: BTreeMap<String, Uuid>,
+    health: &'a ReplicationStateTracker,
 }
 
 impl QueryServerWriteTransaction<'_> {
     pub(crate) fn trim_cid(&self) -> &Cid {
         &self.trim_cid
+    }
+}
+
+/// Kubidm: OAuth2 client providers are loaded from both `OAuth2Client` and
+/// `OAuth2Federation` entries, so a change to either kind must reload them.
+pub(crate) fn is_oauth2_client_provider<VALID, STATE>(e: &Entry<VALID, STATE>) -> bool {
+    e.attribute_equality(Attribute::Class, &EntryClass::OAuth2Client.into())
+        || e.attribute_equality(Attribute::Class, &EntryClass::OAuth2Federation.into())
+}
+
+/// Extract the referenced uuids from a reference valueset. Both the single value
+/// (`ReferenceUuid`) and multi value (`ReferenceUuidN`) syntaxes are supported, so that
+/// they can be resolved for presentation in the same way. Returns `None` if the valueset
+/// is not a reference type.
+fn valueset_reference_uuids(value: &ValueSet) -> Option<Vec<Uuid>> {
+    match value.syntax() {
+        SyntaxType::ReferenceUuidN => value
+            .as_refer_set()
+            .map(|r_set| r_set.iter().copied().collect()),
+        SyntaxType::ReferenceUuid => value.to_refer_single().map(|uuid| vec![uuid]),
+        _ => None,
     }
 }
 
@@ -1329,10 +1360,9 @@ pub trait QueryServerTransaction<'a> {
 
     // In the opposite direction, we can resolve values for presentation
     fn resolve_valueset(&mut self, value: &ValueSet) -> Result<Vec<String>, OperationError> {
-        if let Some(r_set) = value.as_refer_set() {
+        if let Some(r_set) = valueset_reference_uuids(value) {
             let v: Result<Vec<_>, _> = r_set
-                .iter()
-                .copied()
+                .into_iter()
                 .map(|ur| {
                     let nv = self.uuid_to_spn(ur)?;
                     match nv {
@@ -1384,10 +1414,9 @@ pub trait QueryServerTransaction<'a> {
         value: &ValueSet,
         basedn: &str,
     ) -> Result<Vec<Vec<u8>>, OperationError> {
-        if let Some(r_set) = value.as_refer_set() {
+        if let Some(r_set) = valueset_reference_uuids(value) {
             let v: Result<Vec<_>, _> = r_set
-                .iter()
-                .copied()
+                .into_iter()
                 .map(|ur| {
                     let rdn = self.uuid_to_rdn(ur)?;
                     Ok(format!("{rdn},{basedn}").into_bytes())
@@ -2070,7 +2099,43 @@ impl QueryServer {
             dyngroup_cache,
             cid_max,
             key_providers,
+            health: ReplicationStateTracker::new(),
         })
+    }
+
+    /// Kubidm: the health and readiness tracker of this server. Write commits and online
+    /// verifications record the database health in it, the replication tasks the
+    /// replication state.
+    pub fn health(&self) -> &ReplicationStateTracker {
+        &self.health
+    }
+
+    /// Kubidm: whether the database shows that this server has synced from a replication
+    /// supplier before. This is decided without a separate marker, from two facts that the
+    /// sync itself writes in the same transaction:
+    ///
+    /// * The domain info entry was created by another server. A fresh server creates its
+    ///   own domain; a refresh replaces the whole content, domain entry and its creation
+    ///   change included, with the supplier's, and gives this server a new server uuid.
+    ///   The creation change of an entry is never trimmed, so this survives restarts,
+    ///   changelog trimming and backups. A server that is not in the supplier's domain can
+    ///   only sync through a refresh, so for a fresh replica this is the complete answer.
+    /// * The replication update vector records changes that originated on another server:
+    ///   an incremental was applied. This covers the server that created the domain, but
+    ///   is lost when every peer has been gone longer than the changelog.
+    pub async fn replication_has_synced(&self) -> Result<bool, OperationError> {
+        let s_uuid = self.cid_max.read().s_uuid;
+        let mut read_txn = self.read().await?;
+        let domain_creator = read_txn
+            .internal_search_uuid(UUID_DOMAIN_INFO)?
+            .get_changestate()
+            .at()
+            .s_uuid;
+        if domain_creator != s_uuid {
+            return Ok(true);
+        }
+        let ReplRuvRange::V1 { ranges, .. } = read_txn.consumer_get_state()?;
+        Ok(ranges.keys().any(|server| *server != s_uuid))
     }
 
     pub fn try_quiesce(&self) {
@@ -2149,19 +2214,24 @@ impl QueryServer {
 
         let be_txn = self.be.read()?;
 
+        // Read transactions have no caller supplied time. Access control time restrictions
+        // are evaluated at the time the transaction was opened.
+        let curtime = duration_from_epoch_now();
+
         Ok(QueryServerReadTransaction {
             be_txn,
             schema,
             d_info: self.d_info.read(),
             system_config: self.system_config.read(),
             feature_config: self.feature_config.read(),
-            accesscontrols: self.accesscontrols.read(),
+            accesscontrols: self.accesscontrols.read(curtime),
             key_providers: self.key_providers.read(),
             _db_ticket: db_ticket,
             _read_ticket: read_ticket,
             resolve_filter_cache: self.resolve_filter_cache.read(),
             trim_cid,
             txn_name_to_uuid: Default::default(),
+            health: &self.health,
         })
     }
 
@@ -2272,9 +2342,10 @@ impl QueryServer {
             trim_cid,
             be_txn,
             schema: schema_write,
-            accesscontrols: self.accesscontrols.write(),
+            accesscontrols: self.accesscontrols.write(curtime),
             changed_flags: ChangeFlag::empty(),
             changed_uuid: HashSet::new(),
+            replication_apply: false,
             _db_ticket: db_ticket,
             _write_ticket: write_ticket,
             resolve_filter_cache: self.resolve_filter_cache.read(),
@@ -2283,6 +2354,7 @@ impl QueryServer {
             dyngroup_cache: self.dyngroup_cache.write(),
             key_providers: self.key_providers.write(),
             txn_name_to_uuid: Default::default(),
+            health: &self.health,
         })
     }
 
@@ -2327,6 +2399,32 @@ impl QueryServer {
             Err(_) => vec![Err(ConsistencyError::Unknown)],
         }
     }
+}
+
+/// Kubidm: the profiles (uuid to name) of an access control reload that are newly
+/// skipped: skipped in `current` as a kind they were not skipped as in `previous`.
+pub(crate) fn acp_newly_skipped<'a>(
+    previous: &SkippedAcps,
+    current: &'a SkippedAcps,
+) -> BTreeMap<Uuid, &'a str> {
+    current
+        .iter()
+        .filter(|(key, _)| !previous.contains_key(key))
+        .map(|((uuid, _), name)| (*uuid, name.as_str()))
+        .collect()
+}
+
+/// Kubidm: describe skipped profiles (uuid to name) for a report: whether any of them is
+/// a built-in profile (in the system uuid range), and each as "name (uuid)".
+pub(crate) fn acp_skipped_report(profiles: &BTreeMap<Uuid, &str>) -> (bool, Vec<String>) {
+    let builtin = profiles
+        .keys()
+        .any(|uuid| *uuid < DYNAMIC_RANGE_MINIMUM_UUID);
+    let profiles = profiles
+        .iter()
+        .map(|(uuid, name)| format!("{name} ({uuid})"))
+        .collect();
+    (builtin, profiles)
 }
 
 impl<'a> QueryServerWriteTransaction<'a> {
@@ -2542,10 +2640,174 @@ impl<'a> QueryServerWriteTransaction<'a> {
         self.accesscontrols
             .update_sync_agreements(sync_agreement_map);
 
+        // Kubidm: the profiles of each kind that are loaded now, before this reload. Such a
+        // profile was valid, so a change in this transaction that leaves it invalid is
+        // rejected, even when the profile entry itself did not change (see
+        // [Self::acp_reload_rejects_invalid]). Captured per kind, as a profile of several
+        // kinds may be valid as one and invalid as another.
+        fn loaded<T>(acps: &[T], acp: impl Fn(&T) -> &AccessControlProfile) -> BTreeSet<Uuid> {
+            acps.iter().map(|a| acp(a).uuid()).collect()
+        }
+        let loaded_search = loaded(self.accesscontrols.get_search(), |a| &a.acp);
+        let loaded_create = loaded(self.accesscontrols.get_create(), |a| &a.acp);
+        let loaded_modify = loaded(self.accesscontrols.get_modify(), |a| &a.acp);
+        let loaded_delete = loaded(self.accesscontrols.get_delete(), |a| &a.acp);
+        let mut skipped = SkippedAcps::new();
+
         // Update search
+        let search_acps = self.reload_acp_kind(
+            EntryClass::AccessControlSearch,
+            AccessControlSearch::try_from,
+            &loaded_search,
+            &mut skipped,
+        )?;
+        self.accesscontrols
+            .update_search(search_acps)
+            .map_err(|e| {
+                admin_error!(err = ?e, "Failed to update search accesscontrols");
+                e
+            })?;
+
+        // Update create
+        let create_acps = self.reload_acp_kind(
+            EntryClass::AccessControlCreate,
+            AccessControlCreate::try_from,
+            &loaded_create,
+            &mut skipped,
+        )?;
+        self.accesscontrols
+            .update_create(create_acps)
+            .map_err(|e| {
+                admin_error!(err = ?e, "Failed to update create accesscontrols");
+                e
+            })?;
+
+        // Update modify
+        let modify_acps = self.reload_acp_kind(
+            EntryClass::AccessControlModify,
+            AccessControlModify::try_from,
+            &loaded_modify,
+            &mut skipped,
+        )?;
+        self.accesscontrols
+            .update_modify(modify_acps)
+            .map_err(|e| {
+                admin_error!("Failed to update modify accesscontrols {:?}", e);
+                e
+            })?;
+
+        // Update delete
+        let delete_acps = self.reload_acp_kind(
+            EntryClass::AccessControlDelete,
+            AccessControlDelete::try_from,
+            &loaded_delete,
+            &mut skipped,
+        )?;
+        self.accesscontrols
+            .update_delete(delete_acps)
+            .map_err(|e| {
+                admin_error!("Failed to update delete accesscontrols {:?}", e);
+                e
+            })?;
+
+        // Kubidm: summarise the profiles that this reload newly skipped once the server is
+        // running (say, made invalid by replication), so that each is reported once. Start
+        // up reports every skipped profile once, at its end (see `initialise_helper`). A
+        // newly skipped built-in profile is an error: the server is missing access it
+        // ships with, until the profile is fixed.
+        if *self.phase >= ServerPhase::Running {
+            let newly_skipped = acp_newly_skipped(self.accesscontrols.get_skipped(), &skipped);
+            let (builtin, profiles) = acp_skipped_report(&newly_skipped);
+            if builtin {
+                error!(
+                    count = profiles.len(),
+                    ?profiles,
+                    "Some access control profiles, including built-in ones, became invalid and are skipped, they grant nothing until they are fixed or disabled"
+                );
+            } else if !profiles.is_empty() {
+                warn!(
+                    count = profiles.len(),
+                    ?profiles,
+                    "Some access control profiles became invalid and are skipped, they grant nothing until they are fixed or disabled"
+                );
+            }
+        }
+        self.accesscontrols.update_skipped(skipped);
+        Ok(())
+    }
+
+    /// Kubidm: is an access control profile that fails to parse an error (rejecting the
+    /// change that made it invalid), rather than skipped?
+    ///
+    /// Never while applying replicated changes: the content was already accepted by the
+    /// supplier, and failing here would block replication. Otherwise, it is an error only
+    /// for a profile created or modified in this transaction (including changes made by
+    /// referential integrity, such as deleting a delegated scope group), or one that was
+    /// loaded before this reload (`loaded`), so a change that breaks a valid profile
+    /// indirectly (say, a schema change) is rejected too. This applies:
+    ///
+    /// - once the server is `Running`, to every profile;
+    /// - before that (start up and migrations), to a built-in profile (in the system uuid
+    ///   range) only, unless an earlier reload already skipped it as invalid as this
+    ///   `kind` (skipped profiles are recorded per kind, like `loaded`). The
+    ///   migrations rewrite every built-in profile in the start up transaction
+    ///   (`internal_migrate_or_create` modifies the stored entry, which marks it changed,
+    ///   even when nothing differs), and a built-in that was valid before is loaded, so a
+    ///   shipped definition or parser change that breaks a built-in fails bootstrap and
+    ///   upgrades loudly rather than silently granting nothing.
+    ///
+    /// Any other invalid profile is skipped and reported, including a stored built-in that
+    /// is invalid before start up rewrites it (say, made invalid by replicated content):
+    /// pre-release builds re-run the migrations of the current level on every start, and
+    /// a node that can not start has no in-band recovery. While running, a profile that is
+    /// neither changed nor loaded is skipped so that it never blocks unrelated writes. A
+    /// replication refresh marks every entry as changed, and runs as replication.
+    fn acp_reload_rejects_invalid(
+        &self,
+        uuid: Uuid,
+        kind: EntryClass,
+        loaded: &BTreeSet<Uuid>,
+    ) -> bool {
+        if self.replication_apply {
+            return false;
+        }
+        if !(self.is_changed_uuid(&uuid) || loaded.contains(&uuid)) {
+            return false;
+        }
+        if *self.phase >= ServerPhase::Running {
+            return true;
+        }
+        // The skipped profiles of the previous reload, as this reload records its own only
+        // once it is done.
+        uuid < DYNAMIC_RANGE_MINIMUM_UUID
+            && !self
+                .accesscontrols
+                .get_skipped()
+                .contains_key(&(uuid, kind.into()))
+    }
+
+    /// Kubidm: search and parse the enabled access control profiles of one kind.
+    ///
+    /// Parsing fails closed per profile: access control profiles only ever grant, so a
+    /// profile that is skipped grants nothing. An invalid profile fails the reload when
+    /// [Self::acp_reload_rejects_invalid], so the offending change is rejected with the
+    /// parser's error, which gives the reason but not the profile: the caller may not be
+    /// allowed to read it. The log names the profile, so that an administrator can tell
+    /// which profile blocks the change (for example the delete of a group that a
+    /// delegated profile is scoped to). Any other invalid profile is logged, added to
+    /// `skipped` and left out, so a stored profile that the current parser rejects never
+    /// blocks unrelated writes, start up or replication. `loaded` are the profiles of this
+    /// kind that were loaded before this reload.
+    fn reload_acp_kind<T>(
+        &mut self,
+        kind: EntryClass,
+        parse: impl Fn(&mut Self, &EntrySealedCommitted) -> Result<T, OperationError>,
+        loaded: &BTreeSet<Uuid>,
+        skipped: &mut SkippedAcps,
+    ) -> Result<Vec<T>, OperationError> {
         let filt = filter!(f_and!([
             f_eq(Attribute::Class, EntryClass::AccessControlProfile.into()),
-            f_eq(Attribute::Class, EntryClass::AccessControlSearch.into()),
+            f_eq(Attribute::Class, kind.into()),
             f_andnot(f_eq(Attribute::AcpEnable, PV_FALSE.clone())),
         ]));
 
@@ -2556,104 +2818,43 @@ impl<'a> QueryServerWriteTransaction<'a> {
             );
             e
         })?;
-        let search_acps: Result<Vec<_>, _> = res
-            .iter()
-            .map(|e| AccessControlSearch::try_from(self, e))
-            .collect();
 
-        let search_acps = search_acps.map_err(|e| {
-            admin_error!(err = ?e, "Unable to parse search accesscontrols");
-            e
-        })?;
+        let mut acps = Vec::with_capacity(res.len());
+        for entry in res.iter() {
+            let uuid = entry.get_uuid();
+            match parse(self, entry.as_ref()) {
+                Ok(acp) => acps.push(acp),
+                Err(err) => {
+                    let name = entry
+                        .get_ava_single_iname(Attribute::Name)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| entry.get_display_id());
+                    if self.acp_reload_rejects_invalid(uuid, kind, loaded) {
+                        error!(
+                            ?err,
+                            %uuid,
+                            %name,
+                            %kind,
+                            "Rejecting a change that leaves this access control profile invalid"
+                        );
+                        // The parser's errors carry the reason only, never the profile
+                        // name or uuid. Any other error (say, from the backend) is passed
+                        // on unchanged too.
+                        return Err(err);
+                    }
+                    error!(
+                        ?err,
+                        %uuid,
+                        %name,
+                        %kind,
+                        "Skipping invalid access control profile, it grants nothing until it is fixed or disabled"
+                    );
+                    skipped.insert((uuid, kind.into()), name);
+                }
+            }
+        }
 
-        self.accesscontrols
-            .update_search(search_acps)
-            .map_err(|e| {
-                admin_error!(err = ?e, "Failed to update search accesscontrols");
-                e
-            })?;
-        // Update create
-        let filt = filter!(f_and!([
-            f_eq(Attribute::Class, EntryClass::AccessControlProfile.into()),
-            f_eq(Attribute::Class, EntryClass::AccessControlCreate.into()),
-            f_andnot(f_eq(Attribute::AcpEnable, PV_FALSE.clone())),
-        ]));
-
-        let res = self.internal_search(filt).map_err(|e| {
-            admin_error!(
-                err = ?e,
-                "reload accesscontrols internal search failed"
-            );
-            e
-        })?;
-        let create_acps: Result<Vec<_>, _> = res
-            .iter()
-            .map(|e| AccessControlCreate::try_from(self, e))
-            .collect();
-
-        let create_acps = create_acps.map_err(|e| {
-            admin_error!(err = ?e, "Unable to parse create accesscontrols");
-            e
-        })?;
-
-        self.accesscontrols
-            .update_create(create_acps)
-            .map_err(|e| {
-                admin_error!(err = ?e, "Failed to update create accesscontrols");
-                e
-            })?;
-        // Update modify
-        let filt = filter!(f_and!([
-            f_eq(Attribute::Class, EntryClass::AccessControlProfile.into()),
-            f_eq(Attribute::Class, EntryClass::AccessControlModify.into()),
-            f_andnot(f_eq(Attribute::AcpEnable, PV_FALSE.clone())),
-        ]));
-
-        let res = self.internal_search(filt).map_err(|e| {
-            admin_error!("reload accesscontrols internal search failed {:?}", e);
-            e
-        })?;
-        let modify_acps: Result<Vec<_>, _> = res
-            .iter()
-            .map(|e| AccessControlModify::try_from(self, e))
-            .collect();
-
-        let modify_acps = modify_acps.map_err(|e| {
-            admin_error!("Unable to parse modify accesscontrols {:?}", e);
-            e
-        })?;
-
-        self.accesscontrols
-            .update_modify(modify_acps)
-            .map_err(|e| {
-                admin_error!("Failed to update modify accesscontrols {:?}", e);
-                e
-            })?;
-        // Update delete
-        let filt = filter!(f_and!([
-            f_eq(Attribute::Class, EntryClass::AccessControlProfile.into()),
-            f_eq(Attribute::Class, EntryClass::AccessControlDelete.into()),
-            f_andnot(f_eq(Attribute::AcpEnable, PV_FALSE.clone())),
-        ]));
-
-        let res = self.internal_search(filt).map_err(|e| {
-            admin_error!("reload accesscontrols internal search failed {:?}", e);
-            e
-        })?;
-        let delete_acps: Result<Vec<_>, _> = res
-            .iter()
-            .map(|e| AccessControlDelete::try_from(self, e))
-            .collect();
-
-        let delete_acps = delete_acps.map_err(|e| {
-            admin_error!("Unable to parse delete accesscontrols {:?}", e);
-            e
-        })?;
-
-        self.accesscontrols.update_delete(delete_acps).map_err(|e| {
-            admin_error!("Failed to update delete accesscontrols {:?}", e);
-            e
-        })
+        Ok(acps)
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -3062,6 +3263,20 @@ impl<'a> QueryServerWriteTransaction<'a> {
         self.changed_flags.contains(ChangeFlag::OAUTH2_CLIENT)
     }
 
+    /// Was the entry with this uuid created, modified or deleted in this transaction?
+    #[inline]
+    pub(crate) fn is_changed_uuid(&self, uuid: &Uuid) -> bool {
+        self.changed_uuid.contains(uuid)
+    }
+
+    /// Kubidm: does this transaction apply replicated changes (incremental or refresh)?
+    /// Validation of the replicated content is the supplier's job, so post commit
+    /// reloads must skip invalid content rather than fail and block replication.
+    #[inline]
+    pub(crate) fn is_replication_apply(&self) -> bool {
+        self.replication_apply
+    }
+
     /// Indicate that we are about to re-bootstrap this server. You should ONLY
     /// call this during a replication refresh!!!
     pub(crate) fn set_phase_bootstrap(&mut self) {
@@ -3191,10 +3406,12 @@ impl<'a> QueryServerWriteTransaction<'a> {
             trim_cid: _,
             changed_flags,
             changed_uuid: _,
+            replication_apply: _,
             resolve_filter_cache: _,
             resolve_filter_cache_clear,
             mut resolve_filter_cache_write,
             txn_name_to_uuid: _,
+            health,
         } = self;
         debug_assert!(!committed);
 
@@ -3205,7 +3422,9 @@ impl<'a> QueryServerWriteTransaction<'a> {
 
         // Write the cid to the db. If this fails, we can't assume replication
         // will be stable, so return if it fails.
-        be_txn.set_db_ts_max(cid.ts)?;
+        be_txn.set_db_ts_max(cid.ts).inspect_err(|_| {
+            health.mark_database_failure(DatabaseCheck::Commit);
+        })?;
         // The WAL archive records this transaction's changes under its CID.
         be_txn.set_wal_cid(&cid);
         cid.commit();
@@ -3228,7 +3447,16 @@ impl<'a> QueryServerWriteTransaction<'a> {
             .map(|_| dyngroup_cache.commit())
             .and_then(|_| key_providers.commit())
             .and_then(|_| accesscontrols.commit())
-            .and_then(|_| be_txn.commit())
+            .and_then(|_| {
+                // Kubidm: only the backend commit itself decides the database health. The
+                // logical validations above reject a change, they do not break the database.
+                let committed = be_txn.commit();
+                match committed {
+                    Ok(()) => health.mark_database_healthy(DatabaseCheck::Commit),
+                    Err(_) => health.mark_database_failure(DatabaseCheck::Commit),
+                }
+                committed
+            })
     }
 
     pub(crate) fn get_txn_cid(&self) -> &Cid {

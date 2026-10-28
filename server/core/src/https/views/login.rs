@@ -2,6 +2,7 @@ use super::{constants::Urls, cookies, empty_string_as_none, UnrecoverableErrorVi
 use crate::https::{
     extractors::{DomainInfo, DomainInfoRead, VerifiedClientInformation},
     middleware::KOpId,
+    oauth2_client_http::{submit_access_token_introspect_request, submit_access_token_request},
     views::errors::HtmxError,
     ServerState,
 };
@@ -20,10 +21,6 @@ use kubidm_proto::{
     internal::{
         UserAuthToken, COOKIE_AUTH_SESSION_ID, COOKIE_BEARER_TOKEN, COOKIE_CU_SESSION_TOKEN,
         COOKIE_OAUTH2_REQ, COOKIE_USERNAME,
-    },
-    oauth2::{
-        AccessTokenIntrospectRequest, AccessTokenIntrospectResponse, AccessTokenRequest,
-        AccessTokenResponse,
     },
     v1::{AuthAllowed, AuthIssueSession, AuthMech},
 };
@@ -1043,6 +1040,7 @@ async fn view_login_step(
                         request,
                     } => {
                         let response = submit_access_token_request(
+                            &state.oauth2_client_http,
                             token_url,
                             client_id,
                             client_secret,
@@ -1074,6 +1072,7 @@ async fn view_login_step(
                         request,
                     } => {
                         let response = submit_access_token_introspect_request(
+                            &state.oauth2_client_http,
                             introspection_url,
                             client_id,
                             client_secret,
@@ -1168,95 +1167,6 @@ async fn view_login_step(
     };
 
     Ok((jar, response).into_response())
-}
-
-async fn submit_access_token_request(
-    token_url: Url,
-    client_id: String,
-    client_secret: String,
-    request: AccessTokenRequest,
-) -> Result<AccessTokenResponse, OperationError> {
-    // Setup a client and post the req.
-    // TODO: Lots of settings we need to be able to configure here,
-    // but for a proof of concept defaults are okay.
-    //
-    // We would probably move the client into the auth server state
-    // if anything.
-    let client = reqwest::ClientBuilder::new().build().map_err(|err| {
-        error!(?err, "Invalid oauth2 http client builder parameters");
-        OperationError::InvalidState
-    })?;
-
-    let res = client
-        .post(token_url.as_str())
-        .basic_auth(&client_id, Some(client_secret))
-        .form(&request)
-        .send()
-        .await
-        .map_err(|err| {
-            error!(
-                ?err,
-                ?token_url,
-                ?client_id,
-                "Unable to submit access token request"
-            );
-            OperationError::InvalidState
-        })?;
-
-    // Now depending on the result we have to choose how to proceed.
-    if res.status() == reqwest::StatusCode::OK {
-        res.json::<AccessTokenResponse>().await.map_err(|err| {
-            error!(?err, "response was not a valid JSON access token response");
-            OperationError::InvalidState
-        })
-    } else {
-        error!(status = ?res.status(), "access token request failed");
-        Err(OperationError::InvalidState)
-    }
-}
-
-async fn submit_access_token_introspect_request(
-    introspection_url: Url,
-    client_id: String,
-    client_secret: String,
-    request: AccessTokenIntrospectRequest,
-) -> Result<AccessTokenIntrospectResponse, OperationError> {
-    let client = reqwest::ClientBuilder::new().build().map_err(|err| {
-        error!(?err, "Invalid oauth2 http client builder parameters");
-        OperationError::InvalidState
-    })?;
-
-    let res = client
-        .post(introspection_url.as_str())
-        .basic_auth(&client_id, Some(client_secret))
-        .form(&request)
-        .send()
-        .await
-        .map_err(|err| {
-            error!(
-                ?err,
-                ?introspection_url,
-                ?client_id,
-                "Unable to submit access token introspect request"
-            );
-            OperationError::InvalidState
-        })?;
-
-    // Now depending on the result we have to choose how to proceed.
-    if res.status() == reqwest::StatusCode::OK {
-        res.json::<AccessTokenIntrospectResponse>()
-            .await
-            .map_err(|err| {
-                error!(
-                    ?err,
-                    "response was not a valid JSON access token introspect response"
-                );
-                OperationError::InvalidState
-            })
-    } else {
-        error!(status = ?res.status(), "access token introspect request failed");
-        Err(OperationError::InvalidState)
-    }
 }
 
 fn add_session_cookie(

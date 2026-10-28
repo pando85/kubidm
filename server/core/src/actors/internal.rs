@@ -11,7 +11,10 @@ use kubidm_proto::{
     scim_v1::client::ScimAssertGeneric,
 };
 use kubidmd_lib::{
-    event::{PurgeDeleteAfterEvent, PurgeRecycledEvent, PurgeTombstoneEvent},
+    event::{
+        ApprovalSweepEvent, PurgeDeleteAfterEvent, PurgeRecycledEvent, PurgeTombstoneEvent,
+        RefreshTimeBoundedMembershipEvent,
+    },
     idm::delayed::DelayedAction,
     prelude::*,
     server::scim::ScimAssertEvent,
@@ -123,6 +126,59 @@ impl QueryServerWriteV1 {
                 }
             })
             .inspect_err(|err| error!(?err, "Unable to purge delete after entries"));
+    }
+
+    #[instrument(
+        level = "info",
+        skip_all,
+        fields(uuid = ?msg.eventid)
+    )]
+    pub async fn handle_refresh_time_bounded_membership_event(
+        &self,
+        msg: RefreshTimeBoundedMembershipEvent,
+    ) {
+        let ct = duration_from_epoch_now();
+        let Ok(mut idms_prox_write) = self.idms.proxy_write(ct).await else {
+            warn!("Unable to start time bounded membership refresh, will retry later");
+            return;
+        };
+        let _ = idms_prox_write
+            .qs_write
+            .refresh_time_bounded_memberships()
+            .and_then(|touched| {
+                // don't need to commit a txn with no changes
+                if touched > 0 {
+                    idms_prox_write.commit()
+                } else {
+                    Ok(())
+                }
+            })
+            .inspect_err(|err| error!(?err, "Unable to refresh time bounded memberships"));
+    }
+
+    #[instrument(
+        level = "info",
+        skip_all,
+        fields(uuid = ?msg.eventid)
+    )]
+    pub async fn handle_approval_sweep_event(&self, msg: ApprovalSweepEvent) {
+        let ct = duration_from_epoch_now();
+        let Ok(mut idms_prox_write) = self.idms.proxy_write(ct).await else {
+            warn!("Unable to start approval sweep, will retry later");
+            return;
+        };
+        let _ = idms_prox_write
+            .qs_write
+            .approval_sweep()
+            .and_then(|touched| {
+                // don't need to commit a txn with no changes
+                if touched > 0 {
+                    idms_prox_write.commit()
+                } else {
+                    Ok(())
+                }
+            })
+            .inspect_err(|err| error!(?err, "Unable to sweep approval requests"));
     }
 
     pub(crate) async fn handle_delayedaction(&self, da_batch: &mut Vec<DelayedAction>) {

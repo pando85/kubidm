@@ -325,8 +325,20 @@ pub async fn restore_server_core(
     config: &Configuration,
     dst_path: &Path,
 ) -> Result<RestoreStatus, OperationError> {
+    let _wal_lock = lock_wal_dir_for_restore(config).await?;
     let committed = restore_and_replay_commit(config, dst_path, Vec::new()).await?;
     finish_restore(config, committed).await
+}
+
+/// Refuse to restore while a server archives into the WAL directory of `config`: see
+/// [`pitr::lock_wal_dir`]. The lock is held until the restore is done.
+async fn lock_wal_dir_for_restore(
+    config: &Configuration,
+) -> Result<Option<kubidmd_lib::repl::wal::WalDirLock>, OperationError> {
+    pitr::lock_wal_dir(config).await.map_err(|err| {
+        error!(%err, "Refusing to restore; the database was not changed");
+        OperationError::InvalidState
+    })
 }
 
 /// The steps of a restore after its commit. The database holds the backup from here on,
@@ -340,6 +352,7 @@ async fn finish_restore(
     committed.reindex(config).await.inspect_err(|_| {
         error!("Run `kubidmd database reindex` before starting the server");
     })?;
+    pitr::note_database_replaced_in_wal(config, status).await;
     Ok(status)
 }
 
@@ -640,6 +653,7 @@ pub async fn restore_s3_database(
     s3_config: S3Config,
     key: &str,
 ) -> Result<RestoreStatus, OperationError> {
+    let _wal_lock = lock_wal_dir_for_restore(config).await?;
     let fetched = fetch_s3_backup(s3_config, key).await.map_err(|err| {
         error!(%err, "Unable to download backup {key} from S3");
         OperationError::InvalidState

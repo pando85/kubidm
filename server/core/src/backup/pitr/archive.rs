@@ -6,15 +6,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kubidm_proto::backup::{
-    PitrBaseBackup, PitrManifest, PitrServerUuidChange, PitrWalGap, WalJournalMode, WalSegment,
-    PITR_MANIFEST_KEY,
+    PitrBaseBackup, PitrManifest, PitrServerUuidChange, PitrTimelineBreak, PitrWalGap,
+    WalJournalMode, WalSegment, PITR_MANIFEST_KEY,
 };
 use kubidmd_lib::be::{lock_wal, BackupStructuralReport, SharedWalArchiver};
 use kubidmd_lib::prelude::duration_from_epoch_now;
 use kubidmd_lib::repl::wal::{
     format_ts_rfc3339, parse_segment_file_name, quarantine_segment, rebuild_sidecar,
-    remove_segment, scan_segments, write_closed_segments, WalArchiver, WalGap, WalPendingEvents,
-    WalServerUuidChange,
+    remove_segment, scan_segments, write_closed_segments, WalArchiver, WalGap, WalGapReason,
+    WalPendingEvents, WalServerUuidChange, WalUnverified,
 };
 use tokio::sync::broadcast;
 use tokio::time::{interval, MissedTickBehavior};
@@ -130,6 +130,85 @@ fn record_gaps(manifest: &mut PitrManifest, gaps: &[WalGap], now: Duration) -> b
         manifest.add_gap(gap);
     }
     !gaps.is_empty()
+}
+
+/// How far the archive accounts for the database, as the archiver knows it when a
+/// synchronisation starts.
+#[derive(Debug, Default, Clone, Copy)]
+struct SyncCoverage {
+    /// See [`WalArchiver::unverified_coverage`].
+    unverified: Option<WalUnverified>,
+    /// See [`WalArchiver::archived_coverage`].
+    archived: Option<Duration>,
+    /// See [`WalArchiver::revert_check`].
+    revert_check: Option<Duration>,
+}
+
+/// When the archiver started without knowing how far the archive covers its database (its
+/// WAL directory was lost, recreated, or never had the record): record a gap for what
+/// `manifest`, and the closed segments the WAL directory held at that start, miss of the
+/// history up to the database the archiver started on. Segments written since do not
+/// count: they all end after that database, and would hide the gap. An archive without
+/// history misses nothing. Returns whether a gap was recorded.
+fn record_uncovered_history(manifest: &mut PitrManifest, unverified: WalUnverified) -> bool {
+    let covered = unverified.local_end.max(manifest.covered_until());
+    let Some(covered) = covered.filter(|covered| *covered < unverified.db_ts_max) else {
+        return false;
+    };
+    let gap = PitrWalGap {
+        from_ts: covered + Duration::from_nanos(1),
+        until_ts: unverified.db_ts_max,
+        reason: WalGapReason::ArchiveNotRunning.to_string(),
+    };
+    error!(
+        from = %format_ts_rfc3339(gap.from_ts),
+        until = %format_ts_rfc3339(gap.until_ts),
+        "WAL ARCHIVE HOLE: the database committed transactions the WAL archive never saw \
+         (archiving was disabled, or the WAL directory was lost or recreated). Point-in-time \
+         recovery can not replay across them until a new base backup is taken."
+    );
+    manifest.add_gap(gap);
+    true
+}
+
+/// When the archiver started on a database whose last transaction was `db_ts_max`: the
+/// history `manifest` holds after it, that no restore or recovery abandoned, belongs to a
+/// state the database was put back from behind the archive's back (the database and its
+/// WAL directory reverted together, from one volume snapshot), and the database goes on
+/// from an earlier one. It is recorded as abandoned, as a restore would, so that a recovery
+/// never replays it. Returns whether it was. A server's archive never holds history after
+/// its database otherwise.
+fn record_reverted_history(
+    manifest: &mut PitrManifest,
+    db_ts_max: Duration,
+    now: Duration,
+) -> bool {
+    let newest = manifest
+        .segments
+        .iter()
+        .map(|segment| segment.end_ts)
+        .chain(manifest.base_backups.iter().map(|base| base.watermark_ts))
+        .chain(manifest.covered_until_ts)
+        .filter(|ts| *ts > db_ts_max && !manifest.is_abandoned(*ts))
+        .max();
+    let Some(until_ts) = newest else {
+        return false;
+    };
+    error!(
+        after = %format_ts_rfc3339(db_ts_max),
+        until = %format_ts_rfc3339(until_ts),
+        "The WAL archive holds history after the last transaction of the database: the database \
+         was put back to an earlier state outside restore and recover (a volume snapshot). The \
+         history after it is recorded as abandoned and is never replayed; take a new base \
+         backup."
+    );
+    manifest.add_timeline_break(PitrTimelineBreak {
+        after_ts: db_ts_max,
+        until_ts,
+        at: format_ts_rfc3339(now),
+        reason: "the database was reverted behind the archive (volume snapshot)".to_string(),
+    });
+    true
 }
 
 /// Drop the timeline breaks and gaps no retained history needs any more. Returns whether
@@ -300,6 +379,7 @@ impl PitrArchive {
         let (sealed, events, server_uuid) = self
             .with_archiver(move |archiver| {
                 archiver.adopt_handed_over_gaps();
+                archiver.persist_coverage();
                 let sealed = if force_flush {
                     archiver.seal_current()
                 } else {
@@ -314,12 +394,34 @@ impl PitrArchive {
             report.flush_failed = true;
             warn!(%err, "Unable to write the closed WAL segments; archiving what is already written");
         }
+        let noticed = events.clone();
+        let coverage = self
+            .with_archiver(move |archiver| {
+                // An event noticed since the snapshot above is not recorded by this run:
+                // the archive must not claim to cover the database past it.
+                let archived = archiver
+                    .archived_coverage()
+                    .filter(|_| archiver.pending_events() == noticed);
+                Ok(SyncCoverage {
+                    unverified: archiver.unverified_coverage(),
+                    archived,
+                    revert_check: archiver.revert_check(),
+                })
+            })
+            .await?;
 
         // The events the archiver noticed go into the manifest with this run. They stay
         // pending in the archiver, on disk, until a saved manifest records them.
         let mut events_recorded = false;
         let mut result = self
-            .sync_locked(now, &events, server_uuid, &mut events_recorded, &mut report)
+            .sync_locked(
+                now,
+                &events,
+                server_uuid,
+                coverage,
+                &mut events_recorded,
+                &mut report,
+            )
             .await;
         if events_recorded && !events.is_empty() {
             self.with_archiver(move |archiver| Ok(archiver.acknowledge_events(&events)?))
@@ -328,6 +430,18 @@ impl PitrArchive {
                     // They are recorded twice at worst, which changes nothing.
                     warn!(%err, "Unable to forget the WAL archive events the manifest records");
                 });
+        }
+        if events_recorded && (coverage.unverified.is_some() || coverage.revert_check.is_some()) {
+            self.with_archiver(move |archiver| {
+                if let Some(checked) = coverage.unverified {
+                    archiver.confirm_coverage(checked);
+                }
+                if coverage.revert_check.is_some() {
+                    archiver.confirm_revert_check();
+                }
+                Ok(())
+            })
+            .await?;
         }
 
         // The archiving may have freed the space the write needed: try it again, and
@@ -343,6 +457,7 @@ impl PitrArchive {
                                 now,
                                 &WalPendingEvents::default(),
                                 server_uuid,
+                                SyncCoverage::default(),
                                 &mut false,
                                 &mut report,
                             )
@@ -368,6 +483,28 @@ impl PitrArchive {
         }
     }
 
+    /// At shutdown, once the last synchronisation ran: make sure the events no manifest
+    /// records yet and the coverage of the database are on disk for the next start, and
+    /// release the lock of the WAL directory, see [`WalArchiver::close`]. The files are
+    /// synced off the async runtime.
+    pub async fn close(&self) {
+        if let Err(err) = self.with_archiver(|archiver| Ok(archiver.close()?)).await {
+            error!(
+                %err,
+                "Unable to hand the pending WAL archive events to the next start; \
+                 point-in-time recovery may replay across their gaps. Take a new online backup."
+            );
+        }
+    }
+
+    /// Release the lock of the WAL directory without anything else, as the end of the
+    /// process does: for tests that simulate a crash by leaking a running server. Not
+    /// behind `cfg(test)`, since those tests live in the testkit crate.
+    #[doc(hidden)]
+    pub fn release_lock(&self) {
+        lock_wal(&self.archiver).release_lock();
+    }
+
     /// At shutdown: make sure the events no manifest records yet are on disk for the next
     /// start.
     pub fn persist_pending_events(&self) {
@@ -389,6 +526,7 @@ impl PitrArchive {
         now: Duration,
         events: &WalPendingEvents,
         server_uuid: Uuid,
+        coverage: SyncCoverage,
         events_recorded: &mut bool,
         report: &mut PitrSyncReport,
     ) -> Result<PitrManifest, PitrError> {
@@ -401,6 +539,12 @@ impl PitrArchive {
             load_or_new_manifest(store, &self.settings.location, server_uuid, events).await?;
 
         changed |= record_gaps(&mut manifest, &events.gaps, now);
+        if let Some(db_ts_max) = coverage.revert_check.filter(|_| events.restores.is_empty()) {
+            changed |= record_reverted_history(&mut manifest, db_ts_max, now);
+        }
+        if let Some(unverified) = coverage.unverified {
+            changed |= record_uncovered_history(&mut manifest, unverified);
+        }
         let settled_bases = self.adopt_manual_bases(&mut manifest).await?;
         changed |= !settled_bases.is_empty();
         let mut local_segments = scan.segments;
@@ -419,6 +563,14 @@ impl PitrArchive {
             .archive_pending(store, &mut manifest, pending, now)
             .await;
         changed |= archived.quarantined;
+        // Everything the archiver recorded is archived now: the archive accounts for the
+        // database up to the last transaction it saw, those that archived nothing included.
+        if let Some(covered) = coverage.archived.filter(|_| archived.error.is_none()) {
+            if manifest.covered_until_ts < Some(covered) {
+                manifest.covered_until_ts = Some(covered);
+                changed = true;
+            }
+        }
 
         if !archived.segments.is_empty() || changed {
             store.save_manifest(&mut manifest, now).await?;
@@ -940,8 +1092,8 @@ mod tests {
     use kubidm_proto::backup::{BackupEncryptionConfig, WalArchiveConfig};
     use kubidmd_lib::repl::cid::Cid;
     use kubidmd_lib::repl::wal::{
-        list_segments, segment_file_name, segment_meta_path, WalArchiver, WalPendingOp,
-        WAL_QUARANTINE_SUFFIX,
+        list_segments, segment_file_name, segment_meta_path, WalArchiver, WalCoverage,
+        WalPendingOp, WAL_QUARANTINE_SUFFIX,
     };
 
     use super::super::recover::{record_timeline_break, RestoredDatabase};
@@ -982,6 +1134,379 @@ mod tests {
         assert_eq!(
             select_segments_to_delete(&m3, Duration::from_secs(DAY + 500), retention),
             vec!["s1".to_string(), "s2".to_string()]
+        );
+    }
+
+    fn unverified(db_ts_max: u64, local_end: Option<u64>) -> WalUnverified {
+        WalUnverified {
+            db_ts_max: Duration::from_secs(db_ts_max),
+            local_end: local_end.map(Duration::from_secs),
+        }
+    }
+
+    #[test]
+    fn test_record_uncovered_history() {
+        // An archive without history misses nothing.
+        let mut empty = PitrManifest::new(Uuid::nil());
+        assert!(!record_uncovered_history(
+            &mut empty,
+            unverified(1000, None)
+        ));
+        assert!(empty.gaps.is_empty());
+
+        // The archive reaches 600 (segment s3); a database at 600 misses nothing.
+        let mut m = manifest();
+        assert!(!record_uncovered_history(&mut m, unverified(600, None)));
+        // A database at 900 committed 600..900 where no archiver saw it.
+        assert!(record_uncovered_history(&mut m, unverified(900, None)));
+        assert_eq!(
+            m.gaps,
+            vec![PitrWalGap {
+                from_ts: Duration::from_secs(600) + Duration::from_nanos(1),
+                until_ts: Duration::from_secs(900),
+                reason: WalGapReason::ArchiveNotRunning.to_string(),
+            }]
+        );
+        let err = plan_recovery(&m, &RecoveryTargetSpec::Time("1970-01-01T00:12:30Z".into()))
+            .unwrap_err();
+        assert!(err.to_string().contains("not running"), "{err}");
+
+        // What the manifest records the archive covered, and what the WAL directory held
+        // when the archiver started, count as well.
+        let mut m = manifest();
+        m.covered_until_ts = Some(Duration::from_secs(700));
+        assert!(!record_uncovered_history(&mut m, unverified(700, None)));
+        assert!(!record_uncovered_history(
+            &mut m,
+            unverified(800, Some(800))
+        ));
+        assert!(m.gaps.is_empty());
+
+        // An archive of base backups only holds history from the oldest of them on.
+        let mut bases_only = PitrManifest::new(Uuid::nil());
+        bases_only.add_base_backup(base("backup-1", 100));
+        bases_only.add_base_backup(base("backup-2", 400));
+        assert!(record_uncovered_history(
+            &mut bases_only,
+            unverified(500, None)
+        ));
+        assert_eq!(
+            bases_only.gaps[0].from_ts,
+            Duration::from_secs(100) + Duration::from_nanos(1)
+        );
+    }
+
+    /// A base backup is indexed when it is taken, before the segments up to its watermark
+    /// reach the archive. With a base at 700 and segments only up to 600, a lost WAL
+    /// directory loses 600..700: the base does not count as archived history, the gap is
+    /// recorded, and a recovery to 650 is refused (it is even before the WAL directory is
+    /// known to be lost).
+    #[test]
+    fn test_a_base_backup_is_not_archived_history() {
+        let mut m = PitrManifest::new(Uuid::nil());
+        m.add_base_backup(base("backup-1", 100));
+        m.add_segment(segment("s1", 110, 600));
+        m.add_base_backup(base("backup-2", 700));
+        let at_650 = RecoveryTargetSpec::Time("1970-01-01T00:10:50Z".into());
+        let err = plan_recovery(&m, &at_650).unwrap_err();
+        assert!(err.to_string().contains("not archived"), "{err}");
+        assert_eq!(
+            m.latest_recoverable_ts(),
+            Some(Duration::from_secs(700)),
+            "the newest base itself is recoverable"
+        );
+
+        assert!(record_uncovered_history(&mut m, unverified(700, None)));
+        assert_eq!(
+            m.gaps,
+            vec![PitrWalGap {
+                from_ts: Duration::from_secs(600) + Duration::from_nanos(1),
+                until_ts: Duration::from_secs(700),
+                reason: WalGapReason::ArchiveNotRunning.to_string(),
+            }]
+        );
+        let err = plan_recovery(&m, &at_650).unwrap_err();
+        assert!(err.to_string().contains("not running"), "{err}");
+        let at_600 = RecoveryTargetSpec::Time("1970-01-01T00:10:00Z".into());
+        assert_eq!(plan_recovery(&m, &at_600).unwrap().base.key, "backup-1");
+        let at_800 = RecoveryTargetSpec::Time("1970-01-01T00:13:20Z".into());
+        assert_eq!(plan_recovery(&m, &at_800).unwrap().base.key, "backup-2");
+    }
+
+    /// The scenario segments written after the start must not hide: the WAL directory is
+    /// lost, the first synchronisation fails, and the archiver writes a segment that ends
+    /// after the database it started on. The next synchronisation that reaches the archive
+    /// still records the history the archive never saw.
+    #[tokio::test]
+    async fn test_segments_written_after_the_start_do_not_hide_the_gap() {
+        use std::collections::BTreeMap;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use crate::backup::s3::fake_s3;
+
+        let objects = Arc::new(Mutex::new(BTreeMap::new()));
+        let down = Arc::new(AtomicBool::new(false));
+        let fake = {
+            let store = fake_s3::store(Arc::clone(&objects));
+            let down = Arc::clone(&down);
+            fake_s3::FakeS3::start(Arc::new(move |request: &fake_s3::Recorded| {
+                if down.load(Ordering::SeqCst) {
+                    fake_s3::error(403, "AccessDenied")
+                } else {
+                    store(request)
+                }
+            }))
+            .await
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("wal");
+        let server = Uuid::new_v4();
+        let wal_cfg = WalArchiveConfig {
+            enabled: true,
+            local_path: Some(wal_dir.clone()),
+            ..WalArchiveConfig::default()
+        };
+        let settings = PitrSettings {
+            wal: wal_cfg.clone(),
+            local_dir: wal_dir.clone(),
+            location: PitrLocation::S3(fake.config("bucket")),
+            bases: BaseLocation::Local(dir.path().join("backups")),
+            encryption: BackupEncryptionConfig::default(),
+        };
+        let open = |db_ts_max: Option<u64>| -> SharedWalArchiver {
+            Arc::new(Mutex::new(
+                WalArchiver::open(
+                    wal_cfg.clone(),
+                    server,
+                    wal_dir.clone(),
+                    db_ts_max.map(Duration::from_secs),
+                )
+                .unwrap(),
+            ))
+        };
+
+        // Archived up to 150, stopped cleanly.
+        let archiver = open(None);
+        append_create(&archiver, server, 100, b"a");
+        archiver
+            .lock()
+            .unwrap()
+            .note_commit(Duration::from_secs(150));
+        let archive = PitrArchive::new(settings.clone(), archiver.clone());
+        archive
+            .sync_at_shutdown(Duration::from_secs(200))
+            .await
+            .unwrap();
+        archive.close().await;
+        drop(archive);
+        drop(archiver);
+
+        // The WAL directory is lost; the database went on to 400 without archiving.
+        fs::remove_dir_all(&wal_dir).unwrap();
+        let archiver = open(Some(400));
+        assert!(archiver.lock().unwrap().pending_events().is_empty());
+        let archive = PitrArchive::new(settings.clone(), archiver.clone());
+        down.store(true, Ordering::SeqCst);
+        assert!(archive.sync(Duration::from_secs(500), true).await.is_err());
+        // A segment ending after 400 is written meanwhile.
+        append_create(&archiver, server, 450, b"b");
+        assert!(archive.sync(Duration::from_secs(600), true).await.is_err());
+        assert!(!list_segments(&wal_dir).unwrap().is_empty());
+        assert!(archiver.lock().unwrap().unverified_coverage().is_some());
+
+        down.store(false, Ordering::SeqCst);
+        archive.sync(Duration::from_secs(700), true).await.unwrap();
+        assert_eq!(archiver.lock().unwrap().unverified_coverage(), None);
+        let store = PitrStore::open(&settings.location).await.unwrap();
+        let manifest = store.load_manifest().await.unwrap().unwrap();
+        assert_eq!(
+            manifest.gaps,
+            vec![PitrWalGap {
+                from_ts: Duration::from_secs(150) + Duration::from_nanos(1),
+                until_ts: Duration::from_secs(400),
+                reason: WalGapReason::ArchiveNotRunning.to_string(),
+            }]
+        );
+        assert!(manifest
+            .segments
+            .iter()
+            .any(|s| s.end_ts == Duration::from_secs(450)));
+    }
+
+    /// The database and its WAL directory put back together (one volume snapshot) agree
+    /// with each other, but the archive holds history after them: the first synchronisation
+    /// records it as abandoned, so that no recovery replays it. A normal start records
+    /// nothing.
+    #[tokio::test]
+    async fn test_a_database_reverted_with_its_wal_directory_abandons_the_newer_history() {
+        use std::collections::BTreeMap;
+
+        use kubidmd_lib::repl::wal::{read_coverage, write_coverage};
+
+        use crate::backup::s3::fake_s3;
+
+        let objects = Arc::new(Mutex::new(BTreeMap::new()));
+        let fake = fake_s3::FakeS3::start(fake_s3::store(Arc::clone(&objects))).await;
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("wal");
+        let server = Uuid::new_v4();
+        let wal_cfg = WalArchiveConfig {
+            enabled: true,
+            local_path: Some(wal_dir.clone()),
+            ..WalArchiveConfig::default()
+        };
+        let settings = PitrSettings {
+            wal: wal_cfg.clone(),
+            local_dir: wal_dir.clone(),
+            location: PitrLocation::S3(fake.config("bucket")),
+            bases: BaseLocation::Local(dir.path().join("backups")),
+            encryption: BackupEncryptionConfig::default(),
+        };
+        let run = |db_ts_max: Option<u64>, writes: Vec<u64>| {
+            let settings = settings.clone();
+            let wal_cfg = wal_cfg.clone();
+            let wal_dir = wal_dir.clone();
+            async move {
+                let archiver: SharedWalArchiver = Arc::new(Mutex::new(
+                    WalArchiver::open(wal_cfg, server, wal_dir, db_ts_max.map(Duration::from_secs))
+                        .unwrap(),
+                ));
+                let archive = PitrArchive::new(settings, archiver.clone());
+                for secs in writes {
+                    append_create(&archiver, server, secs, b"x");
+                    archive.sync(Duration::from_secs(secs), true).await.unwrap();
+                }
+                archive
+                    .sync_at_shutdown(Duration::from_secs(1000))
+                    .await
+                    .unwrap();
+                archive.close().await;
+            }
+        };
+        let store = PitrStore::open(&settings.location).await.unwrap();
+
+        // History up to 200; a restart on the database at 200 records nothing.
+        run(None, vec![100, 200]).await;
+        let snapshot = read_coverage(&wal_dir).unwrap();
+        assert_eq!(snapshot.covered_ts, Duration::from_secs(200));
+        run(Some(200), vec![]).await;
+        assert!(store
+            .load_manifest()
+            .await
+            .unwrap()
+            .unwrap()
+            .timeline_breaks
+            .is_empty());
+
+        // Both put back to 100 by a volume snapshot: they agree, the archive does not.
+        write_coverage(
+            &wal_dir,
+            &WalCoverage {
+                covered_ts: Duration::from_secs(100),
+                ..snapshot
+            },
+        )
+        .unwrap();
+        run(Some(100), vec![300]).await;
+        let manifest = store.load_manifest().await.unwrap().unwrap();
+        assert!(manifest.gaps.is_empty(), "{:?}", manifest.gaps);
+        assert_eq!(manifest.timeline_breaks.len(), 1);
+        let reverted = &manifest.timeline_breaks[0];
+        assert_eq!(reverted.after_ts, Duration::from_secs(100));
+        assert_eq!(reverted.until_ts, Duration::from_secs(200));
+        assert!(manifest.is_abandoned(Duration::from_secs(200)));
+        assert!(!manifest.is_abandoned(Duration::from_secs(300)));
+    }
+
+    /// A server that starts without the record of its WAL directory compares its database
+    /// with the manifest at its first synchronisation; a clean stop records in the manifest
+    /// how far the archive covers the database, so that a lost WAL directory after it is
+    /// no gap.
+    #[tokio::test]
+    async fn test_sync_compares_an_unverified_database_with_the_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("wal");
+        let backup_dir = dir.path().join("backups");
+        fs::create_dir_all(&backup_dir).unwrap();
+        let server = Uuid::new_v4();
+        let wal_cfg = WalArchiveConfig {
+            enabled: true,
+            segment_interval_seconds: 60,
+            local_path: Some(wal_dir.clone()),
+            ..WalArchiveConfig::default()
+        };
+        let settings = PitrSettings {
+            wal: wal_cfg.clone(),
+            local_dir: wal_dir.clone(),
+            location: PitrLocation::Local(wal_dir.clone()),
+            bases: BaseLocation::Local(backup_dir.clone()),
+            encryption: BackupEncryptionConfig::default(),
+        };
+        let open = |db_ts_max: Option<u64>| -> SharedWalArchiver {
+            Arc::new(Mutex::new(
+                WalArchiver::open(
+                    wal_cfg.clone(),
+                    server,
+                    wal_dir.clone(),
+                    db_ts_max.map(Duration::from_secs),
+                )
+                .unwrap(),
+            ))
+        };
+        let coverage_file = wal_dir.join(kubidmd_lib::repl::wal::WAL_COVERAGE_FILE);
+
+        // A first run archives up to 100, then commits at 150 with nothing to archive and
+        // stops cleanly: the manifest records the archive covers 150.
+        let archiver = open(None);
+        append_create(&archiver, server, 100, b"a");
+        archiver
+            .lock()
+            .unwrap()
+            .note_commit(Duration::from_secs(150));
+        let archive = PitrArchive::new(settings.clone(), archiver.clone());
+        archive
+            .sync_at_shutdown(Duration::from_secs(200))
+            .await
+            .unwrap();
+        archive.close().await;
+        drop(archive);
+        drop(archiver);
+        let store = PitrStore::open(&settings.location).await.unwrap();
+        let manifest = store.load_manifest().await.unwrap().unwrap();
+        assert_eq!(manifest.covered_until_ts, Some(Duration::from_secs(150)));
+        assert!(manifest.gaps.is_empty());
+
+        // The record of the WAL directory is lost; the database is still at 150: nothing
+        // is missing, and the coverage is verified.
+        fs::remove_file(&coverage_file).unwrap();
+        let archiver = open(Some(150));
+        assert_eq!(
+            archiver.lock().unwrap().unverified_coverage(),
+            Some(unverified(150, Some(150)))
+        );
+        let archive = PitrArchive::new(settings.clone(), archiver.clone());
+        archive.sync(Duration::from_secs(300), false).await.unwrap();
+        assert_eq!(archiver.lock().unwrap().unverified_coverage(), None);
+        let manifest = store.load_manifest().await.unwrap().unwrap();
+        assert!(manifest.gaps.is_empty());
+        archive.close().await;
+        drop(archive);
+        drop(archiver);
+
+        // Lost again, while the database went on to 400 without archiving: a gap.
+        fs::remove_file(&coverage_file).unwrap();
+        let archiver = open(Some(400));
+        let archive = PitrArchive::new(settings.clone(), archiver.clone());
+        archive.sync(Duration::from_secs(500), false).await.unwrap();
+        assert_eq!(archiver.lock().unwrap().unverified_coverage(), None);
+        let manifest = store.load_manifest().await.unwrap().unwrap();
+        assert_eq!(
+            manifest.gaps,
+            vec![PitrWalGap {
+                from_ts: Duration::from_secs(150) + Duration::from_nanos(1),
+                until_ts: Duration::from_secs(400),
+                reason: WalGapReason::ArchiveNotRunning.to_string(),
+            }]
         );
     }
 

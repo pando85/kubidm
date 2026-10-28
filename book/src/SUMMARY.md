@@ -34,12 +34,14 @@
   - [People Accounts](accounts/people_accounts.md)
   - [Authentication and Credentials](accounts/authentication_and_credentials.md)
   - [Groups](accounts/groups.md)
+    - [Temporary Group Membership](accounts/time_bounded_membership.md)
   - [Service Accounts](accounts/service_accounts.md)
   - [Anonymous Account](accounts/anonymous_account.md)
   - [Account Policy](accounts/account_policy.md)
   - [POSIX Accounts and Groups](accounts/posix_accounts_and_groups.md)
 
 - [Access Control](access_control/intro.md)
+  - [Approval Workflows](access_control/approvals.md)
 
 - [Service Integrations](integrations/readme.md)
   - [LDAP](integrations/ldap.md)
@@ -47,6 +49,7 @@
     - [How does OAuth2 work?](integrations/oauth2/how_does_oauth2_work.md)
     - [Custom Claims](integrations/oauth2/custom_claims.md)
     - [Example Configurations](integrations/oauth2/examples.md)
+  - [OAuth2 Federation](integrations/oauth2_federation.md)
   - [PAM and nsswitch](integrations/pam_and_nsswitch.md)
     - [FreeBSD](integrations/pam_and_nsswitch/freebsd.md)
     - [SUSE / OpenSUSE](integrations/pam_and_nsswitch/suse.md)

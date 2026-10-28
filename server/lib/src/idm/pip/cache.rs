@@ -39,11 +39,18 @@ impl CachedEntry {
     }
 }
 
-/// Cache key combining PIP ID and subject UUID
+/// Cache key combining the PIP ID with every subject field that can influence
+/// the query (UUID, username, email and context).
+///
+/// The context is a `BTreeMap`, so its ordering (and therefore the key) is
+/// deterministic regardless of insertion order.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct CacheKey {
     pip_id: PipId,
     subject_uuid: uuid::Uuid,
+    username: Option<String>,
+    email: Option<String>,
+    context: BTreeMap<String, String>,
 }
 
 impl CacheKey {
@@ -51,6 +58,9 @@ impl CacheKey {
         CacheKey {
             pip_id,
             subject_uuid: subject.uuid,
+            username: subject.username.clone(),
+            email: subject.email.clone(),
+            context: subject.context.clone(),
         }
     }
 }
@@ -151,12 +161,14 @@ impl PipAttributeCache {
         self.entries.insert(key, CachedEntry::new(attributes, ttl));
     }
 
-    /// Remove cached entry for a specific subject
+    /// Remove all cached entries of a PIP for the subject's UUID, whatever
+    /// username, email or context they were cached with.
     pub fn remove(&mut self, pip_id: &PipId, subject: &PipSubject) {
-        let key = CacheKey::new(pip_id.clone(), subject);
-        if self.entries.remove(&key).is_some() {
-            self.stats.evictions += 1;
-        }
+        let before = self.entries.len();
+        self.entries
+            .retain(|key, _| !(key.pip_id == *pip_id && key.subject_uuid == subject.uuid));
+        let removed = before.saturating_sub(self.entries.len());
+        self.stats.evictions += removed as u64;
     }
 
     /// Clear all cached entries
@@ -520,6 +532,73 @@ mod tests {
         let key2 = CacheKey::new(pip_id2, &subject);
 
         assert!(key1 < key2);
+    }
+
+    #[test]
+    fn test_cache_key_includes_context_username_email() {
+        let mut cache = PipAttributeCache::new(Duration::from_secs(60));
+        let pip_id = PipId::new("test_pip");
+        let uuid = Uuid::new_v4();
+
+        let office = PipSubject::from_uuid(uuid)
+            .with_username("alice")
+            .with_context("location", "office");
+        let home = PipSubject::from_uuid(uuid)
+            .with_username("alice")
+            .with_context("location", "home");
+
+        let mut attrs = PipAttributeSet::new();
+        attrs.insert(
+            super::super::PipAttributeName::new(&pip_id, "risk"),
+            super::super::PipAttributeValue::String("low".to_string()),
+        );
+        cache.put(&pip_id, &office, attrs);
+
+        // Same UUID but a different context must not hit the office entry.
+        assert!(cache.get(&pip_id, &home).is_none());
+        assert!(cache
+            .get(
+                &pip_id,
+                &PipSubject::from_uuid(uuid).with_context("location", "office")
+            )
+            .is_none());
+        assert!(cache
+            .get(&pip_id, &office.clone().with_email("alice@example.com"))
+            .is_none());
+        assert!(cache.get(&pip_id, &office).is_some());
+    }
+
+    #[test]
+    fn test_cache_key_context_order_is_deterministic() {
+        let pip_id = PipId::new("test_pip");
+        let uuid = Uuid::new_v4();
+        let a = PipSubject::from_uuid(uuid)
+            .with_context("x", "1")
+            .with_context("y", "2");
+        let b = PipSubject::from_uuid(uuid)
+            .with_context("y", "2")
+            .with_context("x", "1");
+        assert_eq!(CacheKey::new(pip_id.clone(), &a), CacheKey::new(pip_id, &b));
+    }
+
+    #[test]
+    fn test_cache_remove_clears_all_contexts_for_subject() {
+        let mut cache = PipAttributeCache::new(Duration::from_secs(60));
+        let pip_id = PipId::new("test_pip");
+        let other_pip = PipId::new("other_pip");
+        let uuid = Uuid::new_v4();
+        let a = PipSubject::from_uuid(uuid).with_context("location", "office");
+        let b = PipSubject::from_uuid(uuid).with_context("location", "home");
+
+        cache.put(&pip_id, &a, PipAttributeSet::new());
+        cache.put(&pip_id, &b, PipAttributeSet::new());
+        cache.put(&other_pip, &a, PipAttributeSet::new());
+        assert_eq!(cache.size(), 3);
+
+        cache.remove(&pip_id, &PipSubject::from_uuid(uuid));
+        assert_eq!(cache.size(), 1);
+        assert_eq!(cache.stats().evictions, 2);
+        assert!(cache.get(&other_pip, &a).is_some());
     }
 
     #[test]

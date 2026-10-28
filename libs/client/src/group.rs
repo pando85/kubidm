@@ -1,5 +1,10 @@
 use crate::{ClientError, KubidmClient};
-use kubidm_proto::v1::Entry;
+use kubidm_proto::constants::{
+    ATTR_CLASS, ATTR_MAX_GRANT_DURATION, ATTR_UUID, ENTRYCLASS_GROUP, ENTRYCLASS_TIME_BOUNDED_GRANT,
+};
+use kubidm_proto::internal::{Filter, Modify, ModifyList};
+use kubidm_proto::v1::{Entry, TimeBoundedMemberGrant, TimeBoundedMemberGrantRequest};
+use time::OffsetDateTime;
 
 impl KubidmClient {
     pub async fn idm_group_search(&self, id: &str) -> Result<Vec<Entry>, ClientError> {
@@ -203,6 +208,77 @@ impl KubidmClient {
         description: &str,
     ) -> Result<(), ClientError> {
         self.perform_put_request(&format!("/v1/group/{id}/_attr/description"), &[description])
+            .await
+    }
+
+    /// Kubidm: allow time-bounded membership grants on a group, optionally setting the
+    /// longest window (in seconds) that a grant may cover. The class and the cap are written
+    /// in a single modify, so the group is never enabled without the requested cap.
+    pub async fn idm_group_time_bounded_enable(
+        &self,
+        id: &str,
+        max_grant_duration: Option<u32>,
+    ) -> Result<(), ClientError> {
+        // Resolve the group to its uuid, so that the modify targets exactly this group.
+        let group_uuid = self
+            .idm_group_get(id)
+            .await?
+            .and_then(|entry| entry.attrs.get(ATTR_UUID).and_then(|v| v.first().cloned()))
+            .ok_or(ClientError::EmptyResponse)?;
+
+        let mut mods = vec![Modify::Present(
+            ATTR_CLASS.to_string(),
+            ENTRYCLASS_TIME_BOUNDED_GRANT.to_string(),
+        )];
+        if let Some(max_grant_duration) = max_grant_duration {
+            mods.push(Modify::Purged(ATTR_MAX_GRANT_DURATION.to_string()));
+            mods.push(Modify::Present(
+                ATTR_MAX_GRANT_DURATION.to_string(),
+                max_grant_duration.to_string(),
+            ));
+        }
+
+        let filter = Filter::And(vec![
+            Filter::Eq(ATTR_CLASS.to_string(), ENTRYCLASS_GROUP.to_string()),
+            Filter::Eq(ATTR_UUID.to_string(), group_uuid),
+        ]);
+        self.modify(filter, ModifyList::new_list(mods)).await
+    }
+
+    /// Kubidm: grant `member` a membership of a group from `valid_from` (or now) until
+    /// `valid_until`, replacing any existing grant of `member`.
+    pub async fn idm_group_time_bounded_member_grant(
+        &self,
+        id: &str,
+        member: &str,
+        valid_from: Option<OffsetDateTime>,
+        valid_until: OffsetDateTime,
+    ) -> Result<(), ClientError> {
+        let request = TimeBoundedMemberGrantRequest {
+            member: member.to_string(),
+            valid_from,
+            valid_until,
+        };
+        self.perform_post_request(&format!("/v1/group/{id}/_time_bounded_member"), request)
+            .await
+    }
+
+    /// Kubidm: revoke the time-bounded membership grant of `member` on a group.
+    pub async fn idm_group_time_bounded_member_revoke(
+        &self,
+        id: &str,
+        member: &str,
+    ) -> Result<(), ClientError> {
+        self.perform_delete_request(&format!("/v1/group/{id}/_time_bounded_member/{member}"))
+            .await
+    }
+
+    /// Kubidm: list the time-bounded membership grants of a group.
+    pub async fn idm_group_time_bounded_member_list(
+        &self,
+        id: &str,
+    ) -> Result<Vec<TimeBoundedMemberGrant>, ClientError> {
+        self.perform_get_request(&format!("/v1/group/{id}/_time_bounded_member"))
             .await
     }
 }

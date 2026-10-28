@@ -250,6 +250,8 @@ pub enum Attribute {
     ApprovalEscalationLevel,
     ApprovalExpires,
     ApprovalOperationDetails,
+    ApprovalQuorumSnapshot,
+    ApprovalRecordRequest,
 
     #[cfg(any(debug_assertions, test, feature = "test"))]
     NonExist,
@@ -564,6 +566,8 @@ impl Attribute {
             Attribute::ApprovalEscalationLevel => ATTR_APPROVAL_ESCALATION_LEVEL,
             Attribute::ApprovalExpires => ATTR_APPROVAL_EXPIRES,
             Attribute::ApprovalOperationDetails => ATTR_APPROVAL_OPERATION_DETAILS,
+            Attribute::ApprovalQuorumSnapshot => ATTR_APPROVAL_QUORUM_SNAPSHOT,
+            Attribute::ApprovalRecordRequest => ATTR_APPROVAL_RECORD_REQUEST,
 
             #[cfg(any(debug_assertions, test, feature = "test"))]
             Attribute::NonExist => TEST_ATTR_NON_EXIST,
@@ -831,6 +835,8 @@ impl Attribute {
             ATTR_APPROVAL_ESCALATION_LEVEL => Attribute::ApprovalEscalationLevel,
             ATTR_APPROVAL_EXPIRES => Attribute::ApprovalExpires,
             ATTR_APPROVAL_OPERATION_DETAILS => Attribute::ApprovalOperationDetails,
+            ATTR_APPROVAL_QUORUM_SNAPSHOT => Attribute::ApprovalQuorumSnapshot,
+            ATTR_APPROVAL_RECORD_REQUEST => Attribute::ApprovalRecordRequest,
 
             #[cfg(any(debug_assertions, test, feature = "test"))]
             TEST_ATTR_NON_EXIST => Attribute::NonExist,

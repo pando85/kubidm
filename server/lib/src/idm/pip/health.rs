@@ -1,8 +1,17 @@
 //! PIP Health State Tracking
 //!
 //! Shared health state tracking logic for all PIP implementations.
+//!
+//! Health is tracked passively from real requests: a source starts `Unknown`
+//! (retrievable), successful fetches mark it `Healthy`, and failures mark it
+//! `Degraded` and then `Unhealthy` once `failure_threshold` is reached. While
+//! `Unhealthy`, requests are short-circuited to the fallback behaviour, except
+//! that one probe request is let through every `interval_secs` so the source can
+//! recover without a background task. After a successful probe, requests flow
+//! again until `success_threshold` consecutive successes mark it `Healthy`.
 
-use std::time::Instant;
+use std::sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::time::{Duration, Instant};
 
 use super::config::PipHealthCheckConfig;
 use super::PipHealthStatus;
@@ -29,20 +38,37 @@ impl PipHealthState {
     }
 
     pub fn record_success(&mut self, config: &PipHealthCheckConfig) {
-        self.consecutive_failures = 0;
-        self.consecutive_successes += 1;
+        self.record_success_at(config, Instant::now());
+    }
 
-        if self.consecutive_successes >= config.success_threshold {
+    pub fn record_success_at(&mut self, config: &PipHealthCheckConfig, now: Instant) {
+        self.consecutive_failures = 0;
+        self.consecutive_successes = self.consecutive_successes.saturating_add(1);
+
+        // The first ever successful contact establishes health directly; recovering
+        // from failures requires `success_threshold` consecutive successes.
+        if self.status == PipHealthStatus::Unknown
+            || self.consecutive_successes >= config.success_threshold
+        {
             self.status = PipHealthStatus::Healthy;
         }
 
-        self.last_check = Some(Instant::now());
+        self.last_check = Some(now);
         self.last_error = None;
     }
 
     pub fn record_failure(&mut self, config: &PipHealthCheckConfig, error: String) {
+        self.record_failure_at(config, error, Instant::now());
+    }
+
+    pub fn record_failure_at(
+        &mut self,
+        config: &PipHealthCheckConfig,
+        error: String,
+        now: Instant,
+    ) {
         self.consecutive_successes = 0;
-        self.consecutive_failures += 1;
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
 
         if self.consecutive_failures >= config.failure_threshold {
             self.status = PipHealthStatus::Unhealthy;
@@ -50,14 +76,82 @@ impl PipHealthState {
             self.status = PipHealthStatus::Degraded;
         }
 
-        self.last_check = Some(Instant::now());
+        self.last_check = Some(now);
         self.last_error = Some(error);
+    }
+
+    /// Decide whether a request may be sent to the source at `now`.
+    ///
+    /// `Unknown`, `Healthy` and `Degraded` sources are always tried. An
+    /// `Unhealthy` source is tried while it is recovering (a probe succeeded), or
+    /// once `interval_secs` have passed since the last failure; in that case this
+    /// call claims the probe (by updating `last_check`) so that concurrent
+    /// requests do not all hit the failing source at once.
+    pub fn try_begin_attempt_at(&mut self, config: &PipHealthCheckConfig, now: Instant) -> bool {
+        if self.status != PipHealthStatus::Unhealthy || self.consecutive_successes > 0 {
+            return true;
+        }
+
+        let interval = Duration::from_secs(config.interval_secs);
+        match self.last_check {
+            Some(last) if now.saturating_duration_since(last) < interval => false,
+            _ => {
+                self.last_check = Some(now);
+                true
+            }
+        }
     }
 }
 
 impl Default for PipHealthState {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Thread-safe, non-blocking holder of a [`PipHealthState`].
+///
+/// Uses a `std::sync::RwLock` whose critical sections are tiny and never held
+/// across an `.await`, so it is safe to use from async code (unlike
+/// `tokio::sync::RwLock::blocking_read`, which panics inside a runtime). A
+/// poisoned lock is recovered, since the state is always left consistent.
+#[derive(Debug, Default)]
+pub struct PipHealthTracker {
+    state: RwLock<PipHealthState>,
+}
+
+impl PipHealthTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn read(&self) -> RwLockReadGuard<'_, PipHealthState> {
+        self.state.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn write(&self) -> RwLockWriteGuard<'_, PipHealthState> {
+        self.state.write().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub fn status(&self) -> PipHealthStatus {
+        self.read().status
+    }
+
+    pub fn snapshot(&self) -> PipHealthState {
+        self.read().clone()
+    }
+
+    pub fn record_success(&self, config: &PipHealthCheckConfig) {
+        self.write().record_success(config);
+    }
+
+    pub fn record_failure(&self, config: &PipHealthCheckConfig, error: String) {
+        self.write().record_failure(config, error);
+    }
+
+    /// See [`PipHealthState::try_begin_attempt_at`].
+    pub fn try_begin_attempt(&self, config: &PipHealthCheckConfig) -> bool {
+        self.write().try_begin_attempt_at(config, Instant::now())
     }
 }
 
@@ -91,18 +185,83 @@ mod tests {
     }
 
     #[test]
-    fn test_success_transitions_to_healthy() {
+    fn test_first_success_from_unknown_is_healthy() {
         let config = test_config();
         let mut state = PipHealthState::new();
 
         state.record_success(&config);
-        assert_eq!(state.status, PipHealthStatus::Unknown);
+        assert_eq!(state.status, PipHealthStatus::Healthy);
         assert_eq!(state.consecutive_successes, 1);
         assert_eq!(state.consecutive_failures, 0);
+    }
 
-        state.record_success(&config);
+    #[test]
+    fn test_unknown_and_degraded_always_attempt() {
+        let config = test_config();
+        let now = Instant::now();
+        let mut state = PipHealthState::new();
+        assert!(state.try_begin_attempt_at(&config, now));
+
+        state.record_failure_at(&config, "e".to_string(), now);
+        assert_eq!(state.status, PipHealthStatus::Degraded);
+        assert!(state.try_begin_attempt_at(&config, now));
+    }
+
+    #[test]
+    fn test_unhealthy_retries_after_interval_and_recovers() {
+        let config = test_config(); // interval 60s, failure 3, success 2
+        let t0 = Instant::now();
+        let mut state = PipHealthState::new();
+
+        for i in 0..3 {
+            assert!(state.try_begin_attempt_at(&config, t0));
+            state.record_failure_at(&config, format!("error{i}"), t0);
+        }
+        assert_eq!(state.status, PipHealthStatus::Unhealthy);
+
+        // Inside the interval: short-circuit.
+        assert!(!state.try_begin_attempt_at(&config, t0 + Duration::from_secs(1)));
+        assert!(!state.try_begin_attempt_at(&config, t0 + Duration::from_secs(59)));
+
+        // Interval elapsed: exactly one probe is let through.
+        let t1 = t0 + Duration::from_secs(60);
+        assert!(state.try_begin_attempt_at(&config, t1));
+        assert!(!state.try_begin_attempt_at(&config, t1));
+
+        // The probe fails: wait another full interval.
+        state.record_failure_at(&config, "still down".to_string(), t1);
+        assert_eq!(state.status, PipHealthStatus::Unhealthy);
+        assert!(!state.try_begin_attempt_at(&config, t1 + Duration::from_secs(30)));
+
+        // Next probe succeeds: requests flow while recovering...
+        let t2 = t1 + Duration::from_secs(60);
+        assert!(state.try_begin_attempt_at(&config, t2));
+        state.record_success_at(&config, t2);
+        assert_eq!(state.status, PipHealthStatus::Unhealthy);
+        assert!(state.try_begin_attempt_at(&config, t2));
+
+        // ...until success_threshold marks it healthy.
+        state.record_success_at(&config, t2);
         assert_eq!(state.status, PipHealthStatus::Healthy);
-        assert_eq!(state.consecutive_failures, 0);
+        assert!(state.try_begin_attempt_at(&config, t2));
+    }
+
+    #[test]
+    fn test_tracker_is_usable_from_async_context() {
+        // Built on a current-thread runtime, where tokio's blocking_read() panics.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            let config = test_config();
+            let tracker = PipHealthTracker::new();
+            assert_eq!(tracker.status(), PipHealthStatus::Unknown);
+            assert!(tracker.try_begin_attempt(&config));
+            tracker.record_failure(&config, "boom".to_string());
+            assert_eq!(tracker.status(), PipHealthStatus::Degraded);
+            tracker.record_success(&config);
+            assert_eq!(tracker.snapshot().consecutive_successes, 1);
+        });
     }
 
     #[test]
@@ -318,7 +477,7 @@ mod tests {
         assert!(PipHealthStatus::Healthy.can_retrieve());
         assert!(PipHealthStatus::Degraded.can_retrieve());
         assert!(!PipHealthStatus::Unhealthy.can_retrieve());
-        assert!(!PipHealthStatus::Unknown.can_retrieve());
+        assert!(PipHealthStatus::Unknown.can_retrieve());
     }
 
     #[test]

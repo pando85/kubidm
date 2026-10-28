@@ -2320,6 +2320,30 @@ mod tests {
         debug!("{:?}", r_uuid);
         assert_eq!(r_uuid, Ok(vec!["testperson2@example.com".to_string()]));
 
+        // Single value references must resolve to an spn in the same way as multi value
+        // references.
+        let t_uuid_single = ValueSetRefer::new(uuid!("cc8e95b4-c24f-4d68-ba54-8bed76f63930")) as _;
+        let r_uuid_single = server_txn.resolve_valueset(&t_uuid_single);
+        assert_eq!(
+            r_uuid_single,
+            Ok(vec!["testperson1@example.com".to_string()])
+        );
+
+        // And in LDAP they must resolve to a dn.
+        let r_uuid_multi_ldap = server_txn.resolve_valueset_ldap(
+            &(vs_refer![uuid!("cc8e95b4-c24f-4d68-ba54-8bed76f63930")] as _),
+            "dc=example,dc=com",
+        );
+        let r_uuid_single_ldap =
+            server_txn.resolve_valueset_ldap(&t_uuid_single, "dc=example,dc=com");
+        assert_eq!(
+            r_uuid_multi_ldap,
+            Ok(vec![
+                b"spn=testperson1@example.com,dc=example,dc=com".to_vec()
+            ])
+        );
+        assert_eq!(r_uuid_single_ldap, r_uuid_multi_ldap);
+
         // Resolve UUID non-exist
         let t_uuid_non = vs_refer![uuid!("b83e98f0-3d2e-41d2-9796-d8d993289c86")] as _;
         let r_uuid_non = server_txn.resolve_valueset(&t_uuid_non);

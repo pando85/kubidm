@@ -8,14 +8,11 @@ use super::{
 };
 use crate::prelude::*;
 use std::{ops::Sub, sync::Arc};
+use time::OffsetDateTime;
 
 pub enum DeleteResult {
     Deny,
     Grant,
-    #[allow(dead_code)]
-    ReauthRequired {
-        reason: String,
-    },
 }
 
 enum IResult {
@@ -28,6 +25,7 @@ pub fn apply_delete_access<'a>(
     ident: &Identity,
     related_acp: &'a [AccessControlDeleteResolved],
     entry: &'a Arc<EntrySealedCommitted>,
+    current_time: OffsetDateTime,
 ) -> DeleteResult {
     let mut denied = false;
     let mut grant = false;
@@ -37,7 +35,7 @@ pub fn apply_delete_access<'a>(
         IResult::Grant | IResult::Ignore => {}
     }
 
-    match delete_filter_entry(ident, related_acp, entry) {
+    match delete_filter_entry(ident, related_acp, entry, current_time) {
         IResult::Deny => denied = true,
         IResult::Grant => grant = true,
         IResult::Ignore => {}
@@ -59,6 +57,7 @@ fn delete_filter_entry<'a>(
     ident: &Identity,
     related_acp: &'a [AccessControlDeleteResolved],
     entry: &'a Arc<EntrySealedCommitted>,
+    current_time: OffsetDateTime,
 ) -> IResult {
     match &ident.origin {
         IdentType::Internal(InternalRole::System) => {
@@ -154,21 +153,6 @@ fn delete_filter_entry<'a>(
                     return false;
                 }
             }
-            AccessControlReceiverCondition::Delegated {
-                scope_filter_resolved,
-            } => {
-                // Check if the entry matches the delegated scope filter
-                if let Some(filter) = scope_filter_resolved {
-                    if !entry.entry_match_no_index(filter) {
-                        trace!(
-                            "entry {:?} DOES NOT match delegated scope filter for acs {}",
-                            entry.get_uuid(),
-                            acd.acp.acp.name
-                        );
-                        return false;
-                    }
-                }
-            }
         };
 
         match &acd.target_condition {
@@ -183,27 +167,13 @@ fn delete_filter_entry<'a>(
                     return false;
                 }
             }
-            AccessControlTargetCondition::DelegatedScope {
-                scope_filter_resolved,
-            } => {
-                // Check if the entry matches the delegated scope filter
-                if let Some(filter) = scope_filter_resolved {
-                    if !entry.entry_match_no_index(filter) {
-                        trace!(
-                            "entry {:?} DOES NOT match delegated scope filter for acs {}",
-                            entry.get_uuid(),
-                            acd.acp.acp.name
-                        );
-                        return false;
-                    }
-                }
-            }
         };
 
         // Check time restrictions
         if !check_time_restriction(
             acd.acp.acp.time_restriction_start,
             acd.acp.acp.time_restriction_end,
+            current_time,
         ) {
             debug!(entry = ?entry.get_display_id(), acd = %acd.acp.acp.name, "time restriction not satisfied");
             return false;
@@ -373,7 +343,12 @@ mod tests {
             uuid::uuid!("ffffffff-ffff-ffff-ffff-000000000100"),
         );
         let acps: Vec<AccessControlDeleteResolved> = vec![];
-        let result = delete_filter_entry(&ident, &acps, &entry);
+        let result = delete_filter_entry(
+            &ident,
+            &acps,
+            &entry,
+            OffsetDateTime::UNIX_EPOCH + duration_from_epoch_now(),
+        );
         match result {
             IResult::Grant => {}
             _ => panic!("Expected Grant for internal system"),
@@ -388,7 +363,12 @@ mod tests {
             uuid::uuid!("ffffffff-ffff-ffff-ffff-000000000100"),
         );
         let acps: Vec<AccessControlDeleteResolved> = vec![];
-        let result = delete_filter_entry(&ident, &acps, &entry);
+        let result = delete_filter_entry(
+            &ident,
+            &acps,
+            &entry,
+            OffsetDateTime::UNIX_EPOCH + duration_from_epoch_now(),
+        );
         match result {
             IResult::Grant => {}
             _ => panic!("Expected Grant for migration with valid class"),
@@ -403,7 +383,12 @@ mod tests {
             uuid::uuid!("ffffffff-ffff-ffff-ffff-000000000100"),
         );
         let acps: Vec<AccessControlDeleteResolved> = vec![];
-        let result = delete_filter_entry(&ident, &acps, &entry);
+        let result = delete_filter_entry(
+            &ident,
+            &acps,
+            &entry,
+            OffsetDateTime::UNIX_EPOCH + duration_from_epoch_now(),
+        );
         match result {
             IResult::Deny => {}
             _ => panic!("Expected Deny for migration with invalid class"),
@@ -421,7 +406,12 @@ mod tests {
             .into_sealed_committed(),
         );
         let acps: Vec<AccessControlDeleteResolved> = vec![];
-        let result = delete_filter_entry(&ident, &acps, &entry);
+        let result = delete_filter_entry(
+            &ident,
+            &acps,
+            &entry,
+            OffsetDateTime::UNIX_EPOCH + duration_from_epoch_now(),
+        );
         match result {
             IResult::Deny => {}
             _ => panic!("Expected Deny for migration with no class"),
@@ -436,7 +426,12 @@ mod tests {
             uuid::uuid!("ffffffff-ffff-ffff-ffff-000000000100"),
         );
         let acps: Vec<AccessControlDeleteResolved> = vec![];
-        let result = delete_filter_entry(&ident, &acps, &entry);
+        let result = delete_filter_entry(
+            &ident,
+            &acps,
+            &entry,
+            OffsetDateTime::UNIX_EPOCH + duration_from_epoch_now(),
+        );
         match result {
             IResult::Ignore => {}
             _ => panic!("Expected Ignore for user with no ACPs"),
@@ -451,7 +446,12 @@ mod tests {
             uuid::uuid!("ffffffff-ffff-ffff-ffff-000000000100"),
         );
         let acps: Vec<AccessControlDeleteResolved> = vec![];
-        let result = apply_delete_access(&ident, &acps, &entry);
+        let result = apply_delete_access(
+            &ident,
+            &acps,
+            &entry,
+            OffsetDateTime::UNIX_EPOCH + duration_from_epoch_now(),
+        );
         match result {
             DeleteResult::Grant => {}
             _ => panic!("Expected Grant for internal system"),
@@ -466,7 +466,12 @@ mod tests {
             uuid::uuid!("ffffffff-ffff-ffff-ffff-000000000100"),
         );
         let acps: Vec<AccessControlDeleteResolved> = vec![];
-        let result = apply_delete_access(&ident, &acps, &entry);
+        let result = apply_delete_access(
+            &ident,
+            &acps,
+            &entry,
+            OffsetDateTime::UNIX_EPOCH + duration_from_epoch_now(),
+        );
         match result {
             DeleteResult::Deny => {}
             _ => panic!("Expected Deny for user with no ACPs"),
@@ -481,7 +486,12 @@ mod tests {
             uuid::uuid!("ffffffff-ffff-ffff-ffff-000000000100"),
         );
         let acps: Vec<AccessControlDeleteResolved> = vec![];
-        let result = apply_delete_access(&ident, &acps, &entry);
+        let result = apply_delete_access(
+            &ident,
+            &acps,
+            &entry,
+            OffsetDateTime::UNIX_EPOCH + duration_from_epoch_now(),
+        );
         match result {
             DeleteResult::Deny => {}
             _ => panic!("Expected Deny for protected class"),

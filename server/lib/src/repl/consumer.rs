@@ -2,7 +2,7 @@ use super::proto::*;
 use crate::{
     plugins::Plugins,
     prelude::*,
-    server::{ChangeFlag, ServerPhase},
+    server::{is_oauth2_client_provider, ChangeFlag, ServerPhase},
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -270,7 +270,8 @@ impl QueryServerWriteTransaction<'_> {
             && cand
                 .iter()
                 .chain(pre_cand.iter().map(|e| e.as_ref()))
-                .any(|e| e.attribute_equality(Attribute::Class, &EntryClass::OAuth2Client.into()))
+                // Kubidm: federation entries are client providers too.
+                .any(is_oauth2_client_provider)
         {
             self.changed_flags.insert(ChangeFlag::OAUTH2_CLIENT)
         }
@@ -325,6 +326,8 @@ impl QueryServerWriteTransaction<'_> {
         &mut self,
         ctx: ReplIncrementalContext,
     ) -> Result<ConsumerState, OperationError> {
+        // Kubidm: post commit reloads of replicated content are lenient.
+        self.replication_apply = true;
         match ctx {
             ReplIncrementalContext::DomainMismatch => {
                 error!("Unable to proceed with consumer incremental - the supplier has indicated that our domain_uuid's are not equivalent. This can occur when adding a new consumer to an existing topology.");
@@ -503,6 +506,8 @@ impl QueryServerWriteTransaction<'_> {
         &mut self,
         ctx: ReplRefreshContext,
     ) -> Result<(), OperationError> {
+        // Kubidm: post commit reloads of replicated content are lenient.
+        self.replication_apply = true;
         match ctx {
             ReplRefreshContext::V1 {
                 domain_version,

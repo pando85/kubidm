@@ -16,7 +16,6 @@ repository = { workspace = true }
 [[bin]]
 name = "kubidmd"
 path = "src/main.rs"
-test = false
 doctest = false
 
 [features]
@@ -39,6 +38,7 @@ tokio-util = { workspace = true, features = ["codec"] }
 tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+uuid = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 sd-notify = { workspace = true }
@@ -56,6 +56,7 @@ clap_complete = { workspace = true }
 kubidm_build_profiles = { workspace = true }
 kubidm_proto = { workspace = true }
 sketching = { workspace = true }
+uuid = { workspace = true }
 
 ## Debian packaging
 [package.metadata.deb]

@@ -240,7 +240,7 @@ impl IdmServer {
 
         idm_write_txn.reload_applications()?;
         idm_write_txn.reload_oauth2()?;
-        idm_write_txn.reload_oauth2_client_providers()?;
+        idm_write_txn.reload_oauth2_client_providers_lenient()?;
 
         idm_write_txn.commit()?;
 
@@ -275,6 +275,17 @@ impl IdmServer {
     #[instrument(level = "debug", skip_all)]
     pub fn domain_read(&self) -> DomainInfoRead {
         self.qs.d_info.read()
+    }
+
+    /// Kubidm: the health and readiness tracker of the query server.
+    pub fn health_tracker(&self) -> crate::status::ReplicationStateTracker {
+        self.qs.health().clone()
+    }
+
+    /// Kubidm: whether this server has synced from a replication supplier before, see
+    /// [`QueryServer::replication_has_synced`].
+    pub async fn replication_has_synced(&self) -> Result<bool, OperationError> {
+        self.qs.replication_has_synced().await
     }
 
     /// Read from the database, in a transaction.
@@ -2175,66 +2186,24 @@ impl IdmServerProxyWriteTransaction<'_> {
     fn process_approval_timeout_check(
         &mut self,
         atc: &ApprovalTimeoutCheck,
+        ct: Duration,
     ) -> Result<(), OperationError> {
         info!(request_uuid = %atc.request_uuid, "Processing approval timeout check");
-
-        let filter = filter!(f_and!([
-            f_eq(Attribute::Class, EntryClass::ApprovalRequest.into()),
-            f_eq(Attribute::Uuid, PartialValue::Uuid(atc.request_uuid)),
-            f_eq(Attribute::ApprovalState, PartialValue::new_utf8s("pending"))
-        ]));
-
-        let entries = self.qs_write.internal_search(filter.clone())?;
-
-        if entries.is_empty() {
-            debug!("Approval request not found or not in pending state");
-            return Ok(());
-        }
-
-        let modlist = ModifyList::new_list(vec![
-            Modify::Purged(Attribute::ApprovalState),
-            Modify::Present(Attribute::ApprovalState, Value::new_iutf8("expired")),
-        ]);
-
-        self.qs_write.internal_modify(&filter, &modlist)
+        self.qs_write
+            .approval_request_expire(atc.request_uuid, ct)
+            .map(|_| ())
     }
 
     #[instrument(level = "debug", skip_all)]
     fn process_approval_escalation_check(
         &mut self,
         aec: &ApprovalEscalationCheck,
+        ct: Duration,
     ) -> Result<(), OperationError> {
         info!(request_uuid = %aec.request_uuid, "Processing approval escalation check");
-
-        let filter = filter!(f_and!([
-            f_eq(Attribute::Class, EntryClass::ApprovalRequest.into()),
-            f_eq(Attribute::Uuid, PartialValue::Uuid(aec.request_uuid)),
-            f_eq(Attribute::ApprovalState, PartialValue::new_utf8s("pending"))
-        ]));
-
-        let entries = self.qs_write.internal_search(filter.clone())?;
-
-        if entries.is_empty() {
-            debug!("Approval request not found or not in pending state");
-            return Ok(());
-        }
-
-        let entry = entries.first().ok_or_else(|| {
-            debug!("Approval request not found after existence check");
-            OperationError::NoMatchingEntries
-        })?;
-        let current_level = entry
-            .get_ava_single_uint32(Attribute::ApprovalEscalationLevel)
-            .unwrap_or(0);
-
-        let new_level = current_level + 1;
-
-        let modlist = ModifyList::new_list(vec![
-            Modify::Purged(Attribute::ApprovalEscalationLevel),
-            Modify::Present(Attribute::ApprovalEscalationLevel, Value::Uint32(new_level)),
-        ]);
-
-        self.qs_write.internal_modify(&filter, &modlist)
+        self.qs_write
+            .approval_request_escalate(aec.request_uuid, ct)
+            .map(|_| ())
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -2381,7 +2350,7 @@ impl IdmServerProxyWriteTransaction<'_> {
     pub fn process_delayedaction(
         &mut self,
         da: &DelayedAction,
-        _ct: Duration,
+        ct: Duration,
     ) -> Result<(), OperationError> {
         match da {
             DelayedAction::PwUpgrade(pwu) => self.process_pwupgrade(pwu),
@@ -2389,9 +2358,11 @@ impl IdmServerProxyWriteTransaction<'_> {
             DelayedAction::WebauthnCounterIncrement(wci) => self.process_webauthncounterinc(wci),
             DelayedAction::BackupCodeRemoval(bcr) => self.process_backupcoderemoval(bcr),
             DelayedAction::AuthSessionRecord(asr) => self.process_authsessionrecord(asr),
-            DelayedAction::ApprovalTimeoutCheck(atc) => self.process_approval_timeout_check(atc),
+            DelayedAction::ApprovalTimeoutCheck(atc) => {
+                self.process_approval_timeout_check(atc, ct)
+            }
             DelayedAction::ApprovalEscalationCheck(aec) => {
-                self.process_approval_escalation_check(aec)
+                self.process_approval_escalation_check(aec, ct)
             }
         }
     }

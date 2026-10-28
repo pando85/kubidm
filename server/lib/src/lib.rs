@@ -40,7 +40,6 @@ pub mod entry;
 pub mod event;
 pub mod filter;
 pub(crate) mod migration_data;
-pub mod pip;
 
 pub mod maintenance;
 pub mod modify;

@@ -14,6 +14,7 @@ use super::{
 use crate::prelude::*;
 use hashbrown::HashMap;
 use std::{collections::BTreeSet, ops::Sub, sync::Arc};
+use time::OffsetDateTime;
 
 pub enum ModifyResult<'a> {
     Deny,
@@ -24,10 +25,6 @@ pub enum ModifyResult<'a> {
         pres_cls: BTreeSet<&'a str>,
         rem_cls: BTreeSet<&'a str>,
     },
-    #[allow(dead_code)]
-    ReauthRequired {
-        reason: String,
-    },
 }
 
 pub fn apply_modify_access<'a>(
@@ -35,6 +32,7 @@ pub fn apply_modify_access<'a>(
     related_acp: &'a [AccessControlModifyResolved],
     sync_agreements: &HashMap<Uuid, BTreeSet<Attribute>>,
     entry: &Arc<EntrySealedCommitted>,
+    current_time: OffsetDateTime,
 ) -> ModifyResult<'a> {
     let mut denied = false;
     let mut grant = false;
@@ -78,9 +76,7 @@ pub fn apply_modify_access<'a>(
             allow_pres_cls.append(&mut pres_class);
             allow_rem_cls.append(&mut rem_class);
         }
-        AccessModResult::Constrain { .. }
-        | AccessModResult::Ignore
-        | AccessModResult::ReauthRequired { .. } => {}
+        AccessModResult::Constrain { .. } | AccessModResult::Ignore => {}
     }
 
     // Check with protected if we should proceed.
@@ -106,9 +102,7 @@ pub fn apply_modify_access<'a>(
         // Can't grant.
         // AccessModResult::Grant |
         // Can't allow
-        AccessModResult::Allow { .. }
-        | AccessModResult::Ignore
-        | AccessModResult::ReauthRequired { .. } => {}
+        AccessModResult::Allow { .. } | AccessModResult::Ignore => {}
     }
 
     if !grant && !denied {
@@ -126,9 +120,7 @@ pub fn apply_modify_access<'a>(
             // Can't grant.
             // AccessModResult::Grant |
             // Can't allow
-            AccessModResult::Allow { .. }
-            | AccessModResult::Ignore
-            | AccessModResult::ReauthRequired { .. } => {}
+            AccessModResult::Allow { .. } | AccessModResult::Ignore => {}
         }
 
         // Setup the acp's here
@@ -162,15 +154,6 @@ pub fn apply_modify_access<'a>(
                             }
                         }
                     }
-                    AccessControlReceiverCondition::Delegated { scope_filter_resolved } => {
-                        // Check if the entry matches the delegated scope filter
-                        if let Some(filter) = scope_filter_resolved {
-                            if !entry.entry_match_no_index(filter) {
-                                debug!(entry = ?entry.get_display_id(), acm = %acm.acp.acp.name, "entry DOES NOT match delegated scope filter");
-                                return None;
-                            }
-                        }
-                    }
                 };
 
                 match &acm.target_condition {
@@ -180,21 +163,13 @@ pub fn apply_modify_access<'a>(
                             return None;
                         }
                     }
-                    AccessControlTargetCondition::DelegatedScope { scope_filter_resolved } => {
-                        // Check if the entry matches the delegated scope filter
-                        if let Some(filter) = scope_filter_resolved {
-                            if !entry.entry_match_no_index(filter) {
-                                debug!(entry = ?entry.get_display_id(), acm = %acm.acp.acp.name, "entry DOES NOT match delegated scope filter");
-                                return None;
-                            }
-                        }
-                    }
                 };
 
                 // Check time restrictions
                 if !check_time_restriction(
                     acm.acp.acp.time_restriction_start,
                     acm.acp.acp.time_restriction_end,
+                    current_time,
                 ) {
                     debug!(entry = ?entry.get_display_id(), acm = %acm.acp.acp.name, "time restriction not satisfied");
                     return None;
@@ -223,7 +198,6 @@ pub fn apply_modify_access<'a>(
                 allow_pres_cls.append(&mut pres_class);
                 allow_rem_cls.append(&mut rem_class);
             }
-            AccessModResult::ReauthRequired { .. } => {}
         }
     }
 
@@ -914,7 +888,13 @@ mod tests {
         let entry = make_sealed_entry("account");
         let acps: Vec<AccessControlModifyResolved> = vec![];
         let sync_agreements = HashMap::new();
-        let result = apply_modify_access(&ident, &acps, &sync_agreements, &entry);
+        let result = apply_modify_access(
+            &ident,
+            &acps,
+            &sync_agreements,
+            &entry,
+            OffsetDateTime::UNIX_EPOCH + duration_from_epoch_now(),
+        );
         assert!(matches!(result, ModifyResult::Grant));
     }
 
@@ -928,7 +908,13 @@ mod tests {
         );
         let acps: Vec<AccessControlModifyResolved> = vec![];
         let sync_agreements = HashMap::new();
-        let result = apply_modify_access(&ident, &acps, &sync_agreements, &entry);
+        let result = apply_modify_access(
+            &ident,
+            &acps,
+            &sync_agreements,
+            &entry,
+            OffsetDateTime::UNIX_EPOCH + duration_from_epoch_now(),
+        );
         match result {
             ModifyResult::Allow {
                 pres,
@@ -959,7 +945,13 @@ mod tests {
         );
         let acps: Vec<AccessControlModifyResolved> = vec![];
         let sync_agreements = HashMap::new();
-        let result = apply_modify_access(&ident, &acps, &sync_agreements, &entry);
+        let result = apply_modify_access(
+            &ident,
+            &acps,
+            &sync_agreements,
+            &entry,
+            OffsetDateTime::UNIX_EPOCH + duration_from_epoch_now(),
+        );
         assert!(matches!(result, ModifyResult::Deny));
     }
 
@@ -969,7 +961,13 @@ mod tests {
         let entry = make_sealed_entry("account");
         let acps: Vec<AccessControlModifyResolved> = vec![];
         let sync_agreements = HashMap::new();
-        let result = apply_modify_access(&ident, &acps, &sync_agreements, &entry);
+        let result = apply_modify_access(
+            &ident,
+            &acps,
+            &sync_agreements,
+            &entry,
+            OffsetDateTime::UNIX_EPOCH + duration_from_epoch_now(),
+        );
         match result {
             ModifyResult::Allow {
                 pres,

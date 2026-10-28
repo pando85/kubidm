@@ -1609,8 +1609,43 @@ fn parse_storage_class(name: &str) -> Result<StorageClass, String> {
 /// Check the settings of an S3 location that S3 would otherwise only reject at the first
 /// upload, or that would silently not do what they say: the storage class must be known
 /// and readable without a restore request, and a KMS key needs `aws:kms` server-side
-/// encryption. Returns the reason, without the location's configuration key.
+/// encryption. The bucket must be named, and the path prefix must be relative and stay
+/// inside the bucket. Returns the reason, without the location's configuration key.
+///
+/// Static credentials sent to a plain `http://` endpoint are logged as a warning: they
+/// cross the network in clear.
 pub fn validate_s3_location(config: &S3Config) -> Result<(), String> {
+    if config.bucket.trim().is_empty() {
+        return Err("bucket must not be empty".to_string());
+    }
+    if let Some(prefix) = config.path_prefix.as_deref() {
+        // A prefix of only slashes is no prefix, see `S3ClientWrapper::listing_prefix`.
+        if prefix.starts_with('/') && !prefix.trim_matches('/').is_empty() {
+            return Err(format!(
+                "path_prefix {prefix:?} must not start with '/': it is relative to the bucket, \
+                 and the leading '/' would become part of every object key"
+            ));
+        }
+        if prefix.split('/').any(|segment| segment == "..") {
+            return Err(format!(
+                "path_prefix {prefix:?} must not contain '..' segments"
+            ));
+        }
+    }
+    let plain_http = config.endpoint.as_deref().is_some_and(|endpoint| {
+        endpoint
+            .trim()
+            .get(..7)
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("http://"))
+    });
+    if plain_http && config.credentials.is_some() {
+        warn!(
+            bucket = %config.bucket,
+            endpoint = ?config.endpoint,
+            "The S3 endpoint is plain http:// and static credentials are configured: the \
+             request signatures and the backups travel unencrypted. Use an https:// endpoint"
+        );
+    }
     parse_storage_class(&config.storage_class)?;
     if let Some(sse) = &config.server_side_encryption {
         if sse.algorithm == Some(S3EncryptionAlgorithm::Aes256) && sse.kms_key_id.is_some() {
@@ -2403,6 +2438,41 @@ mod tests {
         });
         let err = validate_s3_location(&config).expect_err("AES256 with a KMS key");
         assert!(err.contains("aws:kms"), "{err}");
+    }
+
+    #[test]
+    fn test_validate_s3_location_bucket_and_prefix() {
+        let mut config = S3Config::with_bucket(String::new());
+        let err = validate_s3_location(&config).expect_err("an empty bucket");
+        assert!(err.contains("bucket"), "{err}");
+        config.bucket = "  ".to_string();
+        assert!(validate_s3_location(&config).is_err());
+        config.bucket = "backups".to_string();
+
+        for valid in ["prod", "prod/", "prod/kubidm", "/", "", "a..b/c"] {
+            config.path_prefix = Some(valid.to_string());
+            assert!(validate_s3_location(&config).is_ok(), "{valid:?}");
+        }
+        for leading in ["/prod", "/prod/kubidm/"] {
+            config.path_prefix = Some(leading.to_string());
+            let err = validate_s3_location(&config).expect_err(leading);
+            assert!(err.contains("must not start with '/'"), "{err}");
+        }
+        for escaping in ["..", "../other", "prod/../other", "prod/.."] {
+            config.path_prefix = Some(escaping.to_string());
+            let err = validate_s3_location(&config).expect_err(escaping);
+            assert!(err.contains("'..'"), "{err}");
+        }
+        config.path_prefix = None;
+
+        // Static credentials over plain http are only warned about.
+        config.endpoint = Some("HTTP://minio.local:9000".to_string());
+        config.credentials = Some(S3Credentials {
+            access_key_id: "key".to_string(),
+            secret_access_key: "secret".to_string(),
+            session_token: None,
+        });
+        assert!(validate_s3_location(&config).is_ok());
     }
 
     #[test]

@@ -1795,9 +1795,8 @@ mod tests {
     use kubidm_lib_crypto::CryptoPolicy;
     use kubidm_proto::{
         internal::{UatPurpose, UserAuthToken},
-        oauth2::{
-            AccessTokenIntrospectResponse, AccessTokenResponse, AccessTokenType, IssuedTokenType,
-        },
+        oauth2::{AccessTokenResponse, AccessTokenType, IssuedTokenType},
+        oauth2_federation::OAuth2ClientIntrospectResponse,
         v1::{AuthAllowed, AuthIssueSession, AuthMech},
     };
     use std::time::Duration;
@@ -3646,7 +3645,7 @@ mod tests {
         // Roll back to the good state
         let mut session = valid_session_state.clone();
 
-        let response = AccessTokenIntrospectResponse {
+        let response = OAuth2ClientIntrospectResponse {
             active: false,
             ..Default::default()
         };
@@ -3677,7 +3676,7 @@ mod tests {
         // Roll back to the good state
         let mut session = valid_session_state.clone();
 
-        let response = AccessTokenIntrospectResponse {
+        let response = OAuth2ClientIntrospectResponse {
             active: true,
             sub: Some("tobias the hacker".to_string()),
             ..Default::default()
@@ -3709,7 +3708,7 @@ mod tests {
         // Roll back to the good state
         let mut session = valid_session_state.clone();
 
-        let response = AccessTokenIntrospectResponse {
+        let response = OAuth2ClientIntrospectResponse {
             active: true,
             sub: Some(account_subject),
             ..Default::default()

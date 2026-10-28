@@ -30,8 +30,9 @@ use futures::{SinkExt, StreamExt};
 use kubidm_proto::internal::OperationError;
 use kubidmd_core::{
     admin::{
-        AdminTaskRequest, AdminTaskResponse, ClientCodec, ProtoDomainInfo,
-        ProtoDomainUpgradeCheckReport, ProtoDomainUpgradeCheckStatus,
+        AdminTaskRequest, AdminTaskResponse, ClientCodec, MaintenanceErrorCode,
+        MaintenanceOperation, ProtoDomainInfo, ProtoDomainUpgradeCheckReport,
+        ProtoDomainUpgradeCheckStatus, ReplicationFence, ReplicationSyncResult,
     },
     backup::pitr::{pitr_list_server_core, pitr_recover_server_core, RecoveryTargetSpec},
     backup_server_core, cert_generate_core,
@@ -46,9 +47,11 @@ use kubidmd_core::{
 };
 use serde::Serialize;
 use sketching::{pipeline::TracingPipelineGuard, tracing_forest::util::*};
-use std::{fmt, io::Read, path::PathBuf, process::ExitCode};
+use std::{fmt, io, io::Read, path::PathBuf, process::ExitCode, time::Duration};
 use tokio::net::UnixStream;
+use tokio::time::{error::Elapsed, timeout};
 use tokio_util::codec::Framed;
+use uuid::Uuid;
 
 include!("./opt.rs");
 
@@ -104,6 +107,66 @@ where
     println!("{json_output}");
 }
 
+/// How long `refresh-replication-consumer --from` waits for the server to answer: with the
+/// news that the refresh started, or with its refusal. The server answers within 15
+/// seconds, the time it gives a supplier to start the refresh, and then waits for the
+/// outcome without that limit. Servers that predate `--from` never answer at all.
+const REFRESH_FROM_ANSWER_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// What the operator is told when the server did not answer within
+/// [`REFRESH_FROM_ANSWER_TIMEOUT`].
+const REFRESH_FROM_NO_ANSWER: &str = "No answer within 45s: the server may be older than this \
+     kubidmd (no --from support) or overloaded. Check its logs before retrying.";
+
+/// What the operator is told when a refresh request got a generic error: the refresh may have
+/// been applied all the same.
+const REFRESH_NOT_CONFIRMED: &str = "The refresh did not confirm success; it may still have \
+     been applied. Check the server logs or `kubidmd domain show`.";
+
+/// What the operator is told when the server closed the connection after it acknowledged the
+/// start of a refresh.
+const REFRESH_CONNECTION_CLOSED: &str = "the refresh started but its outcome is unknown \
+     (connection closed); check the server logs or `kubidmd domain show`";
+
+/// Whether `req` asks the server to refresh this node from a supplier.
+fn is_refresh_request(req: &AdminTaskRequest) -> bool {
+    matches!(
+        req,
+        AdminTaskRequest::RefreshReplicationConsumer
+            | AdminTaskRequest::RefreshReplicationConsumerFrom { .. }
+    )
+}
+
+/// How long to wait for the first answer to `req`, when it is bounded at all.
+fn first_answer_timeout(req: &AdminTaskRequest) -> Option<Duration> {
+    matches!(req, AdminTaskRequest::RefreshReplicationConsumerFrom { .. })
+        .then_some(REFRESH_FROM_ANSWER_TIMEOUT)
+}
+
+/// Read the final response to a request. With `first_answer_timeout`, the server must answer
+/// within it, either with its final response or with [`AdminTaskResponse::RefreshStarted`],
+/// after which the final response follows without a limit.
+async fn read_admin_response(
+    reqs: &mut Framed<UnixStream, ClientCodec>,
+    first_answer_timeout: Option<Duration>,
+) -> Result<Option<Result<AdminTaskResponse, io::Error>>, Elapsed> {
+    let Some(first_answer_timeout) = first_answer_timeout else {
+        return Ok(reqs.next().await);
+    };
+    match timeout(first_answer_timeout, reqs.next()).await? {
+        Some(Ok(AdminTaskResponse::RefreshStarted { supplier })) => {
+            info!("Refresh started from {supplier}, waiting for it to complete ...");
+            // The server closing the connection now leaves the outcome unknown.
+            Ok(reqs.next().await.or_else(|| {
+                Some(Ok(AdminTaskResponse::ErrorMessage {
+                    message: REFRESH_CONNECTION_CLOSED.to_string(),
+                }))
+            }))
+        }
+        response => Ok(response),
+    }
+}
+
 async fn submit_admin_req_json(path: &str, req: AdminTaskRequest) -> ExitCode {
     // Connect to the socket.
     let stream = match UnixStream::connect(path).await {
@@ -116,6 +179,8 @@ async fn submit_admin_req_json(path: &str, req: AdminTaskRequest) -> ExitCode {
     };
 
     let mut reqs = Framed::new(stream, ClientCodec);
+    let answer_timeout = first_answer_timeout(&req);
+    let is_refresh = is_refresh_request(&req);
 
     if let Err(err) = reqs.send(req).await {
         display_json_error(err, "Unable to connect to send request.");
@@ -129,7 +194,12 @@ async fn submit_admin_req_json(path: &str, req: AdminTaskRequest) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    match reqs.next().await {
+    let Ok(response) = read_admin_response(&mut reqs, answer_timeout).await else {
+        display_json_error("Timeout", REFRESH_FROM_NO_ANSWER);
+        return ExitCode::FAILURE;
+    };
+
+    match response {
         Some(Ok(AdminTaskResponse::RecoverAccount { password })) => {
             display_json_success_output(password)
         }
@@ -137,10 +207,24 @@ async fn submit_admin_req_json(path: &str, req: AdminTaskRequest) -> ExitCode {
             display_json_success();
         }
         Some(Ok(AdminTaskResponse::Error)) => {
+            let message = if is_refresh {
+                REFRESH_NOT_CONFIRMED
+            } else {
+                "Error processing request - you should inspect the server logs."
+            };
+            display_json_error("ResponseError", message);
+            return ExitCode::FAILURE;
+        }
+        // Only ever the first answer to a refresh, which `read_admin_response` reads.
+        Some(Ok(AdminTaskResponse::RefreshStarted { supplier })) => {
             display_json_error(
-                "ResponseError",
-                "Error processing request - you should inspect the server logs.",
+                "UnexpectedResponse",
+                format!("Unexpected refresh started response from {supplier}: the outcome of the refresh is unknown. Check the server logs or `kubidmd domain show`."),
             );
+            return ExitCode::FAILURE;
+        }
+        Some(Ok(AdminTaskResponse::ErrorMessage { message })) => {
+            display_json_error("ResponseError", message);
             return ExitCode::FAILURE;
         }
         Some(Err(err)) => {
@@ -171,6 +255,8 @@ async fn submit_admin_req_human(path: &str, req: AdminTaskRequest) -> ExitCode {
     };
 
     let mut reqs = Framed::new(stream, ClientCodec);
+    let answer_timeout = first_answer_timeout(&req);
+    let is_refresh = is_refresh_request(&req);
 
     if let Err(e) = reqs.send(req).await {
         error!(err = ?e, "Unable to send request");
@@ -184,7 +270,12 @@ async fn submit_admin_req_human(path: &str, req: AdminTaskRequest) -> ExitCode {
 
     trace!("flushed, waiting ...");
 
-    match reqs.next().await {
+    let Ok(response) = read_admin_response(&mut reqs, answer_timeout).await else {
+        error!("{REFRESH_FROM_NO_ANSWER}");
+        return ExitCode::FAILURE;
+    };
+
+    match response {
         Some(Ok(AdminTaskResponse::RecoverAccount { password })) => info!(new_password = ?password),
         Some(Ok(AdminTaskResponse::ShowReplicationCertificate { cert })) => {
             info!(certificate = ?cert)
@@ -296,40 +387,37 @@ async fn submit_admin_req_human(path: &str, req: AdminTaskRequest) -> ExitCode {
             info!("domain_uuid   : {}", uuid);
             info!("domain_level  : {}", level);
         }
-        Some(Ok(AdminTaskResponse::MaintenanceCapabilities { capabilities })) => {
-            info!(?capabilities, "maintenance capabilities")
+        Some(Ok(
+            AdminTaskResponse::MaintenanceCapabilities { .. }
+            | AdminTaskResponse::MaintenanceStatus { .. }
+            | AdminTaskResponse::MaintenanceDrain { .. }
+            | AdminTaskResponse::MaintenanceRun { .. }
+            | AdminTaskResponse::ReplicationFence { .. }
+            | AdminTaskResponse::ReplicationSyncUntil { .. }
+            | AdminTaskResponse::MaintenanceResume { .. }
+            | AdminTaskResponse::MaintenanceError { .. },
+        )) => {
+            // Only `kubidmd maintenance` sends maintenance requests, and it prints its own
+            // responses, so seeing one here means the server answered the wrong request.
+            error!("Unexpected maintenance response to a non maintenance request");
+            return ExitCode::FAILURE;
         }
-        Some(Ok(AdminTaskResponse::MaintenanceStatus { status, fence })) => {
-            info!(?status, ?fence, "maintenance status")
-        }
-        Some(Ok(AdminTaskResponse::MaintenanceDrain {
-            operation_id,
-            fence,
-        })) => {
-            info!(?operation_id, ?fence, "maintenance drain")
-        }
-        Some(Ok(AdminTaskResponse::MaintenanceRun { result })) => {
-            info!(?result, "maintenance run")
-        }
-        Some(Ok(AdminTaskResponse::ReplicationFence { fence })) => {
-            info!(?fence, "replication fence")
-        }
-        Some(Ok(AdminTaskResponse::ReplicationSyncUntil {
-            result,
-            current_fence,
-        })) => {
-            info!(?result, ?current_fence, "replication sync until")
-        }
-        Some(Ok(AdminTaskResponse::MaintenanceResume { operation_id })) => {
-            info!(?operation_id, "maintenance resume")
-        }
-        Some(Ok(AdminTaskResponse::MaintenanceError { code, message })) => {
-            error!(?code, ?message, "maintenance error");
+        // Only ever the first answer to a refresh, which `read_admin_response` reads.
+        Some(Ok(AdminTaskResponse::RefreshStarted { .. })) => {
+            error!("Unexpected refresh started response: the outcome of the refresh is unknown. Check the server logs or `kubidmd domain show`.");
             return ExitCode::FAILURE;
         }
         Some(Ok(AdminTaskResponse::Success)) => info!("success"),
         Some(Ok(AdminTaskResponse::Error)) => {
-            info!("Error - you should inspect the logs.");
+            if is_refresh {
+                error!("{REFRESH_NOT_CONFIRMED}");
+            } else {
+                info!("Error - you should inspect the logs.");
+            }
+            return ExitCode::FAILURE;
+        }
+        Some(Ok(AdminTaskResponse::ErrorMessage { message })) => {
+            error!("Error - {message}");
             return ExitCode::FAILURE;
         }
         Some(Err(err)) => {
@@ -343,6 +431,378 @@ async fn submit_admin_req_human(path: &str, req: AdminTaskRequest) -> ExitCode {
     };
 
     ExitCode::SUCCESS
+}
+
+/// The request `kubidmd refresh-replication-consumer` sends. `Err` is a usage error that
+/// must be reported before anything is sent to the server.
+fn refresh_replication_consumer_request(
+    proceed: bool,
+    from: Option<&str>,
+) -> Result<AdminTaskRequest, String> {
+    if !proceed {
+        return Err("Unwilling to proceed. Check --help.".to_string());
+    }
+    // Without a source, the request released versions know; with one, a request that a
+    // server without `--from` refuses rather than refreshing from any supplier.
+    Ok(match from {
+        None => AdminTaskRequest::RefreshReplicationConsumer,
+        Some(from) => AdminTaskRequest::RefreshReplicationConsumerFrom {
+            from: from.to_owned(),
+        },
+    })
+}
+
+/// The `kubidmd maintenance` request a subcommand stands for. `Err` is a usage error that
+/// must be reported before anything is sent to the server.
+fn maintenance_request(cmd: &MaintenanceCmds) -> Result<AdminTaskRequest, String> {
+    Ok(match cmd {
+        MaintenanceCmds::Capabilities => AdminTaskRequest::MaintenanceCapabilities,
+        MaintenanceCmds::Status => AdminTaskRequest::MaintenanceStatus,
+        MaintenanceCmds::Drain(opt) => AdminTaskRequest::MaintenanceDrain {
+            operation_id: opt.operation_id,
+        },
+        MaintenanceCmds::Run(opt) => AdminTaskRequest::MaintenanceRun {
+            operation_id: opt.operation_id.operation_id,
+            operation: match opt.operation {
+                MaintenanceRunOperation::Reindex => MaintenanceOperation::Reindex,
+                MaintenanceRunOperation::Verify => MaintenanceOperation::Verify,
+            },
+        },
+        MaintenanceCmds::Fence => AdminTaskRequest::ReplicationFence,
+        MaintenanceCmds::SyncUntil(opt) => AdminTaskRequest::ReplicationSyncUntil {
+            operation_id: opt.operation_id.operation_id,
+            fence: maintenance_fence(&opt.fence)?,
+            timeout_seconds: opt.timeout_seconds,
+        },
+        MaintenanceCmds::Resume(opt) => AdminTaskRequest::MaintenanceResume {
+            operation_id: opt.operation_id,
+        },
+    })
+}
+
+/// Parse the fence given to `sync-until`, inline or from a file.
+fn maintenance_fence(source: &MaintenanceFenceSource) -> Result<ReplicationFence, String> {
+    let json = match (&source.fence, &source.fence_file) {
+        (Some(json), _) => json.clone(),
+        (None, Some(path)) => std::fs::read_to_string(path)
+            .map_err(|err| format!("Unable to read the fence file '{}': {err}", path.display()))?,
+        (None, None) => return Err("A replication fence is required".to_string()),
+    };
+    serde_json::from_str(&json).map_err(|err| format!("Invalid replication fence JSON: {err}"))
+}
+
+/// The snake_case name serde gives a plain enum value, as used on the wire and in JSON output.
+fn serde_label<T: Serialize>(value: &T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn json_text<T: Serialize>(value: &T) -> String {
+    serde_json::to_string(value).unwrap_or_else(|err| format!("<unserializable value: {err}>"))
+}
+
+fn or_none<T: fmt::Display>(value: Option<T>) -> String {
+    value.map_or_else(|| "none".to_string(), |value| value.to_string())
+}
+
+/// What `kubidmd maintenance` prints for a response, and whether the step succeeded.
+#[derive(Debug, PartialEq, Eq)]
+struct MaintenanceOutcome {
+    text: String,
+    success: bool,
+}
+
+impl MaintenanceOutcome {
+    fn ok(human: String, output: serde_json::Value, format: MaintenanceOutput) -> Self {
+        let text = match format {
+            MaintenanceOutput::Human => human,
+            MaintenanceOutput::Json => {
+                let mut object = serde_json::json!({ "status": "ok" });
+                object["output"] = output;
+                object.to_string()
+            }
+        };
+        MaintenanceOutcome {
+            text,
+            success: true,
+        }
+    }
+
+    /// `output` carries the structured detail of a failure that is more than an error
+    /// message, such as the result of a run that did not succeed.
+    fn failed(
+        reason: &str,
+        message: &str,
+        retryable: bool,
+        output: serde_json::Value,
+        format: MaintenanceOutput,
+    ) -> Self {
+        let text = match format {
+            MaintenanceOutput::Human => {
+                let retry = if retryable {
+                    " (retryable: repeat the same request)"
+                } else {
+                    ""
+                };
+                format!("error: {reason}{retry}\n{message}")
+            }
+            MaintenanceOutput::Json => {
+                let mut object = serde_json::json!({
+                    "status": "error",
+                    "reason": reason,
+                    "message": message,
+                    "retryable": retryable,
+                });
+                object["output"] = output;
+                object.to_string()
+            }
+        };
+        MaintenanceOutcome {
+            text,
+            success: false,
+        }
+    }
+}
+
+fn maintenance_outcome(
+    response: &AdminTaskResponse,
+    format: MaintenanceOutput,
+) -> MaintenanceOutcome {
+    match response {
+        AdminTaskResponse::MaintenanceCapabilities { capabilities } => {
+            let human = format!(
+                "api_version        : {}\n\
+                 drain              : {}\n\
+                 replication_fence  : {}\n\
+                 sync_until         : {}\n\
+                 reindex            : {}\n\
+                 verify             : {}\n\
+                 vacuum             : {}\n\
+                 restore            : {}",
+                capabilities.api_version,
+                capabilities.drain,
+                capabilities.replication_fence,
+                capabilities.sync_until,
+                capabilities.reindex,
+                capabilities.verify,
+                capabilities.vacuum,
+                capabilities.restore,
+            );
+            MaintenanceOutcome::ok(
+                human,
+                serde_json::json!({ "capabilities": capabilities }),
+                format,
+            )
+        }
+        AdminTaskResponse::MaintenanceStatus { status, fence } => {
+            let mut human = format!(
+                "state               : {}\n\
+                 active_operation_id : {}\n\
+                 last_error          : {}",
+                serde_label(&status.state),
+                or_none(status.active_operation_id),
+                or_none(status.last_error.as_deref()),
+            );
+            if let Some(fence) = fence {
+                human.push_str(&format!("\nfence               : {}", json_text(fence)));
+            }
+            MaintenanceOutcome::ok(
+                human,
+                serde_json::json!({ "status": status, "fence": fence }),
+                format,
+            )
+        }
+        AdminTaskResponse::MaintenanceDrain {
+            operation_id,
+            fence,
+        } => MaintenanceOutcome::ok(
+            format!(
+                "drained\noperation_id : {operation_id}\nfence        : {}",
+                json_text(fence)
+            ),
+            serde_json::json!({ "operation_id": operation_id, "fence": fence }),
+            format,
+        ),
+        AdminTaskResponse::MaintenanceRun { result } => {
+            let operation = serde_label(&result.operation);
+            if result.success {
+                let mut human = format!(
+                    "{operation} succeeded\noperation_id : {}",
+                    result.operation_id
+                );
+                if let Some(fence) = &result.fence {
+                    human.push_str(&format!("\nfence        : {}", json_text(fence)));
+                }
+                MaintenanceOutcome::ok(human, serde_json::json!({ "result": result }), format)
+            } else {
+                let mut message =
+                    format!("{operation} failed for operation {}", result.operation_id);
+                if let Some(error) = &result.error {
+                    message.push_str(&format!(": {error}"));
+                }
+                for verification_error in &result.verification_errors {
+                    message.push_str(&format!("\nverification error: {verification_error}"));
+                }
+                MaintenanceOutcome::failed(
+                    "run_failed",
+                    &message,
+                    false,
+                    serde_json::json!({ "result": result }),
+                    format,
+                )
+            }
+        }
+        AdminTaskResponse::ReplicationFence { fence } => MaintenanceOutcome::ok(
+            format!("fence : {}", json_text(fence)),
+            serde_json::json!({ "fence": fence }),
+            format,
+        ),
+        AdminTaskResponse::ReplicationSyncUntil {
+            result,
+            current_fence,
+        } => {
+            let label = serde_label(result);
+            let detail = serde_json::json!({ "result": result, "current_fence": current_fence });
+            match result {
+                ReplicationSyncResult::Satisfied => MaintenanceOutcome::ok(
+                    format!(
+                        "fence satisfied\ncurrent_fence : {}",
+                        json_text(current_fence)
+                    ),
+                    detail,
+                    format,
+                ),
+                // The wait simply ran out: nothing changed, so asking again is safe.
+                ReplicationSyncResult::TimedOut => MaintenanceOutcome::failed(
+                    &label,
+                    &format!(
+                        "the fence was not satisfied in time\ncurrent_fence : {}",
+                        json_text(current_fence)
+                    ),
+                    true,
+                    detail,
+                    format,
+                ),
+                ReplicationSyncResult::DomainMismatch
+                | ReplicationSyncResult::GenerationMismatch => MaintenanceOutcome::failed(
+                    &label,
+                    &format!(
+                        "the fence can never be satisfied by this node\ncurrent_fence : {}",
+                        json_text(current_fence)
+                    ),
+                    false,
+                    detail,
+                    format,
+                ),
+            }
+        }
+        AdminTaskResponse::MaintenanceResume { operation_id } => MaintenanceOutcome::ok(
+            format!("resumed\noperation_id : {operation_id}"),
+            serde_json::json!({ "operation_id": operation_id }),
+            format,
+        ),
+        AdminTaskResponse::MaintenanceError { code, message } => MaintenanceOutcome::failed(
+            &serde_label(code),
+            message,
+            // A busy step never changed any state.
+            *code == MaintenanceErrorCode::Busy,
+            serde_json::Value::Null,
+            format,
+        ),
+        AdminTaskResponse::Error => MaintenanceOutcome::failed(
+            "response_error",
+            "Error processing request - you should inspect the server logs.",
+            false,
+            serde_json::Value::Null,
+            format,
+        ),
+        _ => MaintenanceOutcome::failed(
+            "unexpected_response",
+            "The server answered a maintenance request with an unrelated response.",
+            false,
+            serde_json::Value::Null,
+            format,
+        ),
+    }
+}
+
+/// Send one request to the admin socket and wait for its response. The server answers a
+/// request only once its step has finished, which can take long, so there is no client
+/// side deadline. `Err` is the failure reason and a message.
+async fn maintenance_exchange(
+    path: &str,
+    req: AdminTaskRequest,
+) -> Result<AdminTaskResponse, (&'static str, String)> {
+    let stream = UnixStream::connect(path).await.map_err(|err| {
+        let diag = kubidm_lib_file_permissions::diagnose_path(path.as_ref());
+        (
+            "socket_connect",
+            format!("Unable to connect to the admin socket '{path}': {err}\n{diag}"),
+        )
+    })?;
+
+    let mut reqs = Framed::new(stream, ClientCodec);
+
+    reqs.send(req)
+        .await
+        .map_err(|err| ("socket_send", format!("Unable to send the request: {err}")))?;
+    reqs.flush()
+        .await
+        .map_err(|err| ("socket_send", format!("Unable to flush the request: {err}")))?;
+
+    match reqs.next().await {
+        Some(Ok(response)) => Ok(response),
+        Some(Err(err)) => Err((
+            "socket_receive",
+            format!("Error during the admin task operation: {err}"),
+        )),
+        None => Err((
+            "socket_closed",
+            "The admin socket closed before it answered.".to_string(),
+        )),
+    }
+}
+
+/// Print `outcome` and return its exit code. Errors go to stderr, except as JSON, where
+/// stdout always carries the one JSON object.
+fn print_maintenance_outcome(outcome: &MaintenanceOutcome, format: MaintenanceOutput) -> ExitCode {
+    if outcome.success || format == MaintenanceOutput::Json {
+        println!("{}", outcome.text);
+    } else {
+        eprintln!("{}", outcome.text);
+    }
+    if outcome.success {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+fn maintenance_command(
+    opt: &MaintenanceOpt,
+    config: &Configuration,
+    rt: &tokio::runtime::Runtime,
+) -> ExitCode {
+    let format = opt.output;
+    let failure = |reason: &str, message: &str| {
+        print_maintenance_outcome(
+            &MaintenanceOutcome::failed(reason, message, false, serde_json::Value::Null, format),
+            format,
+        )
+    };
+
+    // Building the request can read a fence file, which must not happen on the runtime.
+    let req = match maintenance_request(&opt.commands) {
+        Ok(req) => req,
+        Err(message) => return failure("invalid_request", &message),
+    };
+
+    match rt.block_on(maintenance_exchange(config.adminbindpath.as_str(), req)) {
+        Ok(response) => print_maintenance_outcome(&maintenance_outcome(&response, format), format),
+        Err((reason, message)) => failure(reason, &message),
+    }
 }
 
 /// Check what we're running as and various filesystem permissions.
@@ -813,6 +1273,8 @@ fn main() -> ExitCode {
 
     let exit_code = if let KubidmdOpt::Scripting { command } = opt.commands {
         rt.block_on(scripting_command(command, config))
+    } else if let KubidmdOpt::Maintenance(maintenance_opt) = opt.commands {
+        maintenance_command(&maintenance_opt, &config, &rt)
     } else {
         rt.block_on(start_daemon(opt, config))
     };
@@ -1134,16 +1596,13 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
             )
             .await;
         }
-        KubidmdOpt::RefreshReplicationConsumer { proceed } => {
+        KubidmdOpt::RefreshReplicationConsumer { proceed, from } => {
             info!("Running refresh replication consumer ...");
-            if !proceed {
-                error!("Unwilling to proceed. Check --help.");
-            } else {
-                submit_admin_req_human(
-                    config.adminbindpath.as_str(),
-                    AdminTaskRequest::RefreshReplicationConsumer,
-                )
-                .await;
+            match refresh_replication_consumer_request(*proceed, from.as_deref()) {
+                Ok(req) => {
+                    submit_admin_req_human(config.adminbindpath.as_str(), req).await;
+                }
+                Err(message) => error!("{message}"),
             }
         }
         KubidmdOpt::RecoverAccount { name } => {
@@ -1338,7 +1797,444 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         }
-        KubidmdOpt::Scripting { .. } | KubidmdOpt::Version => {}
+        KubidmdOpt::Scripting { .. } | KubidmdOpt::Maintenance(_) | KubidmdOpt::Version => {}
     }
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    const OP: &str = "6f0c1d52-2f64-4b3e-9a5e-0f6a8c2a7d11";
+
+    fn op() -> Uuid {
+        Uuid::parse_str(OP).unwrap_or_default()
+    }
+
+    fn parse(args: &[&str]) -> Result<MaintenanceOpt, clap::Error> {
+        let mut argv = vec!["kubidmd", "maintenance"];
+        argv.extend_from_slice(args);
+        KubidmdParser::try_parse_from(argv).and_then(|parsed| match parsed.commands {
+            KubidmdOpt::Maintenance(opt) => Ok(opt),
+            _ => Err(clap::Error::new(clap::error::ErrorKind::InvalidSubcommand)),
+        })
+    }
+
+    fn request(args: &[&str]) -> Result<AdminTaskRequest, String> {
+        let opt = parse(args).map_err(|err| err.to_string())?;
+        maintenance_request(&opt.commands)
+    }
+
+    fn fence() -> ReplicationFence {
+        ReplicationFence {
+            version: 1,
+            domain_uuid: Uuid::nil(),
+            generation: None,
+            ranges: BTreeMap::new(),
+        }
+    }
+
+    fn refresh_request(args: &[&str]) -> Result<AdminTaskRequest, String> {
+        let mut argv = vec!["kubidmd", "refresh-replication-consumer"];
+        argv.extend_from_slice(args);
+        match KubidmdParser::try_parse_from(argv)
+            .map_err(|err| err.to_string())?
+            .commands
+        {
+            KubidmdOpt::RefreshReplicationConsumer { proceed, from } => {
+                refresh_replication_consumer_request(proceed, from.as_deref())
+            }
+            _ => Err("not a refresh-replication-consumer command".to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_from_gives_up_on_a_server_that_does_not_answer() {
+        use tokio::io::AsyncWriteExt;
+
+        // Only a refresh from a given supplier waits for a bounded time.
+        assert_eq!(
+            first_answer_timeout(&AdminTaskRequest::RefreshReplicationConsumerFrom {
+                from: "repl://pod-1.example.com:8444".to_string(),
+            }),
+            Some(REFRESH_FROM_ANSWER_TIMEOUT)
+        );
+        assert_eq!(
+            first_answer_timeout(&AdminTaskRequest::RefreshReplicationConsumer),
+            None
+        );
+
+        // A server that predates --from: its codec waits for more bytes forever.
+        let (client_sock, _server_sock) = UnixStream::pair().expect("socket pair");
+        let mut client = Framed::new(client_sock, ClientCodec);
+        assert!(
+            read_admin_response(&mut client, Some(Duration::from_millis(50)))
+                .await
+                .is_err()
+        );
+
+        // A current one answers that the refresh started, then with its outcome once that
+        // is known, however long after the first answer.
+        let (client_sock, mut server_sock) = UnixStream::pair().expect("socket pair");
+        let mut client = Framed::new(client_sock, ClientCodec);
+        let server = tokio::spawn(async move {
+            let started = br#"{"RefreshStarted":{"supplier":"repl://pod-1.example.com:8444"}}"#;
+            server_sock.write_all(started).await.expect("write");
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            server_sock.write_all(br#""Success""#).await.expect("write");
+            server_sock
+        });
+        assert!(matches!(
+            read_admin_response(&mut client, Some(Duration::from_millis(50))).await,
+            Ok(Some(Ok(AdminTaskResponse::Success)))
+        ));
+        assert!(server.await.is_ok());
+
+        // A server that closes the connection after it acknowledged the start: the outcome
+        // is unknown, not a socket error.
+        let (client_sock, mut server_sock) = UnixStream::pair().expect("socket pair");
+        let mut client = Framed::new(client_sock, ClientCodec);
+        server_sock
+            .write_all(br#"{"RefreshStarted":{"supplier":"repl://pod-1.example.com:8444"}}"#)
+            .await
+            .expect("write");
+        drop(server_sock);
+        assert!(matches!(
+            read_admin_response(&mut client, Some(Duration::from_millis(50))).await,
+            Ok(Some(Ok(AdminTaskResponse::ErrorMessage { ref message }))) if message.contains("outcome is unknown")
+        ));
+
+        // Or refuses it at once.
+        let (client_sock, mut server_sock) = UnixStream::pair().expect("socket pair");
+        let mut client = Framed::new(client_sock, ClientCodec);
+        server_sock
+            .write_all(br#"{"ErrorMessage":{"message":"not a supplier"}}"#)
+            .await
+            .expect("write");
+        assert!(matches!(
+            read_admin_response(&mut client, Some(Duration::from_millis(50))).await,
+            Ok(Some(Ok(AdminTaskResponse::ErrorMessage { ref message }))) if message == "not a supplier"
+        ));
+    }
+
+    #[test]
+    fn refresh_replication_consumer_maps_to_request() {
+        assert!(matches!(
+            refresh_request(&["--i-want-to-refresh-this-servers-database"]),
+            Ok(AdminTaskRequest::RefreshReplicationConsumer)
+        ));
+        assert!(matches!(
+            refresh_request(&[
+                "--i-want-to-refresh-this-servers-database",
+                "--from",
+                "repl://pod-1.example.com:8444",
+            ]),
+            Ok(AdminTaskRequest::RefreshReplicationConsumerFrom { ref from })
+                if from == "repl://pod-1.example.com:8444"
+        ));
+        // Nothing is sent without the acknowledgement, with or without a source.
+        assert!(refresh_request(&[]).is_err());
+        assert!(refresh_request(&["--from", "repl://pod-1.example.com:8444"]).is_err());
+        // --from needs a value.
+        assert!(refresh_request(&["--i-want-to-refresh-this-servers-database", "--from"]).is_err());
+    }
+
+    #[test]
+    fn maintenance_simple_subcommands_map_to_requests() {
+        assert!(matches!(
+            request(&["capabilities"]),
+            Ok(AdminTaskRequest::MaintenanceCapabilities)
+        ));
+        assert!(matches!(
+            request(&["status"]),
+            Ok(AdminTaskRequest::MaintenanceStatus)
+        ));
+        assert!(matches!(
+            request(&["fence"]),
+            Ok(AdminTaskRequest::ReplicationFence)
+        ));
+    }
+
+    #[test]
+    fn maintenance_operation_subcommands_map_to_requests() {
+        assert!(matches!(
+            request(&["drain", "--operation-id", OP]),
+            Ok(AdminTaskRequest::MaintenanceDrain { operation_id }) if operation_id == op()
+        ));
+        assert!(matches!(
+            request(&["resume", "--operation-id", OP]),
+            Ok(AdminTaskRequest::MaintenanceResume { operation_id }) if operation_id == op()
+        ));
+        assert!(matches!(
+            request(&["run", "--operation-id", OP, "reindex"]),
+            Ok(AdminTaskRequest::MaintenanceRun {
+                operation_id,
+                operation: MaintenanceOperation::Reindex,
+            }) if operation_id == op()
+        ));
+        assert!(matches!(
+            request(&["run", "--operation-id", OP, "verify"]),
+            Ok(AdminTaskRequest::MaintenanceRun {
+                operation_id,
+                operation: MaintenanceOperation::Verify,
+            }) if operation_id == op()
+        ));
+    }
+
+    #[test]
+    fn maintenance_sync_until_maps_fence_and_timeout() {
+        let wanted = fence();
+        let json = json_text(&wanted);
+
+        let with_timeout = request(&[
+            "sync-until",
+            "--operation-id",
+            OP,
+            "--fence",
+            &json,
+            "--timeout-seconds",
+            "90",
+        ]);
+        assert!(matches!(
+            with_timeout,
+            Ok(AdminTaskRequest::ReplicationSyncUntil {
+                operation_id,
+                ref fence,
+                timeout_seconds: Some(90),
+            }) if operation_id == op() && *fence == wanted
+        ));
+
+        let default_timeout = request(&["sync-until", "--operation-id", OP, "--fence", &json]);
+        assert!(matches!(
+            default_timeout,
+            Ok(AdminTaskRequest::ReplicationSyncUntil {
+                timeout_seconds: None,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn maintenance_sync_until_reads_a_fence_file() {
+        let path = std::env::temp_dir().join(format!("kubidmd-fence-{}.json", std::process::id()));
+        assert!(std::fs::write(&path, json_text(&fence())).is_ok());
+        let path_str = path.to_string_lossy().to_string();
+
+        let req = request(&[
+            "sync-until",
+            "--operation-id",
+            OP,
+            "--fence-file",
+            &path_str,
+        ]);
+        let _ = std::fs::remove_file(&path);
+        assert!(matches!(
+            req,
+            Ok(AdminTaskRequest::ReplicationSyncUntil { ref fence, .. }) if *fence == self::fence()
+        ));
+
+        let missing = request(&[
+            "sync-until",
+            "--operation-id",
+            OP,
+            "--fence-file",
+            "/nonexistent/kubidmd-fence.json",
+        ]);
+        assert!(matches!(missing, Err(ref msg) if msg.contains("Unable to read")));
+    }
+
+    #[test]
+    fn maintenance_sync_until_rejects_a_bad_fence() {
+        let invalid = request(&["sync-until", "--operation-id", OP, "--fence", "{not json"]);
+        assert!(matches!(invalid, Err(ref msg) if msg.contains("Invalid replication fence")));
+    }
+
+    #[test]
+    fn maintenance_arguments_are_validated() {
+        // The operation ID is required, and must be a UUID.
+        assert!(parse(&["drain"]).is_err());
+        assert!(parse(&["drain", "--operation-id", "not-a-uuid"]).is_err());
+        assert!(parse(&["resume"]).is_err());
+        // `run` needs a known operation.
+        assert!(parse(&["run", "--operation-id", OP]).is_err());
+        assert!(parse(&["run", "--operation-id", OP, "vacuum"]).is_err());
+        // Exactly one fence source.
+        assert!(parse(&["sync-until", "--operation-id", OP]).is_err());
+        assert!(parse(&[
+            "sync-until",
+            "--operation-id",
+            OP,
+            "--fence",
+            "{}",
+            "--fence-file",
+            "/tmp/fence.json",
+        ])
+        .is_err());
+        // There is no subcommand without a name.
+        assert!(parse(&[]).is_err());
+    }
+
+    #[test]
+    fn maintenance_output_option() {
+        assert_eq!(
+            parse(&["status"]).map(|opt| opt.output).ok(),
+            Some(MaintenanceOutput::Human)
+        );
+        assert_eq!(
+            parse(&["-o", "json", "status"]).map(|opt| opt.output).ok(),
+            Some(MaintenanceOutput::Json)
+        );
+        assert_eq!(
+            parse(&["status", "--output", "json"])
+                .map(|opt| opt.output)
+                .ok(),
+            Some(MaintenanceOutput::Json)
+        );
+        assert!(parse(&["-o", "yaml", "status"]).is_err());
+    }
+
+    #[test]
+    fn maintenance_busy_is_retryable_in_both_formats() {
+        let busy = AdminTaskResponse::MaintenanceError {
+            code: MaintenanceErrorCode::Busy,
+            message: "step in progress".to_string(),
+        };
+
+        let human = maintenance_outcome(&busy, MaintenanceOutput::Human);
+        assert!(!human.success);
+        assert!(human.text.contains("busy"));
+        assert!(human.text.contains("retryable"));
+
+        let json = maintenance_outcome(&busy, MaintenanceOutput::Json);
+        assert!(!json.success);
+        let value: serde_json::Value = serde_json::from_str(&json.text).unwrap_or_default();
+        assert_eq!(value["status"], "error");
+        assert_eq!(value["reason"], "busy");
+        assert_eq!(value["retryable"], true);
+
+        let other = AdminTaskResponse::MaintenanceError {
+            code: MaintenanceErrorCode::InvalidState,
+            message: "not drained".to_string(),
+        };
+        let json = maintenance_outcome(&other, MaintenanceOutput::Json);
+        let value: serde_json::Value = serde_json::from_str(&json.text).unwrap_or_default();
+        assert_eq!(value["reason"], "invalid_state");
+        assert_eq!(value["retryable"], false);
+    }
+
+    #[test]
+    fn maintenance_drain_output_carries_a_reusable_fence() {
+        let drained = AdminTaskResponse::MaintenanceDrain {
+            operation_id: op(),
+            fence: fence(),
+        };
+
+        let json = maintenance_outcome(&drained, MaintenanceOutput::Json);
+        assert!(json.success);
+        let value: serde_json::Value = serde_json::from_str(&json.text).unwrap_or_default();
+        assert_eq!(value["status"], "ok");
+        assert_eq!(value["output"]["operation_id"], OP);
+        // The printed fence is what `sync-until --fence` accepts.
+        let parsed: Result<ReplicationFence, _> =
+            serde_json::from_value(value["output"]["fence"].clone());
+        assert!(matches!(parsed, Ok(ref f) if *f == fence()));
+
+        let human = maintenance_outcome(&drained, MaintenanceOutput::Human);
+        assert!(human.success);
+        assert!(human.text.contains(OP));
+        assert!(human.text.contains(&json_text(&fence())));
+    }
+
+    #[test]
+    fn maintenance_run_and_sync_results_set_the_exit_state() {
+        let run = |success| AdminTaskResponse::MaintenanceRun {
+            result: kubidmd_core::admin::MaintenanceRunResult {
+                operation_id: op(),
+                operation: MaintenanceOperation::Verify,
+                success,
+                verification_errors: if success {
+                    Vec::new()
+                } else {
+                    vec!["entry 4 is broken".to_string()]
+                },
+                fence: None,
+                error: None,
+            },
+        };
+        assert!(maintenance_outcome(&run(true), MaintenanceOutput::Human).success);
+        let failed = maintenance_outcome(&run(false), MaintenanceOutput::Human);
+        assert!(!failed.success);
+        assert!(failed.text.contains("entry 4 is broken"));
+
+        let sync = |result| AdminTaskResponse::ReplicationSyncUntil {
+            result,
+            current_fence: fence(),
+        };
+        assert!(
+            maintenance_outcome(
+                &sync(ReplicationSyncResult::Satisfied),
+                MaintenanceOutput::Human
+            )
+            .success
+        );
+
+        let timed_out = maintenance_outcome(
+            &sync(ReplicationSyncResult::TimedOut),
+            MaintenanceOutput::Json,
+        );
+        assert!(!timed_out.success);
+        let value: serde_json::Value = serde_json::from_str(&timed_out.text).unwrap_or_default();
+        assert_eq!(value["reason"], "timed_out");
+        assert_eq!(value["retryable"], true);
+
+        let mismatch = maintenance_outcome(
+            &sync(ReplicationSyncResult::DomainMismatch),
+            MaintenanceOutput::Json,
+        );
+        assert!(!mismatch.success);
+        let value: serde_json::Value = serde_json::from_str(&mismatch.text).unwrap_or_default();
+        assert_eq!(value["retryable"], false);
+    }
+
+    #[test]
+    fn maintenance_status_output() {
+        let response: Result<AdminTaskResponse, _> = serde_json::from_value(serde_json::json!({
+            "MaintenanceStatus": {
+                "status": {
+                    "state": "fenced",
+                    "active_operation_id": OP,
+                    "last_error": null,
+                    "capabilities": {
+                        "api_version": "v1",
+                        "drain": true,
+                        "replication_fence": true,
+                        "sync_until": true,
+                        "reindex": true,
+                        "verify": true,
+                        "vacuum": false,
+                        "restore": false
+                    }
+                },
+                "fence": null
+            }
+        }));
+        assert!(response.is_ok(), "the status response must deserialize");
+        let Ok(response) = response else {
+            return;
+        };
+
+        let human = maintenance_outcome(&response, MaintenanceOutput::Human);
+        assert!(human.success);
+        assert!(human.text.contains("fenced"));
+        assert!(human.text.contains(OP));
+        assert!(human.text.contains("none"));
+
+        let json = maintenance_outcome(&response, MaintenanceOutput::Json);
+        let value: serde_json::Value = serde_json::from_str(&json.text).unwrap_or_default();
+        assert_eq!(value["status"], "ok");
+        assert_eq!(value["output"]["status"]["state"], "fenced");
+        assert_eq!(value["output"]["status"]["active_operation_id"], OP);
+    }
 }

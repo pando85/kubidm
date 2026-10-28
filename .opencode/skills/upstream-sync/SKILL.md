@@ -75,7 +75,7 @@ When unsure, check what the fork's HEAD uses: `git grep -n '<name>' HEAD -- '*.r
   `patches/aws-runtime-1.7.2` workspace exclude.
 - **ServerRole**: `proto/src/config.rs` (`pub use kubidm_proto::config::ServerRole` in
   `server/core/src/config.rs`; upstream has its own local `ServerRole` enum, drop upstream's copy).
-- **proto**: `proto/src/internal/{authorization,pip}.rs` re-exported from `internal/mod.rs`.
+- **proto**: `proto/src/internal/authorization.rs` re-exported from `internal/mod.rs`.
 - **WAL / PITR helpers**: `DbEntry::stored_uuid()` / `stored_name()` in `server/lib/src/be/dbentry.rs`
   match `DbValueSetV2` variants directly; when upstream changes DB value formats, extend them (keep
   the legacy arms so old WAL segments replay). Symptom when missed: all `pitr_test::*` fail with
@@ -200,7 +200,7 @@ Rules that made this work:
   `git show HEAD:<file> > <file>` plus rebrand when the 3-way output is hopeless.
 - **crypto-glue / cert code** (`server/core/src/crypto.rs`, `server/lib/src/repl/supplier.rs`): the
   fork's custom x509 profiles were replaced by upstream's crypto-glue 0.2.1 code; take upstream.
-  `x509-cert` is now an unused dependency.
+  (`x509-cert` was dropped as unused after the 2026-10-27 sync.)
 - **Templates**: keep the fork's `github.com/pando85/kubidm` link and `KUBIDM_PKG_VERSION`.
 - **Directory restructures**: accept upstream's layout, delete the fork's orphaned directories,
   re-apply branding.
@@ -292,6 +292,5 @@ merge commit.
 - [ ] PR opened as draft, body filled, CI green, then `gh pr ready`
 - [ ] PR body and the final report both remind the user to merge with a merge commit (no squash, no
       rebase)
-- [ ] Known follow-ups listed in the PR (currently: unused `x509-cert` dep; stale
-      `server/daemon/insecure_server.toml` and `server/daemon/run_insecure_dev_server.sh` copies of
-      the `scripts/` versions)
+- [ ] Known follow-ups listed in the PR, and a follow-up PR opened to fix them (2026-10-27: #511's
+      list was fixed in the `fix/post-sync-followups-2026-10-27` PR)

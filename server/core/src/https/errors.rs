@@ -116,6 +116,11 @@ impl IntoResponse for WebError {
                     | OperationError::VL0001ValueSshPublicKeyString => {
                         (StatusCode::BAD_REQUEST, None)
                     }
+                    // Kubidm: the request can be understood, but its approval policy can
+                    // never be satisfied for this requester.
+                    OperationError::AP0001ApprovalQuorumUnreachable => {
+                        (StatusCode::UNPROCESSABLE_ENTITY, None)
+                    }
                     _ => (StatusCode::INTERNAL_SERVER_ERROR, None),
                 };
 
@@ -141,5 +146,15 @@ mod tests {
             WebError::OperationError(OperationError::AttributeUniqueness(vec![Attribute::Uuid]));
         let response = err.into_response();
         assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn test_approval_quorum_unreachable_error_response() {
+        use super::*;
+        use axum::response::IntoResponse;
+
+        let err = WebError::OperationError(OperationError::AP0001ApprovalQuorumUnreachable);
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 }

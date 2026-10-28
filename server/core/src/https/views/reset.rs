@@ -118,11 +118,6 @@ struct CredResetPartialView {
     attested_passkeys_have_pending_changes: bool,
     unixcred_has_pending_changes: bool,
     sshkeys_have_pending_changes: bool,
-    // Auto-commit indicators (used by backend, not directly in template)
-    #[allow(dead_code)]
-    should_auto_commit_first_cred: bool,
-    #[allow(dead_code)]
-    should_auto_commit_passkey: bool,
 }
 
 #[skip_serializing_none]
@@ -1301,8 +1296,6 @@ fn get_cu_partial(cu_status: CUStatus) -> CredResetPartialView {
         attested_passkeys_have_pending_changes,
         unixcred_has_pending_changes,
         sshkeys_have_pending_changes,
-        should_auto_commit_first_cred,
-        should_auto_commit_passkey,
         ..
     } = cu_status;
 
@@ -1341,8 +1334,6 @@ fn get_cu_partial(cu_status: CUStatus) -> CredResetPartialView {
         attested_passkeys_have_pending_changes,
         unixcred_has_pending_changes,
         sshkeys_have_pending_changes,
-        should_auto_commit_first_cred,
-        should_auto_commit_passkey,
     }
 }
 

@@ -213,14 +213,23 @@ mod tests {
         }
     }
 
-    fn make_tombstone_entry() -> DbEntry {
+    /// A tombstone as the server writes it: every attribute is gone but the uuid (and the
+    /// class and the last modification), so that replication and recovery can still find
+    /// the entry it replaces.
+    fn make_tombstone_entry(uuid: Uuid) -> DbEntry {
         let sid = Uuid::new_v4();
+        let mut attrs = BTreeMap::new();
+        attrs.insert(Attribute::Uuid, DbValueSetV2::UuidSingle(uuid));
+        attrs.insert(
+            Attribute::Class,
+            DbValueSetV2::Iutf8(vec!["object".to_string(), "tombstone".to_string()]),
+        );
         DbEntry {
             ent: DbEntryVers::V3 {
                 changestate: DbEntryChangeState::V1Tombstone {
                     at: make_cid(sid, 100),
                 },
-                attrs: BTreeMap::new(),
+                attrs,
             },
         }
     }
@@ -269,9 +278,10 @@ mod tests {
 
     #[test]
     fn test_dbentry_stored_identity_absent_or_malformed() {
-        // A tombstone carries no attributes at all.
-        let tombstone = make_tombstone_entry();
-        assert_eq!(tombstone.stored_uuid(), None);
+        // A tombstone keeps its uuid, and no name.
+        let uuid = Uuid::new_v4();
+        let tombstone = make_tombstone_entry(uuid);
+        assert_eq!(tombstone.stored_uuid(), Some(uuid));
         assert_eq!(tombstone.stored_name(), None);
 
         // Attributes present but stored with an unexpected value type must not be
@@ -312,7 +322,8 @@ mod tests {
 
     #[test]
     fn test_dbentry_v3_tombstone_serde_roundtrip() {
-        let entry = make_tombstone_entry();
+        let uuid = Uuid::new_v4();
+        let entry = make_tombstone_entry(uuid);
         let json = serde_json::to_string(&entry).unwrap();
         let deserialized: DbEntry = serde_json::from_str(&json).unwrap();
         match &deserialized.ent {
@@ -321,9 +332,10 @@ mod tests {
                     changestate,
                     DbEntryChangeState::V1Tombstone { .. }
                 ));
-                assert!(attrs.is_empty());
+                assert_eq!(attrs.len(), 2);
             }
         }
+        assert_eq!(deserialized.stored_uuid(), Some(uuid));
     }
 
     #[test]
@@ -462,7 +474,7 @@ mod tests {
 
     #[test]
     fn test_dbentry_debug_tombstone() {
-        let entry = make_tombstone_entry();
+        let entry = make_tombstone_entry(Uuid::new_v4());
         let debug_str = format!("{:?}", entry);
         assert!(debug_str.contains("v3"));
         assert!(debug_str.contains("tombstone"));
@@ -477,7 +489,7 @@ mod tests {
 
     #[test]
     fn test_dbentry_display_tombstone() {
-        let entry = make_tombstone_entry();
+        let entry = make_tombstone_entry(Uuid::new_v4());
         let display_str = format!("{}", entry);
         assert!(display_str.contains("tombstoned"));
     }
@@ -545,7 +557,7 @@ mod tests {
             db_d_uuid: Uuid::new_v4(),
             db_ts_max: Duration::from_secs(300),
             keyhandles: BTreeMap::new(),
-            entries: vec![make_tombstone_entry()],
+            entries: vec![make_tombstone_entry(Uuid::new_v4())],
         };
 
         let json = serde_json::to_string(&backup).unwrap();
@@ -582,7 +594,10 @@ mod tests {
 
     #[test]
     fn test_dbbackup_v1_serde_roundtrip() {
-        let backup = DbBackup::V1(vec![make_live_entry(), make_tombstone_entry()]);
+        let backup = DbBackup::V1(vec![
+            make_live_entry(),
+            make_tombstone_entry(Uuid::new_v4()),
+        ]);
 
         let json = serde_json::to_string(&backup).unwrap();
         let deserialized: DbBackup = serde_json::from_str(&json).unwrap();

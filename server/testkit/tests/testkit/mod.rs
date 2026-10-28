@@ -1,4 +1,5 @@
 mod apidocs;
+mod approval_test;
 mod authorization_test;
 mod backup_common;
 mod backup_encryption_test;
@@ -15,6 +16,7 @@ mod identity_verification_tests;
 mod integration;
 mod ip_addr_extractors;
 mod ldap_basic;
+mod oauth2_federation_test;
 mod oauth2_test;
 mod person;
 mod pitr_test;

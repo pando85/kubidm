@@ -70,6 +70,15 @@ pub use self::{
 };
 use self::{apppwd::ValueSetApplicationPassword, image::ValueSetImage};
 
+/// Kubidm: parse an RFC 3339 time and normalise it to UTC. `None` when the time does not
+/// parse, or can not be expressed in UTC (`to_offset` would panic, for example for
+/// `9999-12-31T23:59:59-23:59`).
+pub(crate) fn parse_utc(s: &str) -> Option<OffsetDateTime> {
+    OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
+        .ok()
+        .and_then(|odt| odt.checked_to_offset(time::UtcOffset::UTC))
+}
+
 mod address;
 mod apppwd;
 mod auditlogstring;

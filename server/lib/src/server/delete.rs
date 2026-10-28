@@ -1,6 +1,6 @@
 use crate::{
     prelude::*,
-    server::{ChangeFlag, DeleteEvent, Plugins},
+    server::{is_oauth2_client_provider, ChangeFlag, DeleteEvent, Plugins},
 };
 use std::collections::BTreeMap;
 
@@ -243,9 +243,7 @@ impl QueryServerWriteTransaction<'_> {
         }
 
         if !self.changed_flags.contains(ChangeFlag::OAUTH2_CLIENT)
-            && del_cand
-                .iter()
-                .any(|e| e.attribute_equality(Attribute::Class, &EntryClass::OAuth2Client.into()))
+            && del_cand.iter().any(is_oauth2_client_provider)
         {
             self.changed_flags.insert(ChangeFlag::OAUTH2_CLIENT)
         }
