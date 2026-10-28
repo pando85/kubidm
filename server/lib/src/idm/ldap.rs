@@ -19,10 +19,12 @@ use crate::{
     event::SearchEvent,
     idm::{
         event::{LdapApplicationAuthEvent, LdapAuthEvent, LdapTokenAuthEvent},
+        pip::prefetch::PipPrefetchedAttributes,
         server::{IdmServer, IdmServerAuthTransaction, IdmServerTransaction},
     },
     prelude::*,
 };
+use std::sync::Arc;
 
 // Clippy doesn't like Bind here. But proto needs unboxed ldapmsg,
 // and ldapboundtoken is moved. Really, it's not too bad, every message here is pretty sucky.
@@ -59,6 +61,9 @@ pub struct LdapBoundToken {
     // In a way, this is a stepping stone to an "ident" but allows us to check
     // the session is still "valid" depending on it's origin.
     pub effective_session: LdapSession,
+    /// Kubidm: the PIP attributes prefetched for the current operation's subject, see
+    /// [crate::idm::pip::prefetch]. Set per operation by the caller, never at bind.
+    pub pip_attributes: Option<Arc<PipPrefetchedAttributes>>,
 }
 
 pub struct LdapServer {
@@ -390,7 +395,8 @@ impl LdapServer {
                 .map_err(|e| {
                     admin_error!("Invalid identity: {:?}", e);
                     e
-                })?;
+                })?
+                .with_pip_attributes(uat.pip_attributes.clone());
             let se = SearchEvent::new_ext_impersonate_uuid(
                 &mut idm_read.qs_read,
                 ident,
@@ -549,7 +555,8 @@ impl LdapServer {
             .map_err(|e| {
                 admin_error!("Invalid identity: {:?}", e);
                 e
-            })?;
+            })?
+            .with_pip_attributes(uat.pip_attributes.clone());
 
         let f = Filter::from_ldap_ro(&ident, &lfilter, &mut idm_read.qs_read)?;
         let filter_orig = f

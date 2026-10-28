@@ -7,10 +7,9 @@
 //! like HR databases, CRM systems, asset management tools, and risk signals from
 //! SIEM/UEBA systems into access control decisions.
 //!
-//! NOTE: This framework is implemented but awaiting integration into the authorization
-//! flow. Dead code warnings are suppressed until integration is complete.
-
-#![allow(dead_code)]
+//! Access control profiles use PIP attributes through `acp_receiver_pip_condition`. The
+//! attributes they reference are prefetched for each request's subject outside of the
+//! transaction, see [`prefetch`].
 
 use crate::prelude::*;
 use async_trait::async_trait;
@@ -19,17 +18,16 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::fmt::Write as _;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
+use std::time::Instant;
 
 pub mod cache;
 pub mod config;
 pub mod health;
 pub mod http;
 pub mod ldap;
+pub mod prefetch;
 
-use cache::PipAttributeCache;
-use config::PipFallbackBehavior;
+use config::{PipConfig, PipFallbackBehavior, PipSourceConfig};
 
 /// Unique identifier for a PIP instance
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Ord, PartialOrd)]
@@ -381,9 +379,25 @@ pub enum PipFailure {
     Unavailable(String),
     /// The request did not complete within the configured timeout.
     Timeout,
-    /// The source answered but the answer could not be used, or the query could
-    /// not be built for this subject.
+    /// The source answered but the answer could not be used (for example a server
+    /// error or an unparsable response).
     Error(String),
+    /// The source works, but has no usable answer for this subject: it holds no
+    /// single matching entry, it rejected the request for this subject (an HTTP 4xx
+    /// other than 408 and 429), or the query could not be built for the subject.
+    ///
+    /// This is not a source failure, so it never resolves to fallback values: an
+    /// unknown account must not be granted what `usefallback` grants during an
+    /// outage.
+    Subject(String),
+}
+
+impl PipFailure {
+    /// Whether the source itself failed (it is unreachable, timed out or answered
+    /// with an error), as opposed to having no answer for this subject.
+    pub fn is_source_failure(&self) -> bool {
+        !matches!(self, PipFailure::Subject(_))
+    }
 }
 
 impl fmt::Display for PipFailure {
@@ -392,6 +406,7 @@ impl fmt::Display for PipFailure {
             PipFailure::Unavailable(reason) => write!(f, "unavailable: {reason}"),
             PipFailure::Timeout => f.write_str("timed out"),
             PipFailure::Error(error) => write!(f, "error: {error}"),
+            PipFailure::Subject(reason) => write!(f, "no usable answer for the subject: {reason}"),
         }
     }
 }
@@ -420,16 +435,24 @@ pub enum PipResult {
 
 impl PipResult {
     /// Resolve a failure according to the configured fallback behaviour.
+    ///
+    /// Fallback values are only used for a source failure (see
+    /// [`PipFailure::is_source_failure`]). With `usefallback`, a failure that is
+    /// specific to the subject (such as an unknown account) is `Ignored`: the
+    /// subject gets no attributes from this source.
     pub fn from_failure(
         behavior: PipFallbackBehavior,
         failure: PipFailure,
         fallback: impl FnOnce() -> PipAttributeSet,
     ) -> Self {
         match behavior {
-            PipFallbackBehavior::UseFallback => PipResult::Fallback {
-                failure,
-                attributes: fallback(),
-            },
+            PipFallbackBehavior::UseFallback if failure.is_source_failure() => {
+                PipResult::Fallback {
+                    failure,
+                    attributes: fallback(),
+                }
+            }
+            PipFallbackBehavior::UseFallback => PipResult::Ignored(failure),
             PipFallbackBehavior::Ignore => PipResult::Ignored(failure),
             PipFallbackBehavior::Deny => PipResult::Denied(failure),
         }
@@ -594,18 +617,44 @@ pub trait PolicyInformationPoint: Send + Sync {
     async fn clear_all_cache(&self);
 }
 
-/// Manager for multiple PIP instances
+/// Manager for multiple PIP instances.
+///
+/// Attributes are cached by each source, for its own `cache_ttl_secs`.
+#[derive(Default)]
 pub struct PipManager {
     pips: BTreeMap<PipId, Arc<dyn PolicyInformationPoint>>,
-    cache: Arc<RwLock<PipAttributeCache>>,
 }
 
 impl PipManager {
-    pub fn new(cache_ttl: Duration) -> Self {
+    pub fn new() -> Self {
         PipManager {
             pips: BTreeMap::new(),
-            cache: Arc::new(RwLock::new(PipAttributeCache::new(cache_ttl))),
         }
+    }
+
+    /// Build a manager with every source of `config`.
+    ///
+    /// Fails if a source is invalid (see [`http::HttpPip::new`] and
+    /// [`ldap::LdapPip::new`]) or if two sources share an id (ignoring case): a misconfigured source
+    /// must not silently drop the attributes access decisions depend on.
+    pub fn from_config(config: &PipConfig) -> Result<Self, String> {
+        let mut manager = PipManager::new();
+        for source in &config.sources {
+            let pip: Arc<dyn PolicyInformationPoint> = match source {
+                PipSourceConfig::Http(http) => Arc::new(http::HttpPip::new(http.clone())?),
+                PipSourceConfig::Ldap(ldap) => Arc::new(ldap::LdapPip::new(ldap.clone())?),
+            };
+            // Conditions name sources case-insensitively.
+            if manager
+                .pips
+                .keys()
+                .any(|id| id.as_str().eq_ignore_ascii_case(pip.id().as_str()))
+            {
+                return Err(format!("PIP '{}': duplicate source id", pip.id()));
+            }
+            manager.register(pip);
+        }
+        Ok(manager)
     }
 
     pub fn register(&mut self, pip: Arc<dyn PolicyInformationPoint>) {
@@ -621,7 +670,7 @@ impl PipManager {
     }
 
     /// Fold one source's result into `all_attributes`, failing closed on `Denied`.
-    fn merge_result(
+    pub(crate) fn merge_result(
         pip_id: &PipId,
         result: PipResult,
         all_attributes: &mut PipAttributeSet,
@@ -1131,6 +1180,20 @@ mod tests {
     }
 
     #[test]
+    fn test_pip_result_from_failure_use_fallback_subject_failure_is_ignored() {
+        // An unknown account (or any subject-specific failure) is not an outage, so
+        // usefallback must not grant the fallback values.
+        let result = PipResult::from_failure(
+            PipFallbackBehavior::UseFallback,
+            PipFailure::Subject("no entry".to_string()),
+            || panic!("fallback values must not be computed for a subject failure"),
+        );
+        assert!(matches!(result, PipResult::Ignored(PipFailure::Subject(_))));
+        assert!(result.attributes().is_none());
+        assert!(!result.fallback_used());
+    }
+
+    #[test]
     fn test_pip_result_from_failure_ignore() {
         let result = PipResult::from_failure(
             PipFallbackBehavior::Ignore,
@@ -1218,13 +1281,13 @@ mod tests {
 
     #[test]
     fn test_pip_manager_new() {
-        let manager = PipManager::new(Duration::from_secs(300));
+        let manager = PipManager::new();
         assert!(manager.health_summary().is_empty());
     }
 
     #[test]
     fn test_pip_manager_register_and_get() {
-        let mut manager = PipManager::new(Duration::from_secs(300));
+        let mut manager = PipManager::new();
         let mock_pip = Arc::new(MockPip::success(PipId::new("test_pip")));
         manager.register(mock_pip.clone());
 
@@ -1234,7 +1297,7 @@ mod tests {
 
     #[test]
     fn test_pip_manager_iter() {
-        let mut manager = PipManager::new(Duration::from_secs(300));
+        let mut manager = PipManager::new();
         manager.register(Arc::new(MockPip::success(PipId::new("pip1"))));
         manager.register(Arc::new(MockPip::success(PipId::new("pip2"))));
 
@@ -1244,7 +1307,7 @@ mod tests {
 
     #[test]
     fn test_pip_manager_health_summary() {
-        let mut manager = PipManager::new(Duration::from_secs(300));
+        let mut manager = PipManager::new();
         manager.register(Arc::new(MockPip::success(PipId::new("healthy_pip"))));
 
         let summary = manager.health_summary();
@@ -1257,7 +1320,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_pip_manager_merges_success_and_fallback() {
-        let mut manager = PipManager::new(Duration::from_secs(300));
+        let mut manager = PipManager::new();
         manager.register(Arc::new(MockPip::success(PipId::new("ok"))));
         manager.register(Arc::new(MockPip::failing(
             PipId::new("down"),
@@ -1287,7 +1350,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_pip_manager_deny_fails_closed() {
-        let mut manager = PipManager::new(Duration::from_secs(300));
+        let mut manager = PipManager::new();
         manager.register(Arc::new(MockPip::success(PipId::new("ok"))));
         manager.register(Arc::new(MockPip::failing(
             PipId::new("strict"),
@@ -1316,7 +1379,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_pip_manager_named_attributes() {
-        let mut manager = PipManager::new(Duration::from_secs(300));
+        let mut manager = PipManager::new();
         manager.register(Arc::new(MockPip::success(PipId::new("ok"))));
         manager.register(Arc::new(MockPip::failing(
             PipId::new("down"),

@@ -202,6 +202,7 @@ impl IdmServerAuthTransaction<'_> {
                 Ok(Some(LdapBoundToken {
                     spn: account.spn().into(),
                     session_id,
+                    pip_attributes: None,
                     effective_session: LdapSession::UnixBind(account.uuid),
                 }))
             }

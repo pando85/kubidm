@@ -29,6 +29,7 @@ impl CachedEntry {
         Instant::now().duration_since(self.cached_at) > self.ttl
     }
 
+    #[cfg(test)]
     fn remaining_ttl(&self) -> Option<Duration> {
         let elapsed = Instant::now().duration_since(self.cached_at);
         if elapsed > self.ttl {

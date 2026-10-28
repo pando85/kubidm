@@ -73,6 +73,7 @@ pub const ATTR_ACP_RECEIVER: &str = "acp_receiver";
 pub const ATTR_ACP_REAUTH_MAX_AGE: &str = "acp_reauth_max_age";
 pub const ATTR_ACP_REQUIRE_REAUTH: &str = "acp_require_reauth";
 pub const ATTR_ACP_RECEIVER_DELEGATED: &str = "acp_receiver_delegated";
+pub const ATTR_ACP_RECEIVER_PIP_CONDITION: &str = "acp_receiver_pip_condition";
 pub const ATTR_ACP_TARGET_DELEGATED_SCOPE: &str = "acp_target_delegated_scope";
 pub const ATTR_DELEGATED_SCOPE_FILTER: &str = "delegated_scope_filter";
 pub const ATTR_DELEGATED_SCOPE_GROUP: &str = "delegated_scope_group";

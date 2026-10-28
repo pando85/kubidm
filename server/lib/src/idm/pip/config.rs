@@ -182,6 +182,15 @@ pub(crate) fn validate_no_userinfo(id: &str, url: &Url) -> Result<(), String> {
     Ok(())
 }
 
+/// Is `id` a valid PIP source id? It is used in `pip:<source>:<attribute>` names, so it
+/// is limited to ASCII letters, digits, `_`, `-` and `.`.
+pub(crate) fn is_valid_source_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+}
+
 /// Validate the settings shared by every source type.
 pub(crate) fn validate_common(
     id: &str,
@@ -190,6 +199,12 @@ pub(crate) fn validate_common(
     fallback_behavior: PipFallbackBehavior,
     fallback_values: &BTreeMap<String, PipAttributeValue>,
 ) -> Result<(), String> {
+    if !is_valid_source_id(id) {
+        return Err(format!(
+            "PIP '{id}': the id must be non-empty and only use ASCII letters, digits, '_', '-' \
+             and '.'"
+        ));
+    }
     if timeout_secs == 0 {
         return Err(format!("PIP '{id}': timeout_secs must be greater than 0"));
     }
@@ -482,29 +497,24 @@ pub struct PipConfig {
     #[serde(default)]
     pub sources: Vec<PipSourceConfig>,
 
-    /// Global default cache TTL in seconds
-    #[serde(default = "default_global_cache_ttl")]
-    pub default_cache_ttl_secs: u64,
-
-    /// Maximum cache entries
-    #[serde(default = "default_max_cache_entries")]
-    pub max_cache_entries: usize,
-
     /// Enable/disable PIP globally
     #[serde(default = "default_enabled")]
     pub enabled: bool,
-}
 
-fn default_global_cache_ttl() -> u64 {
-    300
-}
-
-fn default_max_cache_entries() -> usize {
-    10000
+    /// The time budget, in milliseconds, for prefetching the PIP attributes of one
+    /// request's subject before its access decisions. Sources that have not answered
+    /// within it contribute no attributes to that request, so the access controls
+    /// conditioned on them do not match (fail closed).
+    #[serde(default = "default_prefetch_timeout_ms")]
+    pub prefetch_timeout_ms: u64,
 }
 
 fn default_enabled() -> bool {
     true
+}
+
+fn default_prefetch_timeout_ms() -> u64 {
+    2000
 }
 
 impl PipSourceConfig {
@@ -545,8 +555,8 @@ impl PipSourceConfig {
 }
 
 impl PipConfig {
-    pub fn default_cache_ttl(&self) -> Duration {
-        Duration::from_secs(self.default_cache_ttl_secs)
+    pub fn prefetch_timeout(&self) -> Duration {
+        Duration::from_millis(self.prefetch_timeout_ms)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -567,15 +577,22 @@ mod tests {
         let config_str = r#"
 sources = []
 
-default_cache_ttl_secs = 300
-max_cache_entries = 5000
 enabled = true
 "#;
 
         let config: PipConfig = toml::from_str(config_str).expect("Failed to parse config");
         assert!(config.enabled);
-        assert_eq!(config.default_cache_ttl_secs, 300);
-        assert_eq!(config.max_cache_entries, 5000);
+        assert_eq!(config.prefetch_timeout_ms, 2000);
+    }
+
+    #[test]
+    fn test_source_id_validation() {
+        assert!(is_valid_source_id("hr_system"));
+        assert!(is_valid_source_id("hr-system.v2"));
+        assert!(!is_valid_source_id(""));
+        assert!(!is_valid_source_id("hr:system"));
+        assert!(!is_valid_source_id("hr system"));
+        assert!(!is_valid_source_id("hr=x"));
     }
 
     #[test]
@@ -916,9 +933,8 @@ endpoint_path = "/employees/{username}"
         // Redaction must survive the wrapping config types.
         let config = PipConfig {
             sources: vec![PipSourceConfig::Http(http), PipSourceConfig::Ldap(ldap)],
-            default_cache_ttl_secs: 300,
-            max_cache_entries: 10,
             enabled: true,
+            prefetch_timeout_ms: 2000,
         };
         assert!(!format!("{config:?}").contains("s3cr3t"));
     }
@@ -1118,17 +1134,6 @@ endpoint_path = "/employees/{username}"
     }
 
     #[test]
-    fn test_pip_config_default_cache_ttl_method() {
-        let config = PipConfig {
-            sources: vec![],
-            default_cache_ttl_secs: 600,
-            max_cache_entries: 5000,
-            enabled: true,
-        };
-        assert_eq!(config.default_cache_ttl(), Duration::from_secs(600));
-    }
-
-    #[test]
     fn test_pip_config_is_empty() {
         let empty_config = PipConfig::default();
         assert!(empty_config.is_empty());
@@ -1150,9 +1155,8 @@ endpoint_path = "/employees/{username}"
                 health_check_path: None,
                 provided_attributes: vec!["attr".to_string()],
             })],
-            default_cache_ttl_secs: 300,
-            max_cache_entries: 10000,
             enabled: true,
+            prefetch_timeout_ms: 2000,
         };
         assert!(!non_empty_config.is_empty());
     }
@@ -1197,9 +1201,8 @@ endpoint_path = "/employees/{username}"
                     attribute_mapping: BTreeMap::new(),
                 }),
             ],
-            default_cache_ttl_secs: 300,
-            max_cache_entries: 10000,
             enabled: true,
+            prefetch_timeout_ms: 2000,
         };
         assert_eq!(config_with_sources.source_count(), 2);
     }
@@ -1283,9 +1286,8 @@ endpoint_path = "/employees/{username}"
     fn test_pip_config_disabled() {
         let config = PipConfig {
             sources: vec![],
-            default_cache_ttl_secs: 300,
-            max_cache_entries: 10000,
             enabled: false,
+            prefetch_timeout_ms: 2000,
         };
         assert!(!config.enabled);
     }
