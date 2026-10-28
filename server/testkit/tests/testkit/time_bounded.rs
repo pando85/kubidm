@@ -314,6 +314,20 @@ async fn test_time_bounded_grant_list_revoke_http(rsclient: &KubidmClient) {
         "{res:?}"
     );
 
+    // A time that is out of range in UTC is rejected rather than crashing the request.
+    let date = time::Date::from_calendar_date(9999, time::Month::December, 31).expect("date");
+    let offset = time::UtcOffset::from_hms(-23, -59, 0).expect("offset");
+    let out_of_range =
+        time::PrimitiveDateTime::new(date, time::Time::from_hms(23, 59, 59).expect("time"))
+            .assume_offset(offset);
+    let res = rsclient
+        .idm_group_time_bounded_member_grant("tb_http_group", "tb_http_user", None, out_of_range)
+        .await;
+    assert!(
+        matches!(res, Err(ClientError::Http(status, _, _)) if status == 400),
+        "{res:?}"
+    );
+
     // Grant, and the membership is reflected immediately.
     rsclient
         .idm_group_time_bounded_member_grant("tb_http_group", "tb_http_user", None, until)

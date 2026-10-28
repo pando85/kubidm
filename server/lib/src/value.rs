@@ -162,17 +162,35 @@ pub struct TimeBoundedMember {
 }
 
 impl TimeBoundedMember {
+    /// Build a grant, normalising both times to UTC, which is how they are stored and
+    /// loaded. Returns `None` when a time can not be expressed in UTC: `to_offset` panics
+    /// for a time near the end of year 9999 with a negative offset, which would be in
+    /// year 10000 in UTC.
+    pub fn try_new(
+        uuid: Uuid,
+        valid_from: Option<OffsetDateTime>,
+        valid_until: OffsetDateTime,
+    ) -> Option<Self> {
+        let valid_from = match valid_from {
+            Some(vf) => Some(vf.checked_to_offset(time::UtcOffset::UTC)?),
+            None => None,
+        };
+        let valid_until = valid_until.checked_to_offset(time::UtcOffset::UTC)?;
+        Some(Self {
+            uuid,
+            valid_from,
+            valid_until,
+        })
+    }
+
+    /// Test helper: [`Self::try_new`] for times that are known to be valid.
+    #[cfg(test)]
     pub fn new(
         uuid: Uuid,
         valid_from: Option<OffsetDateTime>,
         valid_until: OffsetDateTime,
     ) -> Self {
-        // Normalise to UTC, which is how these are stored and loaded.
-        Self {
-            uuid,
-            valid_from: valid_from.map(|vf| vf.to_offset(time::UtcOffset::UTC)),
-            valid_until: valid_until.to_offset(time::UtcOffset::UTC),
-        }
+        Self::try_new(uuid, valid_from, valid_until).expect("time not representable in UTC")
     }
 
     pub fn is_valid_at(&self, when: OffsetDateTime) -> bool {
@@ -915,7 +933,8 @@ impl PartialValue {
     pub fn new_datetime_s(s: &str) -> Option<Self> {
         OffsetDateTime::parse(s, &Rfc3339)
             .ok()
-            .map(|odt| odt.to_offset(time::UtcOffset::UTC))
+            // Kubidm: checked, as to_offset panics for a time that is out of range in UTC.
+            .and_then(|odt| odt.checked_to_offset(time::UtcOffset::UTC))
             .map(PartialValue::DateTime)
     }
 
@@ -1911,7 +1930,8 @@ impl Value {
     pub fn new_datetime_s(s: &str) -> Option<Self> {
         OffsetDateTime::parse(s, &Rfc3339)
             .ok()
-            .map(|odt| odt.to_offset(time::UtcOffset::UTC))
+            // Kubidm: checked, as to_offset panics for a time that is out of range in UTC.
+            .and_then(|odt| odt.checked_to_offset(time::UtcOffset::UTC))
             .map(Value::DateTime)
     }
 
@@ -2743,8 +2763,9 @@ mod tests {
     }
 
     mod time_bounded_member_tests {
-        use super::super::{TimeBoundedMember, Value};
+        use super::super::{PartialValue, TimeBoundedMember, Value};
         use std::time::Duration;
+        use time::format_description::well_known::Rfc3339;
         use time::OffsetDateTime;
 
         fn create_test_uuid() -> uuid::Uuid {
@@ -2997,6 +3018,28 @@ mod tests {
             assert_eq!(member.valid_from, Some(start));
             assert_eq!(member.valid_until, end);
             assert!(member.has_valid_window());
+        }
+
+        #[test]
+        fn test_time_bounded_member_try_new_out_of_range_in_utc() {
+            // The reported input: valid_from is 9999-12-31T23:59:00Z, but valid_until is in
+            // year 10000 once converted to UTC, where to_offset would panic.
+            let from = OffsetDateTime::parse("9999-12-31T00:00:00-23:59", &Rfc3339).unwrap();
+            let until = OffsetDateTime::parse("9999-12-31T23:59:59-23:59", &Rfc3339).unwrap();
+            let uuid = create_test_uuid();
+            assert!(TimeBoundedMember::try_new(uuid, Some(from), until).is_none());
+            assert!(TimeBoundedMember::try_new(uuid, None, until).is_none());
+            // A valid_from that is out of range in UTC.
+            let late_from = OffsetDateTime::parse("9999-12-31T01:00:00-23:59", &Rfc3339).unwrap();
+            assert!(TimeBoundedMember::try_new(uuid, Some(late_from), baseline_time()).is_none());
+            // In range values are normalised.
+            let ok = TimeBoundedMember::try_new(uuid, Some(from), baseline_time()).unwrap();
+            assert_eq!(
+                ok.valid_from.map(|vf| vf.offset()),
+                Some(time::UtcOffset::UTC)
+            );
+            assert!(Value::new_datetime_s("9999-12-31T23:59:59-23:59").is_none());
+            assert!(PartialValue::new_datetime_s("9999-12-31T23:59:59-23:59").is_none());
         }
 
         #[test]

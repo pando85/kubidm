@@ -436,7 +436,10 @@ impl SchemaAttribute {
         };
             */
 
-        let valid = self.syntax == ava.syntax();
+        let valid = self.syntax == ava.syntax()
+            // Kubidm: a maximum grant duration of 0 would make every time-bounded grant on
+            // the group fail, so it is rejected rather than treated as "disabled".
+            && (*a != Attribute::MaxGrantDuration || ava.to_uint32_single() != Some(0));
 
         if valid && ava.validate(self) {
             Ok(())

@@ -35,8 +35,7 @@ use kubidm_proto::{
         ApprovalPolicyCreateRequest, ApprovalRequest, ApprovalRequestCreateRequest,
         AuthIssueSession, AuthRequest, AuthResponse, AuthState as ProtoAuthState,
         Entry as ProtoEntry, GroupUnixExtend, SingleStringRequest, TimeBoundedMemberGrant,
-        TimeBoundedMemberGrantRequest, UatStatus, UnixGroupToken,
-        UnixUserToken, WhoamiResponse,
+        TimeBoundedMemberGrantRequest, UatStatus, UnixGroupToken, UnixUserToken, WhoamiResponse,
     },
 };
 use kubidmd_lib::{

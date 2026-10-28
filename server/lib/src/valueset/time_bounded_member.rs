@@ -7,6 +7,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
+/// Parse an RFC 3339 time and normalise it to UTC. `None` when the time does not parse, or
+/// can not be expressed in UTC (`to_offset` would panic).
+fn parse_utc(s: &str) -> Option<OffsetDateTime> {
+    OffsetDateTime::parse(s, &Rfc3339)
+        .ok()
+        .and_then(|odt| odt.checked_to_offset(time::UtcOffset::UTC))
+}
+
 #[derive(Debug, Clone)]
 pub struct ValueSetTimeBoundedMember {
     map: BTreeMap<Uuid, TimeBoundedMember>,
@@ -32,21 +40,17 @@ impl ValueSetTimeBoundedMember {
                 let valid_from = dbv
                     .valid_from
                     .map(|vf| {
-                        OffsetDateTime::parse(&vf, &Rfc3339)
-                            .map(|odt| odt.to_offset(time::UtcOffset::UTC))
+                        parse_utc(&vf).ok_or_else(|| {
+                            error!(uuid = %dbv.uuid, "invalid valid_from in time bounded member");
+                            OperationError::InvalidValueState
+                        })
                     })
-                    .transpose()
-                    .map_err(|err| {
-                        error!(?err, uuid = %dbv.uuid, "invalid valid_from in time bounded member");
-                        OperationError::InvalidValueState
-                    })?;
+                    .transpose()?;
 
-                let valid_until = OffsetDateTime::parse(&dbv.valid_until, &Rfc3339)
-                    .map(|odt| odt.to_offset(time::UtcOffset::UTC))
-                    .map_err(|err| {
-                        error!(?err, uuid = %dbv.uuid, "invalid valid_until in time bounded member");
-                        OperationError::InvalidValueState
-                    })?;
+                let valid_until = parse_utc(&dbv.valid_until).ok_or_else(|| {
+                    error!(uuid = %dbv.uuid, "invalid valid_until in time bounded member");
+                    OperationError::InvalidValueState
+                })?;
 
                 let member = TimeBoundedMember {
                     uuid: dbv.uuid,
@@ -366,6 +370,29 @@ mod tests {
             valid_until: end.format(&Rfc3339).unwrap(),
         }];
 
+        let vs = ValueSetTimeBoundedMember::from_dbvs2(data);
+        assert!(matches!(vs, Err(OperationError::InvalidValueState)));
+    }
+
+    #[test]
+    fn test_valueset_from_dbvs2_out_of_range_in_utc() {
+        // Valid RFC 3339, but in year 10000 once converted to UTC. This must be an error,
+        // not a panic in to_offset.
+        let data = vec![DbValueTimeBoundedMemberV1 {
+            uuid: create_test_uuid(),
+            valid_from: None,
+            valid_until: "9999-12-31T23:59:59-23:59".to_string(),
+        }];
+        let vs = ValueSetTimeBoundedMember::from_dbvs2(data);
+        assert!(matches!(vs, Err(OperationError::InvalidValueState)));
+
+        let data = vec![DbValueTimeBoundedMemberV1 {
+            uuid: create_test_uuid(),
+            valid_from: Some("9999-12-31T01:00:00-23:59".to_string()),
+            valid_until: (baseline_time() + Duration::from_secs(3600))
+                .format(&Rfc3339)
+                .unwrap(),
+        }];
         let vs = ValueSetTimeBoundedMember::from_dbvs2(data);
         assert!(matches!(vs, Err(OperationError::InvalidValueState)));
     }

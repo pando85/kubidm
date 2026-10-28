@@ -1,5 +1,8 @@
 use crate::{ClientError, KubidmClient};
-use kubidm_proto::constants::{ATTR_MAX_GRANT_DURATION, ENTRYCLASS_TIME_BOUNDED_GRANT};
+use kubidm_proto::constants::{
+    ATTR_CLASS, ATTR_MAX_GRANT_DURATION, ATTR_UUID, ENTRYCLASS_GROUP, ENTRYCLASS_TIME_BOUNDED_GRANT,
+};
+use kubidm_proto::internal::{Filter, Modify, ModifyList};
 use kubidm_proto::v1::{Entry, TimeBoundedMemberGrant, TimeBoundedMemberGrantRequest};
 use time::OffsetDateTime;
 
@@ -209,26 +212,37 @@ impl KubidmClient {
     }
 
     /// Kubidm: allow time-bounded membership grants on a group, optionally setting the
-    /// longest window (in seconds) that a grant may cover.
+    /// longest window (in seconds) that a grant may cover. The class and the cap are written
+    /// in a single modify, so the group is never enabled without the requested cap.
     pub async fn idm_group_time_bounded_enable(
         &self,
         id: &str,
         max_grant_duration: Option<u32>,
     ) -> Result<(), ClientError> {
-        self.perform_post_request::<_, ()>(
-            &format!("/v1/group/{id}/_attr/class"),
-            vec![ENTRYCLASS_TIME_BOUNDED_GRANT.to_string()],
-        )
-        .await?;
+        // Resolve the group to its uuid, so that the modify targets exactly this group.
+        let group_uuid = self
+            .idm_group_get(id)
+            .await?
+            .and_then(|entry| entry.attrs.get(ATTR_UUID).and_then(|v| v.first().cloned()))
+            .ok_or(ClientError::EmptyResponse)?;
 
+        let mut mods = vec![Modify::Present(
+            ATTR_CLASS.to_string(),
+            ENTRYCLASS_TIME_BOUNDED_GRANT.to_string(),
+        )];
         if let Some(max_grant_duration) = max_grant_duration {
-            self.perform_put_request::<_, ()>(
-                &format!("/v1/group/{id}/_attr/{ATTR_MAX_GRANT_DURATION}"),
-                vec![max_grant_duration.to_string()],
-            )
-            .await?;
+            mods.push(Modify::Purged(ATTR_MAX_GRANT_DURATION.to_string()));
+            mods.push(Modify::Present(
+                ATTR_MAX_GRANT_DURATION.to_string(),
+                max_grant_duration.to_string(),
+            ));
         }
-        Ok(())
+
+        let filter = Filter::And(vec![
+            Filter::Eq(ATTR_CLASS.to_string(), ENTRYCLASS_GROUP.to_string()),
+            Filter::Eq(ATTR_UUID.to_string(), group_uuid),
+        ]);
+        self.modify(filter, ModifyList::new_list(mods)).await
     }
 
     /// Kubidm: grant `member` a membership of a group from `valid_from` (or now) until

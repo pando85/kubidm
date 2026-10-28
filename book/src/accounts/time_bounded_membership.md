@@ -19,7 +19,15 @@ to remember to do it. This suits break-glass access, on-call rotations, and acce
 
 Granting, revoking and listing temporary memberships of a group are allowed to whoever may change (or, for listing,
 read) the members of the group under the normal access controls. For example, the entry managers of a group can grant
-temporary memberships of it, as can members of `idm_group_admins` for groups that are not high privilege.
+temporary memberships of it, as can members of `idm_group_admins` for groups that are not high privilege. Replacing a
+grant that is active or has not started yet also needs the right to remove members, since it takes that grant away;
+replacing an expired grant only needs the right to add members.
+
+Anyone who may read the members of a group can also list its temporary memberships, including their start and end times.
+
+Temporary memberships of high privilege groups (`idm_high_privilege` and the groups that are members of it, directly or
+through nesting) are refused, even when the group was enabled before it became high privilege. Grants that already exist
+on such a group can still be listed and revoked.
 
 Enabling temporary memberships and setting the maximum grant duration is allowed to members of `idm_group_admins`, for
 groups that are not high privilege. The entry managers of a group can not change its maximum grant duration.
@@ -28,8 +36,9 @@ groups that are not high privilege. The entry managers of a group can not change
 
 A grant may cover at most the group's maximum grant duration (the `max_grant_duration` attribute, in seconds), counted
 from the later of now and `valid_from` until `valid_until`. When the group does not set one, a default cap of 90 days
-applies. Grants that would exceed the cap are rejected. Setting the maximum on an existing group does not change the
-grants it already holds.
+applies. Grants that would exceed the cap are rejected. A grant may also start at most that long from now, so that a
+grant can not be scheduled to begin long after the person who granted it has lost the right to do so. Setting the
+maximum on an existing group does not change the grants it already holds. A maximum of 0 is rejected.
 
 ## Refresh Lag
 
