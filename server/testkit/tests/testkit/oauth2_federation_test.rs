@@ -480,7 +480,7 @@ async fn test_oauth2_federation_missing_required_fields(rsclient: &KubidmClient)
             "Missing authorisation endpoint",
         ),
         ("oauth2_token_endpoint", "Missing token endpoint"),
-        // Kubidm: without introspection every login would be denied.
+        // Kubidm: without introspection (or a jwks uri) every login would be denied.
         (
             "oauth2_token_introspect_endpoint",
             "Missing introspection endpoint",
@@ -489,6 +489,20 @@ async fn test_oauth2_federation_missing_required_fields(rsclient: &KubidmClient)
         let entry = without_attr(default_federation_entry(&format!("missing_{attr}")), attr);
         assert_create_rejected(rsclient, entry, reason).await;
     }
+
+    // Kubidm: a jwks uri (with the required issuer) verifies the id_token instead.
+    let entry = without_attr(
+        default_federation_entry("id_token_only"),
+        "oauth2_token_introspect_endpoint",
+    );
+    let entry = with_attr(
+        entry,
+        "oauth2_jwks_uri",
+        &["https://idp.example.com/oauth2/jwks"],
+    );
+    post_federation(rsclient, entry)
+        .await
+        .expect("A jwks uri without introspection should be valid");
 
     let entry = default_federation_entry("issuer_only");
     let entry = without_attr(entry, "oauth2_authorisation_endpoint");
@@ -532,8 +546,8 @@ async fn test_oauth2_federation_invalid_issuer_url(rsclient: &KubidmClient) {
     assert_create_rejected(rsclient, entry, "Invalid issuer URL").await;
 }
 
-/// Kubidm: the authorisation, token and introspection endpoints must use https, except
-/// on loopback, and must not carry credentials.
+/// Kubidm: the authorisation, token, introspection and jwks endpoints must use https,
+/// except on loopback, and must not carry credentials.
 #[kubidmd_testkit::test]
 async fn test_oauth2_federation_backchannel_requires_https(rsclient: &KubidmClient) {
     login_admin(rsclient).await;
@@ -542,6 +556,7 @@ async fn test_oauth2_federation_backchannel_requires_https(rsclient: &KubidmClie
         "oauth2_authorisation_endpoint",
         "oauth2_token_endpoint",
         "oauth2_token_introspect_endpoint",
+        "oauth2_jwks_uri",
     ] {
         let entry = with_attr(
             default_federation_entry(&format!("http_{attr}")),
@@ -574,6 +589,7 @@ async fn test_oauth2_federation_backchannel_requires_https(rsclient: &KubidmClie
         "oauth2_token_introspect_endpoint",
         &["http://127.0.0.1:8443/oauth2/token/introspect"],
     );
+    let entry = with_attr(entry, "oauth2_jwks_uri", &["http://127.0.0.1:8443/jwks"]);
     post_federation(rsclient, entry)
         .await
         .expect("Loopback http endpoints should be valid");
@@ -948,11 +964,22 @@ const SELF_IDP_RS_NAME: &str = "self_idp_rs";
 const SELF_IDP_FEDERATION_NAME: &str = "self_federation";
 const SELF_IDP_USER: &str = "self_idp_user";
 
+/// How the self federation verifies a login.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SelfIdpVerifier {
+    /// RFC 7662 introspection of the access token.
+    Introspection,
+    /// The OIDC id_token, with the IdP's JWKS (`oauth2_jwks_uri`) and no introspection.
+    IdToken,
+    /// Both: the id_token, then introspection.
+    IdTokenAndIntrospection,
+}
+
 /// Configure this instance as its own upstream IdP: an OAuth2 resource server for the
 /// federation, an IdP side user, and a federation that points at this instance over
-/// (loopback) http. Returns the IdP side user's uuid, which introspection reports as
-/// the subject.
-async fn setup_self_federation(rsclient: &KubidmClient) -> String {
+/// (loopback) http. Returns the IdP side user's uuid, which introspection and the
+/// id_token report as the subject.
+async fn setup_self_federation(rsclient: &KubidmClient, verifier: SelfIdpVerifier) -> String {
     login_admin(rsclient).await;
 
     let landing_url = rsclient.make_url("/ui/login/oauth2_landing");
@@ -1016,7 +1043,19 @@ async fn setup_self_federation(rsclient: &KubidmClient) -> String {
         "oauth2_token_introspect_endpoint",
         &[rsclient.make_url(OAUTH2_TOKEN_INTROSPECT_ENDPOINT).as_str()],
     );
-    let entry = with_attr(entry, "oauth2_request_scopes", &["openid"]);
+    let jwks_uri = rsclient.make_url(&format!("/oauth2/openid/{SELF_IDP_RS_NAME}/public_key.jwk"));
+    let entry = match verifier {
+        SelfIdpVerifier::Introspection => with_attr(entry, "oauth2_request_scopes", &["openid"]),
+        // No configured scopes: `openid` is requested anyway for the id_token.
+        SelfIdpVerifier::IdToken => with_attr(
+            without_attr(entry, "oauth2_token_introspect_endpoint"),
+            "oauth2_jwks_uri",
+            &[jwks_uri.as_str()],
+        ),
+        SelfIdpVerifier::IdTokenAndIntrospection => {
+            with_attr(entry, "oauth2_jwks_uri", &[jwks_uri.as_str()])
+        }
+    };
     post_federation(rsclient, entry)
         .await
         .expect("Failed to create the self federation");
@@ -1081,10 +1120,11 @@ fn location(response: &reqwest::Response) -> String {
 /// Run a federation login for `local_user` in a browser like client, with the IdP side
 /// login and consent done by `SELF_IDP_USER` through the API. Returns the browser client
 /// and the response of the landing page, where the server exchanges the code and
-/// introspects the access token.
+/// verifies the login.
 async fn self_federation_login(
     rsclient: &KubidmClient,
     local_user: &str,
+    verifier: SelfIdpVerifier,
 ) -> (reqwest::Client, reqwest::Response) {
     let browser = reqwest::Client::builder()
         .cookie_store(true)
@@ -1115,6 +1155,15 @@ async fn self_federation_login(
     assert!(authorise_query
         .iter()
         .any(|(k, v)| k == "code_challenge_method" && v == "S256"));
+    // Kubidm: the id_token verifier requests `openid` and binds the token with a nonce.
+    let nonce = authorise_query.iter().find(|(k, _)| k == "nonce");
+    let scope = authorise_query.iter().find(|(k, _)| k == "scope");
+    assert!(scope.is_some_and(|(_, v)| v.split(' ').any(|s| s == "openid")));
+    if verifier == SelfIdpVerifier::Introspection {
+        assert!(nonce.is_none());
+    } else {
+        assert!(nonce.is_some_and(|(_, v)| v.len() >= 32), "{nonce:?}");
+    }
 
     // The IdP side user authorises the request and consents.
     let res = rsclient
@@ -1168,11 +1217,29 @@ async fn self_federation_login(
 /// is only logged in when the introspected subject matches the admin linked one.
 #[kubidmd_testkit::test(role = ServerRole::WriteReplica)]
 async fn test_oauth2_federation_login_self_idp(rsclient: &KubidmClient) {
-    let idp_user_uuid = setup_self_federation(rsclient).await;
+    assert_self_federation_logins(rsclient, SelfIdpVerifier::Introspection).await;
+}
+
+/// Kubidm: as [test_oauth2_federation_login_self_idp], with the id_token verified against
+/// the IdP's JWKS (fetched through the shared outbound client) instead of introspection.
+#[kubidmd_testkit::test(role = ServerRole::WriteReplica)]
+async fn test_oauth2_federation_login_self_idp_id_token(rsclient: &KubidmClient) {
+    assert_self_federation_logins(rsclient, SelfIdpVerifier::IdToken).await;
+}
+
+/// Kubidm: with both a jwks uri and an introspection endpoint, both verifiers run.
+#[kubidmd_testkit::test(role = ServerRole::WriteReplica)]
+async fn test_oauth2_federation_login_self_idp_id_token_and_introspection(rsclient: &KubidmClient) {
+    assert_self_federation_logins(rsclient, SelfIdpVerifier::IdTokenAndIntrospection).await;
+}
+
+/// A correctly linked account logs in, one linked to another subject is denied.
+async fn assert_self_federation_logins(rsclient: &KubidmClient, verifier: SelfIdpVerifier) {
+    let idp_user_uuid = setup_self_federation(rsclient, verifier).await;
 
     // Correctly linked: the login succeeds.
     create_linked_account(rsclient, "fed_linked_user", &idp_user_uuid).await;
-    let (browser, response) = self_federation_login(rsclient, "fed_linked_user").await;
+    let (browser, response) = self_federation_login(rsclient, "fed_linked_user", verifier).await;
     assert!(
         response.status().is_redirection(),
         "expected a successful login redirect, got {}: {}",
@@ -1196,7 +1263,7 @@ async fn test_oauth2_federation_login_self_idp(rsclient: &KubidmClient) {
         &uuid::Uuid::new_v4().to_string(),
     )
     .await;
-    let (browser, response) = self_federation_login(rsclient, "fed_wrong_user").await;
+    let (browser, response) = self_federation_login(rsclient, "fed_wrong_user", verifier).await;
     assert_eq!(
         response.status(),
         StatusCode::OK,

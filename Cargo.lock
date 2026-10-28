@@ -4375,16 +4375,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "kanidm_actors"
-version = "1.12.0-dev"
-dependencies = [
- "pin-project-lite",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "kanidm_radiusd"
 version = "1.12.0-dev"
 dependencies = [
@@ -4392,17 +4382,6 @@ dependencies = [
  "clap",
  "rlm_kanidm_shared",
  "toml",
-]
-
-[[package]]
-name = "kanidm_templating"
-version = "1.12.0-dev"
-dependencies = [
- "peg",
- "serde",
- "serde_json",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -4512,6 +4491,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "kubidm_actors"
+version = "1.12.0-dev"
+dependencies = [
+ "pin-project-lite",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "kubidm_build_profiles"
 version = "1.12.0-dev"
 dependencies = [
@@ -4600,6 +4589,17 @@ dependencies = [
  "utoipa",
  "uuid",
  "webauthn-rs-proto",
+]
+
+[[package]]
+name = "kubidm_templating"
+version = "1.12.0-dev"
+dependencies = [
+ "peg",
+ "serde",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -5380,7 +5380,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "nss_kanidm"
+name = "nss_kubidm"
 version = "1.12.0-dev"
 dependencies = [
  "cc",

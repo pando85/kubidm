@@ -186,7 +186,7 @@ test:
 
 .PHONY: precommit
 precommit: ## all the usual test things
-precommit: test codespell test/pykubidm doc/format
+precommit: test codespell guards doc/check test/pykubidm doc/format
 
 .PHONY: vendor
 vendor: ## Vendor required crates
@@ -251,6 +251,17 @@ test/pykubidm/coverage: ## run the Kubidm Python module test suite with coverage
 doc: ## Build the rust documentation locally
 doc:
 	cargo doc --document-private-items
+
+.PHONY: doc/check
+doc/check: ## Build the rust documentation with warnings denied (stricter than the CI book job, which does not deny them)
+doc/check:
+	RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
+
+.PHONY: guards
+guards: ## Check the rebrand and forbidden-pattern guards
+guards:
+	scripts/check_rebrand.sh
+	scripts/check_forbidden_patterns.sh
 
 .PHONY: doc/find
 doc/find: ## Find all markdown files for docs

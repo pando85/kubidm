@@ -32,7 +32,7 @@ use kubidmd_lib::{
     prelude::{OperationError, *},
 };
 use serde::{Deserialize, Serialize};
-use std::{fmt, str::FromStr};
+use std::{fmt, str::FromStr, time::Instant};
 use webauthn_rs::prelude::PublicKeyCredential;
 
 #[derive(Default, Serialize, Deserialize)]
@@ -869,7 +869,9 @@ async fn view_login_step(
     session_context.id = Some(sessionid);
 
     // This lets us break out the loop in case of a fault. Take that halting problem!
-    let mut safety = 3;
+    // Kubidm: a federation login takes up to five steps (the token exchange, the JWKS, a
+    // JWKS refresh, the introspection, and the result). Leave some headroom.
+    let mut safety = 8;
 
     // Unlike the api version, only set the cookie.
     let response = loop {
@@ -1095,6 +1097,32 @@ async fn view_login_step(
                             .await?;
 
                         // Set the state now for the next loop.
+                        auth_state = inter.state;
+                        continue;
+                    }
+                    // Kubidm: the provider's JWKS, to verify the id_token.
+                    AuthExternal::OAuth2JwksRequest {
+                        provider_id,
+                        jwks_uri,
+                        refresh,
+                    } => {
+                        let keys = state
+                            .oauth2_client_http
+                            .provider_jwks(provider_id, jwks_uri, refresh, Instant::now())
+                            .await?;
+
+                        let auth_cred = AuthCredential::OAuth2JwksResponse { keys };
+
+                        let inter = state
+                            .qe_r_ref
+                            .handle_auth(
+                                Some(sessionid),
+                                AuthStep::Cred(auth_cred),
+                                kopid.eventid,
+                                client_auth_info.clone(),
+                            )
+                            .await?;
+
                         auth_state = inter.state;
                         continue;
                     }

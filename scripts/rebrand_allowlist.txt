@@ -1,0 +1,61 @@
+# Allow-list for scripts/check_rebrand.sh.
+#
+# Each line is an extended regex describing a token that may keep the name
+# "kanidm" (case-sensitive, matched with awk gsub). The matched token is removed
+# from the line before the check, so a line only passes when NOTHING else on it
+# says kanidm. Keep entries narrow.
+#
+# Syntax:
+#   <token regex>                  applies to every file
+#   <path regex> <TAB> <token>     applies only to files whose path matches
+#
+# Rules live in .opencode/skills/upstream-sync/SKILL.md ("Names that must stay
+# kanidm"). Files and directories upstream created keep their names.
+
+# --- Upstream repositories and URLs -----------------------------------------
+github\.com/kanidm/[A-Za-z0-9_.-]+
+
+# --- External crate -----------------------------------------------------------
+kanidm[-_]hsm[-_]crypto
+
+# --- Directories and crates upstream created ---------------------------------
+# rlm_kanidm (+ _shared and the _authorise/_instantiate/_module/_rdebug/_rerror/_rinfo
+# internals), librlm_kanidm.so, rlm_kanidm.so, rlm_kanidm.c, resolver_kanidm.
+# The NSS and PAM modules are renamed (nss_kubidm, pam_kubidm) and must NOT be listed
+# here: glibc derives the nsswitch library and symbol names from the nsswitch name.
+(lib)?(rlm|resolver)_kanidm(_(shared|authorise|instantiate|module|rdebug|rerror|rinfo))?(\.so|\.c)?
+
+# --- RADIUS module internals (rlm_kanidm) ------------------------------------
+^(rlm_kanidm/|Cargo\.lock$)	kanidm_radiusd
+^rlm_kanidm/	kanidm_rust
+# The FreeRADIUS module is named "kanidm" (MODULE_NAME = c"kanidm").
+^rlm_kanidm/module/src/ffi\.rs$	c"kanidm"
+# Bare module instance in the raddb config files.
+^rlm_kanidm/container/(mods-available|sites-available)/	^[[:space:]]*kanidm( \{)?$
+^rlm_kanidm/Dockerfile$	mods-enabled/kanidm
+^rlm_kanidm/Dockerfile$	native kanidm module
+
+# --- Unsure: orphaned upstream Debian units -----------------------------------
+# The fork packages kubidm-unixd*.service (see resolver_kanidm/Cargo.toml); these
+# two upstream copies are not referenced. Allowed until someone deletes them.
+^unix_integration/resolver_kanidm/debian/kanidm-unixd(-tasks)?\.service$	kanidm[A-Za-z_/.-]*
+
+# --- Genuine references to upstream -------------------------------------------
+# FreeBSD port lives in the upstream ports tree.
+^book/src/packaging/freebsd_port\.md$	security/kanidm
+# Upstream's ldap3 client default is quoted in the example script.
+^examples/kanidm-ldap-sync$	Kanidm ldap3 client
+# Fork attribution in the README.
+^README\.md$	\[Kanidm\]
+^README\.md$	sustaining Kanidm
+^README\.md$	upstream Kanidm project
+^README\.md$	maintaining Kanidm
+^README\.md$	\[Kanidm LDAP bindings\]
+# Design note comparing against upstream and the external Kaniop operator.
+^book/src/developers/designs/node_drain_replication_fences_maintenance\.md$	Upstream Kanidm
+^book/src/developers/designs/node_drain_replication_fences_maintenance\.md$	inherits Kanidm's
+^book/src/developers/designs/node_drain_replication_fences_maintenance\.md$	fallback for Kanidm
+^book/src/developers/designs/node_drain_replication_fences_maintenance\.md$	KanidmMaintenance
+
+# --- Upstream submodule --------------------------------------------------------
+^\.gitmodules$	kanidm_ppa_automation

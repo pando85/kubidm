@@ -1,6 +1,6 @@
 //! Kubidm: outbound HTTP for OAuth2 client providers (`OAuth2Client` and
-//! `OAuth2Federation`), used by the login views for the access token exchange and the
-//! RFC 7662 token introspection.
+//! `OAuth2Federation`), used by the login views for the access token exchange, the
+//! RFC 7662 token introspection and the JWKS that verifies an OpenID Connect id_token.
 //!
 //! The clients are built at startup and shared through [super::ServerState]. They never
 //! follow redirects (the requests carry the client secret and the access token), have a
@@ -15,24 +15,48 @@
 //!
 //! The introspection response is parsed leniently, as an
 //! [OAuth2ClientIntrospectResponse], so that common providers interoperate.
+//!
+//! The JWKS of each provider (and jwks uri) is cached for [JWKS_CACHE_TTL]. A refresh,
+//! requested when an id_token names a key the cached JWKS does not have, bypasses the
+//! cache. The JWKS is never fetched more often than every [JWKS_MIN_REFRESH_INTERVAL]
+//! (counting failed attempts), and concurrent logins through one provider share a single
+//! fetch. When the cache has expired and the IdP is unavailable (a transport error, a
+//! timeout or a 5xx response), a JWKS up to [JWKS_STALE_IF_ERROR] old is used instead.
+//! Any other answer of the IdP is authoritative: a JWKS without usable keys, a 4xx, a
+//! redirect or an invalid body replaces the cached JWKS, so a key the IdP stopped
+//! publishing is never used again.
 
+use compact_jwt::Jwk;
 use kubidm_proto::{
     oauth2::{AccessTokenIntrospectRequest, AccessTokenRequest, AccessTokenResponse},
     oauth2_federation::OAuth2ClientIntrospectResponse,
 };
 use kubidmd_lib::prelude::*;
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{
+    collections::BTreeMap,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
-    time::Duration,
+    sync::{Arc, Mutex, PoisonError},
+    time::{Duration, Instant},
 };
 
 /// Time allowed to establish the connection to the provider.
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Time allowed for the whole request, including reading the response body.
 pub(crate) const TOTAL_TIMEOUT: Duration = Duration::from_secs(10);
-/// Largest accepted response body. Token and introspection responses are small.
+/// Largest accepted response body. Token and introspection responses, and JWKS, are
+/// small.
 pub(crate) const MAX_RESPONSE_BYTES: usize = 64 * 1024;
+/// How long a provider's JWKS is used before it is fetched again.
+pub(crate) const JWKS_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
+/// The JWKS of a provider is not fetched again (the cached JWKS is used) within this
+/// time of the last attempt, successful or not, so that tokens with unknown keys or a
+/// failing IdP can not make the server hammer the IdP.
+pub(crate) const JWKS_MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+/// When the cache has expired and the IdP is unavailable, the last JWKS is used if it is
+/// younger than this, so that a short IdP outage does not stop every login. The same
+/// default as the "last known good" configuration of Microsoft.IdentityModel.
+pub(crate) const JWKS_STALE_IF_ERROR: Duration = Duration::from_secs(60 * 60);
 
 /// The shared OAuth2 client provider HTTP clients: one for loopback endpoints, which
 /// never uses a proxy, and one for every other endpoint, which uses the system proxy
@@ -43,6 +67,108 @@ pub(crate) struct OAuth2ClientHttp {
     remote: reqwest::Client,
     /// Loopback endpoints, never through a proxy.
     loopback: reqwest::Client,
+    /// The JWKS of each provider, by provider uuid and jwks uri, so that sessions
+    /// started before and after a change of the jwks uri do not share (or wipe) an
+    /// entry. The std mutex is only held to look up an entry, never across an await.
+    jwks_cache: Arc<Mutex<BTreeMap<(Uuid, Url), SharedJwksCacheEntry>>>,
+}
+
+type SharedJwksCacheEntry = Arc<tokio::sync::Mutex<JwksCacheEntry>>;
+
+/// The JWKS of one provider. Its async mutex is held while the JWKS is fetched, so that
+/// concurrent logins wait for that fetch and then use its result.
+#[derive(Default)]
+struct JwksCacheEntry {
+    /// The JWKS the IdP last published, and when it was fetched. It may have no usable
+    /// key, then every login is denied until the IdP publishes one.
+    keys: Option<(Vec<Jwk>, Instant)>,
+    /// The last fetch attempt, and its outcome.
+    last_attempt: Option<(Instant, JwksFetchOutcome)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JwksFetchOutcome {
+    Fetched,
+    Unavailable,
+    Rejected,
+}
+
+/// Why a JWKS was not fetched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JwksFetchError {
+    /// The IdP could not be reached or failed: a transport error, a timeout, a 5xx
+    /// response, or a body cut short. The last JWKS may bridge this.
+    Unavailable,
+    /// The IdP answered, but not with a JWKS: a 4xx response, a redirect, or a body that
+    /// is too large or not a JWKS. The last JWKS must not be used any more.
+    Rejected,
+}
+
+impl JwksCacheEntry {
+    /// The last JWKS, if it is younger than `max_age`.
+    fn keys_younger_than(&self, max_age: Duration, now: Instant) -> Option<Vec<Jwk>> {
+        self.keys
+            .as_ref()
+            .filter(|(_, fetched_at)| now.saturating_duration_since(*fetched_at) < max_age)
+            .map(|(keys, _)| keys.clone())
+    }
+
+    /// The JWKS to use while the IdP is unavailable: the last one, if it is not older
+    /// than [JWKS_STALE_IF_ERROR].
+    fn stale_keys(&self, jwks_uri: &Url, now: Instant) -> Result<Vec<Jwk>, OperationError> {
+        let keys = self
+            .keys_younger_than(JWKS_STALE_IF_ERROR, now)
+            .ok_or(OperationError::InvalidState)?;
+        warn!(
+            url = ?jwks_uri,
+            "the jwks is unavailable, using the last jwks fetched (stale-if-error)"
+        );
+        usable_keys(keys, jwks_uri)
+    }
+
+    /// Record the outcome of the fetch started at `now`, and return the keys to use.
+    fn record_fetch(
+        &mut self,
+        result: Result<Vec<Jwk>, JwksFetchError>,
+        jwks_uri: &Url,
+        refresh: bool,
+        now: Instant,
+    ) -> Result<Vec<Jwk>, OperationError> {
+        match result {
+            Ok(keys) => {
+                self.last_attempt = Some((now, JwksFetchOutcome::Fetched));
+                self.keys = Some((keys.clone(), now));
+                usable_keys(keys, jwks_uri)
+            }
+            Err(JwksFetchError::Unavailable) => {
+                self.last_attempt = Some((now, JwksFetchOutcome::Unavailable));
+                if refresh {
+                    // A refresh is only needed for a key the last JWKS does not have,
+                    // so the last JWKS would not help.
+                    Err(OperationError::InvalidState)
+                } else {
+                    self.stale_keys(jwks_uri, now)
+                }
+            }
+            Err(JwksFetchError::Rejected) => {
+                self.last_attempt = Some((now, JwksFetchOutcome::Rejected));
+                // The IdP no longer publishes the last JWKS.
+                self.keys = None;
+                Err(OperationError::InvalidState)
+            }
+        }
+    }
+}
+
+/// `keys`, unless there are none. Logins are denied while the IdP publishes no usable
+/// key.
+fn usable_keys(keys: Vec<Jwk>, jwks_uri: &Url) -> Result<Vec<Jwk>, OperationError> {
+    if keys.is_empty() {
+        error!(url = ?jwks_uri, "jwks has no usable key");
+        Err(OperationError::InvalidState)
+    } else {
+        Ok(keys)
+    }
 }
 
 impl OAuth2ClientHttp {
@@ -52,6 +178,71 @@ impl OAuth2ClientHttp {
         } else {
             &self.remote
         }
+    }
+
+    /// The usable keys of the JWKS of the provider `provider_id`, from the cache or
+    /// fetched from `jwks_uri`. `refresh` bypasses the cache. The JWKS is not fetched
+    /// within [JWKS_MIN_REFRESH_INTERVAL] of the last attempt; the cached JWKS is used
+    /// instead. `now` is a monotonic time.
+    pub(crate) async fn provider_jwks(
+        &self,
+        provider_id: Uuid,
+        jwks_uri: Url,
+        refresh: bool,
+        now: Instant,
+    ) -> Result<Vec<Jwk>, OperationError> {
+        let entry = self
+            .jwks_cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry((provider_id, jwks_uri.clone()))
+            .or_default()
+            .clone();
+
+        // Held across the fetch: a concurrent login for this provider waits here, and
+        // then finds the JWKS this one fetched.
+        let mut entry = entry.lock_owned().await;
+
+        if !refresh {
+            if let Some(keys) = entry.keys_younger_than(JWKS_CACHE_TTL, now) {
+                return usable_keys(keys, &jwks_uri);
+            }
+        }
+
+        if let Some((_, outcome)) = entry
+            .last_attempt
+            .filter(|(at, _)| now.saturating_duration_since(*at) < JWKS_MIN_REFRESH_INTERVAL)
+        {
+            debug!(url = ?jwks_uri, ?refresh, ?outcome, "jwks fetched recently, not fetching it again");
+            return match outcome {
+                // The cache expired (or the key is not in it) and the IdP is down.
+                JwksFetchOutcome::Unavailable if !refresh => entry.stale_keys(&jwks_uri, now),
+                // A refresh right after a fetch: the key is not in the JWKS.
+                JwksFetchOutcome::Fetched => entry
+                    .keys_younger_than(JWKS_STALE_IF_ERROR, now)
+                    .ok_or(OperationError::InvalidState)
+                    .and_then(|keys| usable_keys(keys, &jwks_uri)),
+                JwksFetchOutcome::Unavailable | JwksFetchOutcome::Rejected => {
+                    Err(OperationError::InvalidState)
+                }
+            };
+        }
+
+        // The fetch runs in its own task, which owns the lock of this entry: if this
+        // login is dropped (the browser went away), the fetch still completes and
+        // records its real outcome, and the logins waiting on the lock use it. Aborted
+        // logins can therefore neither cancel a fetch nor start more than one fetch per
+        // interval.
+        let client = self.clone();
+        let fetch = tokio::spawn(async move {
+            let result = fetch_jwks(&client, jwks_uri.clone()).await;
+            entry.record_fetch(result, &jwks_uri, refresh, now)
+        });
+
+        fetch.await.map_err(|err| {
+            error!(?err, "jwks fetch task failed");
+            OperationError::InvalidState
+        })?
     }
 }
 
@@ -113,6 +304,7 @@ fn build_client_with(
     Ok(OAuth2ClientHttp {
         remote: build(remote)?,
         loopback: build(loopback)?,
+        jwks_cache: Arc::new(Mutex::new(BTreeMap::new())),
     })
 }
 
@@ -152,6 +344,109 @@ pub(crate) async fn submit_access_token_introspect_request(
     .await
 }
 
+/// A JWKS as published by an IdP. The keys are parsed one by one, see [fetch_jwks].
+#[derive(Deserialize)]
+struct JwksDocument {
+    keys: Vec<serde_json::Value>,
+}
+
+/// Fetch the JWKS at `jwks_uri`, and return the keys that `compact_jwt` can use. Real
+/// JWKS often also hold keys of other kinds (an `OKP` or `P-384` key, an `RSA-OAEP`
+/// encryption key) which are skipped, rather than failing the whole set. The result may
+/// be empty: the IdP publishes no key Kubidm can use.
+pub(crate) async fn fetch_jwks(
+    client: &OAuth2ClientHttp,
+    jwks_uri: Url,
+) -> Result<Vec<Jwk>, JwksFetchError> {
+    let kind = "jwks";
+    let res = client
+        .for_url(&jwks_uri)
+        .get(jwks_uri.as_str())
+        .header(reqwest::header::ACCEPT, "application/json")
+        .send()
+        .await
+        .map_err(|err| {
+            error!(?err, url = ?jwks_uri, "Unable to submit {kind} request");
+            JwksFetchError::Unavailable
+        })?;
+
+    let status = res.status();
+    if status != reqwest::StatusCode::OK {
+        error!(?status, url = ?jwks_uri, "{kind} request failed");
+        // Throttling (429) and request timeouts (408) say nothing about the key set.
+        return Err(
+            if status.is_server_error()
+                || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                || status == reqwest::StatusCode::REQUEST_TIMEOUT
+            {
+                JwksFetchError::Unavailable
+            } else {
+                JwksFetchError::Rejected
+            },
+        );
+    }
+
+    let body = read_body(res, kind, &jwks_uri)
+        .await
+        .map_err(|err| match err {
+            ReadBodyError::Transport => JwksFetchError::Unavailable,
+            ReadBodyError::TooLarge => JwksFetchError::Rejected,
+        })?;
+
+    let document: JwksDocument = serde_json::from_slice(&body).map_err(|err| {
+        error!(?err, url = ?jwks_uri, "response was not a valid JSON {kind} response");
+        JwksFetchError::Rejected
+    })?;
+
+    Ok(document
+        .keys
+        .into_iter()
+        .filter_map(|key| match serde_json::from_value::<Jwk>(key) {
+            Ok(key) => Some(key),
+            Err(err) => {
+                debug!(?err, url = ?jwks_uri, "skipping unsupported jwks key");
+                None
+            }
+        })
+        .collect())
+}
+
+enum ReadBodyError {
+    /// The body could not be read: the connection failed or timed out.
+    Transport,
+    /// The body is larger than [MAX_RESPONSE_BYTES].
+    TooLarge,
+}
+
+/// Read a response body of at most [MAX_RESPONSE_BYTES] (after decompression).
+async fn read_body(
+    mut res: reqwest::Response,
+    kind: &str,
+    url: &Url,
+) -> Result<Vec<u8>, ReadBodyError> {
+    if res
+        .content_length()
+        .is_some_and(|len| len > MAX_RESPONSE_BYTES as u64)
+    {
+        error!(?url, "{kind} response exceeds {MAX_RESPONSE_BYTES} bytes");
+        return Err(ReadBodyError::TooLarge);
+    }
+
+    let mut body = Vec::new();
+    while let Some(chunk) = res.chunk().await.map_err(|err| {
+        error!(?err, ?url, "Unable to read {kind} response");
+        ReadBodyError::Transport
+    })? {
+        if body.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
+            error!(?url, "{kind} response exceeds {MAX_RESPONSE_BYTES} bytes");
+            return Err(ReadBodyError::TooLarge);
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    Ok(body)
+}
+
 /// POST `request` as a form with HTTP basic client authentication, and parse a `200 OK`
 /// JSON response. Anything else, including a redirect, is an error.
 async fn post_form<Req: Serialize, Resp: DeserializeOwned>(
@@ -162,7 +457,7 @@ async fn post_form<Req: Serialize, Resp: DeserializeOwned>(
     client_secret: String,
     request: &Req,
 ) -> Result<Resp, OperationError> {
-    let mut res = client
+    let res = client
         .for_url(&url)
         .post(url.as_str())
         .basic_auth(&client_id, Some(client_secret))
@@ -174,30 +469,24 @@ async fn post_form<Req: Serialize, Resp: DeserializeOwned>(
             OperationError::InvalidState
         })?;
 
+    read_json_response(res, kind, &url).await
+}
+
+/// Parse a `200 OK` JSON response of at most [MAX_RESPONSE_BYTES]. Anything else,
+/// including a redirect, is an error.
+async fn read_json_response<Resp: DeserializeOwned>(
+    res: reqwest::Response,
+    kind: &str,
+    url: &Url,
+) -> Result<Resp, OperationError> {
     if res.status() != reqwest::StatusCode::OK {
         error!(status = ?res.status(), ?url, "{kind} request failed");
         return Err(OperationError::InvalidState);
     }
 
-    if res
-        .content_length()
-        .is_some_and(|len| len > MAX_RESPONSE_BYTES as u64)
-    {
-        error!(?url, "{kind} response exceeds {MAX_RESPONSE_BYTES} bytes");
-        return Err(OperationError::InvalidState);
-    }
-
-    let mut body = Vec::new();
-    while let Some(chunk) = res.chunk().await.map_err(|err| {
-        error!(?err, ?url, "Unable to read {kind} response");
-        OperationError::InvalidState
-    })? {
-        if body.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
-            error!(?url, "{kind} response exceeds {MAX_RESPONSE_BYTES} bytes");
-            return Err(OperationError::InvalidState);
-        }
-        body.extend_from_slice(&chunk);
-    }
+    let body = read_body(res, kind, url)
+        .await
+        .map_err(|_| OperationError::InvalidState)?;
 
     serde_json::from_slice(&body).map_err(|err| {
         error!(?err, "response was not a valid JSON {kind} response");
@@ -222,44 +511,53 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind");
         let addr = listener.local_addr().expect("no local address");
         let handle = std::thread::spawn(move || {
-            let (mut sock, _) = listener.accept().expect("failed to accept");
-            let mut buf = Vec::new();
-            let mut chunk = [0u8; 1024];
-            // Read the head and the (form) body, so closing does not reset the connection.
-            let request_len = |buf: &[u8]| {
-                let head_end = buf.windows(4).position(|w| w == b"\r\n\r\n")? + 4;
-                let head = String::from_utf8_lossy(&buf[..head_end]).to_lowercase();
-                let body_len = head
-                    .lines()
-                    .find_map(|l| l.strip_prefix("content-length:"))
-                    .and_then(|v| v.trim().parse::<usize>().ok())
-                    .unwrap_or(0);
-                Some(head_end + body_len)
-            };
-            while request_len(&buf).is_none_or(|len| buf.len() < len) {
-                let n = sock.read(&mut chunk).unwrap_or(0);
-                if n == 0 {
-                    break;
-                }
-                buf.extend_from_slice(&chunk[..n]);
-            }
-            let mut response = response.as_slice();
-            if let Some(n) = stall_after {
-                let (head, rest) = response.split_at(n.min(response.len()));
-                let _ = sock.write_all(head);
-                let _ = sock.flush();
-                response = rest;
-                // Blocks until the client gives up and closes the connection (bounded,
-                // so a broken client can not hang the test forever).
-                let _ = sock.set_read_timeout(Some(Duration::from_secs(30)));
-                while sock.read(&mut chunk).is_ok_and(|n| n > 0) {}
-            }
-            // The client may hang up early (body too large, timeout).
-            let _ = sock.write_all(response);
-            String::from_utf8_lossy(&buf).to_string()
+            let (sock, _) = listener.accept().expect("failed to accept");
+            answer(sock, &response, stall_after)
         });
         let url = Url::parse(&format!("http://{addr}/token")).expect("invalid url");
         (url, handle)
+    }
+
+    /// Answer one connection with `response`, and return the request.
+    fn answer(
+        mut sock: std::net::TcpStream,
+        response: &[u8],
+        stall_after: Option<usize>,
+    ) -> String {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 1024];
+        // Read the head and the (form) body, so closing does not reset the connection.
+        let request_len = |buf: &[u8]| {
+            let head_end = buf.windows(4).position(|w| w == b"\r\n\r\n")? + 4;
+            let head = String::from_utf8_lossy(&buf[..head_end]).to_lowercase();
+            let body_len = head
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:"))
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            Some(head_end + body_len)
+        };
+        while request_len(&buf).is_none_or(|len| buf.len() < len) {
+            let n = sock.read(&mut chunk).unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        let mut response = response;
+        if let Some(n) = stall_after {
+            let (head, rest) = response.split_at(n.min(response.len()));
+            let _ = sock.write_all(head);
+            let _ = sock.flush();
+            response = rest;
+            // Blocks until the client gives up and closes the connection (bounded,
+            // so a broken client can not hang the test forever).
+            let _ = sock.set_read_timeout(Some(Duration::from_secs(30)));
+            while sock.read(&mut chunk).is_ok_and(|n| n > 0) {}
+        }
+        // The client may hang up early (body too large, timeout).
+        let _ = sock.write_all(response);
+        String::from_utf8_lossy(&buf).to_string()
     }
 
     /// A complete introspection response, as Kubidm's own endpoint returns it.
@@ -551,5 +849,531 @@ mod tests {
         let response = introspect(&client, url).await.expect("request failed");
         assert!(!response.active);
         join(handle).await;
+    }
+
+    // =========================================
+    // Kubidm: JWKS for id_token verification.
+
+    /// Serve `responses` to consecutive connections (repeating the last one) on a
+    /// detached thread, counting the requests. For tests that check whether a request is
+    /// made at all.
+    fn serve_counted(responses: Vec<Vec<u8>>) -> (Url, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind");
+        let addr = listener.local_addr().expect("no local address");
+        let count = Arc::new(AtomicUsize::new(0));
+        let thread_count = count.clone();
+        std::thread::spawn(move || {
+            for sock in listener.incoming() {
+                let Ok(sock) = sock else { break };
+                let n = thread_count.fetch_add(1, Ordering::SeqCst);
+                let served = responses.get(n); // not an axum route: skip_route_check
+                let response = served.or(responses.last()).expect("no response");
+                answer(sock, response, None);
+            }
+        });
+        let url = Url::parse(&format!("http://{addr}/jwks")).expect("invalid url");
+        (url, count)
+    }
+
+    /// As [serve_counted], with one response, sent only once `gate` is signalled for
+    /// that connection.
+    fn serve_gated(
+        response: Vec<u8>,
+    ) -> (
+        Url,
+        Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind");
+        let addr = listener.local_addr().expect("no local address");
+        let count = Arc::new(AtomicUsize::new(0));
+        let thread_count = count.clone();
+        let (gate, gate_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            for sock in listener.incoming() {
+                let Ok(sock) = sock else { break };
+                thread_count.fetch_add(1, Ordering::SeqCst);
+                if gate_rx.recv().is_err() {
+                    break;
+                }
+                answer(sock, &response, None);
+            }
+        });
+        let url = Url::parse(&format!("http://{addr}/jwks")).expect("invalid url");
+        (url, count, gate)
+    }
+
+    /// A public key JSON, with `kid`.
+    fn es256_jwk(kid: &str) -> serde_json::Value {
+        use compact_jwt::{JwsEs256Signer, JwsSigner, JwsSignerToVerifier};
+        let mut signer = JwsEs256Signer::generate_es256().expect("failed to generate key");
+        signer.set_kid(kid);
+        let jwk = signer
+            .get_verifier()
+            .and_then(|verifier| verifier.public_key_as_jwk())
+            .expect("failed to export key");
+        serde_json::to_value(jwk).expect("failed to serialise key")
+    }
+
+    fn jwks_body(keys: &[serde_json::Value]) -> Vec<u8> {
+        http_response(
+            "200 OK",
+            "",
+            &serde_json::json!({ "keys": keys }).to_string(),
+        )
+    }
+
+    fn kids(keys: &[Jwk]) -> Vec<String> {
+        keys.iter()
+            .filter_map(|key| match key {
+                Jwk::EC { kid, .. } | Jwk::RSA { kid, .. } => kid.clone(),
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_oauth2_client_http_jwks_fetch() {
+        let client = build_client().expect("failed to build client");
+
+        // Keys compact_jwt can not use are skipped, the rest are kept.
+        let keycloak_enc = serde_json::json!({
+            "kid": "enc", "kty": "RSA", "alg": "RSA-OAEP", "use": "enc",
+            "n": "AQAB", "e": "AQAB"
+        });
+        let okp = serde_json::json!({
+            "kid": "ed", "kty": "OKP", "crv": "Ed25519", "x": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo"
+        });
+        let p384 = serde_json::json!({
+            "kid": "p384", "kty": "EC", "crv": "P-384", "x": "AQAB", "y": "AQAB"
+        });
+        let body = jwks_body(&[keycloak_enc, okp, es256_jwk("sig"), p384]);
+        let (url, handle) = serve_once(body, None);
+        let keys = fetch_jwks(&client, url).await.expect("jwks fetch failed");
+        assert_eq!(kids(&keys), vec!["sig"]);
+        let head = join(handle).await;
+        assert!(head.starts_with("GET /token "), "{head}");
+        assert!(!head.to_lowercase().contains("authorization:"));
+
+        // A valid JWKS without usable keys is an (empty) answer, not an error.
+        for response in [
+            jwks_body(&[]),
+            jwks_body(&[serde_json::json!({"kty": "oct", "k": "c2VjcmV0"})]),
+        ] {
+            let (url, handle) = serve_once(response, None);
+            let keys = fetch_jwks(&client, url).await.expect("jwks fetch failed");
+            assert!(keys.is_empty());
+            join(handle).await;
+        }
+
+        // The IdP answered, but not with a JWKS: rejected.
+        let too_large = format!(
+            r#"{{"keys":[],"pad":"{}"}}"#,
+            "a".repeat(MAX_RESPONSE_BYTES)
+        );
+        for response in [
+            http_response("200 OK", "", "{}"),
+            http_response("200 OK", "", "not json"),
+            http_response("404 Not Found", "", ""),
+            http_response("401 Unauthorized", "", ""),
+            http_response("302 Found", "Location: http://127.0.0.1:1/jwks\r\n", ""),
+            http_response("200 OK", "", &too_large),
+        ] {
+            let (url, handle) = serve_once(response, None);
+            assert_eq!(
+                fetch_jwks(&client, url).await.map(|_| ()),
+                Err(JwksFetchError::Rejected)
+            );
+            join(handle).await;
+        }
+
+        // The IdP is unavailable: a 5xx, throttling, or no connection.
+        for response in [
+            http_response("500 Internal Server Error", "", ""),
+            http_response("503 Service Unavailable", "", ""),
+            http_response("429 Too Many Requests", "", ""),
+            http_response("408 Request Timeout", "", ""),
+        ] {
+            let (url, handle) = serve_once(response, None);
+            assert_eq!(
+                fetch_jwks(&client, url).await.map(|_| ()),
+                Err(JwksFetchError::Unavailable)
+            );
+            join(handle).await;
+        }
+        let refused = Url::parse("http://127.0.0.1:1/jwks").expect("invalid url");
+        assert_eq!(
+            fetch_jwks(&client, refused).await.map(|_| ()),
+            Err(JwksFetchError::Unavailable)
+        );
+    }
+
+    /// A body that stalls is a timeout: unavailable.
+    #[tokio::test]
+    async fn test_oauth2_client_http_jwks_timeout_unavailable() {
+        let client = build_client_with(CONNECT_TIMEOUT, Duration::from_millis(300), None)
+            .expect("failed to build client");
+        let body = jwks_body(&[es256_jwk("key")]);
+        for stall_after in [0, body.len() - 10] {
+            let (url, handle) = serve_once(body.clone(), Some(stall_after));
+            assert_eq!(
+                fetch_jwks(&client, url).await.map(|_| ()),
+                Err(JwksFetchError::Unavailable)
+            );
+            join(handle).await;
+        }
+    }
+
+    /// The JWKS is cached per provider for the TTL. A refresh bypasses the cache, but
+    /// at most once per minimum refresh interval.
+    #[tokio::test]
+    async fn test_oauth2_client_http_jwks_cache() {
+        use std::sync::atomic::Ordering;
+        let client = build_client().expect("failed to build client");
+        let (url, count) = serve_counted(vec![
+            jwks_body(&[es256_jwk("first")]),
+            jwks_body(&[es256_jwk("second")]),
+            jwks_body(&[es256_jwk("third")]),
+        ]);
+        let provider = Uuid::new_v4();
+        let start = Instant::now();
+        let jwks = |refresh: bool, after: Duration| {
+            client.provider_jwks(provider, url.clone(), refresh, start + after)
+        };
+
+        let keys = jwks(false, Duration::ZERO).await.expect("fetch failed");
+        assert_eq!(kids(&keys), vec!["first"]);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+
+        // Cached.
+        let keys = jwks(false, JWKS_CACHE_TTL - Duration::from_secs(1))
+            .await
+            .expect("cache failed");
+        assert_eq!(kids(&keys), vec!["first"]);
+        // A refresh right after a fetch is rate limited.
+        let keys = jwks(true, JWKS_MIN_REFRESH_INTERVAL - Duration::from_secs(1))
+            .await
+            .expect("cache failed");
+        assert_eq!(kids(&keys), vec!["first"]);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+
+        // A refresh after the minimum interval fetches again.
+        let keys = jwks(true, JWKS_MIN_REFRESH_INTERVAL)
+            .await
+            .expect("refresh failed");
+        assert_eq!(kids(&keys), vec!["second"]);
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+
+        // The TTL counts from the last fetch.
+        let keys = jwks(false, JWKS_MIN_REFRESH_INTERVAL + JWKS_CACHE_TTL)
+            .await
+            .expect("fetch failed");
+        assert_eq!(kids(&keys), vec!["third"]);
+        assert_eq!(count.load(Ordering::SeqCst), 3);
+
+        // Other providers, and a changed jwks uri, have their own entry.
+        let (other_url, other_count) = serve_counted(vec![jwks_body(&[es256_jwk("other")])]);
+        let keys = client
+            .provider_jwks(Uuid::new_v4(), url.clone(), false, start)
+            .await
+            .expect("fetch failed");
+        assert_eq!(kids(&keys), vec!["third"]);
+        assert_eq!(count.load(Ordering::SeqCst), 4);
+        let keys = client
+            .provider_jwks(provider, other_url, false, start + JWKS_CACHE_TTL)
+            .await
+            .expect("fetch failed");
+        assert_eq!(kids(&keys), vec!["other"]);
+        assert_eq!(other_count.load(Ordering::SeqCst), 1);
+    }
+
+    fn server_error() -> Vec<u8> {
+        http_response("500 Internal Server Error", "", "")
+    }
+
+    /// A failed fetch without a usable cached JWKS is an error (the login is denied).
+    /// The failed attempt counts for the rate limit: the JWKS is not fetched again (by a
+    /// normal request or a refresh) until the minimum interval has passed.
+    #[tokio::test]
+    async fn test_oauth2_client_http_jwks_fetch_failure() {
+        use std::sync::atomic::Ordering;
+        let client = build_client().expect("failed to build client");
+        let (url, count) = serve_counted(vec![server_error(), jwks_body(&[es256_jwk("key")])]);
+        let provider = Uuid::new_v4();
+        let start = Instant::now();
+        let jwks = |refresh: bool, after: Duration| {
+            client.provider_jwks(provider, url.clone(), refresh, start + after)
+        };
+
+        for (refresh, after) in [
+            (false, Duration::ZERO),
+            (false, Duration::from_secs(1)),
+            (true, Duration::from_secs(1)),
+            (false, JWKS_MIN_REFRESH_INTERVAL - Duration::from_secs(1)),
+        ] {
+            assert_eq!(
+                jwks(refresh, after).await.map(|_| ()),
+                Err(OperationError::InvalidState)
+            );
+            assert_eq!(
+                count.load(Ordering::SeqCst),
+                1,
+                "no refetch within the window"
+            );
+        }
+
+        let keys = jwks(false, JWKS_MIN_REFRESH_INTERVAL)
+            .await
+            .expect("fetch failed");
+        assert_eq!(kids(&keys), vec!["key"]);
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+    }
+
+    /// Repeated failures are rate limited too: one attempt per minimum interval.
+    #[tokio::test]
+    async fn test_oauth2_client_http_jwks_repeated_failures() {
+        use std::sync::atomic::Ordering;
+        let client = build_client().expect("failed to build client");
+        let (url, count) = serve_counted(vec![server_error()]);
+        let provider = Uuid::new_v4();
+        let start = Instant::now();
+
+        for step in 0..60u32 {
+            let after = Duration::from_secs(u64::from(step));
+            assert!(client
+                .provider_jwks(provider, url.clone(), step % 2 == 1, start + after)
+                .await
+                .is_err());
+        }
+        // Attempts at 0s and 30s only.
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+    }
+
+    /// When the cache expired and the IdP fails, the last JWKS is used for up to
+    /// [JWKS_STALE_IF_ERROR]. A failed refresh does not fall back.
+    #[tokio::test]
+    async fn test_oauth2_client_http_jwks_stale_if_error() {
+        use std::sync::atomic::Ordering;
+        let client = build_client().expect("failed to build client");
+        let (url, count) = serve_counted(vec![jwks_body(&[es256_jwk("key")]), server_error()]);
+        let provider = Uuid::new_v4();
+        let start = Instant::now();
+        let jwks = |refresh: bool, after: Duration| {
+            client.provider_jwks(provider, url.clone(), refresh, start + after)
+        };
+
+        jwks(false, Duration::ZERO).await.expect("fetch failed");
+
+        // Expired, the fetch fails: the stale JWKS is used.
+        let keys = jwks(false, JWKS_CACHE_TTL).await.expect("stale fallback");
+        assert_eq!(kids(&keys), vec!["key"]);
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        // Within the rate limit window of that failure, too, without a fetch.
+        let keys = jwks(false, JWKS_CACHE_TTL + Duration::from_secs(1))
+            .await
+            .expect("stale fallback");
+        assert_eq!(kids(&keys), vec!["key"]);
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+
+        // A refresh that fails is an error.
+        assert!(jwks(true, JWKS_CACHE_TTL + JWKS_MIN_REFRESH_INTERVAL)
+            .await
+            .is_err());
+        assert_eq!(count.load(Ordering::SeqCst), 3);
+
+        // Just before the bound, the stale JWKS is still used, past it it is not.
+        let keys = jwks(false, JWKS_STALE_IF_ERROR - Duration::from_secs(1))
+            .await
+            .expect("stale fallback");
+        assert_eq!(kids(&keys), vec!["key"]);
+        assert_eq!(count.load(Ordering::SeqCst), 4);
+        assert_eq!(
+            jwks(false, JWKS_STALE_IF_ERROR + JWKS_MIN_REFRESH_INTERVAL)
+                .await
+                .map(|_| ()),
+            Err(OperationError::InvalidState)
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 5);
+    }
+
+    /// Concurrent logins through one provider share a single fetch.
+    #[tokio::test]
+    async fn test_oauth2_client_http_jwks_concurrent_single_fetch() {
+        use std::sync::atomic::Ordering;
+        let client = build_client().expect("failed to build client");
+        let (url, count) = serve_counted(vec![jwks_body(&[es256_jwk("key")])]);
+        let provider = Uuid::new_v4();
+        let now = Instant::now();
+
+        let results = futures::future::join_all(
+            (0..8).map(|_| client.provider_jwks(provider, url.clone(), false, now)),
+        )
+        .await;
+        for keys in results {
+            assert_eq!(kids(&keys.expect("fetch failed")), vec!["key"]);
+        }
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+
+        // Concurrent refreshes right after share it as well (rate limited).
+        let results = futures::future::join_all(
+            (0..8).map(|_| client.provider_jwks(provider, url.clone(), true, now)),
+        )
+        .await;
+        assert!(results.iter().all(Result::is_ok));
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    /// A parseable 200 is authoritative: a JWKS that is empty, or has no usable key,
+    /// replaces the cached one, and so do a 4xx and a redirect. Only an unavailable IdP
+    /// (5xx) falls back to the last JWKS.
+    #[tokio::test]
+    async fn test_oauth2_client_http_jwks_authoritative_answers() {
+        use std::sync::atomic::Ordering;
+        let client = build_client().expect("failed to build client");
+        let ed25519 = serde_json::json!({
+            "kid": "ed", "kty": "OKP", "crv": "Ed25519",
+            "x": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo"
+        });
+        let p384 = serde_json::json!({
+            "kid": "p384", "kty": "EC", "crv": "P-384", "x": "AQAB", "y": "AQAB"
+        });
+        for (name, answer, falls_back) in [
+            ("200 with empty keys", jwks_body(&[]), false),
+            (
+                "200 with only unusable keys",
+                jwks_body(&[ed25519, p384]),
+                false,
+            ),
+            ("404", http_response("404 Not Found", "", ""), false),
+            (
+                "redirect",
+                http_response("302 Found", "Location: http://127.0.0.1:1/jwks\r\n", ""),
+                false,
+            ),
+            (
+                "503",
+                http_response("503 Service Unavailable", "", ""),
+                true,
+            ),
+        ] {
+            let (url, count) = serve_counted(vec![
+                jwks_body(&[es256_jwk("revoked")]),
+                answer,
+                http_response("503 Service Unavailable", "", ""),
+            ]);
+            let provider = Uuid::new_v4();
+            let start = Instant::now();
+            let jwks = |refresh: bool, after: Duration| {
+                client.provider_jwks(provider, url.clone(), refresh, start + after)
+            };
+            jwks(false, Duration::ZERO).await.expect("fetch failed");
+
+            // The cache expired, and the IdP answers.
+            let result = jwks(false, JWKS_CACHE_TTL).await;
+            assert_eq!(result.is_ok(), falls_back, "{name}");
+            if let Ok(keys) = result {
+                assert_eq!(kids(&keys), vec!["revoked"], "{name}");
+            }
+            assert_eq!(count.load(Ordering::SeqCst), 2, "{name}");
+            // Within the rate limit window, and refreshes, never bring the key back.
+            assert_eq!(
+                jwks(false, JWKS_CACHE_TTL + Duration::from_secs(1))
+                    .await
+                    .is_ok(),
+                falls_back,
+                "{name}"
+            );
+            assert!(
+                jwks(true, JWKS_CACHE_TTL + Duration::from_secs(1))
+                    .await
+                    .is_err(),
+                "{name}"
+            );
+            // A later outage (503), once the answer itself expired, does not bring the
+            // replaced key back either.
+            let result = jwks(false, JWKS_CACHE_TTL * 2).await;
+            assert_eq!(result.is_ok(), falls_back, "{name}");
+            assert_eq!(count.load(Ordering::SeqCst), 3, "{name}");
+        }
+    }
+
+    /// The cache is keyed by provider and jwks uri: logins started before and after a
+    /// change of the jwks uri keep their own entry and rate limit, instead of wiping
+    /// each other's.
+    #[tokio::test]
+    async fn test_oauth2_client_http_jwks_keyed_by_uri() {
+        use std::sync::atomic::Ordering;
+        let client = build_client().expect("failed to build client");
+        let (old_url, old_count) = serve_counted(vec![jwks_body(&[es256_jwk("old")])]);
+        let (new_url, new_count) = serve_counted(vec![jwks_body(&[es256_jwk("new")])]);
+        let provider = Uuid::new_v4();
+        let start = Instant::now();
+
+        for step in 0..4u64 {
+            let now = start + Duration::from_secs(step);
+            let keys = client
+                .provider_jwks(provider, old_url.clone(), false, now)
+                .await
+                .expect("old fetch failed");
+            assert_eq!(kids(&keys), vec!["old"]);
+            let keys = client
+                .provider_jwks(provider, new_url.clone(), false, now)
+                .await
+                .expect("new fetch failed");
+            assert_eq!(kids(&keys), vec!["new"]);
+        }
+        assert_eq!(old_count.load(Ordering::SeqCst), 1);
+        assert_eq!(new_count.load(Ordering::SeqCst), 1);
+
+        // Each uri has its own rate limit: a refresh on the new uri right after its
+        // fetch is limited, whatever happens on the old one.
+        assert!(client
+            .provider_jwks(
+                provider,
+                new_url.clone(),
+                true,
+                start + Duration::from_secs(5)
+            )
+            .await
+            .is_ok());
+        assert_eq!(new_count.load(Ordering::SeqCst), 1);
+    }
+
+    /// Logins dropped while the JWKS is fetched (the browser went away) neither cancel
+    /// that fetch nor start new ones: the fetch completes, records its outcome, and the
+    /// next login uses it.
+    #[tokio::test]
+    async fn test_oauth2_client_http_jwks_cancelled_logins() {
+        use std::sync::atomic::Ordering;
+        let client = build_client().expect("failed to build client");
+        let (url, count, gate) = serve_gated(jwks_body(&[es256_jwk("key")]));
+        let provider = Uuid::new_v4();
+        let start = Instant::now();
+
+        for step in 0..5u64 {
+            let login = client.provider_jwks(
+                provider,
+                url.clone(),
+                step % 2 == 1,
+                start + Duration::from_secs(step),
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), login)
+                    .await
+                    .is_err(),
+                "the fetch is still in flight"
+            );
+        }
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+
+        // The one fetch completes although its login was dropped.
+        gate.send(()).expect("server gone");
+        let keys = client
+            .provider_jwks(provider, url.clone(), false, start + Duration::from_secs(6))
+            .await
+            .expect("the dropped login's fetch must be used");
+        assert_eq!(kids(&keys), vec!["key"]);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 }

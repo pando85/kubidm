@@ -65,7 +65,8 @@ pub fn sort_backup_names<S: AsRef<str>>(names: &mut [S]) {
 /// metadata: RFC3339 in UTC with a fixed nine digit fraction, so that names of new backups
 /// also sort chronologically as plain strings, as directory listings show them.
 pub fn backup_timestamp(now: OffsetDateTime) -> String {
-    let now = now.to_offset(UtcOffset::UTC);
+    // Only fails when UTC can't represent the instant; keep the original then.
+    let now = now.checked_to_offset(UtcOffset::UTC).unwrap_or(now);
     format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:09}Z",
         now.year(),

@@ -76,10 +76,11 @@ impl ServiceAccountOpt {
                     let expiry_odt = if let Some(t) = expiry {
                         // Convert the time to local timezone.
                         match OffsetDateTime::parse(t, &Rfc3339).map(|odt| {
-                            odt.to_offset(
+                            odt.checked_to_offset(
                                 time::UtcOffset::local_offset_at(OffsetDateTime::UNIX_EPOCH)
                                     .unwrap_or(time::UtcOffset::UTC),
                             )
+                            .unwrap_or(odt)
                         }) {
                             Ok(odt) => {
                                 debug!("valid until: {}", odt);
@@ -366,12 +367,12 @@ impl ServiceAccountOpt {
                         // Convert the time to local timezone.
                         let t = OffsetDateTime::parse(&t[0], &Rfc3339)
                             .map(|odt| {
-                                odt.to_offset(
+                                odt.checked_to_offset(
                                     time::UtcOffset::local_offset_at(OffsetDateTime::UNIX_EPOCH)
                                         .unwrap_or(time::UtcOffset::UTC),
                                 )
-                                .format(&Rfc3339)
-                                .unwrap_or(odt.to_string())
+                                .and_then(|local| local.format(&Rfc3339).ok())
+                                .unwrap_or_else(|| odt.to_string())
                             })
                             .unwrap_or_else(|_| "invalid timestamp".to_string());
 
@@ -383,12 +384,12 @@ impl ServiceAccountOpt {
                     if let Some(t) = entry.attrs.get(ATTR_ACCOUNT_EXPIRE) {
                         let t = OffsetDateTime::parse(&t[0], &Rfc3339)
                             .map(|odt| {
-                                odt.to_offset(
+                                odt.checked_to_offset(
                                     time::UtcOffset::local_offset_at(OffsetDateTime::UNIX_EPOCH)
                                         .unwrap_or(time::UtcOffset::UTC),
                                 )
-                                .format(&Rfc3339)
-                                .unwrap_or(odt.to_string())
+                                .and_then(|local| local.format(&Rfc3339).ok())
+                                .unwrap_or_else(|| odt.to_string())
                             })
                             .unwrap_or_else(|_| "invalid timestamp".to_string());
                         println!("expire: {t:?}");

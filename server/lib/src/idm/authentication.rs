@@ -1,8 +1,8 @@
 use crate::{
-    prelude::{OperationError, Url},
+    prelude::{OperationError, Url, Uuid},
     server::identity::Source,
 };
-use compact_jwt::JwsCompact;
+use compact_jwt::{Jwk, JwsCompact};
 use crypto_glue::{s256::Sha256Output, x509::Certificate};
 use kubidm_proto::{
     internal::UserAuthToken,
@@ -66,6 +66,14 @@ pub enum AuthExternal {
         client_secret: String,
         request: AccessTokenIntrospectRequest,
     },
+    /// Kubidm: fetch the JWKS of an OAuth2 client provider to verify an `id_token`.
+    /// `refresh` asks to bypass the cache, because the token is signed by a key that
+    /// the cached JWKS does not have.
+    OAuth2JwksRequest {
+        provider_id: Uuid,
+        jwks_uri: Url,
+        refresh: bool,
+    },
 }
 
 impl fmt::Debug for AuthExternal {
@@ -75,6 +83,9 @@ impl fmt::Debug for AuthExternal {
             Self::OAuth2AccessTokenRequest { .. } => write!(f, "OAuth2AccessTokenRequest"),
             Self::OAuth2AccessTokenIntrospectionRequest { .. } => {
                 write!(f, "OAuth2AccessTokenIntrospectionRequest")
+            }
+            Self::OAuth2JwksRequest { refresh, .. } => {
+                write!(f, "OAuth2JwksRequest {{ refresh: {refresh} }}")
             }
         }
     }
@@ -129,6 +140,10 @@ pub enum AuthCredential {
     OAuth2AccessTokenIntrospectResponse {
         response: OAuth2ClientIntrospectResponse,
     },
+    /// Kubidm: the usable keys of the JWKS requested by [AuthExternal::OAuth2JwksRequest].
+    OAuth2JwksResponse {
+        keys: Vec<Jwk>,
+    },
 }
 
 impl From<ProtoAuthCredential> for AuthCredential {
@@ -161,6 +176,9 @@ impl fmt::Debug for AuthCredential {
             }
             AuthCredential::OAuth2AccessTokenIntrospectResponse { .. } => {
                 write!(fmt, "OAuth2AccessTokenIntrospectResponse{{..}}")
+            }
+            AuthCredential::OAuth2JwksResponse { .. } => {
+                write!(fmt, "OAuth2JwksResponse{{..}}")
             }
         }
     }

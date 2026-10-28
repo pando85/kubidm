@@ -392,12 +392,12 @@ impl PersonOpt {
                         // Convert the time to local timezone.
                         let t = OffsetDateTime::parse(&t[0], &Rfc3339)
                             .map(|odt| {
-                                odt.to_offset(
+                                odt.checked_to_offset(
                                     time::UtcOffset::local_offset_at(OffsetDateTime::UNIX_EPOCH)
                                         .unwrap_or(time::UtcOffset::UTC),
                                 )
-                                .format(&Rfc3339)
-                                .unwrap_or(odt.to_string())
+                                .and_then(|local| local.format(&Rfc3339).ok())
+                                .unwrap_or_else(|| odt.to_string())
                             })
                             .unwrap_or_else(|_| "invalid timestamp".to_string());
 
@@ -409,12 +409,12 @@ impl PersonOpt {
                     if let Some(t) = entry.attrs.get(ATTR_ACCOUNT_EXPIRE) {
                         let t = OffsetDateTime::parse(&t[0], &Rfc3339)
                             .map(|odt| {
-                                odt.to_offset(
+                                odt.checked_to_offset(
                                     time::UtcOffset::local_offset_at(OffsetDateTime::UNIX_EPOCH)
                                         .unwrap_or(time::UtcOffset::UTC),
                                 )
-                                .format(&Rfc3339)
-                                .unwrap_or(odt.to_string())
+                                .and_then(|local| local.format(&Rfc3339).ok())
+                                .unwrap_or_else(|| odt.to_string())
                             })
                             .unwrap_or_else(|_| "invalid timestamp".to_string());
                         println!("expire: {t}");
@@ -650,7 +650,9 @@ impl AccountCredential {
                         // Now get the abs time
                         let local_offset =
                             UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
-                        let expiry_time = expiry_time.to_offset(local_offset);
+                        let expiry_time = expiry_time
+                            .checked_to_offset(local_offset)
+                            .unwrap_or(expiry_time);
 
                         println!(
                             "This token will expire at: {}",

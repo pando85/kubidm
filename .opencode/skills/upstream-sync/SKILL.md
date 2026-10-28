@@ -40,12 +40,14 @@ Apply to the UPSTREAM side only. The fork side is already branded.
 ### Names that must stay `kanidm` (restore them after any blanket sed)
 
 - External crate `kanidm-hsm-crypto` / `kanidm_hsm_crypto`.
-- Directory and crate names upstream created: `rlm_kanidm/`, `resolver_kanidm/`, `nss_kanidm/`,
-  `pam_kanidm/`, `pam_kanidm_common`, `rlm_kanidm.so`, and the RADIUS module internals
-  (`kanidm_shared`, `kanidm_rerror`, `kanidm_rinfo`, `kanidm_rdebug`, `kanidm_module`,
+- Directory and crate names upstream created: `rlm_kanidm/`, `resolver_kanidm/`, `rlm_kanidm.so`, and the RADIUS module
+  internals (`kanidm_shared`, `kanidm_rerror`, `kanidm_rinfo`, `kanidm_rdebug`, `kanidm_module`,
   `kanidm_authorise`, `kanidm_instantiate`, `kanidm_radiusd`, `MODULE_NAME = c"kanidm"`).
-- NSS exported symbols `_nss_kanidm_*`, `kanidm_getpwnam_r` etc.; unixd service names
-  `kanidm-unixd`, `kanidm-unixd.service`, `kanidm-unixd-tasks.service`.
+- The NSS and PAM modules are renamed: `nss_kubidm/`, `pam_kubidm/`, `libnss_kubidm.so.2`,
+  `pam_kubidm.so`, exported symbols `_nss_kubidm_*`, and `passwd: kubidm` in nsswitch.conf. glibc
+  derives the library and symbol names from the nsswitch name, so they must always agree. Upstream's
+  `nss_kanidm`/`pam_kanidm` map to these when merging.
+- Unixd service names `kanidm-unixd`, `kanidm-unixd.service`, `kanidm-unixd-tasks.service`.
 - URLs and git deps: `github.com/kanidm/...`, `kanidm/webauthn-rs.git`, `kanidm/ldap3.git`,
   `kanidm_ppa_automation`.
 - Things that genuinely refer to upstream: the FreeBSD port `security/kanidm`, "Kanidm ldap3 client"
@@ -101,7 +103,12 @@ When unsure, check what the fork's HEAD uses: `git grep -n '<name>' HEAD -- '*.r
   `kubidm_schema_attributes()` / `kubidm_schema_classes()` in `schema.rs`, chained last in
   `generate_in_memory`, `migrate_schema_1_11` and `migrate_schema_1_12`. When upstream adds a
   `migrate_schema_1_N`, chain them there too, and add fork single-value attrs to any upstream
-  on-disk rewrite list in migrations.
+  on-disk rewrite list in migrations. Audit this at every new target domain level: #511 raised the
+  level without the fork schema and the server lost it. The tests
+  `test_schema_kubidm_extras_registered_at_target_level` (attributes and classes) and
+  `test_migrations_kubidm_builtin_entries_exist` (`kubidm_builtin_entries()`) fail when a level
+  misses it; run them (`cargo test -p kubidmd_lib -- kubidm_`) after any change to the domain level
+  or the migrations.
 - **SECURITY.md**: the fork removed AI-content restrictions (commit f6b16569f). Do not adopt
   upstream's "AI Usage in Vulnerability Reports" section.
 - **Dependencies**: accept upstream bumps, but keep the fork's version when it is newer (renovate
@@ -145,8 +152,8 @@ plus upstream's import-reordering commits. Rebrand upstream's base and theirs bl
 ```bash
 rebrand() { sed -e 's/kanidmd/kubidmd/g' -e 's/kanidm/kubidm/g' -e 's/Kanidm/Kubidm/g' -e 's/KANIDM/KUBIDM/g' \
   -e 's/kubidm-hsm-crypto/kanidm-hsm-crypto/g' -e 's/kubidm_hsm_crypto/kanidm_hsm_crypto/g' \
-  -e 's#rlm_kubidm#rlm_kanidm#g' -e 's#resolver_kubidm#resolver_kanidm#g' -e 's#nss_kubidm#nss_kanidm#g' \
-  -e 's#pam_kubidm#pam_kanidm#g' -e 's#github.com/kubidm/#github.com/kanidm/#g' -e 's/kubidm-unixd/kanidm-unixd/g'; }
+  -e 's#rlm_kubidm#rlm_kanidm#g' -e 's#resolver_kubidm#resolver_kanidm#g' \
+  -e 's#github.com/kubidm/#github.com/kanidm/#g' -e 's/kubidm-unixd/kanidm-unixd/g'; }
 threeway() { f="$1"; d=$(mktemp -d); git show ":1:$f" | rebrand > $d/base; git show ":2:$f" > $d/ours;
   git show ":3:$f" | rebrand > $d/theirs; git merge-file -p -L fork -L base -L upstream $d/ours $d/base $d/theirs; }
 
@@ -178,6 +185,9 @@ Rules that made this work:
   net delta). Rule: take upstream's change AND keep fork additions. Integrate, never pick a side.
 - Each agent reports "follow-up risks" (call sites outside its files); collect them for the build
   loop.
+- Worktree agents (`isolation: worktree`) branch from `master`, not from the current `HEAD`. They
+  will not see the merge in progress or a sync branch. Create follow-up worktrees manually from the
+  branch you want (`git worktree add <path> -b <name> <base>`) and point agents at them.
 - The orchestrator must never put a mutating git command inside a diagnostic one-liner. A stray
   `git stash` once silently dropped `MERGE_HEAD` and reset the tree; later checks ran against plain
   master for 20 minutes. Recovery:
@@ -215,8 +225,18 @@ cargo check --workspace --all-targets
 
 Fix by category (missing constants, then types/enum variants, then imports, then signatures). Also
 sweep auto-merged files for stray branding: new upstream files merge without conflict and still say
-`kanidm` (`git diff --cached --name-only --diff-filter=AM | xargs grep -nE 'kanidm|Kanidm|KANIDM'`
-minus the allow-list).
+`kanidm`. The content rebrand applies to files ADDED upstream (workflows, YAML, Dockerfiles, docs,
+crate manifests), not only to conflicted files: #511 shipped `docker_build_kanidm_tools.yml` and the
+`ghcr.io/<owner>/kanidm-tools` image that way. Run the guard, which scans every tracked file against
+`scripts/rebrand_allowlist.txt`, and fix each hit or add a narrow allow-list entry:
+
+```bash
+scripts/check_rebrand.sh
+scripts/check_forbidden_patterns.sh
+```
+
+Upstream file and directory names are kept on purpose (`platform/linux/kanidmd.service`,
+`examples/kanidm`); only their contents are rebranded.
 
 ### Step 6: Verify
 
@@ -286,7 +306,9 @@ merge commit.
       intentionally changed semantics
 - [ ] No duplicate UUIDs; new upstream UUIDs that collide were relocated
 - [ ] External crate names, RADIUS/NSS internals, service names and upstream URLs still say `kanidm`
-- [ ] Auto-merged new files rebranded; SECURITY.md AI section not adopted
+- [ ] Auto-merged AND newly added upstream files rebranded (`scripts/check_rebrand.sh` and
+      `scripts/check_forbidden_patterns.sh` pass); SECURITY.md AI section not adopted
+- [ ] Fork schema and builtin entries registered at the new target domain level (guard tests pass)
 - [ ] Workspace dependency keys consistent between root and member `Cargo.toml` files; both lock
       files regenerated
 - [ ] PR opened as draft, body filled, CI green, then `gh pr ready`

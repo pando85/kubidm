@@ -1,5 +1,5 @@
 ---
-name: Container - Kanidm Tools
+name: Container - Kubidm Tools
 
 "on":
   pull_request:
@@ -11,11 +11,11 @@ concurrency:
 
 jobs:
   container_build:
-    name: Build kanidm-tools container
+    name: Build kubidm-tools container
     permissions:
       contents: read
       packages: write
     uses: ./.github/workflows/reusable_container_build.yml
     with:
-      container_name: kanidm-tools
+      container_name: kubidm-tools
       docker_file: tools/Dockerfile

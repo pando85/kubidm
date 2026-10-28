@@ -56,6 +56,8 @@ const PW_BADLIST_MSG: &str = "password is in badlist";
 const BAD_OAUTH2_CSRF_STATE_MSG: &str = "invalid oauth2 csrf state";
 const BAD_OAUTH2_SUBJECT_MSG: &str = "invalid oauth2 token subject";
 const BAD_OAUTH2_SESSION_MSG: &str = "oauth2 session expired";
+// Kubidm: the federation's id_token is missing or invalid.
+const BAD_OAUTH2_ID_TOKEN_MSG: &str = "invalid oauth2 id token";
 
 #[derive(Debug, Clone)]
 enum AuthIntent {
