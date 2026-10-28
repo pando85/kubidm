@@ -51,10 +51,10 @@ supplier is reachable.
 ## Troubleshooting: Dangling Required References
 
 A reference is dangling when the entry it points to does not exist, for example after a bug, a manual database repair,
-or when one node deletes a group while another node makes it the only approver of a policy. Replication removes dangling
-references from optional attributes. When a dangling reference is the only value of a required attribute, removing it
-would make the entry invalid and fail the refresh or the incremental replication every time. Replication keeps that
-value instead, so that the node can always catch up.
+or when one node deletes a group while another node makes it the only receiver of an access control profile. Replication
+removes dangling references from optional attributes. When a dangling reference is the only value of a required
+attribute, removing it would make the entry invalid and fail the refresh or the incremental replication every time.
+Replication keeps that value instead, so that the node can always catch up.
 
 ### How They Appear
 
@@ -79,8 +79,10 @@ missing target. A reference to an entry that is in the recycle bin is reported t
   its target, which would otherwise receive what the reference grants. This applies to every create with a uuid in the
   dynamic range, including the entries created by a sync connector. Before its tombstone is purged, the uuid of a
   deleted entry can not be reused anyway.
-- **A recycled holder keeps blocking the uuid.** An entry in the recycle bin that holds the dangling reference still
-  blocks the uuid, until its tombstone is purged.
+- **A recycled holder only blocks the uuid for a while.** An entry that holds the dangling reference and is then deleted
+  keeps blocking the uuid on the node that deleted it. Replication only keeps the value on live entries, so once the
+  deletion replicates the value is removed and the uuid is no longer blocked. Reviving such a holder then fails, because
+  its required attribute is empty.
 
 ### How to Fix Them
 
