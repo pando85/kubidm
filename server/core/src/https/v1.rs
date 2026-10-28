@@ -2487,7 +2487,7 @@ pub async fn group_id_time_bounded_member_post(
     get,
     path = "/v1/group/{id}/_time_bounded_member",
     responses(
-        (status=200, body=Vec<TimeBoundedMemberGrant>, content_type=APPLICATION_JSON),
+        (status=200, description = "The list of time-bounded membership grants", body=Vec<TimeBoundedMemberGrant>, content_type=APPLICATION_JSON),
         ApiResponseWithout200,
     ),
     security(("token_jwt" = [])),
@@ -3685,7 +3685,7 @@ pub async fn approval_request_get(
     post,
     path = "/v1/approval/request",
     responses(
-        (status = 200, body=Uuid, content_type=APPLICATION_JSON),
+        (status = 200, description = "The UUID of the created approval request", body=Uuid, content_type=APPLICATION_JSON),
         (status = 404, description = "Unknown approval policy or target"),
         (status = 422, description = "The policy can never be satisfied for this requester"),
         ApiResponseWithout200,
