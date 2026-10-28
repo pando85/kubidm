@@ -1,6 +1,6 @@
 use super::modify::ModifyPartial;
 use crate::{event::ReviveRecycledEvent, prelude::*, server::Plugins};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 impl QueryServerWriteTransaction<'_> {
     #[instrument(level = "debug", skip_all)]
@@ -189,6 +189,21 @@ impl QueryServerWriteTransaction<'_> {
 
         pre_candidates.append(&mut pre_cascade_revive_candidates);
 
+        // Kubidm: reviving restores the direct memberships recorded in
+        // `RecycledDirectMemberOf`, which adds members with internal writes. Apply the approval
+        // gate on high privilege membership here, before anything is written (see
+        // `plugins::approval_gate`).
+        let restored_groups: BTreeSet<Uuid> = pre_candidates
+            .iter()
+            .filter_map(|entry| entry.get_ava_as_refuuid(Attribute::RecycledDirectMemberOf))
+            .flatten()
+            .collect();
+        crate::plugins::approval_gate::approval_gate_check_member_adds(
+            self,
+            &re.ident,
+            "revive",
+            restored_groups,
+        )?;
         // Kubidm: a revoked delegation is never revived. Its grant was checked against
         // the groups as they were then (entry managers, dynamic groups, nesting), which a
         // revive would skip: grant it again instead.

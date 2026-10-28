@@ -14,6 +14,7 @@ use std::{
 };
 
 mod approval;
+pub(crate) mod approval_gate;
 mod attrunique;
 mod base;
 mod cred_import;
@@ -260,6 +261,7 @@ impl Plugins {
     ) -> Result<(), OperationError> {
         base::Base::pre_create_transform(qs, cand, ce)?;
         approval::ApprovalProtect::pre_create_transform(qs, cand, ce)?;
+        approval_gate::ApprovalGate::pre_create_transform(qs, cand, ce)?;
         valuedeny::ValueDeny::pre_create_transform(qs, cand, ce)?;
         max_grant_duration::MaxGrantDuration::pre_create_transform(qs, cand, ce)?;
 
@@ -315,6 +317,7 @@ impl Plugins {
     ) -> Result<(), OperationError> {
         base::Base::pre_modify(qs, pre_cand, cand, me)?;
         approval::ApprovalProtect::pre_modify(qs, pre_cand, cand, me)?;
+        approval_gate::ApprovalGate::pre_modify(qs, pre_cand, cand, me)?;
         valuedeny::ValueDeny::pre_modify(qs, pre_cand, cand, me)?;
         max_grant_duration::MaxGrantDuration::pre_modify(qs, pre_cand, cand, me)?;
 
@@ -355,6 +358,7 @@ impl Plugins {
     ) -> Result<(), OperationError> {
         base::Base::pre_batch_modify(qs, pre_cand, cand, me)?;
         approval::ApprovalProtect::pre_batch_modify(qs, pre_cand, cand, me)?;
+        approval_gate::ApprovalGate::pre_batch_modify(qs, pre_cand, cand, me)?;
         valuedeny::ValueDeny::pre_batch_modify(qs, pre_cand, cand, me)?;
         max_grant_duration::MaxGrantDuration::pre_batch_modify(qs, pre_cand, cand, me)?;
 

@@ -105,4 +105,14 @@ impl KubidmClient {
         self.perform_delete_request(format!("/v1/approval/request/{}", uuid).as_str())
             .await
     }
+
+    /// Execute an approved request as its requester: carry out its operation and consume
+    /// the approval. Only `group_membership_high_privilege` requests can be executed.
+    pub async fn approval_request_execute(&self, uuid: &str) -> Result<(), ClientError> {
+        self.perform_post_request(
+            format!("/v1/approval/request/{}/_execute", uuid).as_str(),
+            serde_json::json!({}),
+        )
+        .await
+    }
 }

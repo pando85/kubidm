@@ -2025,8 +2025,9 @@ impl QueryServerWriteV1 {
                 e
             })?;
 
-        let request_uuid =
-            Uuid::parse_str(&uuid).map_err(|_| OperationError::InvalidRequestState)?;
+        let request_uuid = Uuid::parse_str(&uuid).map_err(|_| {
+            OperationError::InvalidAttribute("invalid approval request uuid".to_string())
+        })?;
 
         idms_prox_write
             .qs_write
@@ -2055,12 +2056,44 @@ impl QueryServerWriteV1 {
                 e
             })?;
 
-        let request_uuid =
-            Uuid::parse_str(&uuid).map_err(|_| OperationError::InvalidRequestState)?;
+        let request_uuid = Uuid::parse_str(&uuid).map_err(|_| {
+            OperationError::InvalidAttribute("invalid approval request uuid".to_string())
+        })?;
 
         idms_prox_write
             .qs_write
             .approval_request_cancel(&ident, request_uuid)
+            .and_then(|_| idms_prox_write.commit())
+    }
+
+    #[instrument(
+        level = "info",
+        name = "approval_request_execute",
+        skip_all,
+        fields(uuid = ?eventid)
+    )]
+    pub async fn handle_approval_request_execute(
+        &self,
+        client_auth_info: ClientAuthInfo,
+        uuid: String,
+        eventid: Uuid,
+    ) -> Result<(), OperationError> {
+        let ct = duration_from_epoch_now();
+        let mut idms_prox_write = self.idms.proxy_write(ct).await?;
+        let ident = idms_prox_write
+            .validate_client_auth_info_to_ident(client_auth_info, ct)
+            .map_err(|e| {
+                error!(?e, "Invalid identity");
+                e
+            })?;
+
+        let request_uuid = Uuid::parse_str(&uuid).map_err(|_| {
+            OperationError::InvalidAttribute("invalid approval request uuid".to_string())
+        })?;
+
+        idms_prox_write
+            .qs_write
+            .approval_request_execute(&ident, request_uuid)
             .and_then(|_| idms_prox_write.commit())
     }
 

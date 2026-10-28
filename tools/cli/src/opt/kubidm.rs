@@ -1659,7 +1659,9 @@ pub struct ApprovalRequestCreateOpt {
     /// The entry the operation applies to: a uuid, name or spn. It must be readable by the logged in account
     #[clap(long = "target")]
     pub target: String,
-    /// Operation details as a JSON object of string values, e.g. '{"group": "idm_admins"}'
+    /// Operation details as a JSON object of string values. For
+    /// group_membership_high_privilege the target is the group and the details are
+    /// '{"member": "MEMBER_UUID"}'
     #[clap(long = "details")]
     pub details: Option<String>,
 }
@@ -1698,6 +1700,10 @@ pub enum ApprovalRequestOpt {
     Reject(ApprovalDecisionOpt),
     #[clap(name = "cancel")]
     Cancel(ApprovalRequestNamedOpt),
+    #[clap(name = "execute")]
+    /// Carry out the operation of your own approved request and consume the approval. Only
+    /// group_membership_high_privilege requests can be executed
+    Execute(ApprovalRequestNamedOpt),
 }
 
 #[derive(Debug, Subcommand, Clone)]

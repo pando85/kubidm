@@ -379,6 +379,30 @@ pub struct ApprovalRequest {
     pub escalation_level: u32,
     pub required_decisions: u32,
     pub operation_details: BTreeMap<String, String>,
+    /// Kubidm: for a `group_membership_high_privilege` request, what the member in the
+    /// operation details is, so that approvers see what they approve. `None` for other
+    /// operation types, when the member no longer exists, or when the reader may not see it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_member: Option<ApprovalOperationMember>,
+}
+
+/// Kubidm: the entry a `group_membership_high_privilege` request would add to its group.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, ToSchema)]
+pub struct ApprovalOperationMember {
+    pub uuid: Uuid,
+    pub name: Option<String>,
+    pub classes: Vec<String>,
+    /// For a group, its number of direct members.
+    pub member_count: Option<usize>,
+    /// Kubidm: for a group, the uuids of its nested members (direct and indirect) when the
+    /// request was created. This is what is approved: the request can only be executed
+    /// while the group contains exactly these.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approved_members: Option<Vec<Uuid>>,
+    /// Kubidm: for a group, whether its nested members now differ from `approved_members`,
+    /// in which case the request can not be executed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub members_changed: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, ToSchema)]
@@ -689,8 +713,34 @@ mod tests {
                 m.insert("key".to_string(), "value".to_string());
                 m
             },
+            operation_member: Some(ApprovalOperationMember {
+                uuid: Uuid::new_v4(),
+                name: Some("member".to_string()),
+                classes: vec!["group".to_string()],
+                member_count: Some(3),
+                approved_members: Some(vec![Uuid::new_v4()]),
+                members_changed: Some(false),
+            }),
         };
         let restored = round_trip(&original);
+        assert_eq!(restored.operation_member, original.operation_member);
+
+        // Kubidm: older servers do not send `operation_member`, and it is left out when
+        // there is none.
+        let mut older = serde_json::to_value(&original).expect("serialize");
+        if let Some(object) = older.as_object_mut() {
+            object.remove("operation_member");
+        }
+        let decoded: ApprovalRequest = serde_json::from_value(older).expect("deserialize");
+        assert_eq!(decoded.operation_member, None);
+        let without = ApprovalRequest {
+            operation_member: None,
+            ..decoded
+        };
+        assert!(serde_json::to_value(&without)
+            .expect("serialize")
+            .get("operation_member")
+            .is_none());
         assert_eq!(restored.uuid, original.uuid);
         assert_eq!(restored.policy_uuid, original.policy_uuid);
         assert_eq!(restored.policy_name, original.policy_name);

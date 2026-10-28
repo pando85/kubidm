@@ -229,6 +229,7 @@ impl Modify for SecurityAddon {
         super::v1::delegation_grant,
         super::v1::delegation_get,
         super::v1::delegation_revoke,
+        super::v1::approval_request_execute,
         super::v1::auth,
         super::v1::auth_valid,
         super::v1::logout,
