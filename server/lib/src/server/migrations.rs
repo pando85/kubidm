@@ -248,10 +248,20 @@ impl QueryServer {
         }
 
         // Kubidm: apply any pending reloads while still in the start up phase, where an
-        // invalid stored access control profile is skipped rather than failing start up.
-        // From `Running` on, profiles changed in a transaction are validated strictly,
-        // and every profile was "changed" by the migrations above.
+        // invalid stored access control profile is skipped rather than failing start up
+        // (built-in profiles excepted, see `acp_reload_rejects_invalid`). From `Running`
+        // on, profiles changed in a transaction are validated strictly, and every profile
+        // was "changed" by the migrations above.
         write_txn.reload()?;
+
+        // Kubidm: the stored profiles that start up skipped because they are invalid, to
+        // report once start up succeeded.
+        let skipped_acps: Vec<String> = write_txn
+            .get_accesscontrols()
+            .get_skipped()
+            .iter()
+            .map(|(uuid, name)| format!("{name} ({uuid})"))
+            .collect();
 
         // We are ready to run
         write_txn.set_phase(ServerPhase::Running);
@@ -259,6 +269,14 @@ impl QueryServer {
         // Commit all changes, this also triggers the final reload, this should be a no-op
         // since we already did all the needed loads above.
         write_txn.commit()?;
+
+        if !skipped_acps.is_empty() {
+            warn!(
+                count = skipped_acps.len(),
+                profiles = ?skipped_acps,
+                "Some access control profiles are invalid and were skipped, they grant nothing until they are fixed or disabled"
+            );
+        }
 
         debug!("Database version check and migrations success! ☀️  ");
         Ok(())

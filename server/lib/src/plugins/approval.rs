@@ -1,14 +1,17 @@
-//! Kubidm: protect approval requests and approval decision records.
+//! Kubidm: protect approval policies, approval requests and approval decision records.
 //!
 //! The outcome of an approval request is computed from the request (its quorum snapshot,
-//! requester and creation time) and from its decision records, see
-//! `crate::server::approval`. Those entries are written only by the approval operations,
-//! which run as the internal system identity after their own authorisation checks. Any
-//! other write - an access control profile granting more than intended, an impersonated
-//! administrator, or another internal role - could forge, alter or remove a decision, so
-//! this plugin refuses every create, modify and delete of these entries that does not
-//! come from the system identity, with `SystemProtectedObject`, whatever the access
-//! controls allow.
+//! requester and creation time) and from its decision records, and whether an approval
+//! can be used depends on its policy (enabled, operation types), see
+//! `crate::server::approval`. Those entries are written only by the approval operations
+//! (`approval_policy_create`, `approval_policy_enable`, `approval_policy_delete`, and the
+//! request and decision operations), which run as the internal system identity after their
+//! own authorisation checks (`idm_approval_admins` for policies), as does referential
+//! integrity. Any other write - an access control profile granting more than intended, an
+//! impersonated administrator, or another internal role - could forge, alter or remove a
+//! decision, or change who approves under a policy, so this plugin refuses every create,
+//! modify and delete of these entries that does not come from the system identity, with
+//! `SystemProtectedObject`, whatever the access controls allow.
 //!
 //! This is a plugin rather than an entry in `server::access::protected`, as those rules are
 //! only applied to non-internal identities, while this must also exclude the internal roles
@@ -25,7 +28,8 @@ use crate::prelude::*;
 pub struct ApprovalProtect {}
 
 fn is_approval_entry<VALID, STATE>(entry: &Entry<VALID, STATE>) -> bool {
-    entry.attribute_equality(Attribute::Class, &EntryClass::ApprovalRequest.into())
+    entry.attribute_equality(Attribute::Class, &EntryClass::ApprovalPolicy.into())
+        || entry.attribute_equality(Attribute::Class, &EntryClass::ApprovalRequest.into())
         || entry.attribute_equality(Attribute::Class, &EntryClass::ApprovalDecisionRecord.into())
 }
 
@@ -48,7 +52,7 @@ impl ApprovalProtect {
         security_access!(
             ident = %ident,
             op,
-            "denied - approval requests and decision records are only written by the approval operations"
+            "denied - approval policies, requests and decision records are only written by the approval operations"
         );
         Err(OperationError::SystemProtectedObject)
     }

@@ -4,7 +4,8 @@
 use self::{
     access::{
         profiles::{
-            AccessControlCreate, AccessControlDelete, AccessControlModify, AccessControlSearch,
+            AccessControlCreate, AccessControlDelete, AccessControlModify, AccessControlProfile,
+            AccessControlSearch,
         },
         AccessControls, AccessControlsReadTransaction, AccessControlsTransaction,
         AccessControlsWriteTransaction,
@@ -2355,6 +2356,20 @@ impl QueryServer {
     }
 }
 
+/// Kubidm: the error for a change that is rejected because it leaves an access control
+/// profile invalid. It names the profile, so that an administrator can tell which profile
+/// blocks the change (for example the delete of a group that a delegated profile is scoped
+/// to), and keeps the reason.
+fn acp_invalid_error(name: &str, uuid: Uuid, err: OperationError) -> OperationError {
+    let reason = match err {
+        OperationError::InvalidAcpState(reason) => reason,
+        err => err.to_string(),
+    };
+    OperationError::InvalidAcpState(format!(
+        "access control profile {name} ({uuid}) is invalid: {reason}"
+    ))
+}
+
 impl<'a> QueryServerWriteTransaction<'a> {
     pub(crate) fn get_server_uuid(&self) -> Uuid {
         // Cid has our server id within
@@ -2568,10 +2583,26 @@ impl<'a> QueryServerWriteTransaction<'a> {
         self.accesscontrols
             .update_sync_agreements(sync_agreement_map);
 
+        // Kubidm: the profiles of each kind that are loaded now, before this reload. Such a
+        // profile was valid, so a change in this transaction that leaves it invalid is
+        // rejected, even when the profile entry itself did not change (see
+        // [Self::acp_reload_rejects_invalid]). Captured per kind, as a profile of several
+        // kinds may be valid as one and invalid as another.
+        fn loaded<T>(acps: &[T], acp: impl Fn(&T) -> &AccessControlProfile) -> BTreeSet<Uuid> {
+            acps.iter().map(|a| acp(a).uuid()).collect()
+        }
+        let loaded_search = loaded(self.accesscontrols.get_search(), |a| &a.acp);
+        let loaded_create = loaded(self.accesscontrols.get_create(), |a| &a.acp);
+        let loaded_modify = loaded(self.accesscontrols.get_modify(), |a| &a.acp);
+        let loaded_delete = loaded(self.accesscontrols.get_delete(), |a| &a.acp);
+        let mut skipped = BTreeMap::new();
+
         // Update search
         let search_acps = self.reload_acp_kind(
             EntryClass::AccessControlSearch,
             AccessControlSearch::try_from,
+            &loaded_search,
+            &mut skipped,
         )?;
         self.accesscontrols
             .update_search(search_acps)
@@ -2584,6 +2615,8 @@ impl<'a> QueryServerWriteTransaction<'a> {
         let create_acps = self.reload_acp_kind(
             EntryClass::AccessControlCreate,
             AccessControlCreate::try_from,
+            &loaded_create,
+            &mut skipped,
         )?;
         self.accesscontrols
             .update_create(create_acps)
@@ -2596,6 +2629,8 @@ impl<'a> QueryServerWriteTransaction<'a> {
         let modify_acps = self.reload_acp_kind(
             EntryClass::AccessControlModify,
             AccessControlModify::try_from,
+            &loaded_modify,
+            &mut skipped,
         )?;
         self.accesscontrols
             .update_modify(modify_acps)
@@ -2608,38 +2643,65 @@ impl<'a> QueryServerWriteTransaction<'a> {
         let delete_acps = self.reload_acp_kind(
             EntryClass::AccessControlDelete,
             AccessControlDelete::try_from,
+            &loaded_delete,
+            &mut skipped,
         )?;
-        self.accesscontrols.update_delete(delete_acps).map_err(|e| {
-            admin_error!("Failed to update delete accesscontrols {:?}", e);
-            e
-        })
+        self.accesscontrols
+            .update_delete(delete_acps)
+            .map_err(|e| {
+                admin_error!("Failed to update delete accesscontrols {:?}", e);
+                e
+            })?;
+
+        self.accesscontrols.update_skipped(skipped);
+        Ok(())
     }
 
-    /// Kubidm: is an access control profile that was changed in this transaction and
-    /// fails to parse an error (rejecting the change), rather than skipped?
+    /// Kubidm: is an access control profile that fails to parse an error (rejecting the
+    /// change that made it invalid), rather than skipped?
     ///
-    /// Only while running and applying local changes. During start up (the server phase
-    /// is not yet `Running`) and while applying replicated changes, every invalid profile
-    /// is skipped: the content was already accepted (by an older version, or by the
-    /// supplier), and failing here would stop the server from starting or block
-    /// replication. A refresh also marks every entry as changed.
-    fn acp_reload_is_strict(&self) -> bool {
-        !self.replication_apply && *self.phase >= ServerPhase::Running
+    /// Never while applying replicated changes: the content was already accepted by the
+    /// supplier, and failing here would block replication. Otherwise, it is an error for:
+    ///
+    /// - a built-in profile (in the system uuid range), always, including during start up
+    ///   and migrations. Built-in profiles come with the server, so one that the parser
+    ///   rejects is a bug, which must fail loudly rather than silently grant nothing;
+    /// - once the server is `Running`, a profile created or modified in this transaction
+    ///   (including changes made by referential integrity, such as deleting a delegated
+    ///   scope group), or one that was loaded before this reload (`loaded`), so a change
+    ///   that breaks a valid profile indirectly (say, a schema change) is rejected too.
+    ///
+    /// Any other invalid profile is skipped: during start up (the server phase is not yet
+    /// `Running`), so that a stored profile that an older version accepted never stops the
+    /// server from starting, and while running, so that such a profile never blocks
+    /// unrelated writes. A replication refresh marks every entry as changed, and runs as
+    /// replication.
+    fn acp_reload_rejects_invalid(&self, uuid: Uuid, loaded: &BTreeSet<Uuid>) -> bool {
+        if self.replication_apply {
+            return false;
+        }
+        if uuid < DYNAMIC_RANGE_MINIMUM_UUID {
+            return true;
+        }
+        *self.phase >= ServerPhase::Running
+            && (self.is_changed_uuid(&uuid) || loaded.contains(&uuid))
     }
 
     /// Kubidm: search and parse the enabled access control profiles of one kind.
     ///
     /// Parsing fails closed per profile: access control profiles only ever grant, so a
-    /// profile that is skipped grants nothing. A profile changed in this transaction that
-    /// is invalid fails the reload when [Self::acp_reload_is_strict], so the offending
-    /// change is rejected with a clear error (this includes changes made by referential
-    /// integrity, such as deleting a delegated scope group). Any other invalid profile is
-    /// logged and skipped, so a stored profile that the current parser rejects never
-    /// blocks unrelated writes, start up or replication.
+    /// profile that is skipped grants nothing. An invalid profile fails the reload when
+    /// [Self::acp_reload_rejects_invalid], so the offending change is rejected with an
+    /// error naming the profile. Any other invalid profile is logged, added to `skipped`
+    /// and left out, so a stored profile that the current parser rejects never blocks
+    /// unrelated writes, start up or replication. `loaded` are the profiles of this kind
+    /// that were loaded before this reload.
     fn reload_acp_kind<T>(
         &mut self,
         kind: EntryClass,
         parse: impl Fn(&mut Self, &EntrySealedCommitted) -> Result<T, OperationError>,
+        loaded: &BTreeSet<Uuid>,
+        skipped: &mut BTreeMap<Uuid, String>,
     ) -> Result<Vec<T>, OperationError> {
         let filt = filter!(f_and!([
             f_eq(Attribute::Class, EntryClass::AccessControlProfile.into()),
@@ -2655,30 +2717,34 @@ impl<'a> QueryServerWriteTransaction<'a> {
             e
         })?;
 
-        let strict = self.acp_reload_is_strict();
         let mut acps = Vec::with_capacity(res.len());
         for entry in res.iter() {
             let uuid = entry.get_uuid();
             match parse(self, entry.as_ref()) {
                 Ok(acp) => acps.push(acp),
-                Err(err) if strict && self.is_changed_uuid(&uuid) => {
-                    error!(
-                        ?err,
-                        ?uuid,
-                        name = ?entry.get_display_id(),
-                        %kind,
-                        "Rejecting a change that leaves this access control profile invalid"
-                    );
-                    return Err(err);
-                }
                 Err(err) => {
+                    let name = entry
+                        .get_ava_single_iname(Attribute::Name)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| entry.get_display_id());
+                    if self.acp_reload_rejects_invalid(uuid, loaded) {
+                        error!(
+                            ?err,
+                            %uuid,
+                            %name,
+                            %kind,
+                            "Rejecting a change that leaves this access control profile invalid"
+                        );
+                        return Err(acp_invalid_error(&name, uuid, err));
+                    }
                     error!(
                         ?err,
-                        ?uuid,
-                        name = ?entry.get_display_id(),
+                        %uuid,
+                        %name,
                         %kind,
                         "Skipping invalid access control profile, it grants nothing until it is fixed or disabled"
                     );
+                    skipped.insert(uuid, name);
                 }
             }
         }

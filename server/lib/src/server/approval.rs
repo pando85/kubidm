@@ -38,8 +38,8 @@
 //! object that also records the slots the approver could fill when they decided. Separate
 //! entries never conflict in replication, so two decisions made on different replicas are
 //! both kept (see `SCHEMA_CLASS_APPROVAL_DECISION_RECORD` for why values of one attribute
-//! would not be). Requests and records are only written by the operations below, as the
-//! internal system identity: `plugins::approval` refuses every other write.
+//! would not be). Policies, requests and records are only written by the operations below,
+//! as the internal system identity: `plugins::approval` refuses every other write.
 //!
 //! **Outcome.** The outcome is recomputed from the snapshot and the decision records:
 //!
@@ -62,7 +62,9 @@
 //! **Gate.** An operation that needs approval must call
 //! `QueryServerWriteTransaction::approval_request_check_and_consume`, and nothing else:
 //! it recomputes the outcome rather than trusting the stored state, checks that the
-//! request is for exactly this operation, and consumes the approval in the same
+//! request is for exactly this operation, under the policy the operation requires (which
+//! the caller chooses, never the requester), that it has not expired and that the policy
+//! is still enabled and still covers the operation, and consumes the approval in the same
 //! transaction, so that it authorises the operation once. An approval is only final once
 //! replication has converged: a decision made concurrently on another replica (say, a
 //! rejection made earlier) can still change the outcome, and two replicas can each consume
@@ -1010,6 +1012,11 @@ impl QueryServerWriteTransaction<'_> {
     /// The approvers, pattern and escalation of the policy are copied onto the request (see
     /// the module documentation), so later changes to the policy do not affect it.
     ///
+    /// The requester picks `policy_name` here, but that grants nothing by itself: the gate,
+    /// [Self::approval_request_check_and_consume], only accepts a request filed under the
+    /// policy that the operation requires. Filing under a laxer policy that covers the same
+    /// operation type does not help.
+    ///
     /// Kubidm: nothing in the server calls this yet - no operation is gated on approval and
     /// there is no API route to create requests. It is the entry point for those.
     pub fn approval_request_create(
@@ -1336,6 +1343,13 @@ impl QueryServerWriteTransaction<'_> {
     ///   counts. The stored state must not be a final state other than approved;
     /// - the request must still be valid (policy, target and requester exist);
     /// - only the requester (or the system) may use the approval;
+    /// - the request must have been filed under `policy_name`, the policy the operation
+    ///   requires. **Callers must choose `policy_name` on the server side** (from the
+    ///   configuration of the operation), never from the requester's input: otherwise a
+    ///   requester could file under any laxer policy that covers the same operation type;
+    /// - the request must not have expired (`expires_at`), and the policy must still be
+    ///   enabled and still cover `operation_type`. Disabling a policy, or no longer covering
+    ///   an operation type, stops its approvals from being used;
     /// - the operation type, target and operation details must match the request exactly;
     /// - the request then moves to the final `consumed` state.
     ///
@@ -1349,6 +1363,7 @@ impl QueryServerWriteTransaction<'_> {
         &mut self,
         ident: &Identity,
         request_uuid: Uuid,
+        policy_name: &str,
         operation_type: &ApprovalOperationType,
         target_uuid: Uuid,
         operation_details: &BTreeMap<String, String>,
@@ -1396,6 +1411,56 @@ impl QueryServerWriteTransaction<'_> {
             return Err(OperationError::InvalidRequestState);
         }
 
+        // Filed under the policy the operation requires, not just any policy covering the
+        // same operation type.
+        let required_policy = self
+            .internal_search(filter!(f_and!([
+                f_eq(Attribute::Class, EntryClass::ApprovalPolicy.into()),
+                f_eq(
+                    Attribute::ApprovalPolicyName,
+                    PartialValue::new_iname(policy_name)
+                )
+            ])))?
+            .first()
+            .map(|entry| entry.get_uuid());
+        if required_policy.is_none() || resolved.request.policy_uuid != required_policy {
+            security_access!(
+                ident = %ident,
+                %request_uuid,
+                required_policy = %policy_name,
+                policy = ?resolved.request.policy_name,
+                "denied - the approval request is not under the policy the operation requires"
+            );
+            return Err(OperationError::InvalidRequestState);
+        }
+
+        if resolved
+            .request
+            .expires_at
+            .is_some_and(|expires_at| expires_at <= now)
+        {
+            error!(%request_uuid, expires_at = ?resolved.request.expires_at, "approval request has expired");
+            return Err(OperationError::InvalidRequestState);
+        }
+
+        let Some(policy) = resolved.policy.as_ref() else {
+            error!(%request_uuid, "approval request policy was deleted");
+            return Err(OperationError::InvalidRequestState);
+        };
+        if !policy.enabled {
+            error!(%request_uuid, policy = %policy.name, "approval policy is disabled");
+            return Err(OperationError::InvalidRequestState);
+        }
+        if !policy.operation_types.contains(operation_type) {
+            error!(
+                %request_uuid,
+                policy = %policy.name,
+                %operation_type,
+                "approval policy no longer covers this operation type"
+            );
+            return Err(OperationError::InvalidRequestState);
+        }
+
         if resolved.request.operation_type != *operation_type
             || resolved.request.target_uuid != Some(target_uuid)
             || resolved.request.operation_details != *operation_details
@@ -1414,6 +1479,7 @@ impl QueryServerWriteTransaction<'_> {
         info!(
             ident = %ident,
             request = %request_uuid,
+            policy = %policy_name,
             %operation_type,
             target = %target_uuid,
             "approval request consumed"
@@ -2364,17 +2430,19 @@ mod tests {
         txn.approval_request_decision(&approver, request, decision, ct)
     }
 
-    /// Consume `request` as `requester` for a schema_modify on idm_admins without details,
-    /// as `create_request` creates it.
+    /// Consume `request` as `requester` for a schema_modify on idm_admins without details
+    /// requiring `policy`, as `create_request` creates it.
     fn consume_as(
         txn: &mut QueryServerWriteTransaction<'_>,
         requester: Uuid,
+        policy: &str,
         request: Uuid,
     ) -> Result<(), OperationError> {
         let requester = identity(txn, requester);
         txn.approval_request_check_and_consume(
             &requester,
             request,
+            policy,
             &ApprovalOperationType::SchemaModify,
             UUID_IDM_ADMINS,
             &BTreeMap::new(),
@@ -3309,6 +3377,7 @@ mod tests {
             write_txn.approval_request_check_and_consume(
                 &requester,
                 decided,
+                "kept_policy",
                 &ApprovalOperationType::SchemaModify,
                 target2,
                 &BTreeMap::new(),
@@ -3429,7 +3498,7 @@ mod tests {
             assert_eq!(read.state, ApprovalRequestState::Rejected);
             assert_eq!(read.required_decisions, 3);
             assert_eq!(
-                consume_as(&mut write_txn, r, request),
+                consume_as(&mut write_txn, r, "all_abc", request),
                 Err(OperationError::InvalidRequestState)
             );
         }
@@ -3438,7 +3507,7 @@ mod tests {
         assert_eq!(read.state, ApprovalRequestState::Pending);
         assert_eq!(read.required_decisions, 3);
         assert_eq!(
-            consume_as(&mut write_txn, r, majority),
+            consume_as(&mut write_txn, r, "majority_abcd", majority),
             Err(OperationError::InvalidRequestState)
         );
         assert_eq!(write_txn.approval_sweep(), Ok(1));
@@ -3583,7 +3652,14 @@ mod tests {
                        operation_type: ApprovalOperationType,
                        target: Uuid,
                        details: &BTreeMap<String, String>| {
-            txn.approval_request_check_and_consume(ident, request, &operation_type, target, details)
+            txn.approval_request_check_and_consume(
+                ident,
+                request,
+                "any_a",
+                &operation_type,
+                target,
+                details,
+            )
         };
 
         // Not approved yet.
@@ -3689,7 +3765,7 @@ mod tests {
             stored_state(&mut write_txn, replicated).as_deref(),
             Some("pending")
         );
-        consume_as(&mut write_txn, r, replicated).expect("approved by its decisions");
+        consume_as(&mut write_txn, r, "any_a", replicated).expect("approved by its decisions");
         // ... and a stored approval that the decisions do not support is refused.
         let forged = create_request(&mut write_txn, r, "any_a", ct).unwrap();
         write_txn
@@ -3702,7 +3778,7 @@ mod tests {
             )
             .expect("failed to set the state");
         assert_eq!(
-            consume_as(&mut write_txn, r, forged),
+            consume_as(&mut write_txn, r, "any_a", forged),
             Err(OperationError::InvalidRequestState)
         );
         write_txn.commit().expect("failed to commit");
@@ -3717,6 +3793,168 @@ mod tests {
                 .unwrap()
                 .state,
             ApprovalRequestState::Consumed
+        );
+    }
+
+    /// The gate binds the policy the operation requires: an approval under another policy
+    /// covering the same operation type (say, a laxer one) is refused, and stays unused.
+    #[qs_test]
+    async fn test_approval_consume_requires_the_policy(server: &QueryServer) {
+        let ct = duration_from_epoch_now();
+        let mut write_txn = server.write(ct).await.unwrap();
+        let a = create_person(&mut write_txn, "approver_a");
+        let b = create_person(&mut write_txn, "approver_b");
+        let r = create_person(&mut write_txn, "requester_r");
+        create_policy(&mut write_txn, "strict", ApprovalPattern::All, vec![a, b]);
+        create_policy(&mut write_txn, "lax", ApprovalPattern::AnyOne, vec![a]);
+
+        let lax = create_request(&mut write_txn, r, "lax", ct).unwrap();
+        decide_as(&mut write_txn, a, lax, approve(), ct).expect("A approves");
+        assert_eq!(
+            read_request(&mut write_txn, lax).state,
+            ApprovalRequestState::Approved
+        );
+
+        // The operation requires the strict policy (or a policy that does not exist).
+        for policy in ["strict", "no_such_policy"] {
+            assert_eq!(
+                consume_as(&mut write_txn, r, policy, lax),
+                Err(OperationError::InvalidRequestState),
+                "{policy}"
+            );
+        }
+        assert_eq!(
+            stored_state(&mut write_txn, lax).as_deref(),
+            Some("approved")
+        );
+        // Under its own policy it is used, once.
+        consume_as(&mut write_txn, r, "lax", lax).expect("approved under lax");
+        assert_eq!(
+            consume_as(&mut write_txn, r, "lax", lax),
+            Err(OperationError::InvalidRequestState)
+        );
+
+        // A request under the strict policy is used for the strict policy.
+        let strict = create_request(&mut write_txn, r, "strict", ct).unwrap();
+        decide_as(&mut write_txn, a, strict, approve(), ct).expect("A approves");
+        decide_as(&mut write_txn, b, strict, approve(), ct).expect("B approves");
+        assert_eq!(
+            consume_as(&mut write_txn, r, "lax", strict),
+            Err(OperationError::InvalidRequestState)
+        );
+        consume_as(&mut write_txn, r, "strict", strict).expect("approved under strict");
+        write_txn.commit().expect("failed to commit");
+    }
+
+    /// The gate checks again, at use, that the request has not expired and that its policy
+    /// is still enabled and still covers the operation type.
+    #[qs_test]
+    async fn test_approval_consume_rechecks_expiry_and_policy(server: &QueryServer) {
+        let ct = duration_from_epoch_now();
+        let mut write_txn = server.write(ct).await.unwrap();
+        let idm_admin = identity(&mut write_txn, UUID_IDM_ADMIN);
+        let a = create_person(&mut write_txn, "approver_a");
+        let r = create_person(&mut write_txn, "requester_r");
+        create_policy(&mut write_txn, "any_a", ApprovalPattern::AnyOne, vec![a]);
+        let policy_uuid = find_policy_uuid(&mut write_txn, "any_a");
+
+        let mut approved = || {
+            let request = create_request(&mut write_txn, r, "any_a", ct).unwrap();
+            decide_as(&mut write_txn, a, request, approve(), ct).expect("A approves");
+            request
+        };
+        let before_expiry = approved();
+        let at_expiry = approved();
+        let after_expiry = approved();
+        let disabled = approved();
+        let not_covered = approved();
+        let deleted = approved();
+        write_txn.commit().expect("failed to commit");
+
+        // The policy timeout is an hour: an approval is used before the request expires.
+        let timeout = Duration::from_secs(3600);
+        let mut write_txn = server.write(ct + timeout).await.unwrap();
+        assert_eq!(
+            consume_as(&mut write_txn, r, "any_a", at_expiry),
+            Err(OperationError::InvalidRequestState)
+        );
+        drop(write_txn);
+        let mut write_txn = server
+            .write(ct + timeout + Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(
+            consume_as(&mut write_txn, r, "any_a", after_expiry),
+            Err(OperationError::InvalidRequestState)
+        );
+        drop(write_txn);
+
+        let mut write_txn = server
+            .write(ct + timeout - Duration::from_secs(1))
+            .await
+            .unwrap();
+        consume_as(&mut write_txn, r, "any_a", before_expiry).expect("not expired yet");
+
+        // A disabled policy's approvals can not be used, until it is enabled again.
+        write_txn
+            .approval_policy_enable(&idm_admin, "any_a", false)
+            .expect("disable");
+        assert_eq!(
+            consume_as(&mut write_txn, r, "any_a", disabled),
+            Err(OperationError::InvalidRequestState)
+        );
+        write_txn
+            .approval_policy_enable(&idm_admin, "any_a", true)
+            .expect("enable");
+
+        // A policy that no longer covers the operation type.
+        write_txn
+            .internal_modify_uuid(
+                policy_uuid,
+                &ModifyList::new_purge_and_set(
+                    Attribute::ApprovalOperationType,
+                    Value::new_iutf8n(ApprovalOperationType::PrivilegeGrant.as_str()),
+                ),
+            )
+            .expect("failed to change the operation types");
+        assert_eq!(
+            consume_as(&mut write_txn, r, "any_a", not_covered),
+            Err(OperationError::InvalidRequestState)
+        );
+        write_txn
+            .internal_modify_uuid(
+                policy_uuid,
+                &ModifyList::new_purge_and_set(
+                    Attribute::ApprovalOperationType,
+                    Value::new_iutf8n(ApprovalOperationType::SchemaModify.as_str()),
+                ),
+            )
+            .expect("failed to change the operation types");
+
+        // A deleted policy.
+        write_txn
+            .approval_policy_delete(&idm_admin, "any_a")
+            .expect("delete");
+        assert_eq!(
+            consume_as(&mut write_txn, r, "any_a", deleted),
+            Err(OperationError::InvalidRequestState)
+        );
+        write_txn.commit().expect("failed to commit");
+
+        // Every refused approval is left unused.
+        let mut write_txn = server
+            .write(ct + timeout - Duration::from_secs(1))
+            .await
+            .unwrap();
+        for request in [at_expiry, after_expiry, disabled, not_covered, deleted] {
+            assert_eq!(
+                stored_state(&mut write_txn, request).as_deref(),
+                Some("approved")
+            );
+        }
+        assert_eq!(
+            stored_state(&mut write_txn, before_expiry).as_deref(),
+            Some("consumed")
         );
     }
 
@@ -3922,7 +4160,7 @@ mod tests {
             ApprovalRequestState::Approved
         );
         assert_eq!(
-            consume_as(&mut write_txn, r, approved),
+            consume_as(&mut write_txn, r, "any_g", approved),
             Err(OperationError::InvalidRequestState)
         );
 
@@ -4116,6 +4354,150 @@ mod tests {
             stored_state(&mut write_txn, request).as_deref(),
             Some("pending")
         );
+    }
+
+    /// Approval policies are only written by the policy operations (as the system, after
+    /// checking `idm_approval_admins`), never directly, even where an access control profile
+    /// allows it.
+    #[qs_test]
+    async fn test_approval_policies_protected(server: &QueryServer) {
+        let ct = duration_from_epoch_now();
+        let mut write_txn = server.write(ct).await.unwrap();
+        let a = create_person(&mut write_txn, "approver_a");
+        let forger = create_person(&mut write_txn, "forger");
+        let forgers = create_group(&mut write_txn, "approval_forgers", &[forger]);
+        create_policy(&mut write_txn, "any_a", ApprovalPattern::AnyOne, vec![a]);
+        let policy_uuid = find_policy_uuid(&mut write_txn, "any_a");
+
+        let mut acp = entry_init!(
+            (Attribute::Class, EntryClass::Object.to_value()),
+            (
+                Attribute::Class,
+                EntryClass::AccessControlProfile.to_value()
+            ),
+            (
+                Attribute::Class,
+                EntryClass::AccessControlTargetScope.to_value()
+            ),
+            (
+                Attribute::Class,
+                EntryClass::AccessControlReceiverGroup.to_value()
+            ),
+            (Attribute::Class, EntryClass::AccessControlSearch.to_value()),
+            (Attribute::Class, EntryClass::AccessControlCreate.to_value()),
+            (Attribute::Class, EntryClass::AccessControlModify.to_value()),
+            (Attribute::Class, EntryClass::AccessControlDelete.to_value()),
+            (
+                Attribute::Name,
+                Value::new_iname("acp_approval_policy_forgers")
+            ),
+            (Attribute::Uuid, Value::Uuid(Uuid::new_v4())),
+            (Attribute::AcpReceiverGroup, Value::ReferN(forgers)),
+            (
+                Attribute::AcpTargetScope,
+                Value::new_json_filter_s(r#"{"eq":["class","approval_policy"]}"#).expect("filter")
+            ),
+            (Attribute::AcpCreateClass, EntryClass::Object.to_value()),
+            (
+                Attribute::AcpCreateClass,
+                EntryClass::ApprovalPolicy.to_value()
+            )
+        );
+        for attr in [
+            Attribute::Class,
+            Attribute::Uuid,
+            Attribute::ApprovalPolicyName,
+            Attribute::ApprovalPatternAttr,
+            Attribute::ApprovalTimeout,
+            Attribute::ApprovalOperationType,
+            Attribute::ApprovalPolicyEnabled,
+            Attribute::Approver,
+        ] {
+            acp.add_ava(Attribute::AcpSearchAttr, Value::new_iutf8n(attr.as_str()));
+            acp.add_ava(
+                Attribute::AcpModifyPresentAttr,
+                Value::new_iutf8n(attr.as_str()),
+            );
+            acp.add_ava(
+                Attribute::AcpModifyRemovedAttr,
+                Value::new_iutf8n(attr.as_str()),
+            );
+            acp.add_ava(Attribute::AcpCreateAttr, Value::new_iutf8n(attr.as_str()));
+        }
+        write_txn
+            .internal_create(vec![acp])
+            .expect("failed to create access control profile");
+        write_txn.commit().expect("failed to commit");
+
+        let mut write_txn = server.write(ct).await.unwrap();
+        let forger = identity(&mut write_txn, forger);
+        let policy_filter = filter!(f_eq(Attribute::Uuid, PartialValue::Uuid(policy_uuid)));
+        assert_eq!(
+            write_txn
+                .impersonate_search(policy_filter.clone(), policy_filter.clone(), &forger)
+                .map(|entries| entries.len()),
+            Ok(1)
+        );
+
+        let new_policy = entry_init!(
+            (Attribute::Class, EntryClass::Object.to_value()),
+            (Attribute::Class, EntryClass::ApprovalPolicy.to_value()),
+            (Attribute::Uuid, Value::Uuid(Uuid::new_v4())),
+            (Attribute::ApprovalPolicyName, Value::new_iname("forged")),
+            (Attribute::ApprovalPatternAttr, Value::new_iutf8("any_one")),
+            (Attribute::ApprovalTimeout, Value::Uint32(3600)),
+            (
+                Attribute::ApprovalOperationType,
+                Value::new_iutf8n(ApprovalOperationType::SchemaModify.as_str())
+            ),
+            (Attribute::Approver, Value::ReferN(forger.get_uuid()))
+        );
+        let ce = CreateEvent::new_impersonate_identity(forger.clone(), vec![new_policy]);
+        assert_eq!(
+            write_txn.create(&ce),
+            Err(OperationError::SystemProtectedObject)
+        );
+        assert_eq!(
+            write_txn.impersonate_modify(
+                &policy_filter,
+                &policy_filter,
+                &ModifyList::new_purge_and_set(
+                    Attribute::Approver,
+                    Value::ReferN(forger.get_uuid())
+                ),
+                &forger,
+            ),
+            Err(OperationError::SystemProtectedObject)
+        );
+        let de = DeleteEvent::new_impersonate_identity(forger.clone(), policy_filter.clone());
+        assert_eq!(
+            write_txn.delete(&de),
+            Err(OperationError::SystemProtectedObject)
+        );
+
+        // The policy operations are unaffected.
+        let idm_admin = identity(&mut write_txn, UUID_IDM_ADMIN);
+        write_txn
+            .approval_policy_enable(&idm_admin, "any_a", false)
+            .expect("disable");
+        write_txn
+            .approval_policy_enable(&idm_admin, "any_a", true)
+            .expect("enable");
+        create_policy(
+            &mut write_txn,
+            "any_a_two",
+            ApprovalPattern::AnyOne,
+            vec![a],
+        );
+        write_txn
+            .approval_policy_delete(&idm_admin, "any_a_two")
+            .expect("delete");
+        let policy = write_txn.internal_search_uuid(policy_uuid).unwrap();
+        assert_eq!(
+            policy.get_ava_refer(Attribute::Approver),
+            Some(&BTreeSet::from([a]))
+        );
+        write_txn.commit().expect("failed to commit");
     }
 
     /// S5: in the tally, decisions by the requester and slots the approver could not hold

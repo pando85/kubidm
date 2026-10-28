@@ -14,7 +14,13 @@
 //!   requirements (also search).
 
 use hashbrown::HashMap;
-use std::{cell::Cell, collections::BTreeSet, ops::DerefMut, sync::Arc, time::Duration};
+use std::{
+    cell::Cell,
+    collections::{BTreeMap, BTreeSet},
+    ops::DerefMut,
+    sync::Arc,
+    time::Duration,
+};
 use time::OffsetDateTime;
 
 use concread::{arcache::ARCacheBuilder, cowcell::*};
@@ -157,6 +163,9 @@ struct AccessControlsInner {
     acps_modify: Vec<AccessControlModify>,
     acps_delete: Vec<AccessControlDelete>,
     sync_agreements: HashMap<Uuid, BTreeSet<Attribute>>,
+    /// Kubidm: the enabled profiles (uuid and name) that the last reload skipped because
+    /// they are invalid. They grant nothing until they are fixed or disabled.
+    skipped: BTreeMap<Uuid, String>,
     // Oauth2
     // Sync prov
 }
@@ -217,6 +226,9 @@ pub trait AccessControlsTransaction<'a> {
     fn get_modify(&self) -> &Vec<AccessControlModify>;
     fn get_delete(&self) -> &Vec<AccessControlDelete>;
     fn get_sync_agreements(&self) -> &HashMap<Uuid, BTreeSet<Attribute>>;
+    /// Kubidm: the enabled profiles (uuid to name) that the last reload skipped because
+    /// they are invalid.
+    fn get_skipped(&self) -> &BTreeMap<Uuid, String>;
 
     #[allow(clippy::mut_from_ref)]
     fn get_acp_resolve_filter_cache(&self) -> &mut ResolveFilterCacheReadTxn<'a>;
@@ -1189,6 +1201,11 @@ impl AccessControlsWriteTransaction<'_> {
         Ok(())
     }
 
+    /// Kubidm: record the profiles the reload skipped, see [AccessControlsTransaction::get_skipped].
+    pub fn update_skipped(&mut self, mut skipped: BTreeMap<Uuid, String>) {
+        std::mem::swap(&mut skipped, &mut self.inner.deref_mut().skipped);
+    }
+
     pub fn update_sync_agreements(
         &mut self,
         mut sync_agreements: HashMap<Uuid, BTreeSet<Attribute>>,
@@ -1225,6 +1242,10 @@ impl<'a> AccessControlsTransaction<'a> for AccessControlsWriteTransaction<'a> {
 
     fn get_sync_agreements(&self) -> &HashMap<Uuid, BTreeSet<Attribute>> {
         &self.inner.sync_agreements
+    }
+
+    fn get_skipped(&self) -> &BTreeMap<Uuid, String> {
+        &self.inner.skipped
     }
 
     fn get_acp_resolve_filter_cache(&self) -> &mut ResolveFilterCacheReadTxn<'a> {
@@ -1275,6 +1296,10 @@ impl<'a> AccessControlsTransaction<'a> for AccessControlsReadTransaction<'a> {
         &self.inner.sync_agreements
     }
 
+    fn get_skipped(&self) -> &BTreeMap<Uuid, String> {
+        &self.inner.skipped
+    }
+
     fn get_acp_resolve_filter_cache(&self) -> &mut ResolveFilterCacheReadTxn<'a> {
         unsafe {
             let mptr = self.acp_resolve_filter_cache.as_ptr();
@@ -1301,6 +1326,7 @@ impl Default for AccessControls {
                 acps_modify: Vec::with_capacity(0),
                 acps_delete: Vec::with_capacity(0),
                 sync_agreements: HashMap::default(),
+                skipped: BTreeMap::new(),
             }),
             // Allow the expect, if this fails it represents a programming/development
             // failure.
@@ -1343,7 +1369,10 @@ impl AccessControls {
 #[cfg(test)]
 mod tests {
     use hashbrown::HashMap;
-    use std::{collections::BTreeSet, sync::Arc};
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        sync::Arc,
+    };
 
     use uuid::uuid;
 
@@ -4794,14 +4823,19 @@ mod tests {
 
         // A local delete of the scope group is refused: referential integrity removes the
         // scope group from the profile in the same transaction, which leaves it invalid.
+        // The error names the profile that blocks the delete.
         let mut qs_write = qs.write(ct).await.unwrap();
         qs_write
             .internal_delete_uuid(scope_uuid)
             .expect("delete scope group");
-        assert!(matches!(
+        assert_eq!(
             qs_write.commit(),
-            Err(OperationError::InvalidAcpState(_))
-        ));
+            Err(OperationError::InvalidAcpState(format!(
+                "access control profile acp_delegated_deleted_scope ({acp_uuid}) is invalid: \
+                 A delegated target requires {}",
+                Attribute::DelegatedScopeGroup
+            )))
+        );
 
         // Nothing changed: the receiver still only administers the scope.
         let mut qs_write = qs.write(ct).await.unwrap();
@@ -4825,6 +4859,10 @@ mod tests {
         let acp_entry = qs_write.internal_search_uuid(acp_uuid).expect("acp");
         assert!(!acp_entry.attribute_pres(Attribute::DelegatedScopeGroup));
         assert!(!dg_loaded_modify(&qs_write).contains("acp_delegated_deleted_scope"));
+        assert_eq!(
+            qs_write.get_accesscontrols().get_skipped(),
+            &BTreeMap::from([(acp_uuid, "acp_delegated_deleted_scope".to_string())])
+        );
         let admin = dg_ident(&mut qs_write, admin_uuid);
         for uuid in [outsider_uuid, target_uuid] {
             assert!(!dg_can_modify(&mut qs_write, &admin, uuid));
@@ -4946,13 +4984,40 @@ mod tests {
         let check = |qs_write: &mut QueryServerWriteTransaction<'_>| {
             let loaded = dg_loaded_modify(qs_write);
             assert!(loaded.contains("acp_stored_valid"));
-            for name in [
+            let invalid = [
                 "acp_stored_reauth_max_age",
                 "acp_stored_delegated_receiver",
                 "acp_stored_filter_only",
-            ] {
+            ];
+            for name in invalid {
                 assert!(!loaded.contains(name), "{name}");
             }
+            // The skipped profiles are recorded (and reported once at start up), unless
+            // they are disabled.
+            let reauth_max_age_enabled = qs_write
+                .internal_search_uuid(reauth_max_age_uuid)
+                .expect("acp")
+                .get_ava_single_bool(Attribute::AcpEnable)
+                != Some(false);
+            let skipped: BTreeSet<&str> = qs_write
+                .get_accesscontrols()
+                .get_skipped()
+                .values()
+                .map(String::as_str)
+                .collect();
+            let expected: BTreeSet<&str> = invalid
+                .into_iter()
+                .filter(|name| reauth_max_age_enabled || *name != "acp_stored_reauth_max_age")
+                .collect();
+            assert_eq!(skipped, expected);
+            assert_eq!(
+                qs_write
+                    .get_accesscontrols()
+                    .get_skipped()
+                    .get(&reauth_max_age_uuid)
+                    .is_some(),
+                reauth_max_age_enabled
+            );
             let admin = dg_ident(qs_write, admin_uuid);
             assert!(!dg_can_modify(qs_write, &admin, other_target_uuid));
             assert!(dg_can_modify(qs_write, &admin, valid_target_uuid));
@@ -5018,6 +5083,243 @@ mod tests {
 
         let mut qs_write = qs.write(ct).await.unwrap();
         check(&mut qs_write);
+    }
+
+    /// Kubidm: every built-in access control profile is loaded after bootstrap and
+    /// migration, as every kind it has. A built-in profile that the parser rejects fails
+    /// start up, rather than being skipped silently.
+    #[qs_test]
+    async fn test_access_builtin_acps_all_loaded(qs: &QueryServer) {
+        let ct = duration_from_epoch_now();
+        let mut qs_write = qs.write(ct).await.unwrap();
+
+        // Nothing was skipped.
+        assert_eq!(
+            qs_write.get_accesscontrols().get_skipped(),
+            &BTreeMap::new()
+        );
+
+        // The built-in profiles of the migrations ...
+        let mut builtin: BTreeSet<Uuid> =
+            crate::migration_data::latest::phase_7_builtin_access_control_profiles()
+                .into_iter()
+                .chain(crate::migration_data::dl14::kubidm_builtin_access_control_profiles())
+                .map(|entry| entry.get_uuid().expect("builtin acp uuid"))
+                .collect();
+        for uuid in builtin.iter() {
+            assert!(*uuid < DYNAMIC_RANGE_MINIMUM_UUID, "{uuid}");
+        }
+        // ... and any other profile in the system range.
+        let stored = qs_write
+            .internal_search(filter!(f_eq(
+                Attribute::Class,
+                EntryClass::AccessControlProfile.into()
+            )))
+            .expect("search");
+        let stored: BTreeMap<Uuid, _> = stored
+            .into_iter()
+            .map(|entry| (entry.get_uuid(), entry))
+            .filter(|(uuid, _)| *uuid < DYNAMIC_RANGE_MINIMUM_UUID)
+            .collect();
+        builtin.extend(stored.keys().copied());
+        assert!(builtin.len() > 40, "{}", builtin.len());
+
+        let acps = qs_write.get_accesscontrols();
+        let kinds: [(EntryClass, BTreeSet<Uuid>); 4] = [
+            (
+                EntryClass::AccessControlSearch,
+                acps.get_search().iter().map(|a| a.acp.uuid()).collect(),
+            ),
+            (
+                EntryClass::AccessControlCreate,
+                acps.get_create().iter().map(|a| a.acp.uuid()).collect(),
+            ),
+            (
+                EntryClass::AccessControlModify,
+                acps.get_modify().iter().map(|a| a.acp.uuid()).collect(),
+            ),
+            (
+                EntryClass::AccessControlDelete,
+                acps.get_delete().iter().map(|a| a.acp.uuid()).collect(),
+            ),
+        ];
+        let mut checked = 0;
+        for uuid in builtin {
+            let entry = stored.get(&uuid).expect("builtin acp is stored");
+            assert_ne!(
+                entry.get_ava_single_bool(Attribute::AcpEnable),
+                Some(false),
+                "{uuid}"
+            );
+            let mut has_kind = false;
+            for (kind, loaded) in kinds.iter() {
+                if entry.attribute_equality(Attribute::Class, &(*kind).into()) {
+                    has_kind = true;
+                    checked += 1;
+                    assert!(
+                        loaded.contains(&uuid),
+                        "{} ({uuid}) is not loaded as {kind}",
+                        entry.get_display_id()
+                    );
+                }
+            }
+            assert!(has_kind, "{uuid}");
+        }
+        assert!(checked > 40, "{checked}");
+    }
+
+    /// Kubidm: a built-in profile is validated strictly, even where another profile would
+    /// be skipped (on a write that does not change it, and at start up), except when it is
+    /// applied through replication.
+    #[qs_test]
+    async fn test_access_reload_strict_for_builtin_acp(qs: &QueryServer) {
+        let ct = duration_from_epoch_now();
+        let invalid =
+            || ModifyList::new_purge_and_set(Attribute::AcpReauthMaxAge, Value::Uint32(300));
+
+        // A local change that leaves it invalid is refused, naming it.
+        let mut qs_write = qs.write(ct).await.unwrap();
+        qs_write
+            .internal_modify_uuid(UUID_IDM_ACP_PEOPLE_READ_V1, &invalid())
+            .expect("modify");
+        assert!(matches!(
+            qs_write.commit(),
+            Err(OperationError::InvalidAcpState(msg))
+                if msg.contains("idm_acp_people_read")
+                    && msg.contains(&UUID_IDM_ACP_PEOPLE_READ_V1.to_string())
+        ));
+
+        // Through replication it is skipped.
+        let mut qs_write = qs.write(ct).await.unwrap();
+        qs_write.replication_apply = true;
+        qs_write
+            .internal_modify_uuid(UUID_IDM_ACP_PEOPLE_READ_V1, &invalid())
+            .expect("modify");
+        qs_write.commit().expect("commit");
+        let qs_write = qs.write(ct).await.unwrap();
+        assert!(qs_write
+            .get_accesscontrols()
+            .get_skipped()
+            .contains_key(&UUID_IDM_ACP_PEOPLE_READ_V1));
+        drop(qs_write);
+
+        // Not on a write that does not change it, nor at start up: both fail.
+        let mut qs_write = qs.write(ct).await.unwrap();
+        qs_write
+            .internal_create(vec![dg_group("strict_builtin_group", Uuid::new_v4(), &[])])
+            .expect("create");
+        qs_write
+            .changed_flags
+            .insert(crate::server::ChangeFlag::ACP);
+        assert!(matches!(
+            qs_write.commit(),
+            Err(OperationError::InvalidAcpState(_))
+        ));
+
+        let mut qs_write = qs.write(ct).await.unwrap();
+        qs_write.set_phase_bootstrap();
+        qs_write.commit().expect("commit");
+        assert!(matches!(
+            qs.initialise_helper(duration_from_epoch_now(), DOMAIN_TGT_LEVEL)
+                .await,
+            Err(OperationError::InvalidAcpState(_))
+        ));
+
+        // Fixing it lets the server start again.
+        let mut qs_write = qs.write(ct).await.unwrap();
+        qs_write
+            .internal_modify_uuid(
+                UUID_IDM_ACP_PEOPLE_READ_V1,
+                &ModifyList::new_purge(Attribute::AcpReauthMaxAge),
+            )
+            .expect("modify");
+        qs_write.commit().expect("commit");
+        qs.initialise_helper(duration_from_epoch_now(), DOMAIN_TGT_LEVEL)
+            .await
+            .expect("restart");
+        let qs_write = qs.write(ct).await.unwrap();
+        assert!(qs_write.get_accesscontrols().get_skipped().is_empty());
+    }
+
+    /// Kubidm: a profile that was valid and loaded, and that a change in the transaction
+    /// leaves invalid without changing the profile itself (here, a schema change removing
+    /// an attribute its target scope uses), is refused like a change to the profile. The
+    /// same change applied by replication skips the profile.
+    #[qs_test]
+    async fn test_access_reload_rejects_indirectly_broken_acp(qs: &QueryServer) {
+        use crate::schema::{SchemaAttribute, SchemaTransaction};
+
+        let ct = duration_from_epoch_now();
+        let receivers_uuid = Uuid::new_v4();
+
+        let acp = delegated_acp_entry(
+            "acp_login_shell_scope",
+            EntryClass::AccessControlReceiverGroup,
+            EntryClass::AccessControlTargetScope,
+            vec![
+                (Attribute::AcpReceiverGroup, Value::ReferN(receivers_uuid)),
+                (
+                    Attribute::AcpTargetScope,
+                    Value::new_json_filter_s("{\"eq\":[\"loginshell\",\"/bin/false\"]}")
+                        .expect("filter"),
+                ),
+            ],
+        );
+        let acp_uuid = acp.get_uuid().expect("uuid");
+
+        let mut qs_write = qs.write(ct).await.unwrap();
+        qs_write
+            .internal_create(vec![dg_group("dgi_receivers", receivers_uuid, &[]), acp])
+            .expect("failed to create entries");
+        qs_write.commit().expect("commit");
+
+        let qs_write = qs.write(ct).await.unwrap();
+        assert!(dg_loaded_modify(&qs_write).contains("acp_login_shell_scope"));
+        drop(qs_write);
+
+        let remove_login_shell = |qs_write: &mut QueryServerWriteTransaction<'_>| {
+            let attrs: Vec<SchemaAttribute> = qs_write
+                .schema
+                .get_attributes()
+                .values()
+                .filter(|attr| attr.name != Attribute::LoginShell)
+                .cloned()
+                .collect();
+            qs_write
+                .schema
+                .update_attributes(attrs.into_iter())
+                .expect("schema");
+            qs_write
+                .changed_flags
+                .insert(crate::server::ChangeFlag::ACP);
+        };
+
+        // A local change is refused, naming the profile.
+        let mut qs_write = qs.write(ct).await.unwrap();
+        remove_login_shell(&mut qs_write);
+        assert!(!qs_write.is_changed_uuid(&acp_uuid));
+        assert!(matches!(
+            qs_write.commit(),
+            Err(OperationError::InvalidAcpState(msg))
+                if msg.contains("acp_login_shell_scope") && msg.contains(&acp_uuid.to_string())
+        ));
+
+        let qs_write = qs.write(ct).await.unwrap();
+        assert!(dg_loaded_modify(&qs_write).contains("acp_login_shell_scope"));
+        drop(qs_write);
+
+        // Through replication the profile is skipped.
+        let mut qs_write = qs.write(ct).await.unwrap();
+        qs_write.replication_apply = true;
+        remove_login_shell(&mut qs_write);
+        qs_write.commit().expect("commit");
+
+        let qs_write = qs.write(ct).await.unwrap();
+        assert!(!dg_loaded_modify(&qs_write).contains("acp_login_shell_scope"));
+        assert_eq!(
+            qs_write.get_accesscontrols().get_skipped(),
+            &BTreeMap::from([(acp_uuid, "acp_login_shell_scope".to_string())])
+        );
     }
 
     // =========================================================================

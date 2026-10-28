@@ -520,9 +520,6 @@ impl AccessControlTargetCondition {
 #[derive(Debug, Clone)]
 pub struct AccessControlProfile {
     pub name: String,
-    // Currently we retrieve this but don't use it. We could depending on how we change
-    // the acp update routine.
-    #[allow(dead_code)]
     uuid: Uuid,
     pub receiver: AccessControlReceiver,
     pub target: AccessControlTarget,
@@ -532,6 +529,11 @@ pub struct AccessControlProfile {
 }
 
 impl AccessControlProfile {
+    /// The uuid of the profile entry.
+    pub fn uuid(&self) -> Uuid {
+        self.uuid
+    }
+
     pub(super) fn try_from(
         qs: &mut QueryServerWriteTransaction,
         value: &Entry<EntrySealed, EntryCommitted>,
@@ -659,7 +661,7 @@ impl AccessControlProfile {
                     Attribute::DelegatedScopeGroup
                 );
                 return Err(OperationError::InvalidAcpState(format!(
-                    "{name}: a delegated target requires {}",
+                    "A delegated target requires {}",
                     Attribute::DelegatedScopeGroup
                 )));
             };
