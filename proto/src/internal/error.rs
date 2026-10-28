@@ -180,6 +180,8 @@ pub enum OperationError {
 
     // Kubidm Approval Errors
     AP0001ApprovalQuorumUnreachable,
+    AP0002ApprovalRequired,
+    AP0003ApprovalNotUsable,
 
     // Credential Update Errors
     CU0001WebauthnAttestationNotTrusted,
@@ -616,6 +618,8 @@ impl OperationError {
             Self::KU005ErrorCheckingAccount => Some("Error checking account".into()),
             Self::KU006OnlyRootAllowed => Some("Only root is allowed to perform this operation".into()),
             Self::AP0001ApprovalQuorumUnreachable => Some("The approval policy can never be satisfied for this request: too few approvers other than the requester".into()),
+            Self::AP0002ApprovalRequired => Some("Adding a member to a high privilege group requires approval: create an approval request for group_membership_high_privilege and, once it is approved, execute it".into()),
+            Self::AP0003ApprovalNotUsable => Some("The approval request or policy is not in a state that allows this now: the request is not approved or no longer pending, was already used or cancelled, has expired, its policy is disabled or does not cover it, or its target or member changed".into()),
             Self::LD0001AnonymousNotAllowed => Some("Anonymous is not allowed to access LDAP with this method.".into()),
             Self::MG0001InvalidReMigrationLevel => None,
             Self::MG0002RaiseDomainLevelExceedsMaximum => None,

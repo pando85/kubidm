@@ -1,7 +1,5 @@
-//! End to end tests for creating approval requests over HTTP.
-//!
-//! No operation is gated on approvals yet, so these exercise the full policy, request and
-//! decision cycle through the API only.
+//! End to end tests for approval workflows over HTTP: the policy, request and decision
+//! cycle, and the opt-in gate on high privilege group membership with its execute step.
 #![deny(warnings)]
 use std::collections::BTreeMap;
 
@@ -320,4 +318,218 @@ async fn test_approval_request_create_target_not_visible(rsclient: &KubidmClient
         .approval_request_create(&request)
         .await
         .expect("A visible target must be accepted");
+}
+
+/// A group nested in idm_high_privilege (through idm_approval_admins), managed by
+/// `REQUESTER`.
+const HP_GROUP: &str = "appr_hp_group";
+const GATE_POLICY: &str = "appr_hp_members";
+
+fn is_approval_required(err: &ClientError) -> bool {
+    matches!(
+        err,
+        ClientError::Http(
+            StatusCode::FORBIDDEN,
+            Some(OperationError::AP0002ApprovalRequired),
+            _
+        )
+    )
+}
+
+fn is_not_usable(err: &ClientError) -> bool {
+    matches!(
+        err,
+        ClientError::Http(
+            StatusCode::CONFLICT,
+            Some(OperationError::AP0003ApprovalNotUsable),
+            _
+        )
+    )
+}
+
+async fn hp_group_members(rsclient: &KubidmClient) -> Vec<String> {
+    login_idm_admin(rsclient).await;
+    rsclient
+        .idm_group_get_members(HP_GROUP)
+        .await
+        .expect("Failed to get members")
+        .unwrap_or_default()
+}
+
+/// Opt-in gate on high privilege membership, end to end: no gate without a policy; with
+/// one, the direct add is refused, the requester files a request, an approver approves,
+/// and the requester executes it once; disabling the policy turns the gate off.
+#[kubidmd_testkit::test]
+async fn test_approval_gate_high_privilege_member(rsclient: &KubidmClient) {
+    setup_directory(rsclient).await;
+    let approver_a = person_uuid(rsclient, APPROVER_A).await;
+    let approver_b = person_uuid(rsclient, APPROVER_B).await;
+
+    rsclient
+        .idm_group_create(HP_GROUP, Some(REQUESTER))
+        .await
+        .expect("Failed to create the high privilege group");
+    rsclient
+        .idm_group_add_members("idm_approval_admins", &[HP_GROUP])
+        .await
+        .expect("Failed to nest the group into a high privilege group");
+    let hp_group_uuid = rsclient
+        .idm_group_get(HP_GROUP)
+        .await
+        .expect("Failed to get the group")
+        .and_then(|e| e.attrs.get("uuid").and_then(|v| v.first().cloned()))
+        .expect("Unable to read the group uuid");
+
+    // No policy: the manager adds and removes members as before.
+    login_person(rsclient, REQUESTER).await;
+    rsclient
+        .idm_group_add_members(HP_GROUP, &[APPROVER_B])
+        .await
+        .expect("Without a policy the add must work");
+    rsclient
+        .idm_group_remove_members(HP_GROUP, &[APPROVER_B])
+        .await
+        .expect("Failed to remove the member");
+
+    // An approval admin enables the gate.
+    login_idm_admin(rsclient).await;
+    let mut policy = policy_request(GATE_POLICY, ApprovalPattern::AnyOne, vec![approver_a]);
+    policy.operation_types = vec![ApprovalOperationType::GroupMembershipHighPrivilege];
+    rsclient
+        .approval_policy_create(&policy)
+        .await
+        .expect("Failed to create approval policy");
+
+    login_person(rsclient, REQUESTER).await;
+    let err = rsclient
+        .idm_group_add_members(HP_GROUP, &[APPROVER_B])
+        .await
+        .expect_err("The add must be gated");
+    assert!(is_approval_required(&err), "unexpected error: {err:?}");
+
+    // File a request, which needs well formed details.
+    let mut request = ApprovalRequestCreateRequest {
+        policy_name: GATE_POLICY.to_string(),
+        operation_type: ApprovalOperationType::GroupMembershipHighPrivilege,
+        target: hp_group_uuid.clone(),
+        operation_details: BTreeMap::from([("member".to_string(), APPROVER_B.to_string())]),
+    };
+    let err = rsclient
+        .approval_request_create(&request)
+        .await
+        .expect_err("A member that is not a uuid must be refused");
+    assert!(
+        matches!(
+            err,
+            ClientError::Http(
+                StatusCode::BAD_REQUEST,
+                Some(OperationError::InvalidAttribute(_)),
+                _
+            )
+        ),
+        "unexpected error: {err:?}"
+    );
+    request.operation_details = BTreeMap::from([("member".to_string(), approver_b.to_string())]);
+    let request_uuid = rsclient
+        .approval_request_create(&request)
+        .await
+        .expect("Failed to create approval request")
+        .to_string();
+
+    // Not approved yet: 409.
+    let err = rsclient
+        .approval_request_execute(&request_uuid)
+        .await
+        .expect_err("A pending request can not be executed");
+    assert!(is_not_usable(&err), "unexpected error: {err:?}");
+    // A malformed uuid is a bad request.
+    let err = rsclient
+        .approval_request_execute("not-a-uuid")
+        .await
+        .expect_err("A malformed uuid must be refused");
+    assert!(
+        matches!(err, ClientError::Http(StatusCode::BAD_REQUEST, _, _)),
+        "unexpected error: {err:?}"
+    );
+    // The requester can read their own request.
+    let own = rsclient
+        .approval_request_get(&request_uuid)
+        .await
+        .expect("The requester may read their request");
+    assert_eq!(own.state, ApprovalRequestState::Pending);
+
+    login_person(rsclient, APPROVER_A).await;
+    rsclient
+        .approval_request_approve(&request_uuid, None)
+        .await
+        .expect("Failed to approve");
+
+    // Only the requester may execute it.
+    login_person(rsclient, APPROVER_B).await;
+    let err = rsclient
+        .approval_request_execute(&request_uuid)
+        .await
+        .expect_err("Only the requester may execute");
+    assert!(
+        matches!(
+            err,
+            ClientError::Http(StatusCode::FORBIDDEN, Some(OperationError::AccessDenied), _)
+        ),
+        "unexpected error: {err:?}"
+    );
+    assert!(!hp_group_members(rsclient)
+        .await
+        .iter()
+        .any(|m| m.starts_with(APPROVER_B)));
+
+    login_person(rsclient, REQUESTER).await;
+    rsclient
+        .approval_request_execute(&request_uuid)
+        .await
+        .expect("Failed to execute the approved request");
+    // Once only.
+    let err = rsclient
+        .approval_request_execute(&request_uuid)
+        .await
+        .expect_err("A consumed request can not be executed again");
+    assert!(is_not_usable(&err), "unexpected error: {err:?}");
+
+    assert!(hp_group_members(rsclient)
+        .await
+        .iter()
+        .any(|m| m.starts_with(APPROVER_B)));
+    let request = rsclient
+        .approval_request_get(&request_uuid)
+        .await
+        .expect("Failed to get approval request");
+    assert_eq!(request.state, ApprovalRequestState::Consumed);
+    // Approval admins see what the member is.
+    let member = request
+        .operation_member
+        .expect("The member is described to approval admins");
+    assert_eq!(member.uuid, approver_b);
+    assert_eq!(member.name.as_deref(), Some(APPROVER_B));
+
+    // Break-glass: disabling the policy turns the gate off.
+    rsclient
+        .approval_policy_disable(GATE_POLICY)
+        .await
+        .expect("Failed to disable the policy");
+    login_person(rsclient, REQUESTER).await;
+    rsclient
+        .idm_group_add_members(HP_GROUP, &[APPROVER_A])
+        .await
+        .expect("With the policy disabled the add must work");
+
+    // A request can not be filed under a disabled policy: 409, not 500.
+    let err = rsclient
+        .approval_request_create(&ApprovalRequestCreateRequest {
+            policy_name: GATE_POLICY.to_string(),
+            operation_type: ApprovalOperationType::GroupMembershipHighPrivilege,
+            target: hp_group_uuid.clone(),
+            operation_details: BTreeMap::from([("member".to_string(), approver_b.to_string())]),
+        })
+        .await
+        .expect_err("A disabled policy accepts no requests");
+    assert!(is_not_usable(&err), "unexpected error: {err:?}");
 }

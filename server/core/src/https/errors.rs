@@ -105,6 +105,12 @@ impl IntoResponse for WebError {
                     OperationError::SystemProtectedObject | OperationError::AccessDenied => {
                         (StatusCode::FORBIDDEN, None)
                     }
+                    // Kubidm: the change is allowed by the access controls, but an enabled
+                    // approval policy requires it to go through an approval request.
+                    OperationError::AP0002ApprovalRequired => (StatusCode::FORBIDDEN, None),
+                    // Kubidm: the request is understood, but the approval request it names
+                    // can not be used in its current state.
+                    OperationError::AP0003ApprovalNotUsable => (StatusCode::CONFLICT, None),
 
                     OperationError::NoMatchingEntries => (StatusCode::NOT_FOUND, None),
                     OperationError::PasswordQuality(_)
@@ -156,5 +162,25 @@ mod tests {
         let err = WebError::OperationError(OperationError::AP0001ApprovalQuorumUnreachable);
         let response = err.into_response();
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[test]
+    fn test_approval_required_error_response() {
+        use super::*;
+        use axum::response::IntoResponse;
+
+        let err = WebError::OperationError(OperationError::AP0002ApprovalRequired);
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn test_approval_not_usable_error_response() {
+        use super::*;
+        use axum::response::IntoResponse;
+
+        let err = WebError::OperationError(OperationError::AP0003ApprovalNotUsable);
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
     }
 }

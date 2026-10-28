@@ -28,10 +28,12 @@
 //! (a group's entry managers can not raise its cap).
 //!
 //! Grants on high privilege groups (`idm_high_privilege` itself and its direct or nested
-//! members) are refused, since approvals for high privilege membership are not wired up
-//! yet and an internal write would bypass them. Grants written before a group became high
-//! privilege grant nothing while it is (see `plugins::memberof`); they are listed as
-//! [`TimeBoundedMemberGrantState::Suppressed`] and can be revoked.
+//! members) are refused. Grants are written internally, so they would bypass the approval
+//! gate on high privilege membership (`plugins::approval_gate`), and they are not routed
+//! through approval requests: adding such a member permanently goes through
+//! `approval_request_execute` when the gate is enabled. Grants written before a group
+//! became high privilege grant nothing while it is (see `plugins::memberof`); they are
+//! listed as [`TimeBoundedMemberGrantState::Suppressed`] and can be revoked.
 //!
 //! # Cap
 //!
@@ -60,15 +62,17 @@ use time::OffsetDateTime;
 pub const DEFAULT_MAX_GRANT_DURATION_SECS: u32 = 90 * 24 * 60 * 60;
 
 /// What the caller may do with the members of a group.
-struct MemberRights {
-    read: bool,
-    add: bool,
-    remove: bool,
+pub(crate) struct MemberRights {
+    pub(crate) read: bool,
+    pub(crate) add: bool,
+    pub(crate) remove: bool,
 }
 
 /// Fetch `group` as the caller and evaluate the caller's rights over its `member`
-/// attribute through the access control engine.
-fn group_member_rights<'a, T: QueryServerTransaction<'a>>(
+/// attribute through the access control engine. Also used by
+/// `approval_request_execute`, which adds a member as the internal identity on behalf of
+/// the requester.
+pub(crate) fn group_member_rights<'a, T: QueryServerTransaction<'a>>(
     qs: &mut T,
     ident: &Identity,
     group: Uuid,
@@ -256,10 +260,12 @@ impl QueryServerWriteTransaction<'_> {
             )));
         }
 
-        // Kubidm: membership of a high privilege group is meant to be gated by approvals
-        // (`ApprovalOperationType::GroupMembershipHighPrivilege`), which is not wired up
-        // yet. Grants are written internally, so they would bypass such a gate. Until it
-        // exists, refuse grants on high privilege groups, including a group that became high
+        // Kubidm: adding a member to a high privilege group is gated on approval
+        // (`ApprovalOperationType::GroupMembershipHighPrivilege`, see
+        // `plugins::approval_gate` and `approval_request_execute`) once a policy covering it
+        // is enabled. Grants are written internally, so they would bypass that gate, and
+        // they are not routed through approval requests. Refuse grants on high privilege
+        // groups whether or not the gate is enabled, including a group that became high
         // privilege (by nesting) after it was enabled for time-bounded grants.
         if time_bounded_grants_suppressed(&entry) {
             security_access!(%ident, %group, "denied - time bounded grant on a high privilege group");

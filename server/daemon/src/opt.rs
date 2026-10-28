@@ -155,6 +155,24 @@ enum DomainSettingsCmds {
     Remigrate { level: Option<u32> },
 }
 
+#[derive(Debug, Subcommand)]
+enum ApprovalPolicyCmds {
+    /// Break-glass: disable an approval policy (or every enabled one with --all) through the
+    /// admin socket of the running server, as the server itself. Use this when no approval
+    /// admin is left to disable a policy, for example because the approval gate on high
+    /// privilege group membership prevents adding one back. Re-enable the policy afterwards
+    /// with `kubidm approval policy enable`.
+    #[clap(name = "disable")]
+    Disable {
+        /// The name of the policy to disable.
+        #[clap(required_unless_present = "all", conflicts_with = "all")]
+        name: Option<String>,
+        /// Disable every enabled approval policy.
+        #[clap(long)]
+        all: bool,
+    },
+}
+
 /// How `kubidmd maintenance` prints the response of the server.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum MaintenanceOutput {
@@ -504,6 +522,13 @@ enum KubidmdOpt {
     /// running server through its admin socket.
     #[clap(name = "maintenance")]
     Maintenance(MaintenanceOpt),
+
+    /// Approval policy break-glass through the admin socket of the running server.
+    #[clap(name = "approval-policy")]
+    ApprovalPolicy {
+        #[clap(subcommand)]
+        commands: ApprovalPolicyCmds,
+    },
 
     /// Print the program version and exit
     #[clap(name = "version")]

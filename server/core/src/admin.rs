@@ -18,7 +18,7 @@ use kubidmd_lib::maintenance::{
 };
 // The request types name these, so a client of the admin socket needs them too.
 pub use kubidmd_lib::maintenance::{MaintenanceOperation, ReplicationFence};
-use kubidmd_lib::prelude::{duration_from_epoch_now, IdmServer};
+use kubidmd_lib::prelude::{duration_from_epoch_now, IdmServer, OperationError};
 use kubidmd_lib::status::{DatabaseCheck, ReplicationStateTracker};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::error::Error;
@@ -105,6 +105,14 @@ pub enum AdminTaskRequest {
         operation_id: Uuid,
     },
     Reload,
+    /// Kubidm: break-glass for approval workflows. Disable the approval policy `name`, or
+    /// every enabled policy with `None`, as the internal system identity, which turns off
+    /// the approval gates they enable even when no one can act as an approval admin. A new
+    /// variant, so the wire form of the other requests is unchanged; only clients that know
+    /// [`AdminTaskResponse::ApprovalPoliciesDisabled`] send it.
+    ApprovalPolicyDisable {
+        name: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -200,6 +208,11 @@ pub enum AdminTaskResponse {
     RefreshStarted {
         supplier: String,
     },
+    /// The answer to [`AdminTaskRequest::ApprovalPolicyDisable`]: the names of the policies
+    /// that were enabled and are now disabled. Never sent for any other request.
+    ApprovalPoliciesDisabled {
+        names: Vec<String>,
+    },
 }
 
 impl std::fmt::Debug for AdminTaskResponse {
@@ -277,6 +290,9 @@ impl std::fmt::Debug for AdminTaskResponse {
             }
             AdminTaskResponse::RefreshStarted { supplier } => {
                 write!(f, "RefreshStarted {{ supplier: {:?} }}", supplier)
+            }
+            AdminTaskResponse::ApprovalPoliciesDisabled { names } => {
+                write!(f, "ApprovalPoliciesDisabled {{ names: {:?} }}", names)
             }
         }
     }
@@ -853,10 +869,11 @@ impl AdminActor {
                     accept_res = listener.accept() => {
                         match accept_res {
                             Ok((socket, _addr)) => {
-                                if let Ok(ucred) = socket.peer_cred() {
+                                let peer_uid = if let Ok(ucred) = socket.peer_cred() {
                                     let incoming_uid = ucred.uid();
                                     if incoming_uid == 0 || incoming_uid == cuid {
-                                        info!(pid = ?ucred.pid(), "Allowing admin socket access");
+                                        info!(uid = %incoming_uid, pid = ?ucred.pid(), "Allowing admin socket access");
+                                        incoming_uid
                                     } else {
                                         warn!(%incoming_uid, "unauthorised user");
                                         continue;
@@ -872,6 +889,7 @@ impl AdminActor {
                                 tokio::spawn(async move {
                                     if let Err(e) = handle_client(
                                         socket,
+                                        peer_uid,
                                         server_rw,
                                         server_ro,
                                         task_repl_ctrl_tx,
@@ -1532,6 +1550,7 @@ async fn maintenance_resume(
 
 async fn handle_client(
     sock: UnixStream,
+    peer_uid: u32,
     server_rw: &'static QueryServerWriteV1,
     server_ro: &'static QueryServerReadV1,
     mut repl_ctrl_tx: Option<mpsc::Sender<ReplCtrl>>,
@@ -1582,6 +1601,29 @@ async fn handle_client(
                         Ok(()) => AdminTaskResponse::Success,
                         Err(e) => {
                             error!(err = ?e, "error during disable-account");
+                            AdminTaskResponse::Error
+                        }
+                    }
+                }
+                AdminTaskRequest::ApprovalPolicyDisable { name } => {
+                    info!(
+                        %peer_uid,
+                        policy = ?name,
+                        "break-glass: approval policy disable requested from the admin socket"
+                    );
+                    match server_rw
+                        .handle_admin_approval_policy_disable(name.clone(), eventid)
+                        .await
+                    {
+                        Ok(names) => AdminTaskResponse::ApprovalPoliciesDisabled { names },
+                        Err(OperationError::NoMatchingEntries) => AdminTaskResponse::ErrorMessage {
+                            message: format!(
+                                "no approval policy named {}",
+                                name.unwrap_or_default()
+                            ),
+                        },
+                        Err(e) => {
+                            error!(err = ?e, "error during approval-policy disable");
                             AdminTaskResponse::Error
                         }
                     }
@@ -2097,6 +2139,40 @@ mod maintenance_protocol_tests {
         assert!(ClientCodec
             .decode(&mut src)
             .is_err_and(|err| err.kind() == io::ErrorKind::InvalidData));
+    }
+
+    #[test]
+    fn approval_policy_disable_wire_format() {
+        // New variants, so existing requests and responses keep their form.
+        let req = serde_json::to_value(AdminTaskRequest::ApprovalPolicyDisable {
+            name: Some("hp".to_string()),
+        })
+        .expect("request should serialize");
+        assert_eq!(
+            req,
+            serde_json::json!({"ApprovalPolicyDisable": {"name": "hp"}})
+        );
+        let req = serde_json::to_value(AdminTaskRequest::ApprovalPolicyDisable { name: None })
+            .expect("request should serialize");
+        assert_eq!(
+            req,
+            serde_json::json!({"ApprovalPolicyDisable": {"name": null}})
+        );
+        assert_eq!(
+            serde_json::to_value(AdminTaskRequest::Reload).expect("request should serialize"),
+            serde_json::json!("Reload")
+        );
+
+        let mut src = BytesMut::from(r#"{"ApprovalPolicyDisable":{"name":null}}"#);
+        assert!(matches!(
+            ServerCodec.decode(&mut src),
+            Ok(Some(AdminTaskRequest::ApprovalPolicyDisable { name: None }))
+        ));
+        let mut src = BytesMut::from(r#"{"ApprovalPoliciesDisabled":{"names":["hp"]}}"#);
+        assert!(matches!(
+            ClientCodec.decode(&mut src),
+            Ok(Some(AdminTaskResponse::ApprovalPoliciesDisabled { ref names })) if names == &["hp".to_string()]
+        ));
     }
 
     #[test]
