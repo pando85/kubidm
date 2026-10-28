@@ -44,16 +44,45 @@ impl fmt::Display for AccountLinkPolicy {
 #[derive(Clone)]
 pub enum OAuth2SubjectVerifier {
     None,
-    Rfc7662TokenIntrospection { endpoint: Url },
+    Rfc7662TokenIntrospection {
+        endpoint: Url,
+    },
+    /// Kubidm: verify the OpenID Connect `id_token` of the token response, signed by a key
+    /// of `jwks_uri` and issued by `issuer`. When `introspection_endpoint` is also set,
+    /// the access token is introspected afterwards and both must pass.
+    OidcIdToken {
+        jwks_uri: Url,
+        issuer: Url,
+        introspection_endpoint: Option<Url>,
+    },
+}
+
+impl OAuth2SubjectVerifier {
+    /// Kubidm: how a login is verified, for logs.
+    pub(crate) fn mode(&self) -> &'static str {
+        match self {
+            OAuth2SubjectVerifier::None => "none",
+            OAuth2SubjectVerifier::Rfc7662TokenIntrospection { .. } => "introspection",
+            OAuth2SubjectVerifier::OidcIdToken {
+                introspection_endpoint: None,
+                ..
+            } => "id_token",
+            OAuth2SubjectVerifier::OidcIdToken {
+                introspection_endpoint: Some(_),
+                ..
+            } => "id_token+introspection",
+        }
+    }
 }
 
 /// A loaded `OAuth2Client` (upstream) or `OAuth2Federation` (Kubidm) provider.
 ///
-/// Kubidm: `jwks_uri`, `userinfo_endpoint`, `display_name`, `email_domains` and
-/// `federation_id` are reserved. They are stored and loaded but not used by the login
-/// flow, which only trusts the RFC 7662 introspection of the access token against a
-/// pre-linked account. `link_policy` is always `Manual`, and `idp_initiated_enabled` and
-/// `auto_discovery` are always false, because any other value is rejected at load.
+/// Kubidm: `userinfo_endpoint`, `display_name`, `email_domains` and `federation_id` are
+/// reserved. They are stored and loaded but not used by the login flow, which trusts the
+/// signed `id_token` (with `jwks_uri` and `issuer`) or the RFC 7662 introspection of the
+/// access token, against a pre-linked account. `link_policy` is always `Manual`, and
+/// `idp_initiated_enabled` and `auto_discovery` are always false, because any other
+/// value is rejected at load.
 #[derive(Clone)]
 #[allow(dead_code)]
 pub struct OAuth2ClientProvider {
@@ -496,6 +525,11 @@ fn oauth2_client_provider_from_entry(
     if let Some(endpoint) = maybe_rfc7662_endpoint.as_ref() {
         require_secure_endpoint_url(uuid, "token introspection", endpoint)?;
     }
+    // Kubidm: the keys of the JWKS decide which id_tokens are trusted, so it must not be
+    // fetched over plain http either.
+    if let Some(endpoint) = jwks_uri.as_ref() {
+        require_secure_endpoint_url(uuid, "jwks", endpoint)?;
+    }
 
     if is_federation {
         // Kubidm: users of a federation type their IdP password at the authorisation
@@ -503,22 +537,38 @@ fn oauth2_client_provider_from_entry(
         // providers keep their behaviour.
         require_secure_endpoint_url(uuid, "authorisation", &authorisation_endpoint)?;
 
-        // Kubidm: a login is only accepted once the access token is introspected, so a
-        // federation without an introspection endpoint would deny every user after they
-        // signed in at the IdP.
-        if maybe_rfc7662_endpoint.is_none() {
+        // Kubidm: a login is only accepted once the id_token is verified or the access
+        // token is introspected, so a federation with neither would deny every user after
+        // they signed in at the IdP.
+        if maybe_rfc7662_endpoint.is_none() && (jwks_uri.is_none() || issuer.is_none()) {
             error!(
                 ?uuid,
-                "OAuth2 federation is missing the token introspection endpoint, which is required to verify logins"
+                "OAuth2 federation needs a token introspection endpoint, or a jwks uri and an issuer, to verify logins"
             );
             return Err(OperationError::InvalidValueState);
         }
     }
 
-    let user_sub_verifier = match maybe_rfc7662_endpoint {
-        Some(endpoint) => OAuth2SubjectVerifier::Rfc7662TokenIntrospection { endpoint },
-        None => OAuth2SubjectVerifier::None,
+    let user_sub_verifier = match (jwks_uri.as_ref(), issuer.as_ref(), maybe_rfc7662_endpoint) {
+        // Kubidm: the id_token is preferred. If an introspection endpoint is also set, it
+        // is still used, and both must pass.
+        (Some(jwks_uri), Some(issuer), introspection_endpoint) => {
+            OAuth2SubjectVerifier::OidcIdToken {
+                jwks_uri: jwks_uri.clone(),
+                issuer: issuer.clone(),
+                introspection_endpoint,
+            }
+        }
+        (_, _, Some(endpoint)) => OAuth2SubjectVerifier::Rfc7662TokenIntrospection { endpoint },
+        (_, _, None) => OAuth2SubjectVerifier::None,
     };
+
+    info!(
+        ?uuid,
+        %name,
+        verifier = user_sub_verifier.mode(),
+        "Loaded OAuth2 client provider"
+    );
 
     let provider = OAuth2ClientProvider {
         name,
@@ -651,14 +701,22 @@ mod tests {
             provider.token_endpoint.as_str(),
             "https://idp.example.com/realms/main/token"
         );
-        // The introspection endpoint is in the federation schema and becomes the subject
-        // verifier. Without it every federation login is denied.
+        // With a jwks uri (and the required issuer), the id_token is verified. The
+        // introspection endpoint is also set, so it is used after the id_token.
         match &provider.user_sub_verifier {
-            OAuth2SubjectVerifier::Rfc7662TokenIntrospection { endpoint } => assert_eq!(
-                endpoint.as_str(),
-                "https://idp.example.com/realms/main/introspect"
-            ),
-            OAuth2SubjectVerifier::None => panic!("federation loaded without a verifier"),
+            OAuth2SubjectVerifier::OidcIdToken {
+                jwks_uri,
+                issuer,
+                introspection_endpoint,
+            } => {
+                assert_eq!(jwks_uri.as_str(), "https://idp.example.com/jwks");
+                assert_eq!(issuer.as_str(), "https://idp.example.com/realms/main");
+                assert_eq!(
+                    introspection_endpoint.as_ref().map(Url::as_str),
+                    Some("https://idp.example.com/realms/main/introspect")
+                );
+            }
+            _ => panic!("federation loaded without the id_token verifier"),
         }
 
         idms_prox_write.commit().expect("failed to commit");
@@ -1040,8 +1098,8 @@ mod tests {
         }
     }
 
-    /// Kubidm: the authorisation, token and introspection endpoints of a federation must
-    /// use https, except on loopback, and must not carry credentials.
+    /// Kubidm: the authorisation, token, introspection and jwks endpoints of a federation
+    /// must use https, except on loopback, and must not carry credentials.
     #[idm_test]
     async fn test_idm_oauth2_federation_backchannel_https(
         idms: &IdmServer,
@@ -1051,6 +1109,7 @@ mod tests {
             Attribute::OAuth2AuthorisationEndpoint,
             Attribute::OAuth2TokenEndpoint,
             Attribute::OAuth2TokenIntrospectEndpoint,
+            Attribute::OAuth2JwksUri,
         ] {
             for url in [
                 "http://idp.example.com/endpoint",
@@ -1085,14 +1144,111 @@ mod tests {
             Attribute::OAuth2TokenIntrospectEndpoint,
             url_value("http://127.0.0.1:8443/introspect"),
         );
+        replace_ava(
+            &mut entry,
+            Attribute::OAuth2JwksUri,
+            url_value("http://127.0.0.1:8443/jwks"),
+        );
         commit_provider(idms, entry)
             .await
             .expect("loopback http endpoints must be accepted");
     }
 
-    /// Kubidm: a federation without an introspection endpoint is rejected when it is
-    /// created or modified, since every login through it would be denied. One already
-    /// stored is skipped at startup.
+    /// Kubidm: a federation with a jwks uri (and the required issuer) verifies the
+    /// id_token, and needs no introspection endpoint. Removing the introspection
+    /// endpoint from it is accepted, removing the jwks uri as well is not.
+    #[idm_test]
+    async fn test_idm_oauth2_federation_id_token_verifier(
+        idms: &IdmServer,
+        _idms_delayed: &mut IdmServerDelayed,
+    ) {
+        let verifier = |uuid: Uuid| async move {
+            let idms_prox_write = idms.proxy_write(duration_from_epoch_now()).await.unwrap();
+            idms_prox_write
+                .oauth2_client_providers
+                .get(&uuid)
+                .map(|p| p.user_sub_verifier.clone())
+        };
+
+        let uuid = Uuid::new_v4();
+        let mut entry = federation_entry(uuid, "id_token_federation");
+        entry.remove_ava(&Attribute::OAuth2TokenIntrospectEndpoint);
+        entry.add_ava(
+            Attribute::OAuth2JwksUri,
+            url_value("https://idp.example.com/jwks"),
+        );
+        commit_provider(idms, entry)
+            .await
+            .expect("a federation with a jwks uri must be accepted");
+        match verifier(uuid).await {
+            Some(OAuth2SubjectVerifier::OidcIdToken {
+                jwks_uri,
+                issuer,
+                introspection_endpoint: None,
+            }) => {
+                assert_eq!(jwks_uri.as_str(), "https://idp.example.com/jwks");
+                assert_eq!(issuer.as_str(), "https://idp.example.com/");
+            }
+            _ => panic!("expected the id_token verifier without introspection"),
+        }
+
+        // Both configured: the id_token verifier, followed by introspection.
+        let both_uuid = Uuid::new_v4();
+        let mut entry = federation_entry(both_uuid, "both_federation");
+        entry.add_ava(
+            Attribute::OAuth2JwksUri,
+            url_value("https://idp.example.com/jwks"),
+        );
+        commit_provider(idms, entry)
+            .await
+            .expect("a federation with both verifiers must be accepted");
+        assert!(matches!(
+            verifier(both_uuid).await,
+            Some(OAuth2SubjectVerifier::OidcIdToken {
+                introspection_endpoint: Some(_),
+                ..
+            })
+        ));
+
+        // Dropping introspection keeps the id_token verifier.
+        let mut idms_prox_write = idms.proxy_write(duration_from_epoch_now()).await.unwrap();
+        idms_prox_write
+            .qs_write
+            .internal_modify_uuid(
+                both_uuid,
+                &ModifyList::new_purge(Attribute::OAuth2TokenIntrospectEndpoint),
+            )
+            .expect("the entry itself is schema valid");
+        idms_prox_write
+            .commit()
+            .expect("dropping introspection must be accepted when a jwks uri is set");
+        assert!(matches!(
+            verifier(both_uuid).await,
+            Some(OAuth2SubjectVerifier::OidcIdToken {
+                introspection_endpoint: None,
+                ..
+            })
+        ));
+
+        // Dropping the jwks uri too leaves no verifier, which is rejected.
+        let mut idms_prox_write = idms.proxy_write(duration_from_epoch_now()).await.unwrap();
+        idms_prox_write
+            .qs_write
+            .internal_modify_uuid(both_uuid, &ModifyList::new_purge(Attribute::OAuth2JwksUri))
+            .expect("the entry itself is schema valid");
+        assert_eq!(
+            idms_prox_write.commit(),
+            Err(OperationError::InvalidValueState)
+        );
+        assert!(matches!(
+            verifier(both_uuid).await,
+            Some(OAuth2SubjectVerifier::OidcIdToken { .. })
+        ));
+    }
+
+    /// Kubidm: a federation with neither an introspection endpoint nor a jwks uri is
+    /// rejected when it is created or modified, since every login through it would be
+    /// denied. One already stored is skipped at startup.
     #[idm_test]
     async fn test_idm_oauth2_federation_requires_introspection(
         idms: &IdmServer,

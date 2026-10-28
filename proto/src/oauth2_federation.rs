@@ -37,9 +37,38 @@ pub struct OAuth2ClientIntrospectResponse {
     pub exp: Option<i64>,
 }
 
+/// The claims of an OpenID Connect `id_token` issued by an upstream identity provider,
+/// as far as a federation login checks them.
+///
+/// Like [OAuth2ClientIntrospectResponse] this is lenient: every claim is optional here
+/// (the login denies a token that lacks a required one), `aud` may be a string or an
+/// array, and unknown claims are ignored. This type is only ever read from a token whose
+/// signature was verified.
+#[serde_as]
+#[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq, Eq)]
+pub struct OAuth2ClientIdTokenClaims {
+    #[serde(default)]
+    pub iss: Option<String>,
+    #[serde(default)]
+    pub sub: Option<String>,
+    #[serde(default)]
+    #[serde_as(as = "DefaultOnNull<OneOrMany<_, PreferMany>>")]
+    pub aud: Vec<String>,
+    #[serde(default)]
+    pub azp: Option<String>,
+    #[serde(default)]
+    pub exp: Option<i64>,
+    #[serde(default)]
+    pub iat: Option<i64>,
+    #[serde(default)]
+    pub nbf: Option<i64>,
+    #[serde(default)]
+    pub nonce: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
-    use super::OAuth2ClientIntrospectResponse;
+    use super::{OAuth2ClientIdTokenClaims, OAuth2ClientIntrospectResponse};
 
     fn parse(json: &str) -> OAuth2ClientIntrospectResponse {
         match serde_json::from_str(json) {
@@ -110,5 +139,38 @@ mod tests {
 
         // `active` is the one required field.
         assert!(serde_json::from_str::<OAuth2ClientIntrospectResponse>(r#"{"sub":"x"}"#).is_err());
+    }
+
+    #[test]
+    fn test_oauth2_client_id_token_claims() {
+        // Abridged Google id_token claims: a single `aud` string, extra claims.
+        let claims: OAuth2ClientIdTokenClaims = serde_json::from_str(
+            r#"{
+                "iss": "https://accounts.google.com", "azp": "kubidm", "aud": "kubidm",
+                "sub": "110169484474386276334", "email": "alice@example.com",
+                "email_verified": true, "at_hash": "abc", "nonce": "n-0S6_WzA2Mj",
+                "iat": 1761649700, "exp": 1761653300
+            }"#,
+        )
+        .expect("must parse");
+        assert_eq!(claims.iss.as_deref(), Some("https://accounts.google.com"));
+        assert_eq!(claims.aud, vec!["kubidm"]);
+        assert_eq!(claims.azp.as_deref(), Some("kubidm"));
+        assert_eq!(claims.sub.as_deref(), Some("110169484474386276334"));
+        assert_eq!(claims.nonce.as_deref(), Some("n-0S6_WzA2Mj"));
+        assert_eq!(claims.iat, Some(1761649700));
+        assert_eq!(claims.exp, Some(1761653300));
+        assert_eq!(claims.nbf, None);
+
+        // An `aud` array, and explicit nulls treated as absent.
+        let claims: OAuth2ClientIdTokenClaims =
+            serde_json::from_str(r#"{"aud":["kubidm","other"],"azp":null,"nonce":null}"#)
+                .expect("must parse");
+        assert_eq!(claims.aud, vec!["kubidm", "other"]);
+        assert_eq!(claims.azp, None);
+        assert_eq!(claims.nonce, None);
+
+        let claims: OAuth2ClientIdTokenClaims = serde_json::from_str("{}").expect("must parse");
+        assert_eq!(claims, OAuth2ClientIdTokenClaims::default());
     }
 }

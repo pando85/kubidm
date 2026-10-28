@@ -1,6 +1,6 @@
 use super::{
-    CredState, BAD_AUTH_TYPE_MSG, BAD_OAUTH2_CSRF_STATE_MSG, BAD_OAUTH2_SESSION_MSG,
-    BAD_OAUTH2_SUBJECT_MSG,
+    CredState, BAD_AUTH_TYPE_MSG, BAD_OAUTH2_CSRF_STATE_MSG, BAD_OAUTH2_ID_TOKEN_MSG,
+    BAD_OAUTH2_SESSION_MSG, BAD_OAUTH2_SUBJECT_MSG,
 };
 use crate::{
     idm::{
@@ -8,11 +8,15 @@ use crate::{
         authentication::{AuthCredential, AuthExternal},
         oauth2::PkceS256Secret,
         oauth2_client::{OAuth2ClientProvider, OAuth2SubjectVerifier},
+        oauth2_client_id_token::{
+            parse_id_token, verify_id_token, IdTokenError, IdTokenExpectations,
+        },
     },
     prelude::*,
     utils,
     value::{AuthType, SessionExtMetadata},
 };
+use compact_jwt::{Jwk, JwsCompact};
 use kubidm_proto::{
     oauth2::{
         AccessTokenIntrospectRequest, AccessTokenRequest, AccessTokenResponse,
@@ -26,6 +30,15 @@ use std::{collections::BTreeSet, fmt};
 enum SessionState {
     Init,
     AccessTokenRequested,
+    /// Kubidm: waiting for the provider's JWKS to verify the `id_token`.
+    /// `jwks_refreshed` is set once a refresh of the JWKS was requested.
+    IdTokenUnverified {
+        id_token: Box<JwsCompact>,
+        access_expires_at: Duration,
+        access_token: String,
+        refresh_token: Option<String>,
+        jwks_refreshed: bool,
+    },
     AccessTokenUnverified {
         access_expires_at: Duration,
         access_token: String,
@@ -56,6 +69,8 @@ pub struct CredHandlerOAuth2Client {
     issuer: Option<Url>,
     pkce_secret: PkceS256Secret,
     csrf_state: String,
+    // Kubidm: the OIDC nonce, which the id_token must carry.
+    nonce: String,
 
     session_state: SessionState,
 }
@@ -80,11 +95,21 @@ impl CredHandlerOAuth2Client {
     ) -> Self {
         let pkce_secret = PkceS256Secret::default();
         let csrf_state = utils::password_from_random();
+        let nonce = utils::password_from_random();
+
+        // Kubidm: an id_token is only issued for the `openid` scope.
+        let mut request_scopes = client_provider.request_scopes.clone();
+        if matches!(
+            client_provider.user_sub_verifier,
+            OAuth2SubjectVerifier::OidcIdToken { .. }
+        ) {
+            request_scopes.insert("openid".to_string());
+        }
 
         CredHandlerOAuth2Client {
             provider_id: client_provider.uuid,
             provider_name: client_provider.name.clone(),
-            request_scopes: client_provider.request_scopes.clone(),
+            request_scopes,
             user_id: client_user_cred.user_id.to_string(),
             user_sub: client_user_cred.user_sub.to_string(),
             user_cred_id: client_user_cred.cred_id,
@@ -96,6 +121,7 @@ impl CredHandlerOAuth2Client {
             issuer: client_provider.issuer.clone(),
             pkce_secret,
             csrf_state,
+            nonce,
             user_sub_verifier: client_provider.user_sub_verifier.clone(),
             session_state: SessionState::Init,
         }
@@ -114,7 +140,8 @@ impl CredHandlerOAuth2Client {
                 state: Some(self.csrf_state.clone()),
                 pkce_request: Some(pkce_request),
                 scope: self.request_scopes.clone(),
-                nonce: None,
+                // Kubidm: bind the id_token to this auth session.
+                nonce: self.uses_id_token().then(|| self.nonce.clone()),
                 oidc_ext: AuthorisationRequestOidc {
                     login_hint: Some(self.user_id.clone()),
                     ..Default::default()
@@ -137,6 +164,25 @@ impl CredHandlerOAuth2Client {
                 SessionState::AccessTokenRequested,
                 AuthCredential::OAuth2AccessTokenResponse { response },
             ) => self.validate_access_token_response(response, current_time),
+
+            (
+                SessionState::IdTokenUnverified {
+                    id_token,
+                    access_expires_at,
+                    access_token,
+                    refresh_token,
+                    jwks_refreshed,
+                },
+                AuthCredential::OAuth2JwksResponse { keys },
+            ) => self.validate_id_token(
+                keys,
+                id_token,
+                access_token,
+                refresh_token,
+                access_expires_at,
+                jwks_refreshed,
+                current_time,
+            ),
 
             (
                 SessionState::AccessTokenUnverified {
@@ -204,31 +250,196 @@ impl CredHandlerOAuth2Client {
         // We have a positive response and now have the access and refresh tokens. However
         // now we need to assert the token belongs to our subject.
 
+        let access_expires_at = current_time + Duration::from_secs(response.expires_in as u64);
+
         match &self.user_sub_verifier {
             OAuth2SubjectVerifier::None => {
                 (SessionState::Finished, CredState::Denied(BAD_AUTH_TYPE_MSG))
             }
-            OAuth2SubjectVerifier::Rfc7662TokenIntrospection { endpoint } => {
-                let request = AccessTokenIntrospectRequest::from(response.access_token.clone());
-
-                let access_expires_at =
-                    current_time + Duration::from_secs(response.expires_in as u64);
+            OAuth2SubjectVerifier::Rfc7662TokenIntrospection { endpoint } => self
+                .introspection_request(
+                    endpoint,
+                    response.access_token.clone(),
+                    response.refresh_token.clone(),
+                    access_expires_at,
+                ),
+            // Kubidm: verify the id_token first. Its signature needs the JWKS, which
+            // the caller fetches.
+            OAuth2SubjectVerifier::OidcIdToken { jwks_uri, .. } => {
+                let id_token = match response.id_token.as_deref().map(parse_id_token) {
+                    Some(Ok(id_token)) => id_token,
+                    Some(Err(reason)) => {
+                        error!(provider = %self.provider_name, "id_token {reason}, refusing to proceed");
+                        return (
+                            SessionState::Finished,
+                            CredState::Denied(BAD_OAUTH2_ID_TOKEN_MSG),
+                        );
+                    }
+                    None => {
+                        error!(provider = %self.provider_name, "token response has no id_token, refusing to proceed");
+                        return (
+                            SessionState::Finished,
+                            CredState::Denied(BAD_OAUTH2_ID_TOKEN_MSG),
+                        );
+                    }
+                };
 
                 (
-                    SessionState::AccessTokenUnverified {
+                    SessionState::IdTokenUnverified {
+                        id_token: Box::new(id_token),
+                        access_expires_at,
                         access_token: response.access_token.clone(),
                         refresh_token: response.refresh_token.clone(),
-                        access_expires_at,
+                        jwks_refreshed: false,
                     },
-                    CredState::External(AuthExternal::OAuth2AccessTokenIntrospectionRequest {
-                        introspection_url: endpoint.clone(),
-                        client_id: self.client_id.clone(),
-                        client_secret: self.client_basic_secret.clone(),
-                        request,
+                    CredState::External(AuthExternal::OAuth2JwksRequest {
+                        provider_id: self.provider_id,
+                        jwks_uri: jwks_uri.clone(),
+                        refresh: false,
                     }),
                 )
             }
         }
+    }
+
+    fn uses_id_token(&self) -> bool {
+        matches!(
+            self.user_sub_verifier,
+            OAuth2SubjectVerifier::OidcIdToken { .. }
+        )
+    }
+
+    fn introspection_request(
+        &self,
+        endpoint: &Url,
+        access_token: String,
+        refresh_token: Option<String>,
+        access_expires_at: Duration,
+    ) -> (SessionState, CredState) {
+        let request = AccessTokenIntrospectRequest::from(access_token.clone());
+
+        (
+            SessionState::AccessTokenUnverified {
+                access_token,
+                refresh_token,
+                access_expires_at,
+            },
+            CredState::External(AuthExternal::OAuth2AccessTokenIntrospectionRequest {
+                introspection_url: endpoint.clone(),
+                client_id: self.client_id.clone(),
+                client_secret: self.client_basic_secret.clone(),
+                request,
+            }),
+        )
+    }
+
+    /// Kubidm: verify the id_token with the keys of the provider's JWKS. When no key
+    /// matches, the JWKS is refreshed once (the IdP may have rotated its keys) before the
+    /// login is denied.
+    #[allow(clippy::too_many_arguments)]
+    fn validate_id_token(
+        &self,
+        keys: &[Jwk],
+        id_token: Box<JwsCompact>,
+        access_token: String,
+        refresh_token: Option<String>,
+        access_expires_at: Duration,
+        jwks_refreshed: bool,
+        current_time: Duration,
+    ) -> (SessionState, CredState) {
+        let OAuth2SubjectVerifier::OidcIdToken {
+            jwks_uri,
+            issuer,
+            introspection_endpoint,
+        } = &self.user_sub_verifier
+        else {
+            return (SessionState::Finished, CredState::Denied(BAD_AUTH_TYPE_MSG));
+        };
+
+        let expect = IdTokenExpectations {
+            issuer,
+            client_id: &self.client_id,
+            nonce: &self.nonce,
+            subject: &self.user_sub,
+        };
+
+        let denied = match verify_id_token(&id_token, keys, &expect, current_time) {
+            Ok(_) => None,
+            Err(IdTokenError::UnknownKey) if !jwks_refreshed => {
+                debug!(provider = %self.provider_name, "id_token key not in the JWKS, refreshing it");
+                return (
+                    SessionState::IdTokenUnverified {
+                        id_token,
+                        access_expires_at,
+                        access_token,
+                        refresh_token,
+                        jwks_refreshed: true,
+                    },
+                    CredState::External(AuthExternal::OAuth2JwksRequest {
+                        provider_id: self.provider_id,
+                        jwks_uri: jwks_uri.clone(),
+                        refresh: true,
+                    }),
+                );
+            }
+            Err(IdTokenError::UnknownKey) => Some((
+                "is signed by a key that is not in the JWKS",
+                BAD_OAUTH2_ID_TOKEN_MSG,
+            )),
+            Err(IdTokenError::Signature) => {
+                Some(("has an invalid signature", BAD_OAUTH2_ID_TOKEN_MSG))
+            }
+            Err(IdTokenError::Claims(reason)) => Some((reason, BAD_OAUTH2_ID_TOKEN_MSG)),
+            Err(IdTokenError::Subject) => Some((
+                "has a different subject than expected",
+                BAD_OAUTH2_SUBJECT_MSG,
+            )),
+        };
+
+        if let Some((reason, msg)) = denied {
+            error!(provider = %self.provider_name, "id_token {reason}, refusing to proceed");
+            return (SessionState::Finished, CredState::Denied(msg));
+        }
+
+        // Both verifiers are configured: the access token must pass introspection too.
+        if let Some(endpoint) = introspection_endpoint {
+            return self.introspection_request(
+                endpoint,
+                access_token,
+                refresh_token,
+                access_expires_at,
+            );
+        }
+
+        self.success(access_token, refresh_token, access_expires_at)
+    }
+
+    fn success(
+        &self,
+        access_token: String,
+        refresh_token: Option<String>,
+        access_expires_at: Duration,
+    ) -> (SessionState, CredState) {
+        // What is the credential id here? The provider id?
+        // How do we make sure that session plugin doesn't kill us?
+        let cred_id = self.user_cred_id;
+
+        // We need a way to bubble up extra session metadata now.
+        // Need to pass up the expiry, token, refresh token.
+        let ext_session_metadata = SessionExtMetadata::OAuth2 {
+            access_token,
+            refresh_token,
+            access_expires_at,
+        };
+
+        (
+            SessionState::Finished,
+            CredState::Success {
+                auth_type: AuthType::OAuth2Trust,
+                cred_id,
+                ext_session_metadata,
+            },
+        )
     }
 
     fn validate_access_token_introspection_response(
@@ -284,26 +495,7 @@ impl CredHandlerOAuth2Client {
             );
         }
 
-        // What is the credential id here? The provider id?
-        // How do we make sure that session plugin doesn't kill us?
-        let cred_id = self.user_cred_id;
-
-        // We need a way to bubble up extra session metadata now.
-        // Need to pass up the expiry, token, refresh token.
-        let ext_session_metadata = SessionExtMetadata::OAuth2 {
-            access_token,
-            refresh_token,
-            access_expires_at,
-        };
-
-        (
-            SessionState::Finished,
-            CredState::Success {
-                auth_type: AuthType::OAuth2Trust,
-                cred_id,
-                ext_session_metadata,
-            },
-        )
+        self.success(access_token, refresh_token, access_expires_at)
     }
 
     /// Kubidm: check the optional claims of an introspection response. Each is only
@@ -550,5 +742,389 @@ mod tests {
             Duration::from_secs(999),
         );
         assert!(matches!(cred_state, CredState::Success { .. }));
+    }
+
+    // =========================================
+    // Kubidm: the id_token verifier.
+
+    mod id_token {
+        use super::super::*;
+        use crate::idm::oauth2_client_id_token::test_idp::{
+            self, claims_with, Signer, CLIENT_ID, ISSUER, NOW, SUBJECT,
+        };
+        use kubidm_proto::oauth2::{AccessTokenType, IssuedTokenType};
+        use serde_json::json;
+
+        const INTROSPECT_URL: &str = "https://idp.example.com/introspect";
+        const JWKS_URI: &str = "https://idp.example.com/jwks";
+
+        fn now() -> Duration {
+            Duration::from_secs(NOW)
+        }
+
+        /// A handler for an id_token federation, optionally also with introspection.
+        fn handler(introspection: bool) -> CredHandlerOAuth2Client {
+            let mut provider = OAuth2ClientProvider::new_test(
+                CLIENT_ID,
+                "https://idp.example.com",
+                ["email"],
+                INTROSPECT_URL,
+            );
+            let issuer = Url::parse(ISSUER).expect("invalid test issuer");
+            provider.issuer = Some(issuer.clone());
+            provider.user_sub_verifier = OAuth2SubjectVerifier::OidcIdToken {
+                jwks_uri: Url::parse(JWKS_URI).expect("invalid test url"),
+                issuer,
+                introspection_endpoint: introspection
+                    .then(|| Url::parse(INTROSPECT_URL).expect("invalid test url")),
+            };
+            let cred = OAuth2AccountCredential {
+                provider: provider.uuid,
+                cred_id: Uuid::new_v4(),
+                user_id: "user".to_string(),
+                user_sub: SUBJECT.to_string(),
+            };
+            CredHandlerOAuth2Client::new(&provider, &cred)
+        }
+
+        fn token_response(id_token: Option<String>) -> AccessTokenResponse {
+            AccessTokenResponse {
+                access_token: "access_token".to_string(),
+                token_type: AccessTokenType::Bearer,
+                issued_token_type: Some(IssuedTokenType::AccessToken),
+                expires_in: 300,
+                refresh_token: None,
+                scope: BTreeSet::new(),
+                id_token,
+            }
+        }
+
+        /// Run the flow up to the token response, which carries `id_token`.
+        fn submit_id_token(
+            handler: &mut CredHandlerOAuth2Client,
+            id_token: Option<String>,
+        ) -> CredState {
+            let state = handler.csrf_state.clone();
+            let cred = AuthCredential::OAuth2AuthorisationResponse {
+                code: "code".to_string(),
+                state: Some(state),
+            };
+            assert!(matches!(
+                handler.validate(&cred, now()),
+                CredState::External(AuthExternal::OAuth2AccessTokenRequest { .. })
+            ));
+            let cred = AuthCredential::OAuth2AccessTokenResponse {
+                response: token_response(id_token),
+            };
+            handler.validate(&cred, now())
+        }
+
+        fn jwks(handler: &mut CredHandlerOAuth2Client, keys: Vec<Jwk>) -> CredState {
+            handler.validate(&AuthCredential::OAuth2JwksResponse { keys }, now())
+        }
+
+        fn is_jwks_request(state: &CredState, expect_refresh: bool) -> bool {
+            matches!(
+                state,
+                CredState::External(AuthExternal::OAuth2JwksRequest { jwks_uri, refresh, .. })
+                    if jwks_uri.as_str() == JWKS_URI && *refresh == expect_refresh
+            )
+        }
+
+        /// Claims valid for this handler's nonce.
+        fn claims(handler: &CredHandlerOAuth2Client) -> serde_json::Value {
+            claims_with(&json!({ "nonce": handler.nonce }))
+        }
+
+        /// The authorisation request asks for `openid` and carries the session nonce.
+        /// An introspection federation sends no nonce and keeps its scopes.
+        #[test]
+        fn test_oauth2_client_id_token_auth_request() {
+            let handler = handler(false);
+            let (_, request) = handler.start_auth_request();
+            assert_eq!(request.nonce.as_deref(), Some(handler.nonce.as_str()));
+            assert!(!handler.nonce.is_empty());
+            assert!(request.scope.contains("openid"));
+            assert!(request.scope.contains("email"));
+
+            // Every session has its own nonce.
+            assert_ne!(handler.nonce, self::handler(false).nonce);
+
+            let introspection = super::handler(Some(ISSUER));
+            let (_, request) = introspection.start_auth_request();
+            assert_eq!(request.nonce, None);
+            assert_eq!(
+                request.scope,
+                BTreeSet::from(["openid".to_string()]),
+                "the configured scopes are sent unchanged"
+            );
+        }
+
+        #[test]
+        fn test_oauth2_client_id_token_success() {
+            let mut handler = handler(false);
+            let signer = Signer::es256("key");
+            let id_token = signer.sign_with_kid(&claims(&handler));
+
+            let state = submit_id_token(&mut handler, Some(id_token));
+            assert!(is_jwks_request(&state, false));
+            assert!(matches!(
+                jwks(&mut handler, vec![signer.jwk()]),
+                CredState::Success { .. }
+            ));
+        }
+
+        /// The token response must carry a valid id_token.
+        #[test]
+        fn test_oauth2_client_id_token_missing_or_malformed() {
+            let hs256 = Signer::hs256().sign_with_kid(&test_idp::valid_claims());
+            for id_token in [None, Some("not-a-jwt".to_string()), Some(hs256)] {
+                let mut handler = handler(false);
+                assert!(matches!(
+                    submit_id_token(&mut handler, id_token),
+                    CredState::Denied(BAD_OAUTH2_ID_TOKEN_MSG)
+                ));
+                assert!(matches!(handler.session_state, SessionState::Finished));
+            }
+        }
+
+        /// An unknown key refreshes the JWKS once. Still unknown after the refresh: denied.
+        #[test]
+        fn test_oauth2_client_id_token_unknown_kid() {
+            let signer = Signer::es256("new-key");
+            let stale = Signer::es256("old-key");
+
+            let mut handler = handler(false);
+            let id_token = signer.sign_with_kid(&claims(&handler));
+            assert!(is_jwks_request(
+                &submit_id_token(&mut handler, Some(id_token)),
+                false
+            ));
+            assert!(is_jwks_request(
+                &jwks(&mut handler, vec![stale.jwk()]),
+                true
+            ));
+            assert!(matches!(
+                jwks(&mut handler, vec![stale.jwk()]),
+                CredState::Denied(BAD_OAUTH2_ID_TOKEN_MSG)
+            ));
+            assert!(matches!(handler.session_state, SessionState::Finished));
+
+            // The refreshed JWKS has the rotated key: accepted.
+            let mut handler = self::handler(false);
+            let id_token = signer.sign_with_kid(&claims(&handler));
+            submit_id_token(&mut handler, Some(id_token));
+            assert!(is_jwks_request(
+                &jwks(&mut handler, vec![stale.jwk()]),
+                true
+            ));
+            assert!(matches!(
+                jwks(&mut handler, vec![stale.jwk(), signer.jwk()]),
+                CredState::Success { .. }
+            ));
+        }
+
+        /// A bad signature is not retried with a refreshed JWKS.
+        #[test]
+        fn test_oauth2_client_id_token_bad_signature() {
+            let signer = Signer::es256("key");
+            let impostor = Signer::es256("key");
+            let mut handler = handler(false);
+            let id_token = impostor.sign_with_kid(&claims(&handler));
+            submit_id_token(&mut handler, Some(id_token));
+            assert!(matches!(
+                jwks(&mut handler, vec![signer.jwk()]),
+                CredState::Denied(BAD_OAUTH2_ID_TOKEN_MSG)
+            ));
+        }
+
+        /// The id_token must carry this session's nonce: one from another session (a
+        /// replayed token) is denied.
+        #[test]
+        fn test_oauth2_client_id_token_nonce_mismatch() {
+            let signer = Signer::es256("key");
+            let other_session = handler(false);
+            let mut handler = handler(false);
+            let id_token = signer.sign_with_kid(&claims(&other_session));
+            submit_id_token(&mut handler, Some(id_token));
+            assert!(matches!(
+                jwks(&mut handler, vec![signer.jwk()]),
+                CredState::Denied(BAD_OAUTH2_ID_TOKEN_MSG)
+            ));
+        }
+
+        #[test]
+        fn test_oauth2_client_id_token_claims_denied() {
+            let signer = Signer::es256("key");
+            for (changes, msg) in [
+                (json!({"sub": "attacker"}), BAD_OAUTH2_SUBJECT_MSG),
+                (
+                    json!({"iss": "https://evil.example.com"}),
+                    BAD_OAUTH2_ID_TOKEN_MSG,
+                ),
+                (json!({"aud": "other"}), BAD_OAUTH2_ID_TOKEN_MSG),
+                (json!({"exp": NOW - 3600}), BAD_OAUTH2_ID_TOKEN_MSG),
+            ] {
+                let mut handler = handler(false);
+                let mut claims = claims(&handler);
+                if let (Some(claims), Some(changes)) = (claims.as_object_mut(), changes.as_object())
+                {
+                    claims.extend(changes.clone());
+                }
+                submit_id_token(&mut handler, Some(signer.sign_with_kid(&claims)));
+                assert!(
+                    matches!(jwks(&mut handler, vec![signer.jwk()]), CredState::Denied(m) if m == msg),
+                    "{changes} must be denied with {msg:?}"
+                );
+            }
+        }
+
+        /// With introspection configured too, both must pass.
+        #[test]
+        fn test_oauth2_client_id_token_and_introspection() {
+            let signer = Signer::es256("key");
+            let valid_introspection = OAuth2ClientIntrospectResponse {
+                active: true,
+                sub: Some(SUBJECT.to_string()),
+                ..Default::default()
+            };
+
+            let mut handler = handler(true);
+            let id_token = signer.sign_with_kid(&claims(&handler));
+            submit_id_token(&mut handler, Some(id_token));
+            assert!(matches!(
+                jwks(&mut handler, vec![signer.jwk()]),
+                CredState::External(AuthExternal::OAuth2AccessTokenIntrospectionRequest {
+                    introspection_url,
+                    ..
+                }) if introspection_url.as_str() == INTROSPECT_URL
+            ));
+            let mut failed = handler.clone();
+            assert!(matches!(
+                handler.validate(
+                    &AuthCredential::OAuth2AccessTokenIntrospectResponse {
+                        response: valid_introspection.clone()
+                    },
+                    now()
+                ),
+                CredState::Success { .. }
+            ));
+            assert!(matches!(
+                failed.validate(
+                    &AuthCredential::OAuth2AccessTokenIntrospectResponse {
+                        response: OAuth2ClientIntrospectResponse {
+                            sub: Some("attacker".to_string()),
+                            ..valid_introspection.clone()
+                        }
+                    },
+                    now()
+                ),
+                CredState::Denied(BAD_OAUTH2_SUBJECT_MSG)
+            ));
+
+            // A bad id_token is denied before introspection.
+            let mut handler = self::handler(true);
+            let id_token = signer.sign_with_kid(&claims_with(&json!({"nonce": "wrong"})));
+            submit_id_token(&mut handler, Some(id_token));
+            assert!(matches!(
+                jwks(&mut handler, vec![signer.jwk()]),
+                CredState::Denied(BAD_OAUTH2_ID_TOKEN_MSG)
+            ));
+        }
+
+        /// The longest flow: an unknown key, a JWKS refresh that has it, then
+        /// introspection. Four external steps before the result (the login view allows
+        /// for them).
+        #[test]
+        fn test_oauth2_client_id_token_refresh_then_introspection() {
+            let signer = Signer::es256("rotated");
+            let stale = Signer::es256("old");
+            let mut handler = handler(true);
+            let id_token = signer.sign_with_kid(&claims(&handler));
+
+            assert!(is_jwks_request(
+                &submit_id_token(&mut handler, Some(id_token)),
+                false
+            ));
+            assert!(is_jwks_request(
+                &jwks(&mut handler, vec![stale.jwk()]),
+                true
+            ));
+            assert!(matches!(
+                jwks(&mut handler, vec![stale.jwk(), signer.jwk()]),
+                CredState::External(AuthExternal::OAuth2AccessTokenIntrospectionRequest { .. })
+            ));
+            assert!(matches!(
+                handler.validate(
+                    &AuthCredential::OAuth2AccessTokenIntrospectResponse {
+                        response: OAuth2ClientIntrospectResponse {
+                            active: true,
+                            sub: Some(SUBJECT.to_string()),
+                            ..Default::default()
+                        }
+                    },
+                    now()
+                ),
+                CredState::Success { .. }
+            ));
+        }
+
+        /// A token signed by provider A's key is never accepted by a session of provider
+        /// B: B asks for its own JWKS, and A's key is not in it, whatever the `kid`.
+        #[test]
+        fn test_oauth2_client_id_token_other_provider_key() {
+            let key_a = Signer::es256("key-a");
+            let key_b = Signer::es256("key-b");
+            let colliding_a = Signer::es256("key-b");
+
+            let mut handler_b = handler(false);
+            let provider_b = handler_b.provider_id;
+            assert_ne!(provider_b, handler(false).provider_id);
+
+            // A's kid: unknown to B, refreshed once, then denied.
+            let id_token = key_a.sign_with_kid(&claims(&handler_b));
+            let state = submit_id_token(&mut handler_b, Some(id_token));
+            assert!(matches!(
+                state,
+                CredState::External(AuthExternal::OAuth2JwksRequest { provider_id, .. })
+                    if provider_id == provider_b
+            ));
+            assert!(is_jwks_request(
+                &jwks(&mut handler_b, vec![key_b.jwk()]),
+                true
+            ));
+            assert!(matches!(
+                jwks(&mut handler_b, vec![key_b.jwk()]),
+                CredState::Denied(BAD_OAUTH2_ID_TOKEN_MSG)
+            ));
+
+            // A's key with B's kid: B's key is tried, and the signature fails.
+            let mut handler_b = handler(false);
+            let id_token = colliding_a.sign_with_kid(&claims(&handler_b));
+            submit_id_token(&mut handler_b, Some(id_token));
+            assert!(matches!(
+                jwks(&mut handler_b, vec![key_b.jwk()]),
+                CredState::Denied(BAD_OAUTH2_ID_TOKEN_MSG)
+            ));
+        }
+
+        /// The JWKS can not be submitted out of order, and an introspection federation
+        /// ignores an id_token entirely.
+        #[test]
+        fn test_oauth2_client_id_token_out_of_order() {
+            let signer = Signer::es256("key");
+            let mut handler = handler(false);
+            assert!(matches!(
+                jwks(&mut handler, vec![signer.jwk()]),
+                CredState::Denied(BAD_AUTH_TYPE_MSG)
+            ));
+
+            let mut introspection = super::handler(Some(ISSUER));
+            let id_token = signer.sign_with_kid(&test_idp::valid_claims());
+            assert!(matches!(
+                submit_id_token(&mut introspection, Some(id_token)),
+                CredState::External(AuthExternal::OAuth2AccessTokenIntrospectionRequest { .. })
+            ));
+        }
     }
 }
