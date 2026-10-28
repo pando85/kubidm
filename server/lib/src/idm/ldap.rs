@@ -728,6 +728,19 @@ impl LdapServer {
                     wr.gen_operror(format!("Unbound Connection {eventid}").as_str()),
                 )),
             },
+            ServerOps::Abandon { msgid } => {
+                // Per RFC 4511, abandon requests don't require a response.
+                // We acknowledge with a simple success result.
+                use ldap3_proto::proto::{LdapMsg, LdapOp, LdapResult, LdapResultCode};
+                let result = LdapResult {
+                    code: LdapResultCode::Success,
+                    matcheddn: String::new(),
+                    message: String::new(),
+                    referral: vec![],
+                };
+                let msg = LdapMsg::new(msgid, LdapOp::SearchResultDone(result));
+                Ok(LdapResponseState::Respond(msg))
+            }
         } // end match server op
     }
 
