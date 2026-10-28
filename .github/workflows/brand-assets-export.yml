@@ -21,7 +21,7 @@ jobs:
           fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: '3.15'
       - name: Install vector renderer
         run: python -m pip install --disable-pip-version-check 'pillow>=11' 'cairosvg>=2.7' 'brotli>=1.1'
       - name: Export approved T1.1 SVG assets
