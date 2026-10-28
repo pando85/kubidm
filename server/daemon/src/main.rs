@@ -145,6 +145,10 @@ async fn submit_admin_req_json(path: &str, req: AdminTaskRequest) -> ExitCode {
             );
             return ExitCode::FAILURE;
         }
+        Some(Ok(AdminTaskResponse::ErrorMessage { message })) => {
+            display_json_error("ResponseError", message);
+            return ExitCode::FAILURE;
+        }
         Some(Err(err)) => {
             display_json_error(err, "Error during admin task operation.");
             return ExitCode::FAILURE;
@@ -318,6 +322,10 @@ async fn submit_admin_req_human(path: &str, req: AdminTaskRequest) -> ExitCode {
             info!("Error - you should inspect the logs.");
             return ExitCode::FAILURE;
         }
+        Some(Ok(AdminTaskResponse::ErrorMessage { message })) => {
+            error!("Error - {message}");
+            return ExitCode::FAILURE;
+        }
         Some(Err(err)) => {
             error!(?err, "Error during admin task operation");
             return ExitCode::FAILURE;
@@ -329,6 +337,20 @@ async fn submit_admin_req_human(path: &str, req: AdminTaskRequest) -> ExitCode {
     };
 
     ExitCode::SUCCESS
+}
+
+/// The request `kubidmd refresh-replication-consumer` sends. `Err` is a usage error that
+/// must be reported before anything is sent to the server.
+fn refresh_replication_consumer_request(
+    proceed: bool,
+    from: Option<&str>,
+) -> Result<AdminTaskRequest, String> {
+    if !proceed {
+        return Err("Unwilling to proceed. Check --help.".to_string());
+    }
+    Ok(AdminTaskRequest::RefreshReplicationConsumer {
+        from: from.map(str::to_owned),
+    })
 }
 
 /// The `kubidmd maintenance` request a subcommand stands for. `Err` is a usage error that
@@ -1475,16 +1497,13 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
             )
             .await;
         }
-        KubidmdOpt::RefreshReplicationConsumer { proceed } => {
+        KubidmdOpt::RefreshReplicationConsumer { proceed, from } => {
             info!("Running refresh replication consumer ...");
-            if !proceed {
-                error!("Unwilling to proceed. Check --help.");
-            } else {
-                submit_admin_req_human(
-                    config.adminbindpath.as_str(),
-                    AdminTaskRequest::RefreshReplicationConsumer,
-                )
-                .await;
+            match refresh_replication_consumer_request(*proceed, from.as_deref()) {
+                Ok(req) => {
+                    submit_admin_req_human(config.adminbindpath.as_str(), req).await;
+                }
+                Err(message) => error!("{message}"),
             }
         }
         KubidmdOpt::RecoverAccount { name } => {
@@ -1716,6 +1735,42 @@ mod tests {
             generation: None,
             ranges: BTreeMap::new(),
         }
+    }
+
+    fn refresh_request(args: &[&str]) -> Result<AdminTaskRequest, String> {
+        let mut argv = vec!["kubidmd", "refresh-replication-consumer"];
+        argv.extend_from_slice(args);
+        match KubidmdParser::try_parse_from(argv)
+            .map_err(|err| err.to_string())?
+            .commands
+        {
+            KubidmdOpt::RefreshReplicationConsumer { proceed, from } => {
+                refresh_replication_consumer_request(proceed, from.as_deref())
+            }
+            _ => Err("not a refresh-replication-consumer command".to_string()),
+        }
+    }
+
+    #[test]
+    fn refresh_replication_consumer_maps_to_request() {
+        assert!(matches!(
+            refresh_request(&["--i-want-to-refresh-this-servers-database"]),
+            Ok(AdminTaskRequest::RefreshReplicationConsumer { from: None })
+        ));
+        assert!(matches!(
+            refresh_request(&[
+                "--i-want-to-refresh-this-servers-database",
+                "--from",
+                "repl://pod-1.example.com:8444",
+            ]),
+            Ok(AdminTaskRequest::RefreshReplicationConsumer { from: Some(ref from) })
+                if from == "repl://pod-1.example.com:8444"
+        ));
+        // Nothing is sent without the acknowledgement, with or without a source.
+        assert!(refresh_request(&[]).is_err());
+        assert!(refresh_request(&["--from", "repl://pod-1.example.com:8444"]).is_err());
+        // --from needs a value.
+        assert!(refresh_request(&["--i-want-to-refresh-this-servers-database", "--from"]).is_err());
     }
 
     #[test]

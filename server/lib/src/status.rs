@@ -114,6 +114,11 @@ pub struct PeerInfo {
     pub last_success: Option<u64>,
     /// Whether no sync with the peer succeeded within the stale window.
     pub stale: bool,
+    /// Whether the peer answered from another domain while this node holds replicated
+    /// content: this node refuses to be refreshed from it automatically (see
+    /// `ReplicationStateTracker::notify_replication_domain_mismatch`), and the peer stays
+    /// stale until an operator resolves the mismatch.
+    pub foreign_domain: bool,
 }
 
 /// Aggregate counts of replication peers.
@@ -128,6 +133,11 @@ pub struct PeerSummary {
     pub healthy: usize,
     /// Peers whose relationship is considered stale.
     pub stale: usize,
+    /// Peers that answered from another domain while this node holds replicated content
+    /// (the domain mismatch guard). They are also counted as stale, and need an operator:
+    /// this node is never refreshed from them automatically.
+    #[serde(default)]
+    pub foreign: usize,
 }
 
 impl PeerSummary {
@@ -136,6 +146,7 @@ impl PeerSummary {
             total: peers.len(),
             healthy: peers.iter().filter(|p| p.connected && !p.stale).count(),
             stale: peers.iter().filter(|p| p.stale).count(),
+            foreign: peers.iter().filter(|p| p.foreign_domain).count(),
         }
     }
 }
@@ -236,8 +247,15 @@ pub struct ReplicationStartup {
     /// The replication poll interval, the unit of the stale and failed thresholds.
     pub poll_interval: Duration,
     /// Whether the database shows that this node has synced from a supplier before, see
-    /// `QueryServer::replication_has_synced`.
+    /// `QueryServer::replication_has_synced`. This decides readiness at startup.
     pub has_synced: bool,
+    /// Whether this node must be treated as holding replicated content by the domain
+    /// mismatch guard (`ReplicationStateTracker::notify_replication_domain_mismatch`):
+    /// `has_synced`, or the replication state of the database could not be read. An
+    /// unreadable state is not proof of a sync, so it does not make the node ready, but it
+    /// is not proof of an empty node either, so the node is never refreshed automatically
+    /// from a peer in another domain.
+    pub sync_evidence: bool,
 }
 
 #[derive(Debug, Default)]
@@ -262,8 +280,8 @@ struct ReplicationTracking {
     /// makes the node ready, not evidence of anything, see `sync_evidence`.
     synced: bool,
     /// Durable evidence that this node holds replicated content: the database showed at
-    /// startup that it synced from a supplier before (`ReplicationStartup::has_synced`),
-    /// or a sync succeeded since. A node with this evidence is never refreshed
+    /// startup that it synced from a supplier before, or could not be read
+    /// (`ReplicationStartup::sync_evidence`), or a sync succeeded since. A node with this evidence is never refreshed
     /// automatically from a peer in another domain, see
     /// `ReplicationStateTracker::notify_replication_domain_mismatch`.
     sync_evidence: bool,
@@ -318,6 +336,7 @@ impl ReplicationTracking {
                 connected: peer.connected,
                 last_success: peer.last_success,
                 stale: self.peer_stale(peer, now),
+                foreign_domain: peer.foreign_domain,
             })
             .collect()
     }
@@ -417,7 +436,7 @@ impl ReplicationStateTracker {
                 started_at: now,
                 automatic_refresh: startup.automatic_refresh,
                 synced,
-                sync_evidence: startup.has_synced,
+                sync_evidence: startup.has_synced || startup.sync_evidence,
                 refreshing: false,
                 apply_failing_since: None,
                 last_apply_failure: None,
@@ -668,13 +687,25 @@ impl ReplicationStateTracker {
             .get_peers(now)
             .map(|peers| PeerSummary::from_peers(&peers));
 
+        // Peers held back by the domain mismatch guard look like unreachable ones in the
+        // state, but unlike them they never recover on their own: say so.
+        let foreign = peers.map(|peers| peers.foreign).unwrap_or_default();
         let message = match serving_ready {
+            ServingReadiness::Ready if foreign > 0 => {
+                format!("Degraded: {foreign} peer(s) in another domain; operator action required")
+            }
             ServingReadiness::Ready => "Ready to serve traffic".to_string(),
             ServingReadiness::NotReady => {
                 if database_health != DatabaseHealth::Healthy {
                     "Database health check failed".to_string()
                 } else if server_phase != "running" {
                     format!("Server not yet ready (phase: {})", server_phase)
+                } else if foreign > 0 {
+                    format!(
+                        "Replication state '{}' does not allow serving; {foreign} peer(s) in \
+                         another domain, operator action required",
+                        replication_state
+                    )
                 } else {
                     format!(
                         "Replication state '{}' does not allow serving",
@@ -767,6 +798,7 @@ mod tests {
                 automatic_refresh,
                 poll_interval: INTERVAL,
                 has_synced,
+                sync_evidence: has_synced,
             }),
             T0,
         );
@@ -1028,6 +1060,7 @@ mod tests {
                 total: 2,
                 healthy: 1,
                 stale: 1,
+                foreign: 0,
             })
         );
         assert_eq!(tracker.get_last_replication_failure(), Some(now));
@@ -1213,6 +1246,7 @@ mod tests {
                 total: 2,
                 healthy: 1,
                 stale: 0,
+                foreign: 0,
             })
         );
 
@@ -1331,6 +1365,7 @@ mod tests {
                 total: 2,
                 healthy: 1,
                 stale: 1,
+                foreign: 1,
             })
         );
 
@@ -1400,6 +1435,7 @@ mod tests {
                 total: 1,
                 healthy: 0,
                 stale: 1,
+                foreign: 1,
             })
         );
 
@@ -1480,6 +1516,115 @@ mod tests {
             ReplicationState::Healthy,
             ServingReadiness::Ready,
         );
+    }
+
+    #[test]
+    fn test_foreign_peer_is_reported_on_readiness() {
+        let tracker = replicated(&[PEER_1, PEER_2], true);
+        tracker.notify_replication_incremental_success(PEER_1, T0 + 10);
+        // An unreachable peer is stale, but not foreign: the usual message.
+        let status = tracker.build_readiness_status(T0 + 10 + STALE);
+        assert_eq!(status.replication_state, ReplicationState::Degraded);
+        assert_eq!(status.peers.map(|peers| peers.foreign), Some(0));
+        assert_eq!(status.message, "Ready to serve traffic");
+
+        // A peer in another domain is held back by the guard: a distinct message.
+        tracker.notify_replication_incremental_success(PEER_1, T0 + 20);
+        assert!(!tracker.notify_replication_domain_mismatch(PEER_2, T0 + 21));
+        let status = tracker.build_readiness_status(T0 + 21);
+        assert_eq!(status.serving_ready, ServingReadiness::Ready);
+        assert_eq!(status.replication_state, ReplicationState::Degraded);
+        assert_eq!(
+            status.peers,
+            Some(PeerSummary {
+                total: 2,
+                healthy: 1,
+                stale: 1,
+                foreign: 1,
+            })
+        );
+        assert_eq!(
+            status.message,
+            "Degraded: 1 peer(s) in another domain; operator action required"
+        );
+        let peers = tracker.get_peers(T0 + 21).unwrap_or_default();
+        assert!(peers
+            .iter()
+            .any(|peer| peer.url == PEER_2 && peer.foreign_domain && peer.stale));
+
+        // Once the peer answers normally again, it is no longer foreign.
+        tracker.notify_replication_incremental_success(PEER_2, T0 + 22);
+        let status = tracker.build_readiness_status(T0 + 22);
+        assert_eq!(status.peers.map(|peers| peers.foreign), Some(0));
+        assert_eq!(status.message, "Ready to serve traffic");
+    }
+
+    #[test]
+    fn test_peer_summary_without_foreign_deserialises() {
+        // A response of an older server, without the `foreign` count.
+        let summary: PeerSummary = serde_json::from_str(r#"{"total":2,"healthy":1,"stale":1}"#)
+            .expect("Failed to deserialize");
+        assert_eq!(
+            summary,
+            PeerSummary {
+                total: 2,
+                healthy: 1,
+                stale: 1,
+                foreign: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn test_unreadable_sync_state_guards_without_making_ready() {
+        // The replication state of the database could not be read at startup: the node is
+        // not ready until its first sync (as before), but it is never refreshed
+        // automatically from a peer in another domain either.
+        let tracker = ReplicationStateTracker::new();
+        tracker.mark_startup_complete(
+            Some(ReplicationStartup {
+                supplier_peers: vec![PEER_1.to_string()],
+                automatic_refresh: true,
+                poll_interval: INTERVAL,
+                has_synced: false,
+                sync_evidence: true,
+            }),
+            T0,
+        );
+        assert_state(
+            &tracker,
+            T0,
+            ReplicationState::CatchingUp,
+            ServingReadiness::NotReady,
+        );
+
+        assert!(!tracker.notify_replication_domain_mismatch(PEER_1, T0 + 1));
+        assert_state(
+            &tracker,
+            T0 + 1,
+            ReplicationState::CatchingUp,
+            ServingReadiness::NotReady,
+        );
+        let status = tracker.build_readiness_status(T0 + 1);
+        assert_eq!(status.peers.map(|peers| peers.foreign), Some(1));
+        assert_eq!(
+            status.message,
+            "Replication state 'catching_up' does not allow serving; 1 peer(s) in another \
+             domain, operator action required"
+        );
+
+        // A sync with a peer in the same domain makes it ready.
+        tracker.notify_replication_incremental_success(PEER_1, T0 + 2);
+        assert_state(
+            &tracker,
+            T0 + 2,
+            ReplicationState::Healthy,
+            ServingReadiness::Ready,
+        );
+
+        // Without the evidence, the same unsynced node is refreshed from the peer.
+        let tracker = replicated(&[PEER_1], false);
+        assert!(tracker.notify_replication_domain_mismatch(PEER_1, T0 + 1));
     }
 
     #[test]

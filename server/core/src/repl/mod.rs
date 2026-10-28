@@ -42,15 +42,61 @@ pub(crate) enum ReplCtrl {
     RenewCertificate {
         respond: oneshot::Sender<bool>,
     },
+    /// Refresh this node from a supplier: from the supplier `from` (its origin, matched as
+    /// [`peer_label`] names it) when given, otherwise from the first supplier task that
+    /// takes the refresh. `Err` when `from` names no configured supplier.
     RefreshConsumer {
-        respond: oneshot::Sender<mpsc::Receiver<()>>,
+        from: Option<String>,
+        respond: oneshot::Sender<Result<mpsc::Receiver<()>, String>>,
     },
 }
 
 #[derive(Debug, Clone)]
 enum ReplConsumerCtrl {
     Stop,
-    Refresh(Arc<Mutex<(bool, mpsc::Sender<()>)>>),
+    /// Refresh this node. Every supplier task receives it, and the first one that takes the
+    /// lock runs it, unless `from` restricts it to the task of one supplier (named as
+    /// [`peer_label`] names it).
+    Refresh {
+        refresh_coord: Arc<Mutex<(bool, mpsc::Sender<()>)>>,
+        from: Option<String>,
+    },
+}
+
+/// Whether the replication task of the supplier `peer_url` may run a refresh restricted to
+/// the supplier `from` (any supplier when `None`).
+fn refresh_is_for_peer(from: Option<&str>, peer_url: &str) -> bool {
+    from.is_none_or(|from| from == peer_url)
+}
+
+/// The supplier a manual refresh asked for with `--from`, named as [`peer_label`] names it.
+/// `Err` is a message for the operator: the origin is not a URL, or is not a configured
+/// supplier (`pull` or `mutual-pull`) of this node.
+fn refresh_source(repl_config: &ReplicationConfiguration, from: &str) -> Result<String, String> {
+    let suppliers: Vec<String> = repl_config
+        .manual
+        .iter()
+        .filter(|(_, node)| !matches!(node, RepNodeConfig::AllowPull { .. }))
+        .map(|(origin, _)| peer_label(origin))
+        .collect();
+
+    // Host names are not case sensitive, but the url crate keeps the case of the host of a
+    // `repl://` url: compare without it, and name the supplier as its task does.
+    let wanted = Url::parse(from.trim()).map(|origin| peer_label(&origin));
+    let found = wanted.ok().and_then(|wanted| {
+        suppliers
+            .iter()
+            .find(|supplier| supplier.eq_ignore_ascii_case(&wanted))
+            .cloned()
+    });
+    match found {
+        Some(supplier) => Ok(supplier),
+        None => Err(format!(
+            "'{from}' is not a replication supplier of this node, refusing to refresh. The \
+             configured suppliers (pull or mutual-pull) are: [{}]",
+            suppliers.join(", ")
+        )),
+    }
 }
 
 pub(crate) struct ReplicationServerHandles {
@@ -107,25 +153,19 @@ fn supplier_peers(repl_config: &ReplicationConfiguration) -> (Vec<String>, bool)
 /// peers are the `pull` and `mutual-pull` nodes: `allow-pull` nodes only pull from us.
 /// Whether this node has synced before only matters when a supplier is configured with
 /// `automatic_refresh`. It comes from the database; when that can not be read the node is
-/// treated as never synced, so it stays not ready until its first successful sync rather
-/// than serving content it can not vouch for.
+/// treated as never synced for readiness, so it stays not ready until its first successful
+/// sync rather than serving content it can not vouch for. It is however treated as holding
+/// replicated content by the domain mismatch guard, see [`startup_sync_state`].
 pub(crate) async fn replication_startup(
     repl_config: &ReplicationConfiguration,
     idms: &IdmServer,
 ) -> ReplicationStartup {
     let (supplier_peers, automatic_refresh) = supplier_peers(repl_config);
 
-    let has_synced = if automatic_refresh {
-        idms.replication_has_synced().await.unwrap_or_else(|err| {
-            error!(
-                ?err,
-                "Unable to read the replication state of the database, treating this node as \
-                 never synced."
-            );
-            false
-        })
+    let (has_synced, sync_evidence) = if automatic_refresh {
+        startup_sync_state(idms.replication_has_synced().await)
     } else {
-        false
+        (false, false)
     };
 
     ReplicationStartup {
@@ -133,6 +173,27 @@ pub(crate) async fn replication_startup(
         automatic_refresh,
         poll_interval: repl_config.get_task_poll_interval(),
         has_synced,
+        sync_evidence,
+    }
+}
+
+/// Whether this node has synced before, for readiness and for the domain mismatch guard,
+/// from the result of reading it from the database. An error is no proof of a sync, so the
+/// node is not ready until its first sync, but no proof of an empty node either: the guard
+/// must never let a peer in another domain replace content this node may hold.
+fn startup_sync_state<E: std::fmt::Debug>(has_synced: Result<bool, E>) -> (bool, bool) {
+    match has_synced {
+        Ok(has_synced) => (has_synced, has_synced),
+        Err(err) => {
+            error!(
+                ?err,
+                "Unable to read the replication state of the database. This node is treated \
+                 as never synced, so it is not ready until its first successful sync, and \
+                 as holding replicated content, so it is never refreshed automatically from \
+                 a peer in another domain."
+            );
+            (false, true)
+        }
     }
 }
 
@@ -573,12 +634,15 @@ async fn repl_run_consumer_inner(
             "Supplier {peer_url} is in a different domain from this node, which holds \
              replicated content. This node will not be refreshed from it automatically, as \
              that would replace its content with the supplier's: the supplier is reported \
-             stale and this node degraded. If the supplier is the one out of the domain (for \
-             example an empty or re-created node), refresh the supplier from this node. If \
-             the supplier's domain is the intended one (the cluster was intentionally \
-             rebuilt in a new domain), an operator must run \
-             `kubidmd refresh-replication-consumer --i-want-to-refresh-this-servers-database` \
-             on this node."
+             stale and this node degraded. Compare the domains with `kubidmd domain show`. \
+             If the supplier is the one out of the domain (for example an empty or re-created \
+             node), refresh the supplier from a node that holds the content: on the \
+             supplier, run `kubidmd refresh-replication-consumer \
+             --i-want-to-refresh-this-servers-database --from <origin of a node in this \
+             domain>`. If the supplier's domain is the intended one (the cluster was \
+             intentionally rebuilt in a new domain), an operator must run \
+             `kubidmd refresh-replication-consumer --i-want-to-refresh-this-servers-database \
+             --from {peer_url}` on this node."
         );
         return None;
     }
@@ -624,7 +688,10 @@ async fn repl_run_consumer_inner(
                 let refresh_coord = Arc::new(Mutex::new((false, tx)));
 
                 if task_tx
-                    .send(ReplConsumerCtrl::Refresh(refresh_coord))
+                    .send(ReplConsumerCtrl::Refresh {
+                        refresh_coord,
+                        from: None,
+                    })
                     .is_err()
                 {
                     error!("Unable to begin replication consumer refresh, tasks are unable to be notified.");
@@ -783,7 +850,12 @@ async fn repl_task(
             Ok(task) = task_rx.recv() => {
                 match task {
                     ReplConsumerCtrl::Stop => break,
-                    ReplConsumerCtrl::Refresh ( refresh_coord ) => {
+                    ReplConsumerCtrl::Refresh { refresh_coord, from } => {
+                        // A refresh restricted to another supplier is not ours to run.
+                        if !refresh_is_for_peer(from.as_deref(), &peer_url) {
+                            trace!("Refresh requested from another supplier, skipping.");
+                            continue;
+                        }
                         last_working_address = (repl_run_consumer_refresh(
                             refresh_coord,
                             &server_name,
@@ -1217,8 +1289,28 @@ async fn repl_acceptor(
                             continue 'event;
                         }
                         ReplCtrl::RefreshConsumer {
+                            from,
                             respond
                         } => {
+                            // Only the task of the requested supplier may run the refresh.
+                            let from = match from
+                                .as_deref()
+                                .map(|from| refresh_source(&repl_config, from))
+                                .transpose()
+                            {
+                                Ok(from) => from,
+                                Err(message) => {
+                                    error!("{message}");
+                                    if respond.send(Err(message)).is_err() {
+                                        warn!("Replication consumer refresh was requested, but requester disconnected");
+                                    }
+                                    continue 'event_inner
+                                }
+                            };
+                            if let Some(from) = &from {
+                                info!("Refreshing this node from the replication supplier {from}");
+                            }
+
                             // Indicate to consumer tasks that they should do a refresh.
                             let (tx, rx) = mpsc::channel(1);
 
@@ -1230,11 +1322,11 @@ async fn repl_acceptor(
                                 )
                             );
 
-                            if task_tx.send(ReplConsumerCtrl::Refresh(refresh_coord)).is_err() {
+                            if task_tx.send(ReplConsumerCtrl::Refresh { refresh_coord, from }).is_err() {
                                 error!("Unable to begin replication consumer refresh, tasks are unable to be notified.");
                             }
 
-                            if respond.send(rx).is_err() {
+                            if respond.send(Ok(rx)).is_err() {
                                 warn!("Replication consumer refresh was requested, but requester disconnected");
                             } else {
                                 trace!("Sent refresh comms channel to requester");
@@ -1295,7 +1387,9 @@ async fn repl_acceptor(
 
 #[cfg(test)]
 mod tests {
-    use super::{peer_label, supplier_peers};
+    use super::{
+        peer_label, refresh_is_for_peer, refresh_source, startup_sync_state, supplier_peers,
+    };
     use crate::repl::config::{RepNodeConfig, ReplicationConfiguration};
     use crypto_glue::{traits::DecodePem, x509::Certificate};
     use std::str::FromStr;
@@ -1396,5 +1490,98 @@ ta41VMU3u9UQfHxF
                 true
             )
         );
+    }
+
+    fn refresh_config() -> ReplicationConfiguration {
+        let mut repl_config = ReplicationConfiguration::default();
+        repl_config.manual.insert(
+            url("repl://pod-0.example.com:8444"),
+            RepNodeConfig::MutualPull {
+                partner_cert: cert(),
+                automatic_refresh: false,
+            },
+        );
+        repl_config.manual.insert(
+            url("repl://pod-1.example.com:8444"),
+            RepNodeConfig::Pull {
+                supplier_cert: cert(),
+                automatic_refresh: true,
+            },
+        );
+        repl_config.manual.insert(
+            url("repl://consumer.example.com:8444"),
+            RepNodeConfig::AllowPull {
+                consumer_cert: cert(),
+            },
+        );
+        repl_config
+    }
+
+    #[test]
+    fn refresh_source_matches_a_configured_supplier() {
+        let repl_config = refresh_config();
+        assert_eq!(
+            refresh_source(&repl_config, "repl://pod-0.example.com:8444"),
+            Ok("repl://pod-0.example.com:8444".to_string())
+        );
+        // Matched as the peer is named: any path is ignored, the host is not case
+        // sensitive.
+        assert_eq!(
+            refresh_source(&repl_config, " repl://POD-1.example.com:8444/ "),
+            Ok("repl://pod-1.example.com:8444".to_string())
+        );
+    }
+
+    #[test]
+    fn refresh_source_rejects_anything_else() {
+        let repl_config = refresh_config();
+        for from in [
+            // Not configured.
+            "repl://pod-2.example.com:8444",
+            // Another port.
+            "repl://pod-0.example.com:9444",
+            // Only a consumer of this node.
+            "repl://consumer.example.com:8444",
+            // Not a URL.
+            "pod-0",
+            "",
+        ] {
+            let err = refresh_source(&repl_config, from).expect_err(from);
+            assert!(
+                err.contains("is not a replication supplier of this node"),
+                "{err}"
+            );
+            // The message lists what can be used instead, but no consumer.
+            assert!(err.contains("repl://pod-0.example.com:8444"), "{err}");
+            assert!(err.contains("repl://pod-1.example.com:8444"), "{err}");
+            assert!(!err.contains("[repl://consumer"), "{err}");
+        }
+        assert!(
+            refresh_source(&ReplicationConfiguration::default(), "repl://a.example.com")
+                .is_err_and(|err| err.ends_with("[]"))
+        );
+    }
+
+    #[test]
+    fn refresh_runs_only_on_the_requested_task() {
+        // Without --from every supplier task may take the refresh.
+        assert!(refresh_is_for_peer(None, "repl://pod-0.example.com:8444"));
+        assert!(refresh_is_for_peer(None, "repl://pod-1.example.com:8444"));
+
+        // With --from only the task of that supplier runs it.
+        let from = refresh_source(&refresh_config(), "repl://pod-1.example.com:8444").ok();
+        let from = from.as_deref();
+        assert!(refresh_is_for_peer(from, "repl://pod-1.example.com:8444"));
+        assert!(!refresh_is_for_peer(from, "repl://pod-0.example.com:8444"));
+    }
+
+    #[test]
+    fn startup_sync_state_guards_when_unreadable() {
+        // (has_synced for readiness, sync_evidence for the domain mismatch guard)
+        assert_eq!(startup_sync_state::<()>(Ok(true)), (true, true));
+        assert_eq!(startup_sync_state::<()>(Ok(false)), (false, false));
+        // An error is never a reason to become ready, nor to be refreshed from a peer in
+        // another domain.
+        assert_eq!(startup_sync_state(Err("db error")), (false, true));
     }
 }

@@ -353,31 +353,39 @@ impl QueryServerWriteTransaction<'_> {
         Ok(())
     }
 
-    /// Kubidm: remove from the stored entry of the built-in (system uuid range) access
-    /// control profile `builtin` the values that `AccessControlProfile::try_from` and the
-    /// per kind parsers (`access/profiles.rs`) always reject, unless the shipped
-    /// definition has them (a shipped definition that the parser rejects must still fail
-    /// loudly). These values can never be a working customisation:
+    /// Kubidm: before the shipped definition `builtin` of a built-in (system uuid range)
+    /// access control profile is rewritten over its stored entry, remove from the stored
+    /// entry the values (absent from the shipped definition) that would break that rewrite
+    /// or the parse of the result. A value the shipped definition has is never removed: a
+    /// shipped definition that the parser rejects must still fail loudly. The values are:
     ///
-    /// - `acp_reauth_max_age`, which is unsupported;
-    /// - the `access_control_receiver_delegated` class, which is unsupported, with
-    ///   `acp_receiver_delegated`. The class also excludes the group receiver of the
-    ///   shipped definition, so the rewrite would otherwise fail;
-    /// - on a built-in that receives through a group, the
-    ///   `access_control_receiver_entry_manager` class, which excludes the group receiver
-    ///   that the rewrite restores;
-    /// - on a built-in that targets a scope, the `access_control_target_delegated_scope`
-    ///   class, which excludes the target scope that the rewrite restores;
+    /// - values that `AccessControlProfile::try_from` and the per kind parsers
+    ///   (`access/profiles.rs`) always reject, so they can never be a working
+    ///   customisation:
+    ///   - `acp_reauth_max_age`, which is unsupported;
+    ///   - the `access_control_receiver_delegated` class, which is unsupported, with
+    ///     `acp_receiver_delegated`. The class also excludes the group receiver of the
+    ///     shipped definition, so the rewrite would otherwise fail;
+    ///   - `memberof` and `directmemberof` in `acp_create_attr`, which are server
+    ///     maintained (the rewrite also replaces `acp_create_attr` outright when the
+    ///     shipped definition has it);
+    /// - values that DO parse, and so may be a deliberate administrator customisation, but
+    ///   exclude what the shipped definition restores. Removing them reverts that
+    ///   customisation to the shipped definition: the shipped values win, and the removal
+    ///   is logged at error level so that it is not silent:
+    ///   - on a built-in that receives through a group, the
+    ///     `access_control_receiver_entry_manager` class (an entry manager receiver),
+    ///     which excludes the group receiver;
+    ///   - on a built-in that targets a scope, the `access_control_target_delegated_scope`
+    ///     class (a delegated target scope), which excludes the target scope;
     /// - with either delegated class removed, the delegated scope attributes, unless a
-    ///   delegated class remains (only those classes allow them);
-    /// - `memberof` and `directmemberof` in `acp_create_attr`, which are server maintained
-    ///   (the rewrite also replaces `acp_create_attr` outright when the shipped definition
-    ///   has it).
+    ///   delegated class remains (only those classes allow them).
     ///
     /// Any other stored value, valid or not, is left to the upstream rewrite, which keeps
-    /// administrator customisations of built-ins. The other parser rejections of a
-    /// built-in (a missing receiver group, target scope or name, or a target scope that
-    /// does not validate) are repaired by the rewrite of the shipped values.
+    /// administrator customisations of built-ins that do not conflict with the shipped
+    /// definition. The other parser rejections of a built-in (a missing receiver group,
+    /// target scope or name, or a target scope that does not validate) are repaired by the
+    /// rewrite of the shipped values.
     fn kubidm_purge_unsupported_builtin_acp_values(
         &mut self,
         builtin: &EntryInitNew,
@@ -471,7 +479,9 @@ impl QueryServerWriteTransaction<'_> {
             %uuid,
             name = ?stored.get_ava_single_iname(Attribute::Name),
             ?mods,
-            "Removing values that are never valid from a built-in access control profile"
+            "Removing values that are never valid, or that conflict with the shipped \
+             definition (reverting an administrator customisation), from a built-in access \
+             control profile"
         );
         self.internal_modify_uuid(uuid, &ModifyList::new_list(mods))
     }

@@ -29,3 +29,15 @@ You can manually perform this on the affected node.
 docker exec -i -t <container name> \
   kubidmd refresh-replication-consumer
 ```
+
+The command asks for confirmation with `--i-want-to-refresh-this-servers-database`. By default the refresh is taken by
+whichever supplier answers first. To choose the source, add `--from` with the replication origin of the supplier as it
+appears in this node's replication configuration:
+
+```bash
+docker exec -i -t <container name> \
+  kubidmd refresh-replication-consumer --i-want-to-refresh-this-servers-database \
+  --from repl://node2.example.com:8444
+```
+
+The command fails without changing anything if the origin is not a `pull` or `mutual-pull` supplier of this node.

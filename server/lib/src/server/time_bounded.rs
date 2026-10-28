@@ -29,7 +29,9 @@
 //!
 //! Grants on high privilege groups (`idm_high_privilege` itself and its direct or nested
 //! members) are refused, since approvals for high privilege membership are not wired up
-//! yet and an internal write would bypass them.
+//! yet and an internal write would bypass them. Grants written before a group became high
+//! privilege grant nothing while it is (see `plugins::memberof`); they are listed as
+//! [`TimeBoundedMemberGrantState::Suppressed`] and can be revoked.
 //!
 //! # Cap
 //!
@@ -44,10 +46,11 @@
 //! such a cap always did, since no window fits in 0 seconds. Grants that already exist on
 //! the group are left as they are, and can be revoked.
 
+use crate::plugins::memberof::time_bounded_grants_suppressed;
 use crate::prelude::*;
 use crate::server::access::{Access, AccessControlsTransaction};
 use crate::value::TimeBoundedMember;
-use kubidm_proto::v1::TimeBoundedMemberGrant;
+use kubidm_proto::v1::{TimeBoundedMemberGrant, TimeBoundedMemberGrantState};
 use std::sync::Arc;
 use time::OffsetDateTime;
 
@@ -116,10 +119,29 @@ fn grant_of(entry: &EntrySealedCommitted, member: Uuid) -> Option<&TimeBoundedMe
         .and_then(|grants| grants.get(&member))
 }
 
+/// Whether `grant` makes its member a member of its group at `now`, by the same rules as
+/// `memberof`: within its window, and not on a high privilege group (`suppressed`).
+fn grant_state(
+    grant: &TimeBoundedMember,
+    suppressed: bool,
+    now: OffsetDateTime,
+) -> TimeBoundedMemberGrantState {
+    if now >= grant.valid_until {
+        TimeBoundedMemberGrantState::Expired
+    } else if suppressed {
+        TimeBoundedMemberGrantState::Suppressed
+    } else if grant.is_valid_at(now) {
+        TimeBoundedMemberGrantState::Active
+    } else {
+        TimeBoundedMemberGrantState::Pending
+    }
+}
+
 fn list_time_bounded_members<'a, T: QueryServerTransaction<'a>>(
     qs: &mut T,
     ident: &Identity,
     group: Uuid,
+    now: OffsetDateTime,
 ) -> Result<Vec<TimeBoundedMemberGrant>, OperationError> {
     let (entry, rights) = group_member_rights(qs, ident, group)?;
 
@@ -127,6 +149,8 @@ fn list_time_bounded_members<'a, T: QueryServerTransaction<'a>>(
         security_access!(%ident, %group, "denied - may not read the members of this group");
         return Err(OperationError::AccessDenied);
     }
+
+    let suppressed = time_bounded_grants_suppressed(&entry);
 
     let grants: Vec<TimeBoundedMember> = entry
         .get_ava_as_time_bounded_member(Attribute::TimeBoundedMemberAttr)
@@ -144,34 +168,37 @@ fn list_time_bounded_members<'a, T: QueryServerTransaction<'a>>(
                 member_spn,
                 valid_from: grant.valid_from,
                 valid_until: grant.valid_until,
+                state: grant_state(&grant, suppressed, now),
             })
         })
         .collect()
 }
 
 impl QueryServerReadTransaction<'_> {
-    /// Kubidm: list the time-bounded grants of `group`. The caller must be able to read
-    /// the members of the group.
+    /// Kubidm: list the time-bounded grants of `group`, with their state at `ct`. The
+    /// caller must be able to read the members of the group.
     #[instrument(level = "debug", skip_all)]
     pub fn time_bounded_member_list(
         &mut self,
         ident: &Identity,
         group: Uuid,
+        ct: Duration,
     ) -> Result<Vec<TimeBoundedMemberGrant>, OperationError> {
-        list_time_bounded_members(self, ident, group)
+        list_time_bounded_members(self, ident, group, OffsetDateTime::UNIX_EPOCH + ct)
     }
 }
 
 impl QueryServerWriteTransaction<'_> {
-    /// Kubidm: list the time-bounded grants of `group`, as
-    /// [`QueryServerReadTransaction::time_bounded_member_list`].
+    /// Kubidm: list the time-bounded grants of `group`, with their state at the time of
+    /// this transaction, as [`QueryServerReadTransaction::time_bounded_member_list`].
     #[instrument(level = "debug", skip_all)]
     pub fn time_bounded_member_list(
         &mut self,
         ident: &Identity,
         group: Uuid,
     ) -> Result<Vec<TimeBoundedMemberGrant>, OperationError> {
-        list_time_bounded_members(self, ident, group)
+        let now = self.get_curtime_odt();
+        list_time_bounded_members(self, ident, group, now)
     }
 
     /// Kubidm: grant `member` a membership of `group` from `valid_from` (or now) until
@@ -234,12 +261,7 @@ impl QueryServerWriteTransaction<'_> {
         // yet. Grants are written internally, so they would bypass such a gate. Until it
         // exists, refuse grants on high privilege groups, including a group that became high
         // privilege (by nesting) after it was enabled for time-bounded grants.
-        if group == UUID_IDM_HIGH_PRIVILEGE
-            || entry.attribute_equality(
-                Attribute::MemberOf,
-                &PartialValue::Refer(UUID_IDM_HIGH_PRIVILEGE),
-            )
-        {
+        if time_bounded_grants_suppressed(&entry) {
             security_access!(%ident, %group, "denied - time bounded grant on a high privilege group");
             return Err(OperationError::InvalidAttribute(
                 "time-bounded grants are not allowed on high privilege groups".to_string(),
@@ -363,9 +385,10 @@ impl QueryServerWriteTransaction<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::DEFAULT_MAX_GRANT_DURATION_SECS;
+    use super::{grant_state, DEFAULT_MAX_GRANT_DURATION_SECS};
     use crate::prelude::*;
     use crate::value::TimeBoundedMember;
+    use kubidm_proto::v1::TimeBoundedMemberGrantState;
     use time::OffsetDateTime;
 
     const UUID_TB_GROUP: Uuid = uuid::uuid!("7b2f8d2e-4b0e-4a43-a39b-3d27a5c1e001");
@@ -496,6 +519,7 @@ mod tests {
             .is_some_and(|spn| spn.starts_with("tb_target@")));
         assert_eq!(grants[0].valid_from, None);
         assert_eq!(grants[0].valid_until, until);
+        assert_eq!(grants[0].state, TimeBoundedMemberGrantState::Active);
 
         // A second grant replaces the first: a future start removes the membership.
         let from = odt(ct + secs(600));
@@ -510,6 +534,7 @@ mod tests {
         assert_eq!(grants.len(), 1);
         assert_eq!(grants[0].valid_from, Some(from));
         assert_eq!(grants[0].valid_until, until);
+        assert_eq!(grants[0].state, TimeBoundedMemberGrantState::Pending);
 
         // Back to an active grant, then revoke it.
         server_txn
@@ -1236,6 +1261,15 @@ mod tests {
             .expect("modify target");
         assert!(!is_memberof(&mut server_txn, UUID_TB_TARGET, UUID_TB_GROUP));
 
+        // Both grants are listed as suppressed, with the state memberof applies.
+        let grants = server_txn
+            .time_bounded_member_list(&Identity::from_internal(), UUID_TB_GROUP)
+            .expect("list");
+        assert_eq!(grants.len(), 2);
+        assert!(grants
+            .iter()
+            .all(|grant| grant.state == TimeBoundedMemberGrantState::Suppressed));
+
         // The grants can still be revoked.
         server_txn
             .revoke_time_bounded_member(&Identity::from_internal(), UUID_TB_GROUP, UUID_TB_TARGET)
@@ -1253,6 +1287,12 @@ mod tests {
             UUID_TB_OUTSIDER,
             UUID_TB_GROUP
         ));
+        let grants = server_txn
+            .time_bounded_member_list(&Identity::from_internal(), UUID_TB_GROUP)
+            .expect("list");
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0].member, UUID_TB_OUTSIDER);
+        assert_eq!(grants[0].state, TimeBoundedMemberGrantState::Active);
         assert!(!is_memberof(&mut server_txn, UUID_TB_TARGET, UUID_TB_GROUP));
         server_txn.commit().expect("commit");
     }
@@ -1592,5 +1632,117 @@ mod tests {
             assert_eq!(can_add, expected, "{name}: may add a member");
             assert_eq!(can_grant, can_add, "{name}: may grant iff may add a member");
         }
+    }
+
+    #[test]
+    fn test_time_bounded_grant_state() {
+        let t = |s: u64| OffsetDateTime::UNIX_EPOCH + Duration::from_secs(s);
+        let windowed = TimeBoundedMember::new(UUID_TB_TARGET, Some(t(100)), t(200));
+        let open = TimeBoundedMember::new(UUID_TB_TARGET, None, t(200));
+
+        for (suppressed, active) in [
+            (false, TimeBoundedMemberGrantState::Active),
+            (true, TimeBoundedMemberGrantState::Suppressed),
+        ] {
+            let state =
+                |grant: &TimeBoundedMember, now: u64| grant_state(grant, suppressed, t(now));
+            // Before the start: pending, unless suppressed (it will not start).
+            let pending = if suppressed {
+                TimeBoundedMemberGrantState::Suppressed
+            } else {
+                TimeBoundedMemberGrantState::Pending
+            };
+            assert_eq!(state(&windowed, 99), pending);
+            // valid_from is inclusive, valid_until exclusive, as in memberof.
+            assert_eq!(state(&windowed, 100), active);
+            assert_eq!(state(&windowed, 199), active);
+            assert_eq!(state(&windowed, 200), TimeBoundedMemberGrantState::Expired);
+            assert_eq!(state(&open, 0), active);
+            assert_eq!(state(&open, 300), TimeBoundedMemberGrantState::Expired);
+            // Active exactly when memberof applies the grant.
+            for now in [0, 99, 100, 150, 199, 200, 300] {
+                assert_eq!(
+                    state(&windowed, now) == TimeBoundedMemberGrantState::Active,
+                    !suppressed && windowed.is_valid_at(t(now))
+                );
+            }
+        }
+    }
+
+    #[qs_test]
+    async fn test_time_bounded_list_reports_state(server: &QueryServer) {
+        let ct = duration_from_epoch_now();
+        setup(server, ct).await;
+
+        let mut server_txn = server.write(ct).await.expect("txn");
+        let manager = ident_of(&mut server_txn, UUID_TB_MANAGER);
+        server_txn
+            .grant_time_bounded_member(
+                &manager,
+                UUID_TB_GROUP,
+                UUID_TB_TARGET,
+                None,
+                odt(ct + secs(60)),
+            )
+            .expect("active grant");
+        server_txn
+            .grant_time_bounded_member(
+                &manager,
+                UUID_TB_GROUP,
+                UUID_TB_OUTSIDER,
+                Some(odt(ct + secs(30))),
+                odt(ct + secs(3600)),
+            )
+            .expect("future grant");
+        server_txn.commit().expect("commit");
+
+        let state_of = |grants: &[kubidm_proto::v1::TimeBoundedMemberGrant], member: Uuid| {
+            grants
+                .iter()
+                .find(|grant| grant.member == member)
+                .map(|grant| grant.state)
+        };
+
+        // Through a read transaction, at the time given.
+        let mut read_txn = server.read().await.expect("txn");
+        let grants = read_txn
+            .time_bounded_member_list(&Identity::from_internal(), UUID_TB_GROUP, ct)
+            .expect("list");
+        assert_eq!(
+            state_of(&grants, UUID_TB_TARGET),
+            Some(TimeBoundedMemberGrantState::Active)
+        );
+        assert_eq!(
+            state_of(&grants, UUID_TB_OUTSIDER),
+            Some(TimeBoundedMemberGrantState::Pending)
+        );
+        // Later, the first grant ended and the second one started.
+        let grants = read_txn
+            .time_bounded_member_list(&Identity::from_internal(), UUID_TB_GROUP, ct + secs(90))
+            .expect("list");
+        assert_eq!(
+            state_of(&grants, UUID_TB_TARGET),
+            Some(TimeBoundedMemberGrantState::Expired)
+        );
+        assert_eq!(
+            state_of(&grants, UUID_TB_OUTSIDER),
+            Some(TimeBoundedMemberGrantState::Active)
+        );
+        drop(read_txn);
+
+        // Through a write transaction, at the time of the transaction.
+        let mut server_txn = server.write(ct + secs(90)).await.expect("txn");
+        let grants = server_txn
+            .time_bounded_member_list(&manager, UUID_TB_GROUP)
+            .expect("list");
+        assert_eq!(
+            state_of(&grants, UUID_TB_TARGET),
+            Some(TimeBoundedMemberGrantState::Expired)
+        );
+        assert_eq!(
+            state_of(&grants, UUID_TB_OUTSIDER),
+            Some(TimeBoundedMemberGrantState::Active)
+        );
+        server_txn.commit().expect("commit");
     }
 }

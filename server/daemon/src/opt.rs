@@ -472,6 +472,12 @@ enum KubidmdOpt {
         /// Acknowledge that this database content will be refreshed from a supplier.
         #[clap(long = "i-want-to-refresh-this-servers-database")]
         proceed: bool,
+        /// Refresh only from this supplier, given by its replication origin as configured
+        /// on this server (for example `repl://pod-1.example.com:8444`). Without it, the
+        /// first supplier that answers is used, which may itself be stale or in another
+        /// domain.
+        #[clap(long = "from", value_name = "ORIGIN")]
+        from: Option<String>,
     },
     // #[clap(name = "reset_server_id")]
     // ResetServerId,

@@ -1559,7 +1559,7 @@ impl QueryServerReadV1 {
 
         idms_prox_read
             .qs_read
-            .time_bounded_member_list(&ident, group_uuid)
+            .time_bounded_member_list(&ident, group_uuid, ct)
     }
 
     #[instrument(

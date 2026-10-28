@@ -44,7 +44,7 @@ fn has_time_bounded_member_attr(qs: &QueryServerWriteTransaction) -> bool {
 /// Those are treated as inactive for as long as the group is high privilege, so that they
 /// can not bypass the approvals that high privilege membership is meant to require. They
 /// can still be revoked.
-fn time_bounded_grants_suppressed(group: &EntrySealedCommitted) -> bool {
+pub(crate) fn time_bounded_grants_suppressed(group: &EntrySealedCommitted) -> bool {
     group.get_uuid() == UUID_IDM_HIGH_PRIVILEGE
         || group.attribute_equality(
             Attribute::MemberOf,

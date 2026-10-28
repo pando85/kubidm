@@ -45,17 +45,41 @@ is `null` when replication is not configured. The peers counted are the _supplie
   "peers": {
     "total": 2,
     "healthy": 2,
-    "stale": 0
+    "stale": 0,
+    "foreign": 0
   },
   "message": "Ready to serve traffic"
 }
 ```
 
-| Field           | Description                                                                |
-| --------------- | -------------------------------------------------------------------------- |
-| `peers.total`   | Number of configured supplier peers                                        |
-| `peers.healthy` | Supplier peers whose last connection succeeded and that are not stale      |
-| `peers.stale`   | Supplier peers with no successful sync within the stale window (see below) |
+| Field           | Description                                                                                                                                                                                 |
+| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `peers.total`   | Number of configured supplier peers                                                                                                                                                         |
+| `peers.healthy` | Supplier peers whose last connection succeeded and that are not stale                                                                                                                       |
+| `peers.stale`   | Supplier peers with no successful sync within the stale window (see below)                                                                                                                  |
+| `peers.foreign` | Supplier peers held back by the [domain mismatch guard](#the-domain-mismatch-guard): they answered from another domain and this node will not be refreshed from them. Also counted as stale |
+
+An unreachable peer and a peer in another domain both make the node `degraded`, but only the first recovers on its own.
+When `peers.foreign` is not zero the `message` says so, for example on a node that is still ready:
+
+```json
+{
+  "serving_ready": "ready",
+  "replication_state": "degraded",
+  "database_health": "healthy",
+  "server_phase": "running",
+  "peers": {
+    "total": 2,
+    "healthy": 1,
+    "stale": 1,
+    "foreign": 1
+  },
+  "message": "Degraded: 1 peer(s) in another domain; operator action required"
+}
+```
+
+On a node that is not ready for another reason, the message of that reason is followed by
+`; N peer(s) in another domain, operator action required`.
 
 **Response (503 Service Unavailable - Not Ready):**
 
@@ -68,7 +92,8 @@ is `null` when replication is not configured. The peers counted are the _supplie
   "peers": {
     "total": 2,
     "healthy": 2,
-    "stale": 0
+    "stale": 0,
+    "foreign": 0
   },
   "message": "Replication state 'refresh_required' does not allow serving"
 }
@@ -204,9 +229,20 @@ When the server starts with replication configured, it decides whether it must w
 
 A node without an `automatic_refresh` supplier is ready as soon as it starts, before it has talked to any peer. If such
 a node was replaced by an empty one (for example pod-0 re-created with a new volume), it creates a new domain and is
-ready for up to one `task_poll_interval`, until its first incremental with a peer is answered with a domain mismatch. It
-then reports `refresh_required` (not ready). The replicas that pull from it never refresh from it automatically, see
-[The Domain Mismatch Guard](#the-domain-mismatch-guard).
+ready until its first incremental with a peer is answered with a domain mismatch. It then reports `refresh_required`
+(not ready). The replicas that pull from it never refresh from it automatically, see
+[The Domain Mismatch Guard](#the-domain-mismatch-guard). How long the empty node is ready depends on its peers:
+
+- **A peer is reachable** (pod-0 alone was re-created while the other pods run): up to one `task_poll_interval`.
+- **No peer is reachable** (a full restart of a StatefulSet with `podManagementPolicy: OrderedReady`, the default):
+  pod-1 is only started once pod-0 is ready, so the empty pod-0 serves its new, empty domain until pod-1 is Ready and
+  answers pod-0's next incremental with a domain mismatch. pod-1 has synced before, so it is ready (and `degraded`) at
+  once and never refreshes from pod-0.
+
+While the empty pod-0 is `refresh_required`, OrderedReady does not create the pods after it. If pod-1 is evicted or
+deleted at that point, it is not re-created, and pod-0 has no peer to be refreshed from. Restart pod-0: it is ready
+again as soon as it starts, so the StatefulSet re-creates pod-1, and pod-0 can then be refreshed from it (see
+[Recovering From a Mismatch](#recovering-from-a-mismatch)).
 
 The database shows that a node has synced before when either:
 
@@ -219,7 +255,10 @@ The database shows that a node has synced before when either:
   than the changelog (7 days).
 
 If the database can not be read at startup, a node with an `automatic_refresh` supplier is treated as never synced and
-stays not ready until its first successful sync; an error is logged.
+stays not ready until its first successful sync; an error is logged. The domain mismatch guard treats it the other way
+round, as holding replicated content: it is never refreshed automatically from a peer in another domain, since it can
+not prove that it has nothing to lose. Such a node stays not ready until a supplier in its own domain syncs with it, or
+an operator refreshes it.
 
 Supplier peers must be configured by DNS name: replication refuses addresses because the TLS check needs a name. A peer
 configured by address is logged at startup, tracked under its address, and reported stale.
@@ -232,11 +271,12 @@ decides as follows:
 
 - **This node has evidence that it holds replicated content, and a supplier configured with `automatic_refresh`:** it is
   never refreshed automatically from a mismatched peer, whatever the other peers do. The evidence is the one used at
-  startup (its database shows that it synced before), or any successful refresh or incremental since it started. The
-  peer is reported stale, the node is `degraded` and keeps serving, and an error is logged on every replication
-  interval. This protects a synced replica from an empty, re-created supplier: such a node has no `automatic_refresh`
-  supplier, so it is ready at once and would otherwise wipe every replica that refreshes from it (in a two replica
-  StatefulSet, or after a full restart of a larger one, where no other peer is in sync yet).
+  startup (its database shows that it synced before, or could not be read), or any successful refresh or incremental
+  since it started. The peer is reported stale and counted in `peers.foreign`, the node is `degraded` and keeps serving,
+  and an error is logged on every replication interval. This protects a synced replica from an empty, re-created
+  supplier: such a node has no `automatic_refresh` supplier, so it is ready at once and would otherwise wipe every
+  replica that refreshes from it (in a two replica StatefulSet, or after a full restart of a larger one, where no other
+  peer is in sync yet).
 - **This node has no such evidence (a fresh replica):** it is the one out of the domain. It reports `refresh_required`
   and, with `automatic_refresh`, is refreshed from the peer.
 - **This node has no supplier configured with `automatic_refresh` (the origin, pod-0):** it is never refreshed
@@ -255,21 +295,31 @@ new replica has been refreshed: refresh the new replica before adding it as the 
 #### Recovering From a Mismatch
 
 The guard never decides which domain is the right one, an operator does. Check the error logged on the degraded node,
-which names the supplier, and compare the domain of both sides (`kubidmd domain show`).
+which names the supplier, and compare the domain of both sides: run `kubidmd domain show` on each node and compare
+`domain_uuid`.
+
+Always name the source of a manual refresh with `--from`, the replication origin of the supplier as it appears in the
+replication configuration of the node being refreshed. Without it, the refresh is taken by whichever supplier answers
+first, which may be another stale or empty node. With it, only that supplier is used, and the command fails without
+changing anything if it is not a configured `pull` or `mutual-pull` supplier of the node.
 
 - **The supplier is the one out of the domain** (an empty or re-created node, for example pod-0 after its volume was
   lost): refresh the supplier from a node that holds the content. On the supplier, run:
 
   ```bash
-  kubidmd refresh-replication-consumer --i-want-to-refresh-this-servers-database
+  kubidmd refresh-replication-consumer --i-want-to-refresh-this-servers-database \
+      --from repl://pod-1.kubidm.example.com:8444
   ```
 
   A node without `automatic_refresh` refreshes from one of its suppliers, so it needs a supplier that holds the content
   (in a Kaniop StatefulSet every pod pulls from every other pod).
 - **The cluster was intentionally rebuilt in a new domain** (for example restored from a backup of another cluster, or
   re-initialised on purpose): the nodes that still hold the old domain refuse the automatic refresh. Run the same
-  command on each of them to replace their content with the new domain's. The manual refresh does not go through the
-  guard, and on success the node is synced and healthy again.
+  command on each of them, with `--from` naming a node of the new domain, to replace their content with the new
+  domain's. The manual refresh does not go through the guard, and on success the node is synced and healthy again.
+
+Refresh one node at a time. After each refresh, run `kubidmd domain show` on the refreshed node and check that its
+`domain_uuid` is the intended one before refreshing the next node from it, or moving on.
 
 ## Database Health
 
@@ -479,10 +529,12 @@ The `/readyz` endpoint exposes state that can be monitored by polling the endpoi
 2. **Replication Degraded:** Alert when `replication_state` is `degraded` for more than 10 minutes, and page when
    `peers.healthy` is `0` while `peers.total` is greater than `0`: the node is serving but not receiving changes from
    any supplier.
-3. **Refresh Required:** Alert when `replication_state` is `refresh_required` for more than 10 minutes
-4. **Fresh Replica Not Synced:** Alert when `replication_state` is `catching_up` for more than 15 minutes
-5. **Database Unhealthy:** Alert immediately when `database_health` is `unhealthy`
-6. **Not Ready:** Alert when a replica has been `not_ready` for more than 15 minutes (excluding initialization)
+3. **Peer in Another Domain:** Alert when `peers.foreign` is greater than `0`. Unlike an unreachable peer it never
+   recovers on its own: an operator must decide which domain is the right one.
+4. **Refresh Required:** Alert when `replication_state` is `refresh_required` for more than 10 minutes
+5. **Fresh Replica Not Synced:** Alert when `replication_state` is `catching_up` for more than 15 minutes
+6. **Database Unhealthy:** Alert immediately when `database_health` is `unhealthy`
+7. **Not Ready:** Alert when a replica has been `not_ready` for more than 15 minutes (excluding initialization)
 
 ### Example Blackbox Exporter Configuration
 
@@ -505,7 +557,7 @@ Check the `/readyz` endpoint response to determine the cause:
 
 3. **`replication_state` is `catching_up`:** The node expects its content from an `automatic_refresh` supplier and has
    never synced from one. Check that the supplier is reachable; the refresh then happens automatically (or run
-   `kubidmd refresh-replication-consumer`).
+   `kubidmd refresh-replication-consumer --i-want-to-refresh-this-servers-database --from <supplier origin>`).
 
 4. **`replication_state` is `refresh_required`:** A supplier reported that this node's content must be refreshed: it is
    a new replica, it has fallen further behind than the changelog, or (on a node without `automatic_refresh`) a supplier
@@ -516,9 +568,9 @@ Check the `/readyz` endpoint response to determine the cause:
    - Peer availability
    - Replication configuration
 
-5. **`replication_state` stays `degraded` with a domain mismatch error in the logs:** a supplier is in another domain,
-   and this node holds replicated content, so it refuses to be refreshed from it automatically. See
-   [Recovering From a Mismatch](#recovering-from-a-mismatch).
+5. **`replication_state` stays `degraded`, `peers.foreign` is not zero and `message` says `operator action required`:**
+   a supplier is in another domain, and this node holds replicated content, so it refuses to be refreshed from it
+   automatically. The logs name the supplier. See [Recovering From a Mismatch](#recovering-from-a-mismatch).
 
 6. **`replication_state` is `failed`:** This node has been unable to apply the changes its suppliers send. Check the
    logs for `Consumer was not able to apply changes`; a refresh from a healthy peer usually resolves it.

@@ -354,6 +354,10 @@ async fn test_time_bounded_grant_list_revoke_http(rsclient: &KubidmClient) {
         grants[0].valid_until.unix_timestamp(),
         until.unix_timestamp()
     );
+    assert_eq!(
+        grants[0].state,
+        kubidm_proto::v1::TimeBoundedMemberGrantState::Active
+    );
 
     // Revoke, and the membership is gone.
     rsclient

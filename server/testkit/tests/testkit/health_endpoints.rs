@@ -122,6 +122,7 @@ async fn test_readyz_replication_without_suppliers_is_ready(
     assert_eq!(body["serving_ready"], "ready");
     assert_eq!(body["replication_state"], "healthy");
     assert_eq!(body["peers"]["total"], 0);
+    assert_eq!(body["peers"]["foreign"], 0);
 }
 
 // A freshly created node configured to pull from a supplier has never received the
@@ -171,6 +172,7 @@ async fn test_readyz_fresh_replica_is_not_ready(rsclient: &kubidm_client::Kubidm
     assert_eq!(body["server_phase"], "running");
     assert_eq!(body["peers"]["total"], 1);
     assert_eq!(body["peers"]["healthy"], 0);
+    assert_eq!(body["peers"]["foreign"], 0);
     assert_eq!(
         body["message"],
         "Replication state 'catching_up' does not allow serving"
@@ -238,6 +240,7 @@ fn replicated_tracker(has_synced: bool) -> ReplicationStateTracker {
             automatic_refresh: true,
             poll_interval: Duration::from_secs(15),
             has_synced,
+            sync_evidence: has_synced,
         }),
         T0,
     );
@@ -363,12 +366,36 @@ fn test_tracker_unreachable_supplier_degrades_but_stays_ready() {
     let peers = tracker.get_peers(T0 + 60).expect("peers are tracked");
     assert!(peers[0].stale);
     assert!(!peers[0].connected);
+    assert!(!peers[0].foreign_domain);
+    // An unreachable peer is not reported as being in another domain.
+    let status = tracker.build_readiness_status(T0 + 60);
+    assert_eq!(status.peers.map(|peers| peers.foreign), Some(0));
+    assert_eq!(status.message, "Ready to serve traffic");
 
     tracker.notify_replication_connected(PEER);
     tracker.notify_replication_incremental_success(PEER, T0 + 75);
     assert_eq!(
         tracker.get_replication_state(T0 + 75),
         ReplicationState::Healthy
+    );
+}
+
+#[test]
+fn test_tracker_foreign_peer_needs_operator() {
+    // A synced replica whose supplier answers from another domain is never refreshed from
+    // it automatically. It keeps serving, and /readyz says that an operator must act.
+    let tracker = replicated_tracker(true);
+    assert!(!tracker.notify_replication_domain_mismatch(PEER, T0 + 15));
+    let status = tracker.build_readiness_status(T0 + 15);
+    assert_eq!(status.serving_ready, ServingReadiness::Ready);
+    assert_eq!(status.replication_state, ReplicationState::Degraded);
+    let json = serde_json::to_value(&status).expect("Failed to serialize");
+    assert_eq!(json["peers"]["total"], 1);
+    assert_eq!(json["peers"]["stale"], 1);
+    assert_eq!(json["peers"]["foreign"], 1);
+    assert_eq!(
+        json["message"],
+        "Degraded: 1 peer(s) in another domain; operator action required"
     );
 }
 

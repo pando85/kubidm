@@ -307,6 +307,7 @@ impl Modify for SecurityAddon {
             v1::GroupUnixExtend,
             v1::TimeBoundedMemberGrantRequest,
             v1::TimeBoundedMemberGrant,
+            v1::TimeBoundedMemberGrantState,
             v1::PublicKeyKindSchema,
             v1::SingleStringRequest,
             v1::SshPublicKeySchema,

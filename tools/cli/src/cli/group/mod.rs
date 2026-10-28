@@ -354,7 +354,8 @@ fn format_grant(grant: &TimeBoundedMemberGrant) -> String {
         .map(format_datetime)
         .unwrap_or_else(|| "-".to_string());
     format!(
-        "{member}: from {from} until {}",
-        format_datetime(&grant.valid_until)
+        "{member}: from {from} until {} ({})",
+        format_datetime(&grant.valid_until),
+        grant.state
     )
 }

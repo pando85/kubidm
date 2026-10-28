@@ -1,14 +1,48 @@
 use crate::{
     prelude::*,
     schema::SchemaAttribute,
-    valueset::{
-        parse_utc, DbValueSetV2, ScimResolveStatus, ValueSet, ValueSetResolveStatus,
-        ValueSetScimPut,
-    },
+    valueset::{DbValueSetV2, ScimResolveStatus, ValueSet, ValueSetResolveStatus, ValueSetScimPut},
 };
 use kubidm_proto::scim_v1::{client::ScimDateTime, JsonValue};
 use smolset::SmolSet;
 use time::OffsetDateTime;
+
+/// Kubidm: load a stored RFC 3339 time, normalised to UTC.
+///
+/// Released versions stored a SCIM put without normalising it to UTC, so a stored time may
+/// be out of range in UTC (`9999-12-31T23:59:59-23:59` is in year 10000), or in range but
+/// not storable as RFC 3339 again (`0000-01-01T00:00:00+01:00` is in year -1). Failing
+/// would make the whole entry unloadable, so such a time is clamped to the latest (or
+/// earliest) time that can be stored, and an error is logged. A value that does not parse
+/// at all is still invalid.
+fn load_utc_clamped(s: &str) -> Result<OffsetDateTime, OperationError> {
+    let odt = OffsetDateTime::parse(s, &Rfc3339).map_err(|err| {
+        error!(?err, "Stored DateTime is not valid RFC 3339");
+        OperationError::InvalidValueState
+    })?;
+
+    // The latest and earliest UTC times that RFC 3339 can store (years 0 to 9999).
+    let max = time::PrimitiveDateTime::MAX.assume_utc();
+    let min = time::Date::from_ordinal_date(0, 1)
+        .map(|date| date.midnight().assume_utc())
+        .map_err(|_| OperationError::InvalidState)?;
+
+    let utc = match odt.checked_to_offset(time::UtcOffset::UTC) {
+        Some(utc) if utc > max => max,
+        Some(utc) if utc < min => min,
+        Some(utc) => return Ok(utc),
+        // Only a negative offset can push a time past the end of the representable range,
+        // only a positive one before its start.
+        None if odt.offset().is_negative() => max,
+        None => min,
+    };
+    error!(
+        stored = %s,
+        clamped = %utc,
+        "Stored DateTime can not be expressed in UTC within the storable range, clamping it"
+    );
+    Ok(utc)
+}
 
 #[derive(Debug, Clone)]
 pub struct ValueSetDateTime {
@@ -29,10 +63,7 @@ impl ValueSetDateTime {
     pub fn from_dbvs2(data: Vec<String>) -> Result<ValueSet, OperationError> {
         let set = data
             .into_iter()
-            .map(|s| {
-                // Kubidm: checked, a time out of range in UTC is invalid.
-                parse_utc(&s).ok_or(OperationError::InvalidValueState)
-            })
+            .map(|s| load_utc_clamped(&s))
             .collect::<Result<_, _>>()?;
         Ok(Box::new(ValueSetDateTime { set }))
     }
@@ -239,12 +270,14 @@ mod tests {
 
         let out_of_range = "9999-12-31T23:59:59-23:59";
         assert!(matches!(
-            ValueSetDateTime::from_dbvs2(vec![out_of_range.to_string()]),
-            Err(OperationError::InvalidValueState)
-        ));
-        assert!(matches!(
             ValueSetDateTime::from_scim_json_put(serde_json::json!(out_of_range)),
             Err(OperationError::SC0010DateTimeSyntaxInvalid)
+        ));
+
+        // A value that does not parse is still invalid.
+        assert!(matches!(
+            ValueSetDateTime::from_dbvs2(vec!["not a time".to_string()]),
+            Err(OperationError::InvalidValueState)
         ));
 
         // A time with an offset is normalised to UTC.
@@ -254,5 +287,50 @@ mod tests {
             vs.to_datetime_single().map(|odt| odt.offset()),
             Some(time::UtcOffset::UTC)
         );
+    }
+
+    /// Kubidm: a stored time out of range in UTC (written by a SCIM put of a released
+    /// version, which did not normalise to UTC) is clamped on load, so that its entry still
+    /// loads, and it can be stored again.
+    #[test]
+    fn test_datetime_out_of_range_in_utc_is_clamped_on_load() {
+        use crate::valueset::DbValueSetV2;
+        use time::format_description::well_known::Rfc3339;
+
+        let load = |s: &str| {
+            ValueSetDateTime::from_dbvs2(vec![s.to_string()])
+                .ok()
+                .and_then(|vs| vs.to_datetime_single())
+        };
+        let stored_again = |s: &str| {
+            ValueSetDateTime::from_dbvs2(vec![s.to_string()])
+                .map(|vs| vs.to_db_valueset_v2())
+                .ok()
+        };
+
+        // Past the end of year 9999 in UTC: the latest storable time.
+        let max = time::PrimitiveDateTime::MAX.assume_utc();
+        assert_eq!(load("9999-12-31T23:59:59-23:59"), Some(max));
+        assert_eq!(load("9999-12-31T23:00:00-01:00"), Some(max));
+        assert!(matches!(
+            stored_again("9999-12-31T23:59:59-23:59"),
+            Some(DbValueSetV2::DateTime(ref v)) if v == &["9999-12-31T23:59:59.999999999Z"]
+        ));
+
+        // Before year 0 in UTC: the earliest storable time.
+        let min = OffsetDateTime::parse("0000-01-01T00:00:00Z", &Rfc3339).ok();
+        assert!(min.is_some());
+        assert_eq!(load("0000-01-01T00:00:00+01:00"), min);
+        assert!(matches!(
+            stored_again("0000-01-01T00:00:00+01:00"),
+            Some(DbValueSetV2::DateTime(ref v)) if v == &["0000-01-01T00:00:00Z"]
+        ));
+
+        // The edges themselves are kept as they are.
+        assert_eq!(
+            load("9999-12-31T23:59:59Z"),
+            OffsetDateTime::parse("9999-12-31T23:59:59Z", &Rfc3339).ok()
+        );
+        assert_eq!(load("0000-01-01T00:00:00Z"), min);
     }
 }

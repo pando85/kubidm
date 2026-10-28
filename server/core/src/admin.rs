@@ -56,7 +56,12 @@ pub enum AdminTaskRequest {
     ShowReplicationCertificate,
     ShowReplicationCertificateMetadata,
     RenewReplicationCertificate,
-    RefreshReplicationConsumer,
+    /// Refresh this node from a supplier: only from the supplier whose origin is `from`
+    /// when given, otherwise from whichever supplier answers first.
+    RefreshReplicationConsumer {
+        #[serde(default)]
+        from: Option<String>,
+    },
     DomainShow,
     DomainUpgradeCheck,
     DomainRaise,
@@ -166,6 +171,10 @@ pub enum AdminTaskResponse {
     },
     Success,
     Error,
+    /// The request failed for a reason the operator can act on, given in `message`.
+    ErrorMessage {
+        message: String,
+    },
 }
 
 impl std::fmt::Debug for AdminTaskResponse {
@@ -238,6 +247,9 @@ impl std::fmt::Debug for AdminTaskResponse {
             }
             AdminTaskResponse::Success => write!(f, "Success"),
             AdminTaskResponse::Error => write!(f, "Error"),
+            AdminTaskResponse::ErrorMessage { message } => {
+                write!(f, "ErrorMessage {{ message: {:?} }}", message)
+            }
         }
     }
 }
@@ -932,11 +944,14 @@ async fn renew_replication_certificate(ctrl_tx: &mut mpsc::Sender<ReplCtrl>) -> 
     }
 }
 
-async fn replication_consumer_refresh(ctrl_tx: &mut mpsc::Sender<ReplCtrl>) -> AdminTaskResponse {
+async fn replication_consumer_refresh(
+    ctrl_tx: &mut mpsc::Sender<ReplCtrl>,
+    from: Option<String>,
+) -> AdminTaskResponse {
     let (tx, rx) = oneshot::channel();
 
     if ctrl_tx
-        .send(ReplCtrl::RefreshConsumer { respond: tx })
+        .send(ReplCtrl::RefreshConsumer { from, respond: tx })
         .await
         .is_err()
     {
@@ -945,7 +960,8 @@ async fn replication_consumer_refresh(ctrl_tx: &mut mpsc::Sender<ReplCtrl>) -> A
     }
 
     match timeout(REPL_CTRL_TIMEOUT, rx).await {
-        Ok(Ok(mut refresh_rx)) => match timeout(REPL_CTRL_TIMEOUT, refresh_rx.recv()).await {
+        Ok(Ok(Err(message))) => AdminTaskResponse::ErrorMessage { message },
+        Ok(Ok(Ok(mut refresh_rx))) => match timeout(REPL_CTRL_TIMEOUT, refresh_rx.recv()).await {
             Ok(Some(())) => {
                 info!("Replication refresh success");
                 AdminTaskResponse::Success
@@ -1389,8 +1405,8 @@ async fn handle_client(
                         AdminTaskResponse::Error
                     }
                 },
-                AdminTaskRequest::RefreshReplicationConsumer => match repl_ctrl_tx.as_mut() {
-                    Some(ctrl_tx) => replication_consumer_refresh(ctrl_tx).await,
+                AdminTaskRequest::RefreshReplicationConsumer { from } => match repl_ctrl_tx.as_mut() {
+                    Some(ctrl_tx) => replication_consumer_refresh(ctrl_tx, from).await,
                     None => {
                         error!("replication not configured, unable to refresh consumer.");
                         AdminTaskResponse::Error
@@ -1513,6 +1529,60 @@ mod maintenance_protocol_tests {
             } => assert_eq!(decoded_id, operation_id),
             other => panic!("unexpected decoded request: {other:?}"),
         }
+    }
+
+    #[test]
+    fn refresh_request_json_round_trip_preserves_source() {
+        for from in [None, Some("repl://pod-1.example.com:8444".to_string())] {
+            let encoded = serde_json::to_vec(&AdminTaskRequest::RefreshReplicationConsumer {
+                from: from.clone(),
+            })
+            .expect("refresh request should serialize");
+            let decoded: AdminTaskRequest =
+                serde_json::from_slice(&encoded).expect("refresh request should deserialize");
+            match decoded {
+                AdminTaskRequest::RefreshReplicationConsumer { from: decoded } => {
+                    assert_eq!(decoded, from)
+                }
+                other => panic!("unexpected decoded request: {other:?}"),
+            }
+        }
+
+        // A request without the source refreshes from any supplier.
+        let decoded: AdminTaskRequest =
+            serde_json::from_str(r#"{"RefreshReplicationConsumer":{}}"#)
+                .expect("refresh request should deserialize");
+        assert!(matches!(
+            decoded,
+            AdminTaskRequest::RefreshReplicationConsumer { from: None }
+        ));
+    }
+
+    #[tokio::test]
+    async fn refresh_with_unknown_source_returns_the_reason() {
+        // The replication supervisor refuses a source that is not one of its suppliers;
+        // the operator gets its message back.
+        let (mut ctrl_tx, mut ctrl_rx) = mpsc::channel(1);
+        let supervisor = tokio::spawn(async move {
+            match ctrl_rx.recv().await {
+                Some(ReplCtrl::RefreshConsumer { from, respond }) => {
+                    assert_eq!(from.as_deref(), Some("repl://nope.example.com:8444"));
+                    let _ = respond.send(Err("not a supplier".to_string()));
+                }
+                _ => panic!("expected a refresh request"),
+            }
+        });
+
+        let response = replication_consumer_refresh(
+            &mut ctrl_tx,
+            Some("repl://nope.example.com:8444".to_string()),
+        )
+        .await;
+        assert!(matches!(
+            response,
+            AdminTaskResponse::ErrorMessage { ref message } if message == "not a supplier"
+        ));
+        assert!(supervisor.await.is_ok());
     }
 
     #[test]
