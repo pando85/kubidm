@@ -2,12 +2,20 @@
 //!
 //! # How a request is decided
 //!
-//! **Slots.** Every entry of the policy's `approver` list is one approver slot, naming
-//! either a person or a group. A person fills a slot that names them directly, or a group
-//! they are a (transitive) member of. One decision fills at most one slot, and a person
-//! decides at most once, so a person who matches several slots (listed directly and through
-//! a group, or listed as approver and as backup approver) still counts once. Two members of
-//! the same group fill that group's slot only once. The requester never fills a slot.
+//! **Snapshot.** When a request is created, what it is decided against is fixed on the
+//! request (`approval_quorum_snapshot`): the requester, the policy's approver slots and
+//! backup approvers (each recorded as a person or a group), the pattern, the number of
+//! approved slots required, and the escalation timeout. These are plain uuids rather than
+//! references, so neither deleting a person or group (which referential integrity removes
+//! from the policy) nor editing the policy changes the outcome of an existing request. A
+//! request without a snapshot is invalid.
+//!
+//! **Slots.** Every approver of the snapshot is one approver slot, naming either a person
+//! or a group. A person fills a slot that names them directly, or a group they are a
+//! (transitive) member of. One decision fills at most one slot, and a person decides at
+//! most once, so a person who matches several slots (listed directly and through a group,
+//! or listed as approver and as backup approver) still counts once. Two members of the same
+//! group fill that group's slot only once. The requester never fills a slot.
 //!
 //! **Quorum.** Over the `n` (distinct) approver slots: `any_one` needs 1 slot approved,
 //! `majority` needs `n / 2 + 1`, and `all` needs all `n`. A group slot is filled by any one
@@ -16,25 +24,51 @@
 //! once the slots that are still open can no longer bring it there (so under `all` a
 //! single rejection rejects it).
 //!
-//! **Escalation.** Once the escalation timeout has passed, the backup approvers may fill
-//! any *open* approver slot: they stand in for approvers who have not responded. The
-//! approvers stay eligible, decisions made before the escalation keep counting, and the
-//! quorum does not change. A backup approver can not take a slot that has already been
-//! decided, so an escalation never turns a rejection into an approval and never lowers the
-//! number of people needed. (The alternative - handing the request over to a separate
-//! backup quorum - would either discard the decisions already made or mix two quorums,
-//! which is how a rejection could previously complete an approval.)
+//! **Escalation.** Once the escalation timeout has passed since the request was created,
+//! the backup approvers may fill any *open* approver slot: they stand in for approvers who
+//! have not responded. This depends only on the time, not on the approval sweep having
+//! recorded the escalation (`escalation_level`, which is informational). The approvers stay
+//! eligible, decisions made before the escalation keep counting, and the quorum does not
+//! change. A backup approver can not take a slot that has already been decided, so an
+//! escalation never turns a rejection into an approval and never lowers the number of
+//! people needed.
 //!
-//! **Storage.** Every decision is its own `approval_decision_record` entry, created once
-//! and never modified, holding one JSON object that also records the slots the approver
-//! could fill when they decided. Separate entries never conflict in replication, so two
-//! decisions made on different replicas are both kept (see
-//! `SCHEMA_CLASS_APPROVAL_DECISION_RECORD` for why values of one attribute would not be).
-//! The outcome is recomputed from all the decisions whenever a request is read or decided,
-//! so it does not depend on group memberships changing later, and a stored state that lags
-//! behind replicated decisions is corrected on read. The approval sweep writes the
-//! recomputed state back.
+//! **Storage.** Every decision is its own `approval_decision_record` entry, linked to its
+//! request by `approval_record_request`, created once and never modified, holding one JSON
+//! object that also records the slots the approver could fill when they decided. Separate
+//! entries never conflict in replication, so two decisions made on different replicas are
+//! both kept (see `SCHEMA_CLASS_APPROVAL_DECISION_RECORD` for why values of one attribute
+//! would not be). Requests and records are only written by the operations below, as the
+//! internal system identity: `plugins::approval` refuses every other write.
+//!
+//! **Outcome.** The outcome is recomputed from the snapshot and the decision records:
+//!
+//! - decisions by the requester are dropped;
+//! - only the first decision of each approver counts. Decisions are ordered by time (with
+//!   nanosecond precision), then approver, then record uuid, so every replica picks the
+//!   same one;
+//! - a decision only fills the slots its approver could hold under the snapshot: slots of
+//!   the snapshot, and a slot naming a person only for that person, or for a backup
+//!   approver deciding after the escalation time. (Group membership at the time of the
+//!   decision can not be checked again later, so group slots are taken as recorded.);
+//! - approvals by approvers who have since been deleted or disabled (account expired or
+//!   not yet valid) are ignored. Rejections always count.
+//!
+//! A stored pending state is replaced by the recomputed one, since after a replication
+//! merge the stored state may lag behind the merged decisions; the approval sweep writes it
+//! back. A stored final state (approved, rejected, expired, cancelled, consumed) is never
+//! changed by a recomputation, so in particular a rejection never becomes an approval.
+//!
+//! **Gate.** An operation that needs approval must call
+//! `QueryServerWriteTransaction::approval_request_check_and_consume`, and nothing else:
+//! it recomputes the outcome rather than trusting the stored state, checks that the
+//! request is for exactly this operation, and consumes the approval in the same
+//! transaction, so that it authorises the operation once. An approval is only final once
+//! replication has converged: a decision made concurrently on another replica (say, a
+//! rejection made earlier) can still change the outcome, and two replicas can each consume
+//! the same approval before they replicate.
 
+use crate::idm::account::Account;
 use crate::prelude::*;
 use kubidm_proto::v1::{
     ApprovalDecision, ApprovalDecisionAction, ApprovalDecisionRequest, ApprovalOperationType,
@@ -79,40 +113,105 @@ fn approval_check_admin(ident: &Identity, write: bool) -> Result<(), OperationEr
     }
 }
 
-/// One decision, as stored in `Attribute::ApprovalDecision` of an approval decision record.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-struct StoredApprovalDecision {
-    approver_uuid: Uuid,
-    approver_spn: String,
-    #[serde(with = "time::serde::timestamp")]
-    decision_time: OffsetDateTime,
-    action: ApprovalDecisionAction,
-    comment: Option<String>,
-    /// The approver slots this approver could fill when they decided.
-    slots: BTreeSet<Uuid>,
+/// Kubidm: only an interactive person may decide on a request: a person (not a service
+/// account, and not anonymous), with a read-write session that is not an API token.
+fn approval_check_decider(ident: &Identity) -> Result<Arc<EntrySealedCommitted>, OperationError> {
+    if ident.is_internal() {
+        security_access!(ident = %ident, "denied - internal identity is not the system");
+        return Err(OperationError::AccessDenied);
+    }
+    if ident.access_scope() != AccessScope::ReadWrite {
+        security_access!("approval decision requires a read-write (privileged) session");
+        return Err(OperationError::AccessDenied);
+    }
+    let Some(entry) = ident.get_user_entry() else {
+        security_access!(ident = %ident, "denied - approval decisions are made by persons");
+        return Err(OperationError::AccessDenied);
+    };
+    // API tokens belong to service accounts, which are excluded below. This also holds
+    // should a person ever carry one.
+    let session_id = ident.get_session_id();
+    if entry
+        .get_ava_as_apitoken_map(Attribute::ApiTokenSession)
+        .is_some_and(|tokens| tokens.contains_key(&session_id))
+    {
+        security_access!(ident = %ident, "denied - approval decisions can not be made with an API token");
+        return Err(OperationError::AccessDenied);
+    }
+    if entry.get_uuid() == UUID_ANONYMOUS
+        || !entry.attribute_equality(Attribute::Class, &EntryClass::Person.into())
+        || entry.attribute_equality(Attribute::Class, &EntryClass::ServiceAccount.into())
+    {
+        security_access!(ident = %ident, "denied - approval decisions are made by persons");
+        return Err(OperationError::AccessDenied);
+    }
+    Ok(entry)
 }
 
-impl StoredApprovalDecision {
-    fn to_proto(&self) -> ApprovalDecision {
-        ApprovalDecision {
-            approver_uuid: self.approver_uuid,
-            approver_spn: self.approver_spn.clone(),
-            decision_time: self.decision_time,
-            action: self.action,
-            comment: self.comment.clone(),
+/// Is the account `entry` usable at `now`: within its valid from and expiry times.
+fn approval_account_active(entry: &EntrySealedCommitted, now: OffsetDateTime) -> bool {
+    let valid_from = entry.get_ava_single_datetime(Attribute::AccountValidFrom);
+    let expire = entry.get_ava_single_datetime(Attribute::AccountExpire);
+    let ct = Duration::try_from(now - OffsetDateTime::UNIX_EPOCH).unwrap_or(Duration::ZERO);
+    Account::check_within_valid_time(ct, valid_from.as_ref(), expire.as_ref())
+}
+
+/// Whether an approver slot or backup approver named a person or a group when the request
+/// was created.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ApprovalMemberKind {
+    /// A person (or any other non-group entry): only they can fill the slot.
+    Account,
+    /// A group: any of its members can fill the slot.
+    Group,
+}
+
+/// What a request is decided against, fixed when it is created. Stored as JSON in
+/// `Attribute::ApprovalQuorumSnapshot`, see `SCHEMA_ATTR_APPROVAL_QUORUM_SNAPSHOT`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+struct ApprovalSnapshot {
+    requester: Uuid,
+    pattern: ApprovalPattern,
+    /// The number of approved slots needed, see `approval_required_decisions`.
+    required: u32,
+    slots: BTreeMap<Uuid, ApprovalMemberKind>,
+    backups: BTreeMap<Uuid, ApprovalMemberKind>,
+    escalation_timeout_seconds: Option<u32>,
+}
+
+impl ApprovalSnapshot {
+    fn slot_set(&self) -> BTreeSet<Uuid> {
+        self.slots.keys().copied().collect()
+    }
+
+    /// When the backup approvers may start deciding on a request created at `created_at`,
+    /// if ever.
+    fn escalation_at(&self, created_at: OffsetDateTime) -> Option<OffsetDateTime> {
+        if self.backups.is_empty() {
+            return None;
         }
+        self.escalation_timeout_seconds
+            .map(|timeout| created_at + Duration::from_secs(u64::from(timeout)))
+    }
+
+    /// Could `approver` be one of the backup approvers? A backup approver named directly is
+    /// known; membership of a backup group at the time of the decision can not be checked
+    /// again, so any approver could be one if a group is a backup approver.
+    fn may_be_backup(&self, approver: Uuid) -> bool {
+        self.backups.contains_key(&approver)
+            || self
+                .backups
+                .values()
+                .any(|kind| *kind == ApprovalMemberKind::Group)
     }
 }
 
-/// The distinct approver slots of `policy`.
-fn approval_slots(policy: &ApprovalPolicy) -> BTreeSet<Uuid> {
-    policy.approvers.iter().copied().collect()
-}
-
-/// The number of approved slots `policy` needs, see the module documentation.
-fn approval_required_decisions(policy: &ApprovalPolicy) -> u32 {
-    let total = approval_slots(policy).len() as u32;
-    let required = match policy.pattern {
+/// The number of approved slots `pattern` needs out of `slots`, see the module
+/// documentation.
+fn approval_required_decisions(pattern: ApprovalPattern, slots: usize) -> u32 {
+    let total = u32::try_from(slots).unwrap_or(u32::MAX);
+    let required = match pattern {
         ApprovalPattern::AnyOne => 1,
         ApprovalPattern::Majority => total / 2 + 1,
         ApprovalPattern::All => total,
@@ -120,25 +219,105 @@ fn approval_required_decisions(policy: &ApprovalPolicy) -> u32 {
     required.max(1)
 }
 
-/// The approver slots `ident` may fill on a request under `policy`: the slots naming them
-/// or one of their groups, or every slot if the request has been escalated and they are a
-/// backup approver. Empty if they are not an approver of the request at all.
+/// One decision, as stored in `Attribute::ApprovalDecision` of an approval decision record.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+struct StoredApprovalDecision {
+    approver_uuid: Uuid,
+    approver_spn: String,
+    /// Whole seconds, see `decided_at`.
+    #[serde(with = "time::serde::timestamp")]
+    decision_time: OffsetDateTime,
+    /// The sub-second part of the decision time. Records written before it existed only
+    /// have whole seconds, and read as 0 here.
+    #[serde(default)]
+    decision_time_nanos: u32,
+    action: ApprovalDecisionAction,
+    comment: Option<String>,
+    /// The approver slots this approver could fill when they decided.
+    slots: BTreeSet<Uuid>,
+    /// The uuid of the record entry, the last tie-break when ordering decisions.
+    #[serde(skip)]
+    record_uuid: Uuid,
+}
+
+impl StoredApprovalDecision {
+    /// The decision time, with nanosecond precision.
+    fn decided_at(&self) -> OffsetDateTime {
+        self.decision_time
+            .replace_nanosecond(self.decision_time_nanos)
+            .unwrap_or(self.decision_time)
+    }
+
+    /// Decisions are ordered by time, then approver, then record: the same on every
+    /// replica, whatever order the backend returns them in.
+    fn order_key(&self) -> (OffsetDateTime, Uuid, Uuid) {
+        (self.decided_at(), self.approver_uuid, self.record_uuid)
+    }
+
+    fn to_proto(&self) -> ApprovalDecision {
+        ApprovalDecision {
+            approver_uuid: self.approver_uuid,
+            approver_spn: self.approver_spn.clone(),
+            decision_time: self.decided_at(),
+            action: self.action,
+            comment: self.comment.clone(),
+        }
+    }
+}
+
+/// The approver slots `ident` may fill on a request decided against `snapshot`: the slots
+/// naming them or one of their groups, or every slot once the request has escalated and
+/// they are a backup approver. Empty if they are not an approver of the request at all.
 fn approval_ident_slots(
     ident: &Identity,
-    policy: &ApprovalPolicy,
+    snapshot: &ApprovalSnapshot,
     escalated: bool,
 ) -> BTreeSet<Uuid> {
     let ident_uuid = ident.get_uuid();
     let matches = |slot: &Uuid| *slot == ident_uuid || ident.is_memberof(*slot);
 
-    if escalated && policy.backup_approvers.iter().any(matches) {
-        approval_slots(policy)
+    if escalated && snapshot.backups.keys().any(matches) {
+        snapshot.slot_set()
     } else {
-        policy.approvers.iter().copied().filter(matches).collect()
+        snapshot.slots.keys().copied().filter(matches).collect()
     }
 }
 
-/// The decisions of a request counted against the slots of its policy.
+/// What the decisions on a request are counted against.
+struct ApprovalTallyContext<'a> {
+    snapshot: &'a ApprovalSnapshot,
+    /// See `ApprovalSnapshot::escalation_at`.
+    escalation_at: Option<OffsetDateTime>,
+    /// Approvers whose approvals no longer count: deleted or disabled since.
+    inactive: &'a BTreeSet<Uuid>,
+}
+
+impl ApprovalTallyContext<'_> {
+    /// The slots of `decision` that its approver could hold under the snapshot.
+    fn valid_slots(&self, decision: &StoredApprovalDecision) -> BTreeSet<Uuid> {
+        let approver = decision.approver_uuid;
+        let as_backup = || {
+            self.snapshot.may_be_backup(approver)
+                && self
+                    .escalation_at
+                    .is_some_and(|at| decision.decided_at() >= at)
+        };
+        decision
+            .slots
+            .iter()
+            .copied()
+            .filter(|slot| match self.snapshot.slots.get(slot) {
+                None => false,
+                // The system may fill any slot.
+                Some(_) if approver == UUID_SYSTEM => true,
+                Some(ApprovalMemberKind::Group) => true,
+                Some(ApprovalMemberKind::Account) => *slot == approver || as_backup(),
+            })
+            .collect()
+    }
+}
+
+/// The decisions of a request counted against the slots of its snapshot.
 struct ApprovalTally {
     required: u32,
     approvals: u32,
@@ -159,25 +338,25 @@ impl ApprovalTally {
     }
 }
 
-/// Try to give decision `idx` a slot, moving earlier decisions to another of their slots
-/// if needed (an augmenting path). Earlier decisions never lose their slot.
+/// Try to give decision `idx` one of its `valid` slots, moving earlier decisions to
+/// another of their slots if needed (an augmenting path). Earlier decisions never lose
+/// their slot.
 fn approval_assign_slot(
     idx: usize,
-    decisions: &[&StoredApprovalDecision],
-    slots: &BTreeSet<Uuid>,
+    valid: &[BTreeSet<Uuid>],
     owner: &mut BTreeMap<Uuid, usize>,
     visited: &mut BTreeSet<Uuid>,
 ) -> bool {
-    let Some(decision) = decisions.get(idx) else {
+    let Some(slots) = valid.get(idx) else {
         return false;
     };
-    for slot in decision.slots.iter() {
-        if !slots.contains(slot) || !visited.insert(*slot) {
+    for slot in slots.iter() {
+        if !visited.insert(*slot) {
             continue;
         }
         let free = match owner.get(slot).copied() {
             None => true,
-            Some(other) => approval_assign_slot(other, decisions, slots, owner, visited),
+            Some(other) => approval_assign_slot(other, valid, owner, visited),
         };
         if free {
             owner.insert(*slot, idx);
@@ -187,22 +366,31 @@ fn approval_assign_slot(
     false
 }
 
-/// Count `decisions` against the slots of `policy`. Decisions are taken in time order; a
-/// decision counts if it can fill a slot without taking one away from an earlier decision,
-/// and only the first decision of each approver counts. Slots recorded in a decision that
-/// are no longer approvers of the policy are ignored.
-fn approval_tally(policy: &ApprovalPolicy, decisions: &[StoredApprovalDecision]) -> ApprovalTally {
-    let slots = approval_slots(policy);
+/// Count `decisions` against the slots of the snapshot, see the module documentation.
+/// Decisions are taken in order; a decision counts if it can fill a slot without taking one
+/// away from an earlier decision.
+fn approval_tally(
+    ctx: &ApprovalTallyContext<'_>,
+    decisions: &[StoredApprovalDecision],
+) -> ApprovalTally {
+    let snapshot = ctx.snapshot;
 
-    let mut ordered: Vec<&StoredApprovalDecision> = decisions.iter().collect();
-    ordered.sort_by_key(|d| (d.decision_time, d.approver_uuid));
+    let mut ordered: Vec<&StoredApprovalDecision> = decisions
+        .iter()
+        .filter(|d| d.approver_uuid != snapshot.requester)
+        .collect();
+    ordered.sort_by_key(|d| d.order_key());
     let mut seen = BTreeSet::new();
     ordered.retain(|d| seen.insert(d.approver_uuid));
+    ordered.retain(|d| {
+        d.action != ApprovalDecisionAction::Approve || !ctx.inactive.contains(&d.approver_uuid)
+    });
 
+    let valid: Vec<BTreeSet<Uuid>> = ordered.iter().map(|d| ctx.valid_slots(d)).collect();
     let mut owner: BTreeMap<Uuid, usize> = BTreeMap::new();
     for idx in 0..ordered.len() {
         let mut visited = BTreeSet::new();
-        approval_assign_slot(idx, &ordered, &slots, &mut owner, &mut visited);
+        approval_assign_slot(idx, &valid, &mut owner, &mut visited);
     }
 
     let assigned: Vec<&StoredApprovalDecision> = owner
@@ -215,9 +403,9 @@ fn approval_tally(policy: &ApprovalPolicy, decisions: &[StoredApprovalDecision])
         .count() as u32;
 
     ApprovalTally {
-        required: approval_required_decisions(policy),
+        required: snapshot.required,
         approvals,
-        open: (slots.len() as u32).saturating_sub(assigned.len() as u32),
+        open: (snapshot.slots.len() as u32).saturating_sub(assigned.len() as u32),
         counted: assigned.iter().map(|d| d.approver_uuid).collect(),
     }
 }
@@ -225,78 +413,128 @@ fn approval_tally(policy: &ApprovalPolicy, decisions: &[StoredApprovalDecision])
 /// An approval request as read from its entry, with its policy if that still exists.
 struct ResolvedApprovalRequest {
     policy: Option<ApprovalPolicy>,
+    /// `None` for a request created before snapshots existed: it is invalid.
+    snapshot: Option<ApprovalSnapshot>,
     /// `request.state` is the effective state, see `approval_effective_state`.
     request: ApprovalRequest,
     stored_state: ApprovalRequestState,
+    /// The state recomputed from the snapshot and the decisions, ignoring the stored state.
+    /// `None` without a snapshot.
+    derived_state: Option<ApprovalRequestState>,
     decisions: Vec<StoredApprovalDecision>,
+    /// See `approval_inactive_approvers`.
+    inactive: BTreeSet<Uuid>,
 }
 
 impl ResolvedApprovalRequest {
-    /// The policy, target and requester all still exist.
+    /// The policy, target and requester all still exist, and the request has a snapshot.
     fn is_valid(&self) -> bool {
         self.policy.is_some()
+            && self.snapshot.is_some()
             && self.request.target_uuid.is_some()
             && self.request.requestor_uuid.is_some()
     }
+
+    /// The context to count the decisions on this request in, `None` without a snapshot.
+    fn tally_context(&self) -> Option<ApprovalTallyContext<'_>> {
+        self.snapshot.as_ref().map(|snapshot| ApprovalTallyContext {
+            snapshot,
+            escalation_at: snapshot.escalation_at(self.request.created_at),
+            inactive: &self.inactive,
+        })
+    }
+
+    /// Has the escalation time passed at `now`, so that backup approvers may decide?
+    fn escalated_at(&self, now: OffsetDateTime) -> bool {
+        self.snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.escalation_at(self.request.created_at))
+            .is_some_and(|at| at <= now)
+    }
 }
 
-/// The state of a request, given its stored state and its decisions.
+/// The state of a request, given its stored state and the state recomputed from its
+/// snapshot and decisions (`None` without a snapshot).
 ///
-/// - Cancelled and expired are set outside of decisions and are final.
-/// - Otherwise the state is recomputed from the decisions. If they decide the request, that
-///   is the state, whatever was stored (after a replication merge the stored state may lag
-///   behind the merged decisions).
-/// - If they do not decide it, a pending request stays pending. A stored approval or
-///   rejection is kept (the policy may have gained approvers since), with a warning.
-/// - A pending request whose policy, target or requester is gone is invalid. Decided
-///   requests keep their state as a record.
+/// - A stored final state (approved, rejected, expired, cancelled, consumed) is kept: a
+///   recomputation never moves a request out of it. If the decisions no longer reach a
+///   stored approval or rejection (after a replication merge of concurrent decisions),
+///   this is logged; `approval_request_check_and_consume` refuses such an approval.
+/// - A pending request takes the recomputed state, unless its policy, target or requester
+///   is gone, or it has no snapshot: then it is invalid.
 fn approval_effective_state(
     request_uuid: Uuid,
     stored: ApprovalRequestState,
     valid: bool,
-    policy: Option<&ApprovalPolicy>,
-    decisions: &[StoredApprovalDecision],
+    derived: Option<ApprovalRequestState>,
 ) -> ApprovalRequestState {
-    let pending = match stored {
+    match stored {
         ApprovalRequestState::Cancelled
         | ApprovalRequestState::Expired
-        | ApprovalRequestState::Invalid => return stored,
-        ApprovalRequestState::Pending | ApprovalRequestState::Escalated => true,
-        ApprovalRequestState::Approved | ApprovalRequestState::Rejected => false,
-    };
-
-    match policy {
-        Some(policy) if valid => {
-            let derived = approval_tally(policy, decisions).state();
-            if derived != ApprovalRequestState::Pending {
-                if derived != stored {
-                    debug!(%request_uuid, %stored, %derived, "approval request state recomputed from its decisions");
+        | ApprovalRequestState::Invalid
+        | ApprovalRequestState::Consumed => stored,
+        ApprovalRequestState::Approved | ApprovalRequestState::Rejected => {
+            if derived.is_some_and(|derived| derived != stored) {
+                warn!(%request_uuid, %stored, ?derived, "approval request decisions no longer reach its stored state, keeping it");
+            }
+            stored
+        }
+        ApprovalRequestState::Pending | ApprovalRequestState::Escalated => match derived {
+            Some(derived) if valid => {
+                if derived != ApprovalRequestState::Pending {
+                    debug!(%request_uuid, %derived, "approval request state recomputed from its decisions");
                 }
                 derived
-            } else if pending {
-                ApprovalRequestState::Pending
-            } else {
-                warn!(%request_uuid, %stored, "approval request decisions no longer reach its stored state, keeping it");
-                stored
             }
-        }
-        _ if pending => ApprovalRequestState::Invalid,
-        _ => stored,
+            _ => ApprovalRequestState::Invalid,
+        },
     }
 }
 
-/// Load an approval request together with the policy it refers to. A missing policy,
-/// target or requester is not an error (the request is then invalid, see
-/// `approval_effective_state`), a malformed request or policy is.
+/// The approvers among `decisions` whose approvals no longer count at `now`: their
+/// account was deleted, or is expired or not yet valid.
+fn approval_inactive_approvers<'a, T: QueryServerTransaction<'a>>(
+    qs: &mut T,
+    decisions: &[StoredApprovalDecision],
+    now: OffsetDateTime,
+) -> Result<BTreeSet<Uuid>, OperationError> {
+    let approvers: BTreeSet<Uuid> = decisions
+        .iter()
+        .filter(|d| d.action == ApprovalDecisionAction::Approve && d.approver_uuid != UUID_SYSTEM)
+        .map(|d| d.approver_uuid)
+        .collect();
+    if approvers.is_empty() {
+        return Ok(approvers);
+    }
+
+    let active: BTreeSet<Uuid> = qs
+        .internal_search(filter!(f_or(
+            approvers
+                .iter()
+                .map(|u| f_eq(Attribute::Uuid, PartialValue::Uuid(*u)))
+                .collect()
+        )))?
+        .iter()
+        .filter(|entry| approval_account_active(entry, now))
+        .map(|entry| entry.get_uuid())
+        .collect();
+
+    Ok(approvers.difference(&active).copied().collect())
+}
+
+/// Load an approval request together with the policy it refers to, as of `now`. A missing
+/// policy, target, requester or snapshot is not an error (the request is then invalid, see
+/// `approval_effective_state`), a malformed request, snapshot or decision record is.
 fn approval_request_resolve<'a, T: QueryServerTransaction<'a>>(
     qs: &mut T,
     entry: &Entry<EntrySealed, EntryCommitted>,
+    now: OffsetDateTime,
 ) -> Result<ResolvedApprovalRequest, OperationError> {
     let request_uuid = entry.get_uuid();
     let decisions = approval_decision_records(qs, &[request_uuid])?
         .remove(&request_uuid)
         .unwrap_or_else(|| Ok(Vec::with_capacity(0)))?;
-    approval_request_resolve_with(qs, entry, decisions)
+    approval_request_resolve_with(qs, entry, decisions, now)
 }
 
 /// `approval_request_resolve`, with the decisions on the request already loaded.
@@ -304,6 +542,7 @@ fn approval_request_resolve_with<'a, T: QueryServerTransaction<'a>>(
     qs: &mut T,
     entry: &Entry<EntrySealed, EntryCommitted>,
     decisions: Vec<StoredApprovalDecision>,
+    now: OffsetDateTime,
 ) -> Result<ResolvedApprovalRequest, OperationError> {
     let request_uuid = entry.get_uuid();
 
@@ -319,52 +558,79 @@ fn approval_request_resolve_with<'a, T: QueryServerTransaction<'a>>(
         None => None,
     };
 
-    let stored_state = approval_request_state(entry)?;
-
-    let mut request = approval_request_from_entry(entry, policy.as_ref(), &decisions)?;
-    let valid =
-        policy.is_some() && request.target_uuid.is_some() && request.requestor_uuid.is_some();
-    request.state = approval_effective_state(
-        request_uuid,
-        stored_state,
-        valid,
-        policy.as_ref(),
-        &decisions,
-    );
-    if request.state == ApprovalRequestState::Invalid {
-        warn!(%request_uuid, "approval request policy, target or requester was deleted");
+    let snapshot = approval_request_snapshot(entry)?;
+    if snapshot.is_none() {
+        warn!(%request_uuid, "approval request has no quorum snapshot, it is invalid");
     }
 
-    Ok(ResolvedApprovalRequest {
+    let stored_state = approval_request_state(entry)?;
+    let request =
+        approval_request_from_entry(entry, policy.as_ref(), snapshot.as_ref(), &decisions)?;
+    let inactive = approval_inactive_approvers(qs, &decisions, now)?;
+
+    let mut resolved = ResolvedApprovalRequest {
         policy,
+        snapshot,
         request,
         stored_state,
+        derived_state: None,
         decisions,
-    })
+        inactive,
+    };
+    resolved.derived_state = resolved
+        .tally_context()
+        .map(|ctx| approval_tally(&ctx, &resolved.decisions).state());
+
+    resolved.request.state = approval_effective_state(
+        request_uuid,
+        stored_state,
+        resolved.is_valid(),
+        resolved.derived_state,
+    );
+    if resolved.request.state == ApprovalRequestState::Invalid {
+        warn!(%request_uuid, "approval request policy, target, requester or snapshot is missing");
+    }
+
+    Ok(resolved)
+}
+
+/// Resolve every entry. Each result is the resolved request, or the uuid of a malformed
+/// request with the error.
+#[allow(clippy::type_complexity)]
+fn approval_request_resolve_each<'a, T: QueryServerTransaction<'a>>(
+    qs: &mut T,
+    entries: &[Arc<EntrySealedCommitted>],
+    now: OffsetDateTime,
+) -> Result<Vec<Result<ResolvedApprovalRequest, (Uuid, OperationError)>>, OperationError> {
+    let request_uuids: Vec<Uuid> = entries.iter().map(|e| e.get_uuid()).collect();
+    let mut records = approval_decision_records(qs, &request_uuids)?;
+
+    Ok(entries
+        .iter()
+        .map(|entry| {
+            let request_uuid = entry.get_uuid();
+            records
+                .remove(&request_uuid)
+                .unwrap_or_else(|| Ok(Vec::with_capacity(0)))
+                .and_then(|decisions| approval_request_resolve_with(qs, entry, decisions, now))
+                .map_err(|err| (request_uuid, err))
+        })
+        .collect())
 }
 
 /// Resolve every entry, logging and skipping the ones that are malformed.
 fn approval_request_resolve_all<'a, T: QueryServerTransaction<'a>>(
     qs: &mut T,
     entries: &[Arc<EntrySealedCommitted>],
+    now: OffsetDateTime,
 ) -> Result<Vec<ResolvedApprovalRequest>, OperationError> {
-    let request_uuids: Vec<Uuid> = entries.iter().map(|e| e.get_uuid()).collect();
-    let mut records = approval_decision_records(qs, &request_uuids)?;
-
-    Ok(entries
-        .iter()
-        .filter_map(|entry| {
-            let request_uuid = entry.get_uuid();
-            let resolved = records
-                .remove(&request_uuid)
-                .unwrap_or_else(|| Ok(Vec::with_capacity(0)))
-                .and_then(|decisions| approval_request_resolve_with(qs, entry, decisions));
-            match resolved {
-                Ok(resolved) => Some(resolved),
-                Err(err) => {
-                    warn!(?err, request = %request_uuid, "skipping malformed approval request");
-                    None
-                }
+    Ok(approval_request_resolve_each(qs, entries, now)?
+        .into_iter()
+        .filter_map(|resolved| match resolved {
+            Ok(resolved) => Some(resolved),
+            Err((request, err)) => {
+                warn!(?err, %request, "skipping malformed approval request");
+                None
             }
         })
         .collect())
@@ -383,19 +649,21 @@ fn approval_decision_records<'a, T: QueryServerTransaction<'a>>(
         return Ok(by_request);
     }
 
-    let targets = request_uuids
+    let requests = request_uuids
         .iter()
-        .map(|u| f_eq(Attribute::ApprovalTarget, PartialValue::Refer(*u)))
+        .map(|u| f_eq(Attribute::ApprovalRecordRequest, PartialValue::Refer(*u)))
         .collect();
     let records = qs.internal_search(filter!(f_and!([
         f_eq(Attribute::Class, EntryClass::ApprovalDecisionRecord.into()),
-        f_or(targets)
+        f_or(requests)
     ])))?;
 
     for record in records.iter() {
-        let Some(request_uuid) = record.get_ava_single_refer(Attribute::ApprovalTarget) else {
+        let Some(request_uuid) = record.get_ava_single_refer(Attribute::ApprovalRecordRequest)
+        else {
             continue;
         };
+        let record_uuid = record.get_uuid();
         let decision = record
             .get_ava_single_utf8(Attribute::ApprovalDecision)
             .ok_or(OperationError::MissingAttribute(Attribute::ApprovalDecision))
@@ -403,8 +671,12 @@ fn approval_decision_records<'a, T: QueryServerTransaction<'a>>(
                 serde_json::from_str::<StoredApprovalDecision>(s)
                     .map_err(|_| OperationError::InvalidValueState)
             })
+            .map(|mut decision| {
+                decision.record_uuid = record_uuid;
+                decision
+            })
             .inspect_err(|err| {
-                error!(?err, record = %record.get_uuid(), request = %request_uuid, "invalid approval decision record");
+                error!(?err, record = %record_uuid, request = %request_uuid, "invalid approval decision record");
             });
         let decisions = by_request
             .entry(request_uuid)
@@ -417,24 +689,18 @@ fn approval_decision_records<'a, T: QueryServerTransaction<'a>>(
     }
 
     for decisions in by_request.values_mut().flatten() {
-        decisions.sort_by_key(|d| (d.decision_time, d.approver_uuid));
+        decisions.sort_by_key(|d| d.order_key());
     }
     Ok(by_request)
 }
 
-/// Has the escalation timeout of a pending, not yet escalated request passed?
+/// Has the escalation timeout of a pending request passed, without the escalation having
+/// been recorded yet?
 fn approval_escalation_due(resolved: &ResolvedApprovalRequest, now: OffsetDateTime) -> bool {
-    let Some(policy) = resolved.policy.as_ref() else {
-        return false;
-    };
     // There is a single escalation level: the backup approvers.
-    let Some(escalation_timeout) = policy.escalation_timeout_seconds else {
-        return false;
-    };
     resolved.request.state == ApprovalRequestState::Pending
         && resolved.request.escalation_level == 0
-        && !policy.backup_approvers.is_empty()
-        && resolved.request.created_at + Duration::from_secs(u64::from(escalation_timeout)) <= now
+        && resolved.escalated_at(now)
 }
 
 /// Has a pending request passed its expiry time?
@@ -491,10 +757,11 @@ impl QueryServerReadTransaction<'_> {
     ) -> Result<Vec<ApprovalRequest>, OperationError> {
         approval_check_admin(ident, false)?;
 
+        let now = self.get_accesscontrols().get_curtime();
         let filter = filter!(f_eq(Attribute::Class, EntryClass::ApprovalRequest.into()));
         let entries = self.internal_search(filter)?;
 
-        Ok(approval_request_resolve_all(self, &entries)?
+        Ok(approval_request_resolve_all(self, &entries, now)?
             .into_iter()
             .map(|resolved| resolved.request)
             .filter(|request| state.is_none_or(|s| request.state == s))
@@ -508,6 +775,7 @@ impl QueryServerReadTransaction<'_> {
     ) -> Result<ApprovalRequest, OperationError> {
         approval_check_admin(ident, false)?;
 
+        let now = self.get_accesscontrols().get_curtime();
         let filter = filter!(f_and!([
             f_eq(Attribute::Class, EntryClass::ApprovalRequest.into()),
             f_eq(Attribute::Uuid, PartialValue::Uuid(uuid))
@@ -518,7 +786,7 @@ impl QueryServerReadTransaction<'_> {
             .next()
             .ok_or(OperationError::NoMatchingEntries)?;
 
-        approval_request_resolve(self, &entry).map(|resolved| resolved.request)
+        approval_request_resolve(self, &entry, now).map(|resolved| resolved.request)
     }
 }
 
@@ -632,8 +900,30 @@ impl QueryServerWriteTransaction<'_> {
         Ok(())
     }
 
-    /// The number of accounts other than `requester` that can fill one of `slots`: the
-    /// slot names them, or a group they are a member of.
+    /// Record whether each of `members` is a group, for the snapshot of a new request.
+    fn approval_member_kinds(
+        &mut self,
+        members: &[Uuid],
+    ) -> Result<BTreeMap<Uuid, ApprovalMemberKind>, OperationError> {
+        let mut kinds = BTreeMap::new();
+        for member in members {
+            let kind = match self.internal_search_uuid(*member) {
+                Ok(entry)
+                    if entry.attribute_equality(Attribute::Class, &EntryClass::Group.into()) =>
+                {
+                    ApprovalMemberKind::Group
+                }
+                Ok(_) | Err(OperationError::NoMatchingEntries) => ApprovalMemberKind::Account,
+                Err(err) => return Err(err),
+            };
+            kinds.insert(*member, kind);
+        }
+        Ok(kinds)
+    }
+
+    /// The number of persons other than `requester` that can decide in one of `slots`
+    /// now: the slot names them, or a group they are a member of. Only enabled persons
+    /// count, never anonymous, as no one else may decide.
     fn approval_slot_candidates(
         &mut self,
         slots: &[Uuid],
@@ -642,6 +932,7 @@ impl QueryServerWriteTransaction<'_> {
         if slots.is_empty() {
             return Ok(0);
         }
+        let now = self.get_curtime_odt();
         let candidates = slots
             .iter()
             .flat_map(|slot| {
@@ -652,45 +943,56 @@ impl QueryServerWriteTransaction<'_> {
             })
             .collect();
         self.internal_search(filter!(f_and!([
-            f_eq(Attribute::Class, EntryClass::Account.into()),
+            f_eq(Attribute::Class, EntryClass::Person.into()),
             f_or(candidates),
-            f_andnot(f_eq(Attribute::Uuid, PartialValue::Uuid(requester)))
+            f_andnot(f_eq(Attribute::Uuid, PartialValue::Uuid(requester))),
+            f_andnot(f_eq(Attribute::Uuid, PartialValue::Uuid(UUID_ANONYMOUS)))
         ])))
-        .map(|entries| entries.len())
+        .map(|entries| {
+            entries
+                .iter()
+                .filter(|entry| approval_account_active(entry, now))
+                .count()
+        })
     }
 
-    /// Kubidm: reject a request that its policy can never approve, because too few of its
+    /// Kubidm: reject a request that its snapshot can never approve, because too few of its
     /// approver slots can be filled by someone other than the requester (for example, the
     /// requester is the only approver). Without this the request would sit pending until it
     /// expires. Backup approvers can fill open slots after escalation, so they count when
-    /// the policy escalates. This is a sanity check that errs on the side of accepting: a
-    /// person who can fill several slots is counted for each.
+    /// the policy escalates.
+    ///
+    /// This is a best-effort sanity check that errs on the side of accepting: a person who
+    /// can fill several slots is counted for each, and approvers can be disabled, deleted
+    /// or removed from a group after the check. A request that passes may still never be
+    /// approved; it then expires.
     fn approval_check_reachable(
         &mut self,
-        policy: &ApprovalPolicy,
-        requester: Uuid,
+        policy_name: &str,
+        snapshot: &ApprovalSnapshot,
     ) -> Result<(), OperationError> {
-        let required = approval_required_decisions(policy) as usize;
-        let slots = approval_slots(policy);
+        let required = snapshot.required as usize;
+        let requester = snapshot.requester;
 
         let mut fillable = 0;
-        for slot in slots.iter() {
+        for slot in snapshot.slots.keys() {
             if self.approval_slot_candidates(&[*slot], requester)? > 0 {
                 fillable += 1;
             }
         }
 
         if fillable < required
-            && policy.escalation_timeout_seconds.is_some()
-            && !policy.backup_approvers.is_empty()
+            && snapshot.escalation_timeout_seconds.is_some()
+            && !snapshot.backups.is_empty()
         {
-            let backups = self.approval_slot_candidates(&policy.backup_approvers, requester)?;
-            fillable += backups.min(slots.len() - fillable);
+            let backups: Vec<Uuid> = snapshot.backups.keys().copied().collect();
+            let backups = self.approval_slot_candidates(&backups, requester)?;
+            fillable += backups.min(snapshot.slots.len() - fillable);
         }
 
         if fillable < required {
             error!(
-                policy = %policy.name,
+                policy = %policy_name,
                 %requester,
                 required,
                 fillable,
@@ -704,6 +1006,9 @@ impl QueryServerWriteTransaction<'_> {
     /// Create a pending approval request from `ident` for `operation_type` on `target_uuid`,
     /// under the enabled policy `policy_name` that must cover that operation type. The
     /// request expires after the policy timeout. Returns the uuid of the new request.
+    ///
+    /// The approvers, pattern and escalation of the policy are copied onto the request (see
+    /// the module documentation), so later changes to the policy do not affect it.
     ///
     /// Kubidm: nothing in the server calls this yet - no operation is gated on approval and
     /// there is no API route to create requests. It is the entry point for those.
@@ -747,7 +1052,23 @@ impl QueryServerWriteTransaction<'_> {
             return Err(OperationError::InvalidRequestState);
         }
 
-        self.approval_check_reachable(&policy, ident.get_uuid())?;
+        let slots = self.approval_member_kinds(&policy.approvers)?;
+        let backups = self.approval_member_kinds(&policy.backup_approvers)?;
+        let snapshot = ApprovalSnapshot {
+            requester: ident.get_uuid(),
+            pattern: policy.pattern,
+            required: approval_required_decisions(policy.pattern, slots.len()),
+            slots,
+            backups,
+            escalation_timeout_seconds: policy.escalation_timeout_seconds,
+        };
+
+        self.approval_check_reachable(&policy.name, &snapshot)?;
+
+        let snapshot_json = serde_json::to_string(&snapshot).map_err(|err| {
+            error!(?err, "unable to serialise approval quorum snapshot");
+            OperationError::SerdeJsonError
+        })?;
 
         let uuid = Uuid::new_v4();
         let mut entry: EntryInitNew = entry_init!(
@@ -767,6 +1088,10 @@ impl QueryServerWriteTransaction<'_> {
                 Value::new_iutf8(ApprovalRequestState::Pending.as_str())
             ),
             (Attribute::ApprovalEscalationLevel, Value::Uint32(0))
+        );
+        entry.add_ava(
+            Attribute::ApprovalQuorumSnapshot,
+            Value::new_utf8(snapshot_json),
         );
 
         if policy.timeout_seconds > 0 {
@@ -799,6 +1124,30 @@ impl QueryServerWriteTransaction<'_> {
         Ok(uuid)
     }
 
+    /// Kubidm: is the decider's account managed by the requester (directly, or through a
+    /// group the requester is a member of)? Such an account is under the requester's
+    /// control, so its decision would be the requester's own.
+    fn approval_decider_managed_by_requester(
+        &mut self,
+        decider: &EntrySealedCommitted,
+        requester: Uuid,
+    ) -> Result<bool, OperationError> {
+        // Single valued.
+        let Some(manager) = decider.get_ava_single_refer(Attribute::EntryManagedBy) else {
+            return Ok(false);
+        };
+        if manager == requester {
+            return Ok(true);
+        }
+        match self.internal_search_uuid(requester) {
+            Ok(requester_entry) => Ok(requester_entry
+                .get_ava_refer(Attribute::MemberOf)
+                .is_some_and(|groups| groups.contains(&manager))),
+            Err(OperationError::NoMatchingEntries) => Ok(false),
+            Err(err) => Err(err),
+        }
+    }
+
     pub fn approval_request_decision(
         &mut self,
         ident: &Identity,
@@ -809,16 +1158,16 @@ impl QueryServerWriteTransaction<'_> {
         let current_time = OffsetDateTime::UNIX_EPOCH + ct;
         let is_system = approval_ident_is_system(ident);
 
-        if !is_system {
-            if ident.is_internal() {
-                security_access!(ident = %ident, "denied - internal identity is not the system");
+        let decider = if is_system {
+            None
+        } else {
+            let decider = approval_check_decider(ident)?;
+            if !approval_account_active(&decider, current_time) {
+                security_access!(ident = %ident, "denied - the approver's account is expired or not yet valid");
                 return Err(OperationError::AccessDenied);
             }
-            if ident.access_scope() != AccessScope::ReadWrite {
-                security_access!("approval decision requires a read-write (privileged) session");
-                return Err(OperationError::AccessDenied);
-            }
-        }
+            Some(decider)
+        };
 
         // Kubidm: a missing request (or policy) and a request the caller may not decide on
         // are indistinguishable to non-system callers, so existence is not revealed.
@@ -840,31 +1189,38 @@ impl QueryServerWriteTransaction<'_> {
             return Err(not_found);
         };
 
-        let resolved = approval_request_resolve(self, &entry)?;
+        let resolved = approval_request_resolve(self, &entry, current_time)?;
 
-        let Some(policy) = resolved.policy.as_ref() else {
-            error!(%request_uuid, "approval request policy not found");
+        let (Some(policy), Some(snapshot)) = (resolved.policy.as_ref(), resolved.snapshot.as_ref())
+        else {
+            error!(%request_uuid, "approval request policy or quorum snapshot not found");
             return Err(not_found);
         };
 
-        // Kubidm: only an approver of the request's policy may decide on it - or a backup
-        // approver once the request has been escalated - and never on their own request.
-        // The system may fill any slot.
-        let escalated = resolved.request.escalation_level > 0;
-        let slots = if is_system {
-            approval_slots(policy)
-        } else {
-            let slots = approval_ident_slots(ident, policy, escalated);
-            if slots.is_empty() {
-                security_access!(ident = %ident, %request_uuid, "denied - not an approver of this request");
-                return Err(OperationError::AccessDenied);
-            }
+        // Kubidm: only an approver of the request may decide on it - or a backup approver
+        // once the escalation time has passed - and never on their own request, nor through
+        // an account the requester manages. The system may fill any slot.
+        let escalated = resolved.escalated_at(current_time);
+        let slots = match decider.as_ref() {
+            None => snapshot.slot_set(),
+            Some(decider) => {
+                let slots = approval_ident_slots(ident, snapshot, escalated);
+                if slots.is_empty() {
+                    security_access!(ident = %ident, %request_uuid, "denied - not an approver of this request");
+                    return Err(OperationError::AccessDenied);
+                }
 
-            if resolved.request.requestor_uuid == Some(ident.get_uuid()) {
-                security_access!(ident = %ident, %request_uuid, "denied - approvers can not decide on their own request");
-                return Err(OperationError::AccessDenied);
+                if snapshot.requester == ident.get_uuid() {
+                    security_access!(ident = %ident, %request_uuid, "denied - approvers can not decide on their own request");
+                    return Err(OperationError::AccessDenied);
+                }
+
+                if self.approval_decider_managed_by_requester(decider, snapshot.requester)? {
+                    security_access!(ident = %ident, %request_uuid, "denied - the requester manages this approver's account");
+                    return Err(OperationError::AccessDenied);
+                }
+                slots
             }
-            slots
         };
 
         if !policy.enabled {
@@ -902,6 +1258,7 @@ impl QueryServerWriteTransaction<'_> {
         }
 
         let action = request.action;
+        let record_uuid = Uuid::new_v4();
         let decision = StoredApprovalDecision {
             approver_uuid,
             approver_spn: ident
@@ -909,15 +1266,22 @@ impl QueryServerWriteTransaction<'_> {
                 .and_then(|e| e.get_ava_single_proto_string(Attribute::Spn))
                 .unwrap_or_default(),
             decision_time: current_time,
+            decision_time_nanos: current_time.nanosecond(),
             action,
             comment: request.comment,
             slots,
+            record_uuid,
         };
 
-        let counted_before = approval_tally(policy, &resolved.decisions).counted;
-        let mut decisions = resolved.decisions;
+        let ctx = ApprovalTallyContext {
+            snapshot,
+            escalation_at: snapshot.escalation_at(resolved.request.created_at),
+            inactive: &resolved.inactive,
+        };
+        let counted_before = approval_tally(&ctx, &resolved.decisions).counted;
+        let mut decisions = resolved.decisions.clone();
         decisions.push(decision.clone());
-        let tally = approval_tally(policy, &decisions);
+        let tally = approval_tally(&ctx, &decisions);
         // The new decision must fill a slot, without displacing an earlier decision (which
         // could otherwise happen when two decisions have the same time, as they are then
         // ordered by approver).
@@ -940,8 +1304,8 @@ impl QueryServerWriteTransaction<'_> {
                 Attribute::Class,
                 EntryClass::ApprovalDecisionRecord.to_value()
             ),
-            (Attribute::Uuid, Value::Uuid(Uuid::new_v4())),
-            (Attribute::ApprovalTarget, Value::Refer(request_uuid)),
+            (Attribute::Uuid, Value::Uuid(record_uuid)),
+            (Attribute::ApprovalRecordRequest, Value::Refer(request_uuid)),
             (
                 Attribute::ApprovalDecision,
                 Value::new_utf8s(&decision_json)
@@ -958,6 +1322,101 @@ impl QueryServerWriteTransaction<'_> {
             %action,
             state = %new_state,
             "approval decision recorded"
+        );
+        Ok(())
+    }
+
+    /// Kubidm: the approval gate. An operation that needs approval calls this, as the
+    /// identity carrying out the operation, before it makes its change and in the same
+    /// transaction. It succeeds once per approved request:
+    ///
+    /// - the outcome is recomputed from the request's snapshot and decision records (see
+    ///   the module documentation) and must be approved; a stored approval is not enough,
+    ///   and an approval whose approvers have since been deleted or disabled no longer
+    ///   counts. The stored state must not be a final state other than approved;
+    /// - the request must still be valid (policy, target and requester exist);
+    /// - only the requester (or the system) may use the approval;
+    /// - the operation type, target and operation details must match the request exactly;
+    /// - the request then moves to the final `consumed` state.
+    ///
+    /// An approval is only final once replication has converged: a decision made
+    /// concurrently on another replica can still change the outcome, and the same approval
+    /// can be consumed once on each replica before they replicate. Callers must not decide
+    /// on approvals any other way, in particular not from `approval_request_get`.
+    ///
+    /// Kubidm: no operation calls this yet.
+    pub fn approval_request_check_and_consume(
+        &mut self,
+        ident: &Identity,
+        request_uuid: Uuid,
+        operation_type: &ApprovalOperationType,
+        target_uuid: Uuid,
+        operation_details: &BTreeMap<String, String>,
+    ) -> Result<(), OperationError> {
+        let is_system = approval_ident_is_system(ident);
+        if ident.is_internal() && !is_system {
+            security_access!(ident = %ident, "denied - internal identity is not the system");
+            return Err(OperationError::AccessDenied);
+        }
+
+        let now = self.get_curtime_odt();
+        let entry = self
+            .internal_search(filter!(f_and!([
+                f_eq(Attribute::Class, EntryClass::ApprovalRequest.into()),
+                f_eq(Attribute::Uuid, PartialValue::Uuid(request_uuid))
+            ])))?
+            .into_iter()
+            .next()
+            .ok_or(OperationError::NoMatchingEntries)?;
+        let resolved = approval_request_resolve(self, &entry, now)?;
+
+        let Some(snapshot) = resolved.snapshot.as_ref() else {
+            error!(%request_uuid, "approval request has no quorum snapshot, it can not be used");
+            return Err(OperationError::InvalidRequestState);
+        };
+        if !is_system && snapshot.requester != ident.get_uuid() {
+            security_access!(ident = %ident, %request_uuid, "denied - only the requester may use an approval");
+            return Err(OperationError::AccessDenied);
+        }
+
+        if !resolved.is_valid() {
+            error!(%request_uuid, "approval request policy, target or requester was deleted");
+            return Err(OperationError::InvalidRequestState);
+        }
+        if resolved.request.state != ApprovalRequestState::Approved
+            || resolved.derived_state != Some(ApprovalRequestState::Approved)
+        {
+            error!(
+                %request_uuid,
+                state = %resolved.request.state,
+                stored = %resolved.stored_state,
+                derived = ?resolved.derived_state,
+                "approval request is not approved"
+            );
+            return Err(OperationError::InvalidRequestState);
+        }
+
+        if resolved.request.operation_type != *operation_type
+            || resolved.request.target_uuid != Some(target_uuid)
+            || resolved.request.operation_details != *operation_details
+        {
+            security_access!(
+                ident = %ident,
+                %request_uuid,
+                %operation_type,
+                target = %target_uuid,
+                "denied - the approval request is for a different operation"
+            );
+            return Err(OperationError::InvalidRequestState);
+        }
+
+        self.approval_request_set_state(request_uuid, ApprovalRequestState::Consumed)?;
+        info!(
+            ident = %ident,
+            request = %request_uuid,
+            %operation_type,
+            target = %target_uuid,
+            "approval request consumed"
         );
         Ok(())
     }
@@ -989,7 +1448,8 @@ impl QueryServerWriteTransaction<'_> {
 
         // Only pending (or invalid) requests can be cancelled, decided ones are final. A
         // malformed request can still be cancelled based on its stored state.
-        let state = match approval_request_resolve(self, &entry) {
+        let now = self.get_curtime_odt();
+        let state = match approval_request_resolve(self, &entry, now) {
             Ok(resolved) => resolved.request.state,
             Err(err) => {
                 warn!(?err, %request_uuid, "malformed approval request");
@@ -1017,7 +1477,7 @@ impl QueryServerWriteTransaction<'_> {
         ct: Duration,
     ) -> Result<bool, OperationError> {
         let current_time = OffsetDateTime::UNIX_EPOCH + ct;
-        let Some(resolved) = self.approval_request_pending(request_uuid)? else {
+        let Some(resolved) = self.approval_request_pending(request_uuid, current_time)? else {
             return Ok(false);
         };
 
@@ -1030,16 +1490,17 @@ impl QueryServerWriteTransaction<'_> {
         Ok(true)
     }
 
-    /// Escalate a pending approval request to the backup approvers of its policy once the
-    /// policy's escalation timeout has passed since the request was created. Returns
-    /// whether the request was escalated.
+    /// Record that a pending approval request has escalated to the backup approvers of its
+    /// snapshot, once the escalation timeout has passed since the request was created.
+    /// Backup approvers may decide from that time on whether or not this was recorded.
+    /// Returns whether the request was escalated.
     pub fn approval_request_escalate(
         &mut self,
         request_uuid: Uuid,
         ct: Duration,
     ) -> Result<bool, OperationError> {
         let current_time = OffsetDateTime::UNIX_EPOCH + ct;
-        let Some(resolved) = self.approval_request_pending(request_uuid)? else {
+        let Some(resolved) = self.approval_request_pending(request_uuid, current_time)? else {
             return Ok(false);
         };
 
@@ -1054,13 +1515,16 @@ impl QueryServerWriteTransaction<'_> {
     /// Kubidm: the periodic approval maintenance, run from the server's interval loop.
     /// For every request stored as pending:
     ///
-    /// - an invalid request (its policy, target or requester was deleted) is expired,
+    /// - an invalid request (its policy, target, requester or snapshot is missing) is
+    ///   expired,
+    /// - a malformed request (or one with a malformed decision record) is expired, as it
+    ///   can never be decided,
     /// - a request whose decisions decide it (after a replication merge) gets that state,
     /// - an overdue request is expired,
-    /// - a request past its escalation timeout is escalated, once.
+    /// - a request past its escalation timeout is marked escalated, once.
     ///
-    /// Malformed requests are logged and skipped. Returns the number of requests changed,
-    /// so that the caller only commits when something changed.
+    /// Returns the number of requests changed, so that the caller only commits when
+    /// something changed.
     #[instrument(level = "debug", skip_all)]
     pub fn approval_sweep(&mut self) -> Result<usize, OperationError> {
         let now = self.get_curtime_odt();
@@ -1074,7 +1538,16 @@ impl QueryServerWriteTransaction<'_> {
         ])))?;
 
         let mut changed = 0;
-        for resolved in approval_request_resolve_all(self, &entries)? {
+        for resolved in approval_request_resolve_each(self, &entries, now)? {
+            let resolved = match resolved {
+                Ok(resolved) => resolved,
+                Err((request_uuid, err)) => {
+                    warn!(?err, %request_uuid, "expiring malformed approval request");
+                    self.approval_request_set_state(request_uuid, ApprovalRequestState::Expired)?;
+                    changed += 1;
+                    continue;
+                }
+            };
             let request_uuid = resolved.request.uuid;
 
             let new_state = match resolved.request.state {
@@ -1136,6 +1609,7 @@ impl QueryServerWriteTransaction<'_> {
     fn approval_request_pending(
         &mut self,
         request_uuid: Uuid,
+        now: OffsetDateTime,
     ) -> Result<Option<ResolvedApprovalRequest>, OperationError> {
         let entries = self.internal_search(filter!(f_and!([
             f_eq(Attribute::Class, EntryClass::ApprovalRequest.into()),
@@ -1145,7 +1619,7 @@ impl QueryServerWriteTransaction<'_> {
                 PartialValue::new_iutf8(ApprovalRequestState::Pending.as_str())
             )
         ])))?;
-        let resolved = approval_request_resolve_all(self, &entries)?
+        let resolved = approval_request_resolve_all(self, &entries, now)?
             .into_iter()
             .next();
         if resolved.is_none() {
@@ -1224,6 +1698,22 @@ fn approval_request_state(
         .ok_or(OperationError::InvalidValueState)
 }
 
+/// The quorum snapshot of a request, `None` if it has none (created before snapshots
+/// existed), an error if it is malformed.
+fn approval_request_snapshot(
+    entry: &Entry<EntrySealed, EntryCommitted>,
+) -> Result<Option<ApprovalSnapshot>, OperationError> {
+    entry
+        .get_ava_single_utf8(Attribute::ApprovalQuorumSnapshot)
+        .map(|s| {
+            serde_json::from_str::<ApprovalSnapshot>(s).map_err(|err| {
+                error!(?err, uuid = %entry.get_uuid(), "invalid approval quorum snapshot");
+                OperationError::InvalidValueState
+            })
+        })
+        .transpose()
+}
+
 /// `ApprovalOperationType` is shared with approval policies, which list every operation
 /// type they cover, so it is multi-value in the schema. A request is about exactly one
 /// operation, which is enforced here.
@@ -1269,6 +1759,7 @@ fn approval_request_operation_details(
 fn approval_request_from_entry(
     entry: &Entry<EntrySealed, EntryCommitted>,
     policy: Option<&ApprovalPolicy>,
+    snapshot: Option<&ApprovalSnapshot>,
     decisions: &[StoredApprovalDecision],
 ) -> Result<ApprovalRequest, OperationError> {
     let uuid = entry.get_uuid();
@@ -1311,7 +1802,7 @@ fn approval_request_from_entry(
             .map(StoredApprovalDecision::to_proto)
             .collect(),
         escalation_level,
-        required_decisions: policy.map(approval_required_decisions).unwrap_or(0),
+        required_decisions: snapshot.map(|s| s.required).unwrap_or(0),
         operation_details,
     })
 }
@@ -1319,6 +1810,9 @@ fn approval_request_from_entry(
 #[cfg(test)]
 mod tests {
     use super::StoredApprovalDecision;
+    use crate::event::{CreateEvent, DeleteEvent};
+    use crate::idm::server::IdmServerTransaction;
+    use crate::idm::serviceaccount::GenerateApiTokenEvent;
     use crate::migration_data::dl14::schema::{
         SCHEMA_ATTR_APPROVAL_OPERATION_TYPE, SCHEMA_ATTR_APPROVAL_PATTERN,
         SCHEMA_ATTR_APPROVAL_POLICY_NAME, SCHEMA_ATTR_APPROVER, SCHEMA_ATTR_BACKUP_APPROVER,
@@ -1382,6 +1876,76 @@ mod tests {
             &Attribute::ApprovalPatternAttr,
             vec![Value::new_iutf8("majority")],
             1,
+        );
+    }
+
+    /// Decision records written before the sub-second part of the decision time was stored
+    /// still read, with whole seconds.
+    #[test]
+    fn test_approval_decision_time_backward_compatible() {
+        let approver = Uuid::new_v4();
+        let legacy = format!(
+            r#"{{"approver_uuid":"{approver}","approver_spn":"","decision_time":1700000000,"action":"approve","comment":null,"slots":["{approver}"]}}"#
+        );
+        let decision: StoredApprovalDecision =
+            serde_json::from_str(&legacy).expect("legacy decision record must parse");
+        assert_eq!(decision.decision_time_nanos, 0);
+        assert_eq!(
+            decision.decided_at(),
+            OffsetDateTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)
+        );
+
+        let at = OffsetDateTime::UNIX_EPOCH + Duration::new(1_700_000_000, 123_456_789);
+        let decision = StoredApprovalDecision {
+            decision_time: at,
+            decision_time_nanos: at.nanosecond(),
+            ..decision
+        };
+        let round_trip: StoredApprovalDecision =
+            serde_json::from_str(&serde_json::to_string(&decision).expect("serialise"))
+                .expect("deserialise");
+        assert_eq!(round_trip.decided_at(), at);
+    }
+
+    /// A recomputation never moves a request out of a final state.
+    #[test]
+    fn test_approval_effective_state_final_states() {
+        use super::approval_effective_state;
+        use ApprovalRequestState::*;
+        let request = Uuid::new_v4();
+
+        assert_eq!(
+            approval_effective_state(request, Rejected, true, Some(Approved)),
+            Rejected
+        );
+        assert_eq!(
+            approval_effective_state(request, Approved, true, Some(Rejected)),
+            Approved
+        );
+        for stored in [Cancelled, Expired, Consumed] {
+            for derived in [Pending, Approved, Rejected] {
+                assert_eq!(
+                    approval_effective_state(request, stored, true, Some(derived)),
+                    stored
+                );
+            }
+        }
+        assert_eq!(
+            approval_effective_state(request, Pending, true, Some(Approved)),
+            Approved
+        );
+        assert_eq!(
+            approval_effective_state(request, Pending, true, Some(Rejected)),
+            Rejected
+        );
+        // Without a snapshot, or with a reference gone, a pending request is invalid.
+        assert_eq!(
+            approval_effective_state(request, Pending, true, None),
+            Invalid
+        );
+        assert_eq!(
+            approval_effective_state(request, Pending, false, Some(Approved)),
+            Invalid
         );
     }
 
@@ -1517,78 +2081,54 @@ mod tests {
             .is_empty());
     }
 
-    /// Only approvers (or backup approvers) of the request's policy may decide on it, and the
+    /// Only approvers (or backup approvers) of the request may decide on it, and the
     /// requestor may cancel their own request (but nobody else's).
     #[qs_test]
     async fn test_approval_request_decision_access(server: &QueryServer) {
         let ct = duration_from_epoch_now();
         let mut write_txn = server.write(ct).await.unwrap();
 
-        let idm_admin_entry = write_txn.internal_search_uuid(UUID_IDM_ADMIN).unwrap();
-        let idm_admin = Identity::from_impersonate_entry_readwrite(idm_admin_entry);
-        let admin_entry = write_txn.internal_search_uuid(UUID_ADMIN).unwrap();
-        let admin = Identity::from_impersonate_entry_readwrite(admin_entry);
-        let anon_entry = write_txn.internal_search_uuid(UUID_ANONYMOUS).unwrap();
-        let anon = Identity::from_impersonate_entry_readwrite(anon_entry);
+        let idm_admin = identity(&mut write_txn, UUID_IDM_ADMIN);
+        let admin = identity(&mut write_txn, UUID_ADMIN);
+        let anon = identity(&mut write_txn, UUID_ANONYMOUS);
+        let a = create_person(&mut write_txn, "approver_a");
+        let other = create_person(&mut write_txn, "not_an_approver");
 
-        // Approvers are idm_admin (direct) and system_admins (backup, by group).
+        // The approver is A (direct), the backup approver system_admins (by group).
         let mut request = two_approver_policy("decision_policy");
-        request.approvers = vec![UUID_IDM_ADMIN];
+        request.approvers = vec![a];
         write_txn
             .approval_policy_create(&idm_admin, &request)
             .expect("failed to create approval policy");
-        let policy_uuid = find_policy_uuid(&mut write_txn, "decision_policy");
-
-        let mk_request = |uuid: Uuid| {
-            entry_init!(
-                (Attribute::Class, EntryClass::Object.to_value()),
-                (Attribute::Class, EntryClass::ApprovalRequest.to_value()),
-                (Attribute::Uuid, Value::Uuid(uuid)),
-                (Attribute::ApprovalRequestPolicy, Value::Refer(policy_uuid)),
-                (
-                    Attribute::ApprovalOperationType,
-                    Value::new_iutf8n("schema_modify")
-                ),
-                (Attribute::ApprovalTarget, Value::Refer(UUID_IDM_ADMINS)),
-                (Attribute::ApprovalRequestor, Value::Refer(UUID_ANONYMOUS)),
-                (Attribute::ApprovalState, Value::new_iutf8("pending"))
-            )
-        };
-        let request_a = Uuid::new_v4();
-        let request_b = Uuid::new_v4();
+        // An approval admin is not implicitly an approver.
         write_txn
-            .internal_create(vec![mk_request(request_a), mk_request(request_b)])
-            .expect("failed to create approval requests");
+            .approval_policy_create(
+                &idm_admin,
+                &policy_request("other_policy", ApprovalPattern::AnyOne, vec![other]),
+            )
+            .expect("failed to create approval policy");
 
-        let approve = || ApprovalDecisionRequest {
-            action: ApprovalDecisionAction::Approve,
-            comment: None,
-        };
+        let request_a = create_request(&mut write_txn, UUID_ANONYMOUS, "decision_policy", ct)
+            .expect("failed to create approval request");
+        let request_b = create_request(&mut write_txn, UUID_ANONYMOUS, "other_policy", ct)
+            .expect("failed to create approval request");
 
         // Neither a direct nor a backup approver of the policy.
         assert_eq!(
             write_txn.approval_request_decision(&anon, request_a, approve(), ct),
             Err(OperationError::AccessDenied)
         );
-        // An approval admin is not implicitly an approver.
-        let mut other_policy = two_approver_policy("other_policy");
-        other_policy.approvers = vec![UUID_ANONYMOUS];
-        other_policy.backup_approvers = vec![];
-        write_txn
-            .approval_policy_create(&idm_admin, &other_policy)
-            .expect("failed to create approval policy");
-        let other_policy_uuid = find_policy_uuid(&mut write_txn, "other_policy");
-        write_txn
-            .internal_modify_uuid(
-                request_b,
-                &ModifyList::new_purge_and_set(
-                    Attribute::ApprovalRequestPolicy,
-                    Value::Refer(other_policy_uuid),
-                ),
-            )
-            .expect("failed to repoint request");
+        assert_eq!(
+            decide_as(&mut write_txn, other, request_a, approve(), ct),
+            Err(OperationError::AccessDenied)
+        );
+        // Approval admins are service accounts here, and not approvers either.
         assert_eq!(
             write_txn.approval_request_decision(&idm_admin, request_b, approve(), ct),
+            Err(OperationError::AccessDenied)
+        );
+        assert_eq!(
+            decide_as(&mut write_txn, a, request_b, approve(), ct),
             Err(OperationError::AccessDenied)
         );
 
@@ -1598,9 +2138,7 @@ mod tests {
         );
 
         // The requestor may cancel their own request, others may not unless approval admin.
-        let request_c = Uuid::new_v4();
-        write_txn
-            .internal_create(vec![mk_request(request_c)])
+        let request_c = create_request(&mut write_txn, UUID_ANONYMOUS, "decision_policy", ct)
             .expect("failed to create approval request");
         assert_eq!(
             write_txn.approval_request_cancel(&admin, request_c),
@@ -1656,6 +2194,20 @@ mod tests {
         uuid
     }
 
+    fn create_service_account(txn: &mut QueryServerWriteTransaction<'_>, name: &str) -> Uuid {
+        let uuid = Uuid::new_v4();
+        txn.internal_create(vec![entry_init!(
+            (Attribute::Class, EntryClass::Object.to_value()),
+            (Attribute::Class, EntryClass::Account.to_value()),
+            (Attribute::Class, EntryClass::ServiceAccount.to_value()),
+            (Attribute::Name, Value::new_iname(name)),
+            (Attribute::DisplayName, Value::new_utf8s(name)),
+            (Attribute::Uuid, Value::Uuid(uuid))
+        )])
+        .expect("failed to create service account");
+        uuid
+    }
+
     fn create_group(
         txn: &mut QueryServerWriteTransaction<'_>,
         name: &str,
@@ -1676,9 +2228,26 @@ mod tests {
         uuid
     }
 
-    /// Store a decision record directly, as replication would deliver one.
-    fn add_decision_record(
+    /// Set (or with `None` clear) the expiry time of an account.
+    fn set_account_expire(
         txn: &mut QueryServerWriteTransaction<'_>,
+        account: Uuid,
+        expire: Option<OffsetDateTime>,
+    ) {
+        let modlist = match expire {
+            Some(expire) => {
+                ModifyList::new_purge_and_set(Attribute::AccountExpire, Value::DateTime(expire))
+            }
+            None => ModifyList::new_purge(Attribute::AccountExpire),
+        };
+        txn.internal_modify_uuid(account, &modlist)
+            .expect("failed to set account expiry");
+    }
+
+    /// Store a decision record directly, as replication would deliver one.
+    fn add_decision_record_uuid(
+        txn: &mut QueryServerWriteTransaction<'_>,
+        record: Uuid,
         request: Uuid,
         decision_json: &str,
     ) {
@@ -1688,11 +2257,39 @@ mod tests {
                 Attribute::Class,
                 EntryClass::ApprovalDecisionRecord.to_value()
             ),
-            (Attribute::Uuid, Value::Uuid(Uuid::new_v4())),
-            (Attribute::ApprovalTarget, Value::Refer(request)),
+            (Attribute::Uuid, Value::Uuid(record)),
+            (Attribute::ApprovalRecordRequest, Value::Refer(request)),
             (Attribute::ApprovalDecision, Value::new_utf8s(decision_json))
         )])
         .expect("failed to create decision record");
+    }
+
+    fn add_decision_record(
+        txn: &mut QueryServerWriteTransaction<'_>,
+        request: Uuid,
+        decision_json: &str,
+    ) {
+        add_decision_record_uuid(txn, Uuid::new_v4(), request, decision_json)
+    }
+
+    /// A decision record of `approver` at `at`, claiming `slots`.
+    fn decision_json(
+        approver: Uuid,
+        action: ApprovalDecisionAction,
+        at: OffsetDateTime,
+        slots: &[Uuid],
+    ) -> String {
+        let decision = StoredApprovalDecision {
+            approver_uuid: approver,
+            approver_spn: String::new(),
+            decision_time: at,
+            decision_time_nanos: at.nanosecond(),
+            action,
+            comment: None,
+            slots: slots.iter().copied().collect(),
+            record_uuid: Uuid::nil(),
+        };
+        serde_json::to_string(&decision).expect("failed to serialise decision")
     }
 
     fn policy_request(
@@ -1710,6 +2307,17 @@ mod tests {
             timeout_seconds: 3600,
             escalation_timeout_seconds: None,
         }
+    }
+
+    fn create_policy(
+        txn: &mut QueryServerWriteTransaction<'_>,
+        name: &str,
+        pattern: ApprovalPattern,
+        approvers: Vec<Uuid>,
+    ) {
+        let idm_admin = identity(txn, UUID_IDM_ADMIN);
+        txn.approval_policy_create(&idm_admin, &policy_request(name, pattern, approvers))
+            .expect("failed to create approval policy");
     }
 
     fn decide(action: ApprovalDecisionAction, comment: Option<&str>) -> ApprovalDecisionRequest {
@@ -1756,9 +2364,27 @@ mod tests {
         txn.approval_request_decision(&approver, request, decision, ct)
     }
 
+    /// Consume `request` as `requester` for a schema_modify on idm_admins without details,
+    /// as `create_request` creates it.
+    fn consume_as(
+        txn: &mut QueryServerWriteTransaction<'_>,
+        requester: Uuid,
+        request: Uuid,
+    ) -> Result<(), OperationError> {
+        let requester = identity(txn, requester);
+        txn.approval_request_check_and_consume(
+            &requester,
+            request,
+            &ApprovalOperationType::SchemaModify,
+            UUID_IDM_ADMINS,
+            &BTreeMap::new(),
+        )
+    }
+
     fn read_request(txn: &mut QueryServerWriteTransaction<'_>, request: Uuid) -> ApprovalRequest {
+        let now = txn.get_curtime_odt();
         let entry = txn.internal_search_uuid(request).expect("request missing");
-        super::approval_request_resolve(txn, &entry)
+        super::approval_request_resolve(txn, &entry, now)
             .expect("failed to resolve request")
             .request
     }
@@ -1771,17 +2397,15 @@ mod tests {
         let mut write_txn = server.write(ct).await.unwrap();
         let idm_admin = identity(&mut write_txn, UUID_IDM_ADMIN);
         let admin = identity(&mut write_txn, UUID_ADMIN);
+        let a = create_person(&mut write_txn, "approver_a");
+        let other = create_person(&mut write_txn, "not_an_approver");
 
-        write_txn
-            .approval_policy_create(
-                &idm_admin,
-                &policy_request(
-                    "approve_policy",
-                    ApprovalPattern::AnyOne,
-                    vec![UUID_IDM_ADMIN],
-                ),
-            )
-            .expect("failed to create approval policy");
+        create_policy(
+            &mut write_txn,
+            "approve_policy",
+            ApprovalPattern::AnyOne,
+            vec![a],
+        );
 
         let details = BTreeMap::from([(
             "reason".to_string(),
@@ -1837,7 +2461,7 @@ mod tests {
             .approval_policy_enable(&idm_admin, "approve_policy", false)
             .expect("failed to disable approval policy");
         assert_eq!(
-            write_txn.approval_request_decision(&idm_admin, request_uuid, approve(), ct),
+            decide_as(&mut write_txn, a, request_uuid, approve(), ct),
             Err(OperationError::InvalidRequestState)
         );
         write_txn
@@ -1846,7 +2470,7 @@ mod tests {
         // A missing request is indistinguishable from an unauthorised one, except to the
         // system identity.
         assert_eq!(
-            write_txn.approval_request_decision(&idm_admin, Uuid::new_v4(), approve(), ct),
+            decide_as(&mut write_txn, a, Uuid::new_v4(), approve(), ct),
             Err(OperationError::AccessDenied)
         );
         assert_eq!(
@@ -1875,23 +2499,23 @@ mod tests {
         assert_eq!(
             write_txn.approval_policy_create(
                 &Identity::message_queue(),
-                &policy_request("internal", ApprovalPattern::AnyOne, vec![UUID_IDM_ADMIN]),
+                &policy_request("internal", ApprovalPattern::AnyOne, vec![a]),
             ),
             Err(OperationError::AccessDenied)
         );
         // Not an approver of the policy.
         assert_eq!(
-            write_txn.approval_request_decision(&admin, request_uuid, approve(), ct),
+            decide_as(&mut write_txn, other, request_uuid, approve(), ct),
             Err(OperationError::AccessDenied)
         );
-        write_txn
-            .approval_request_decision(
-                &idm_admin,
-                request_uuid,
-                decide(ApprovalDecisionAction::Approve, Some("looks good")),
-                ct,
-            )
-            .expect("approver must be able to approve");
+        decide_as(
+            &mut write_txn,
+            a,
+            request_uuid,
+            decide(ApprovalDecisionAction::Approve, Some("looks good")),
+            ct,
+        )
+        .expect("approver must be able to approve");
         write_txn.commit().expect("failed to commit");
 
         let mut read_txn = server.read().await.unwrap();
@@ -1900,9 +2524,14 @@ mod tests {
             .expect("failed to read approval request");
         assert_eq!(request.state, ApprovalRequestState::Approved);
         assert_eq!(request.decisions.len(), 1);
-        assert_eq!(request.decisions[0].approver_uuid, UUID_IDM_ADMIN);
+        assert_eq!(request.decisions[0].approver_uuid, a);
         assert_eq!(request.decisions[0].action, ApprovalDecisionAction::Approve);
         assert_eq!(request.decisions[0].comment.as_deref(), Some("looks good"));
+        // The decision time keeps its sub-second part.
+        assert_eq!(
+            request.decisions[0].decision_time,
+            OffsetDateTime::UNIX_EPOCH + ct
+        );
 
         let approved = read_txn
             .approval_request_list(&idm_admin, Some(ApprovalRequestState::Approved))
@@ -1917,7 +2546,7 @@ mod tests {
         // A decided request is final.
         let mut write_txn = server.write(ct).await.unwrap();
         assert_eq!(
-            write_txn.approval_request_decision(&idm_admin, request_uuid, reject(), ct),
+            decide_as(&mut write_txn, a, request_uuid, reject(), ct),
             Err(OperationError::InvalidRequestState)
         );
         assert_eq!(
@@ -1934,19 +2563,15 @@ mod tests {
         let ct = duration_from_epoch_now();
         let mut write_txn = server.write(ct).await.unwrap();
         let idm_admin = identity(&mut write_txn, UUID_IDM_ADMIN);
-        let admin = identity(&mut write_txn, UUID_ADMIN);
+        let a = create_person(&mut write_txn, "approver_a");
+        let b = create_person(&mut write_txn, "approver_b");
 
         for (name, pattern) in [
             ("majority_policy", ApprovalPattern::Majority),
             ("all_policy", ApprovalPattern::All),
             ("any_policy", ApprovalPattern::AnyOne),
         ] {
-            write_txn
-                .approval_policy_create(
-                    &idm_admin,
-                    &policy_request(name, pattern, vec![UUID_IDM_ADMIN, UUID_ADMIN]),
-                )
-                .expect("failed to create approval policy");
+            create_policy(&mut write_txn, name, pattern, vec![a, b]);
         }
 
         let majority_request =
@@ -1954,40 +2579,36 @@ mod tests {
                 .expect("failed to create approval request");
         let all_request = create_request(&mut write_txn, UUID_ANONYMOUS, "all_policy", ct)
             .expect("failed to create approval request");
-        // admin is one of the two approvers that a majority needs, so a request from admin
-        // could never be approved.
+        // B is one of the two approvers that a majority needs, so a request from B could
+        // never be approved.
         assert_eq!(
-            create_request(&mut write_txn, UUID_ADMIN, "majority_policy", ct),
+            create_request(&mut write_txn, b, "majority_policy", ct),
             Err(OperationError::AP0001ApprovalQuorumUnreachable)
         );
-        let own_request = create_request(&mut write_txn, UUID_ADMIN, "any_policy", ct)
+        let own_request = create_request(&mut write_txn, b, "any_policy", ct)
             .expect("failed to create approval request");
         write_txn.commit().expect("failed to commit");
 
         let mut write_txn = server.write(ct).await.unwrap();
         // Majority of two approvers needs both: one approval keeps it pending.
-        write_txn
-            .approval_request_decision(&idm_admin, majority_request, approve(), ct)
-            .expect("failed to approve");
+        decide_as(&mut write_txn, a, majority_request, approve(), ct).expect("failed to approve");
         assert_eq!(
-            write_txn.approval_request_decision(&idm_admin, majority_request, approve(), ct),
+            decide_as(&mut write_txn, a, majority_request, approve(), ct),
             Err(OperationError::InvalidRequestState)
         );
-        write_txn
-            .approval_request_decision(
-                &admin,
-                majority_request,
-                decide(ApprovalDecisionAction::Reject, Some("no")),
-                ct,
-            )
-            .expect("failed to reject");
+        decide_as(
+            &mut write_txn,
+            b,
+            majority_request,
+            decide(ApprovalDecisionAction::Reject, Some("no")),
+            ct,
+        )
+        .expect("failed to reject");
 
-        write_txn
-            .approval_request_decision(&admin, all_request, reject(), ct)
-            .expect("failed to reject");
+        decide_as(&mut write_txn, b, all_request, reject(), ct).expect("failed to reject");
 
         assert_eq!(
-            write_txn.approval_request_decision(&admin, own_request, approve(), ct),
+            decide_as(&mut write_txn, b, own_request, approve(), ct),
             Err(OperationError::AccessDenied)
         );
         write_txn.commit().expect("failed to commit");
@@ -2021,30 +2642,39 @@ mod tests {
 
     /// A request carries exactly one operation type, although the attribute is multi-value
     /// in the schema (it is shared with policies). The operation details are a JSON object.
-    /// Malformed requests fail to read on their own, and are skipped when listing.
+    /// Malformed requests fail to read on their own, and are skipped when listing. A request
+    /// without a quorum snapshot (created before snapshots existed) is invalid. The sweep
+    /// expires all of them, so that none stays pending for ever.
     #[qs_test]
     async fn test_approval_request_operation_type_and_details(server: &QueryServer) {
         let ct = duration_from_epoch_now();
         let mut write_txn = server.write(ct).await.unwrap();
         let idm_admin = identity(&mut write_txn, UUID_IDM_ADMIN);
+        let a = create_person(&mut write_txn, "approver_a");
 
-        write_txn
-            .approval_policy_create(
-                &idm_admin,
-                &policy_request(
-                    "fields_policy",
-                    ApprovalPattern::AnyOne,
-                    vec![UUID_IDM_ADMIN],
-                ),
-            )
-            .expect("failed to create approval policy");
+        create_policy(
+            &mut write_txn,
+            "fields_policy",
+            ApprovalPattern::AnyOne,
+            vec![a],
+        );
         let policy_uuid = find_policy_uuid(&mut write_txn, "fields_policy");
+        let good = create_request(&mut write_txn, UUID_ANONYMOUS, "fields_policy", ct)
+            .expect("failed to create approval request");
+        let snapshot = write_txn
+            .internal_search_uuid(good)
+            .expect("request missing")
+            .get_ava_single_utf8(Attribute::ApprovalQuorumSnapshot)
+            .expect("snapshot missing")
+            .to_string();
 
         let two_types = Uuid::new_v4();
         let bad_details = Uuid::new_v4();
         let bad_decision = Uuid::new_v4();
-        let mk_request = |uuid: Uuid| {
-            entry_init!(
+        let bad_snapshot = Uuid::new_v4();
+        let legacy = Uuid::new_v4();
+        let mk_request = |uuid: Uuid, snapshot: Option<&str>| {
+            let mut entry = entry_init!(
                 (Attribute::Class, EntryClass::Object.to_value()),
                 (Attribute::Class, EntryClass::ApprovalRequest.to_value()),
                 (Attribute::Uuid, Value::Uuid(uuid)),
@@ -2056,45 +2686,78 @@ mod tests {
                 (Attribute::ApprovalTarget, Value::Refer(UUID_IDM_ADMINS)),
                 (Attribute::ApprovalRequestor, Value::Refer(UUID_ANONYMOUS)),
                 (Attribute::ApprovalState, Value::new_iutf8("pending"))
-            )
+            );
+            if let Some(snapshot) = snapshot {
+                entry.add_ava(
+                    Attribute::ApprovalQuorumSnapshot,
+                    Value::new_utf8s(snapshot),
+                );
+            }
+            entry
         };
-        let mut e_two_types = mk_request(two_types);
+        let mut e_two_types = mk_request(two_types, Some(&snapshot));
         e_two_types.add_ava(
             Attribute::ApprovalOperationType,
             Value::new_iutf8n("privilege_grant"),
         );
-        let mut e_bad_details = mk_request(bad_details);
+        let mut e_bad_details = mk_request(bad_details, Some(&snapshot));
         e_bad_details.add_ava(
             Attribute::ApprovalOperationDetails,
             Value::new_utf8s("not json"),
         );
         write_txn
-            .internal_create(vec![e_two_types, e_bad_details, mk_request(bad_decision)])
+            .internal_create(vec![
+                e_two_types,
+                e_bad_details,
+                mk_request(bad_decision, Some(&snapshot)),
+                mk_request(bad_snapshot, Some("not json")),
+                mk_request(legacy, None),
+            ])
             .expect("failed to create approval requests");
         add_decision_record(&mut write_txn, bad_decision, "[]");
-        let good = create_request(&mut write_txn, UUID_ANONYMOUS, "fields_policy", ct)
-            .expect("failed to create approval request");
         write_txn.commit().expect("failed to commit");
 
         let mut read_txn = server.read().await.unwrap();
-        for malformed in [two_types, bad_details, bad_decision] {
+        for malformed in [two_types, bad_details, bad_decision, bad_snapshot] {
             assert!(matches!(
                 read_txn.approval_request_get(&idm_admin, malformed),
                 Err(OperationError::InvalidValueState)
             ));
         }
-        let listed = read_txn
+        let legacy_request = read_txn
+            .approval_request_get(&idm_admin, legacy)
+            .expect("a request without a snapshot reads");
+        assert_eq!(legacy_request.state, ApprovalRequestState::Invalid);
+        assert_eq!(legacy_request.required_decisions, 0);
+        let listed: BTreeSet<Uuid> = read_txn
             .approval_request_list(&idm_admin, None)
-            .expect("one malformed request must not fail the list");
-        assert_eq!(
-            listed.iter().map(|r| r.uuid).collect::<Vec<_>>(),
-            vec![good]
-        );
+            .expect("one malformed request must not fail the list")
+            .iter()
+            .map(|r| r.uuid)
+            .collect();
+        assert_eq!(listed, BTreeSet::from([good, legacy]));
         drop(read_txn);
 
-        // The sweep skips them too.
+        // A request without a snapshot can not be decided.
         let mut write_txn = server.write(ct).await.unwrap();
+        assert_eq!(
+            decide_as(&mut write_txn, a, legacy, approve(), ct),
+            Err(OperationError::AccessDenied)
+        );
+        // The sweep expires the malformed and the invalid requests, once.
+        assert_eq!(write_txn.approval_sweep(), Ok(5));
         assert_eq!(write_txn.approval_sweep(), Ok(0));
+        for expired in [two_types, bad_details, bad_decision, bad_snapshot, legacy] {
+            assert_eq!(
+                stored_state(&mut write_txn, expired).as_deref(),
+                Some("expired")
+            );
+        }
+        assert_eq!(
+            stored_state(&mut write_txn, good).as_deref(),
+            Some("pending")
+        );
+        write_txn.commit().expect("failed to commit");
     }
 
     /// Escalation: All of [A, B] with backup [X]. The quorum stays at two slots after
@@ -2300,8 +2963,9 @@ mod tests {
         );
     }
 
-    /// The requester never fills a slot. A request that can therefore never be approved is
-    /// refused when it is created rather than left pending until it expires.
+    /// The requester never fills a slot. A request that can therefore never be approved is,
+    /// on a best-effort basis, refused when it is created rather than left pending until it
+    /// expires.
     #[qs_test]
     async fn test_approval_request_unreachable_quorum(server: &QueryServer) {
         let ct = duration_from_epoch_now();
@@ -2389,15 +3053,12 @@ mod tests {
         let request = create_request(&mut write_txn, r, "majority", ct).unwrap();
 
         let decision = |approver: Uuid, action: ApprovalDecisionAction, offset: u64| {
-            let decision = StoredApprovalDecision {
-                approver_uuid: approver,
-                approver_spn: String::new(),
-                decision_time: OffsetDateTime::UNIX_EPOCH + ct + Duration::from_secs(offset),
+            decision_json(
+                approver,
                 action,
-                comment: None,
-                slots: BTreeSet::from([approver]),
-            };
-            serde_json::to_string(&decision).unwrap()
+                OffsetDateTime::UNIX_EPOCH + ct + Duration::from_secs(offset),
+                &[approver],
+            )
         };
         // A's first decision counts, a later conflicting one from A (made on another
         // replica) does not.
@@ -2448,7 +3109,8 @@ mod tests {
         let ct = duration_from_epoch_now();
         let mut write_txn = server.write(ct).await.unwrap();
         let idm_admin = identity(&mut write_txn, UUID_IDM_ADMIN);
-        let mut policy = policy_request("short", ApprovalPattern::AnyOne, vec![UUID_IDM_ADMIN]);
+        let a = create_person(&mut write_txn, "approver_a");
+        let mut policy = policy_request("short", ApprovalPattern::AnyOne, vec![a]);
         policy.timeout_seconds = 60;
         write_txn
             .approval_policy_create(&idm_admin, &policy)
@@ -2464,7 +3126,7 @@ mod tests {
         let ct_expired = ct + Duration::from_secs(61);
         let mut write_txn = server.write(ct_expired).await.unwrap();
         assert_eq!(
-            write_txn.approval_request_decision(&idm_admin, request, approve(), ct_expired),
+            decide_as(&mut write_txn, a, request, approve(), ct_expired),
             Err(OperationError::InvalidRequestState)
         );
         assert_eq!(write_txn.approval_sweep(), Ok(1));
@@ -2487,12 +3149,9 @@ mod tests {
         let ct = duration_from_epoch_now();
         let mut idms_prox_write = idms.proxy_write(ct).await.unwrap();
         let idm_admin = identity(&mut idms_prox_write.qs_write, UUID_IDM_ADMIN);
+        let a = create_person(&mut idms_prox_write.qs_write, "approver_a");
 
-        let mut policy = policy_request(
-            "timeout_policy",
-            ApprovalPattern::AnyOne,
-            vec![UUID_IDM_ADMIN],
-        );
+        let mut policy = policy_request("timeout_policy", ApprovalPattern::AnyOne, vec![a]);
         policy.timeout_seconds = 60;
         policy.escalation_timeout_seconds = Some(30);
         policy.backup_approvers = vec![UUID_SYSTEM_ADMINS];
@@ -2551,7 +3210,7 @@ mod tests {
 
     /// Requests do not block deleting their policy, target or requester. A pending request
     /// that lost one of them is invalid: it lists as invalid, can not be decided, and the
-    /// sweep expires it. A decided request keeps its state.
+    /// sweep expires it. A decided request keeps its state, but can no longer be consumed.
     #[qs_test]
     async fn test_approval_request_references_deleted(server: &QueryServer) {
         let ct = duration_from_epoch_now();
@@ -2629,7 +3288,8 @@ mod tests {
             .unwrap();
         assert_eq!(request.policy_uuid, None);
         assert_eq!(request.policy_name, None);
-        assert_eq!(request.required_decisions, 0);
+        // The quorum comes from the snapshot, not the (deleted) policy.
+        assert_eq!(request.required_decisions, 1);
         let request = read_txn
             .approval_request_get(&idm_admin, lost_target)
             .unwrap();
@@ -2645,6 +3305,16 @@ mod tests {
         drop(read_txn);
 
         let mut write_txn = server.write(ct).await.unwrap();
+        assert_eq!(
+            write_txn.approval_request_check_and_consume(
+                &requester,
+                decided,
+                &ApprovalOperationType::SchemaModify,
+                target2,
+                &BTreeMap::new(),
+            ),
+            Err(OperationError::InvalidRequestState)
+        );
         for request in [lost_target, lost_requester] {
             assert_eq!(
                 decide_as(&mut write_txn, a, request, approve(), ct),
@@ -2675,6 +3345,858 @@ mod tests {
             .approval_request_list(&idm_admin, Some(ApprovalRequestState::Expired))
             .expect("failed to list approval requests");
         assert_eq!(expired.len(), 3);
+    }
+
+    /// M1: deleting an approver removes them from the policy (referential integrity), but
+    /// not from the snapshot of existing requests, so it never changes their outcome.
+    #[qs_test]
+    async fn test_approval_snapshot_survives_approver_deletion(server: &QueryServer) {
+        let ct = duration_from_epoch_now();
+        let now = OffsetDateTime::UNIX_EPOCH + ct;
+        let mut write_txn = server.write(ct).await.unwrap();
+        let idm_admin = identity(&mut write_txn, UUID_IDM_ADMIN);
+        let a = create_person(&mut write_txn, "approver_a");
+        let b = create_person(&mut write_txn, "approver_b");
+        let c = create_person(&mut write_txn, "approver_c");
+        let d = create_person(&mut write_txn, "approver_d");
+        let r = create_person(&mut write_txn, "requester_r");
+        create_policy(
+            &mut write_txn,
+            "all_abc",
+            ApprovalPattern::All,
+            vec![a, b, c],
+        );
+        create_policy(
+            &mut write_txn,
+            "majority_abcd",
+            ApprovalPattern::Majority,
+            vec![a, b, c, d],
+        );
+
+        // All of [A, B, C]: A and B approve, C rejects.
+        let rejected = create_request(&mut write_txn, r, "all_abc", ct).unwrap();
+        decide_as(&mut write_txn, a, rejected, approve(), ct).expect("A approves");
+        decide_as(&mut write_txn, b, rejected, approve(), ct).expect("B approves");
+        decide_as(&mut write_txn, c, rejected, reject(), ct).expect("C rejects");
+        assert_eq!(
+            read_request(&mut write_txn, rejected).state,
+            ApprovalRequestState::Rejected
+        );
+        // The same decisions, delivered by replication without the state being stored.
+        let replicated = create_request(&mut write_txn, r, "all_abc", ct).unwrap();
+        for (approver, action) in [
+            (a, ApprovalDecisionAction::Approve),
+            (b, ApprovalDecisionAction::Approve),
+            (c, ApprovalDecisionAction::Reject),
+        ] {
+            add_decision_record(
+                &mut write_txn,
+                replicated,
+                &decision_json(approver, action, now, &[approver]),
+            );
+        }
+
+        // Majority of [A, B, C, D] needs three: two approvals keep it pending.
+        let majority = create_request(&mut write_txn, r, "majority_abcd", ct).unwrap();
+        decide_as(&mut write_txn, a, majority, approve(), ct).expect("A approves");
+        decide_as(&mut write_txn, b, majority, approve(), ct).expect("B approves");
+        assert_eq!(
+            read_request(&mut write_txn, majority).state,
+            ApprovalRequestState::Pending
+        );
+        write_txn.commit().expect("failed to commit");
+
+        let mut write_txn = server.write(ct).await.unwrap();
+        write_txn
+            .internal_delete_uuid(c)
+            .expect("failed to delete C");
+        write_txn
+            .internal_delete_uuid(d)
+            .expect("failed to delete D");
+        write_txn.commit().expect("failed to commit");
+
+        let mut write_txn = server.write(ct).await.unwrap();
+        // The policies lost C and D ...
+        let policy_uuid = find_policy_uuid(&mut write_txn, "all_abc");
+        let policy = write_txn.internal_search_uuid(policy_uuid).unwrap();
+        assert_eq!(
+            policy.get_ava_refer(Attribute::Approver),
+            Some(&BTreeSet::from([a, b]))
+        );
+        // ... but the requests did not: the rejection stands, stored or recomputed.
+        for request in [rejected, replicated] {
+            let read = read_request(&mut write_txn, request);
+            assert_eq!(read.state, ApprovalRequestState::Rejected);
+            assert_eq!(read.required_decisions, 3);
+            assert_eq!(
+                consume_as(&mut write_txn, r, request),
+                Err(OperationError::InvalidRequestState)
+            );
+        }
+        // ... and the majority still needs three of the four.
+        let read = read_request(&mut write_txn, majority);
+        assert_eq!(read.state, ApprovalRequestState::Pending);
+        assert_eq!(read.required_decisions, 3);
+        assert_eq!(
+            consume_as(&mut write_txn, r, majority),
+            Err(OperationError::InvalidRequestState)
+        );
+        assert_eq!(write_txn.approval_sweep(), Ok(1));
+        assert_eq!(
+            stored_state(&mut write_txn, replicated).as_deref(),
+            Some("rejected")
+        );
+        assert_eq!(
+            stored_state(&mut write_txn, majority).as_deref(),
+            Some("pending")
+        );
+
+        // A new request is decided against the policy as it is now.
+        let new_request = create_request(&mut write_txn, r, "majority_abcd", ct).unwrap();
+        assert_eq!(
+            read_request(&mut write_txn, new_request).required_decisions,
+            2
+        );
+        write_txn.commit().expect("failed to commit");
+
+        let mut read_txn = server.read().await.unwrap();
+        let read = read_txn.approval_request_get(&idm_admin, majority).unwrap();
+        assert_eq!(read.state, ApprovalRequestState::Pending);
+        let read = read_txn.approval_request_get(&idm_admin, rejected).unwrap();
+        assert_eq!(read.state, ApprovalRequestState::Rejected);
+    }
+
+    /// S1: the order of decisions, and so which decision of an approver counts, does not
+    /// depend on the order the backend returns the records in: decision times have
+    /// sub-second precision, and records are the last tie-break.
+    #[qs_test]
+    async fn test_approval_decision_order_is_deterministic(server: &QueryServer) {
+        let ct = duration_from_epoch_now();
+        let second = OffsetDateTime::UNIX_EPOCH + Duration::from_secs(ct.as_secs() + 5);
+        let mut write_txn = server.write(ct).await.unwrap();
+        let a = create_person(&mut write_txn, "approver_a");
+        let b = create_person(&mut write_txn, "approver_b");
+        let r = create_person(&mut write_txn, "requester_r");
+        create_policy(&mut write_txn, "all_ab", ApprovalPattern::All, vec![a, b]);
+
+        // Same second: A's reject 100ns in comes first, although written second.
+        let request = create_request(&mut write_txn, r, "all_ab", ct).unwrap();
+        let approve_at = second + time::Duration::nanoseconds(200);
+        let reject_at = second + time::Duration::nanoseconds(100);
+        add_decision_record(
+            &mut write_txn,
+            request,
+            &decision_json(a, ApprovalDecisionAction::Approve, approve_at, &[a]),
+        );
+        add_decision_record(
+            &mut write_txn,
+            request,
+            &decision_json(a, ApprovalDecisionAction::Reject, reject_at, &[a]),
+        );
+        let read = read_request(&mut write_txn, request);
+        assert_eq!(read.state, ApprovalRequestState::Rejected);
+        assert_eq!(read.decisions[0].decision_time, reject_at);
+
+        // A record without the sub-second part (as written before it was stored) is at
+        // the start of its second.
+        let request = create_request(&mut write_txn, r, "all_ab", ct).unwrap();
+        add_decision_record(
+            &mut write_txn,
+            request,
+            &decision_json(a, ApprovalDecisionAction::Reject, reject_at, &[a]),
+        );
+        let legacy = format!(
+            r#"{{"approver_uuid":"{a}","approver_spn":"","decision_time":{},"action":"approve","comment":null,"slots":["{a}"]}}"#,
+            second.unix_timestamp()
+        );
+        add_decision_record(&mut write_txn, request, &legacy);
+        decide_as(&mut write_txn, b, request, approve(), ct).expect("B approves");
+        assert_eq!(
+            read_request(&mut write_txn, request).state,
+            ApprovalRequestState::Approved
+        );
+
+        // Exactly the same time: the record uuid decides, whichever is written first.
+        for (first, second_action, expected) in [
+            (
+                ApprovalDecisionAction::Reject,
+                ApprovalDecisionAction::Approve,
+                ApprovalRequestState::Rejected,
+            ),
+            (
+                ApprovalDecisionAction::Approve,
+                ApprovalDecisionAction::Reject,
+                ApprovalRequestState::Approved,
+            ),
+        ] {
+            let request = create_request(&mut write_txn, r, "all_ab", ct).unwrap();
+            let (low, high) = {
+                let (one, two) = (Uuid::new_v4(), Uuid::new_v4());
+                (one.min(two), one.max(two))
+            };
+            add_decision_record_uuid(
+                &mut write_txn,
+                high,
+                request,
+                &decision_json(a, second_action, second, &[a]),
+            );
+            add_decision_record_uuid(
+                &mut write_txn,
+                low,
+                request,
+                &decision_json(a, first, second, &[a]),
+            );
+            add_decision_record(
+                &mut write_txn,
+                request,
+                &decision_json(b, ApprovalDecisionAction::Approve, second, &[b]),
+            );
+            assert_eq!(read_request(&mut write_txn, request).state, expected);
+        }
+    }
+
+    /// S2: the gate. An approval authorises exactly the requested operation, once, and only
+    /// for the requester. It is computed from the decisions rather than the stored state.
+    #[qs_test]
+    async fn test_approval_request_check_and_consume(server: &QueryServer) {
+        let ct = duration_from_epoch_now();
+        let mut write_txn = server.write(ct).await.unwrap();
+        let a = create_person(&mut write_txn, "approver_a");
+        let r = create_person(&mut write_txn, "requester_r");
+        let o = create_person(&mut write_txn, "other_o");
+        create_policy(&mut write_txn, "any_a", ApprovalPattern::AnyOne, vec![a]);
+        let requester = identity(&mut write_txn, r);
+        let details = BTreeMap::from([("attribute".to_string(), "mail".to_string())]);
+
+        let request = write_txn
+            .approval_request_create(
+                &requester,
+                "any_a",
+                &ApprovalOperationType::SchemaModify,
+                UUID_IDM_ADMINS,
+                &details,
+                ct,
+            )
+            .expect("failed to create approval request");
+        let consume = |txn: &mut QueryServerWriteTransaction<'_>,
+                       ident: &Identity,
+                       operation_type: ApprovalOperationType,
+                       target: Uuid,
+                       details: &BTreeMap<String, String>| {
+            txn.approval_request_check_and_consume(ident, request, &operation_type, target, details)
+        };
+
+        // Not approved yet.
+        assert_eq!(
+            consume(
+                &mut write_txn,
+                &requester,
+                ApprovalOperationType::SchemaModify,
+                UUID_IDM_ADMINS,
+                &details
+            ),
+            Err(OperationError::InvalidRequestState)
+        );
+        decide_as(&mut write_txn, a, request, approve(), ct).expect("A approves");
+
+        // Only the requester may use it.
+        let other = identity(&mut write_txn, o);
+        for ident in [other, Identity::migration()] {
+            assert_eq!(
+                consume(
+                    &mut write_txn,
+                    &ident,
+                    ApprovalOperationType::SchemaModify,
+                    UUID_IDM_ADMINS,
+                    &details
+                ),
+                Err(OperationError::AccessDenied)
+            );
+        }
+        // Only for exactly this operation.
+        let other_details = BTreeMap::from([("attribute".to_string(), "uid".to_string())]);
+        for (operation_type, target, details) in [
+            (
+                ApprovalOperationType::PrivilegeGrant,
+                UUID_IDM_ADMINS,
+                &details,
+            ),
+            (ApprovalOperationType::SchemaModify, UUID_ADMIN, &details),
+            (
+                ApprovalOperationType::SchemaModify,
+                UUID_IDM_ADMINS,
+                &other_details,
+            ),
+            (
+                ApprovalOperationType::SchemaModify,
+                UUID_IDM_ADMINS,
+                &BTreeMap::new(),
+            ),
+        ] {
+            assert_eq!(
+                consume(&mut write_txn, &requester, operation_type, target, details),
+                Err(OperationError::InvalidRequestState)
+            );
+        }
+        assert_eq!(
+            read_request(&mut write_txn, request).state,
+            ApprovalRequestState::Approved
+        );
+
+        // Once.
+        consume(
+            &mut write_txn,
+            &requester,
+            ApprovalOperationType::SchemaModify,
+            UUID_IDM_ADMINS,
+            &details,
+        )
+        .expect("an approved request must be consumable");
+        assert_eq!(
+            stored_state(&mut write_txn, request).as_deref(),
+            Some("consumed")
+        );
+        assert_eq!(
+            consume(
+                &mut write_txn,
+                &requester,
+                ApprovalOperationType::SchemaModify,
+                UUID_IDM_ADMINS,
+                &details
+            ),
+            Err(OperationError::InvalidRequestState)
+        );
+        // A consumed request is final.
+        assert_eq!(
+            write_txn.approval_request_cancel(&requester, request),
+            Err(OperationError::InvalidRequestState)
+        );
+
+        // The approval is computed from the decisions: a stored pending state that lags
+        // behind a replicated approval does not block it ...
+        let replicated = create_request(&mut write_txn, r, "any_a", ct).unwrap();
+        add_decision_record(
+            &mut write_txn,
+            replicated,
+            &decision_json(
+                a,
+                ApprovalDecisionAction::Approve,
+                OffsetDateTime::UNIX_EPOCH + ct,
+                &[a],
+            ),
+        );
+        assert_eq!(
+            stored_state(&mut write_txn, replicated).as_deref(),
+            Some("pending")
+        );
+        consume_as(&mut write_txn, r, replicated).expect("approved by its decisions");
+        // ... and a stored approval that the decisions do not support is refused.
+        let forged = create_request(&mut write_txn, r, "any_a", ct).unwrap();
+        write_txn
+            .internal_modify_uuid(
+                forged,
+                &ModifyList::new_purge_and_set(
+                    Attribute::ApprovalState,
+                    Value::new_iutf8(ApprovalRequestState::Approved.as_str()),
+                ),
+            )
+            .expect("failed to set the state");
+        assert_eq!(
+            consume_as(&mut write_txn, r, forged),
+            Err(OperationError::InvalidRequestState)
+        );
+        write_txn.commit().expect("failed to commit");
+
+        let mut read_txn = server.read().await.unwrap();
+        let idm_admin = Identity::from_impersonate_entry_readwrite(
+            read_txn.internal_search_uuid(UUID_IDM_ADMIN).unwrap(),
+        );
+        assert_eq!(
+            read_txn
+                .approval_request_get(&idm_admin, request)
+                .unwrap()
+                .state,
+            ApprovalRequestState::Consumed
+        );
+    }
+
+    /// S3: only interactive persons decide: not service accounts, API tokens, anonymous,
+    /// read-only sessions, disabled accounts, or accounts managed by the requester.
+    #[idm_test]
+    async fn test_approval_decider_must_be_interactive_person(
+        idms: &IdmServer,
+        _idms_delayed: &mut IdmServerDelayed,
+    ) {
+        let ct = duration_from_epoch_now();
+        let mut idms_prox_write = idms.proxy_write(ct).await.unwrap();
+        let txn = &mut idms_prox_write.qs_write;
+        let sa = create_service_account(txn, "approver_service_account");
+        let p = create_person(txn, "approver_p");
+        let r = create_person(txn, "requester_r");
+        let managed = create_person(txn, "managed_by_requester");
+        let group_managed = create_person(txn, "managed_by_requester_group");
+        let expired = create_person(txn, "expired_approver");
+        let requester_group = create_group(txn, "requester_group", &[r]);
+        txn.internal_modify_uuid(
+            managed,
+            &ModifyList::new_purge_and_set(Attribute::EntryManagedBy, Value::Refer(r)),
+        )
+        .expect("failed to set entry managed by");
+        txn.internal_modify_uuid(
+            group_managed,
+            &ModifyList::new_purge_and_set(
+                Attribute::EntryManagedBy,
+                Value::Refer(requester_group),
+            ),
+        )
+        .expect("failed to set entry managed by");
+        create_policy(
+            txn,
+            "any_of_many",
+            ApprovalPattern::AnyOne,
+            vec![sa, p, managed, group_managed, expired, UUID_ANONYMOUS],
+        );
+        let request = create_request(txn, r, "any_of_many", ct).unwrap();
+        set_account_expire(
+            txn,
+            expired,
+            Some(OffsetDateTime::UNIX_EPOCH + ct - Duration::from_secs(60)),
+        );
+        idms_prox_write.commit().expect("failed to commit");
+
+        let mut idms_prox_write = idms.proxy_write(ct).await.unwrap();
+        let mut gte = GenerateApiTokenEvent::new_internal(sa, "approval", None);
+        gte.read_write = true;
+        let api_token = idms_prox_write
+            .service_account_generate_api_token(&gte, ct)
+            .expect("failed to generate api token");
+        let api_ident = idms_prox_write
+            .validate_client_auth_info_to_ident(api_token.into(), ct)
+            .expect("failed to validate api token");
+        assert_eq!(api_ident.get_uuid(), sa);
+        assert_eq!(api_ident.access_scope(), AccessScope::ReadWrite);
+
+        let txn = &mut idms_prox_write.qs_write;
+        assert_eq!(
+            txn.approval_request_decision(&api_ident, request, approve(), ct),
+            Err(OperationError::AccessDenied)
+        );
+        for (name, denied) in [
+            ("service account", sa),
+            ("anonymous", UUID_ANONYMOUS),
+            ("managed by the requester", managed),
+            ("managed by the requester's group", group_managed),
+            ("expired", expired),
+        ] {
+            assert_eq!(
+                decide_as(txn, denied, request, approve(), ct),
+                Err(OperationError::AccessDenied),
+                "{name}"
+            );
+        }
+        let p_ro = Identity::from_impersonate_entry_readonly(txn.internal_search_uuid(p).unwrap());
+        assert_eq!(
+            txn.approval_request_decision(&p_ro, request, approve(), ct),
+            Err(OperationError::AccessDenied)
+        );
+        assert!(read_request(txn, request).decisions.is_empty());
+
+        decide_as(txn, p, request, approve(), ct).expect("a person may decide");
+        assert_eq!(
+            read_request(txn, request).state,
+            ApprovalRequestState::Approved
+        );
+        idms_prox_write.commit().expect("failed to commit");
+    }
+
+    /// Service accounts and disabled persons are not counted as possible approvers when a
+    /// request is created.
+    #[qs_test]
+    async fn test_approval_reachable_counts_enabled_persons(server: &QueryServer) {
+        let ct = duration_from_epoch_now();
+        let mut write_txn = server.write(ct).await.unwrap();
+        let sa = create_service_account(&mut write_txn, "service_approver");
+        let expired = create_person(&mut write_txn, "expired_approver");
+        let r = create_person(&mut write_txn, "requester_r");
+        set_account_expire(
+            &mut write_txn,
+            expired,
+            Some(OffsetDateTime::UNIX_EPOCH + ct - Duration::from_secs(60)),
+        );
+        let group = create_group(&mut write_txn, "inactive_group", &[sa, expired]);
+        for (name, approvers) in [
+            ("service_only", vec![sa]),
+            ("expired_only", vec![expired]),
+            ("anonymous_only", vec![UUID_ANONYMOUS]),
+            ("group_without_persons", vec![group]),
+        ] {
+            create_policy(&mut write_txn, name, ApprovalPattern::AnyOne, approvers);
+            assert_eq!(
+                create_request(&mut write_txn, r, name, ct),
+                Err(OperationError::AP0001ApprovalQuorumUnreachable),
+                "{name}"
+            );
+        }
+    }
+
+    /// S4: while a request is pending, approvals by approvers who have since been deleted
+    /// or disabled do not count, rejections do.
+    #[qs_test]
+    async fn test_approval_inactive_approvers(server: &QueryServer) {
+        let ct = duration_from_epoch_now();
+        let past = OffsetDateTime::UNIX_EPOCH + ct - Duration::from_secs(60);
+        let mut write_txn = server.write(ct).await.unwrap();
+        let a = create_person(&mut write_txn, "approver_a");
+        let b = create_person(&mut write_txn, "approver_b");
+        let c = create_person(&mut write_txn, "approver_c");
+        let d = create_person(&mut write_txn, "approver_d");
+        let e = create_person(&mut write_txn, "approver_e");
+        let f = create_person(&mut write_txn, "approver_f");
+        let g = create_person(&mut write_txn, "approver_g");
+        let r = create_person(&mut write_txn, "requester_r");
+        create_policy(
+            &mut write_txn,
+            "majority_abc",
+            ApprovalPattern::Majority,
+            vec![a, b, c],
+        );
+        create_policy(
+            &mut write_txn,
+            "majority_def",
+            ApprovalPattern::Majority,
+            vec![d, e, f],
+        );
+        create_policy(&mut write_txn, "any_g", ApprovalPattern::AnyOne, vec![g]);
+
+        let disabled_approval = create_request(&mut write_txn, r, "majority_abc", ct).unwrap();
+        let disabled_rejection = create_request(&mut write_txn, r, "majority_abc", ct).unwrap();
+        let deleted_approval = create_request(&mut write_txn, r, "majority_def", ct).unwrap();
+        let approved = create_request(&mut write_txn, r, "any_g", ct).unwrap();
+        decide_as(&mut write_txn, a, disabled_approval, approve(), ct).expect("A approves");
+        decide_as(&mut write_txn, c, disabled_rejection, reject(), ct).expect("C rejects");
+        decide_as(&mut write_txn, d, deleted_approval, approve(), ct).expect("D approves");
+        decide_as(&mut write_txn, g, approved, approve(), ct).expect("G approves");
+        write_txn.commit().expect("failed to commit");
+
+        let mut write_txn = server.write(ct).await.unwrap();
+        set_account_expire(&mut write_txn, a, Some(past));
+        set_account_expire(&mut write_txn, c, Some(past));
+        set_account_expire(&mut write_txn, g, Some(past));
+        write_txn
+            .internal_delete_uuid(d)
+            .expect("failed to delete D");
+        write_txn.commit().expect("failed to commit");
+
+        let mut write_txn = server.write(ct).await.unwrap();
+        // A's approval no longer counts, B's alone is not a majority.
+        decide_as(&mut write_txn, b, disabled_approval, approve(), ct).expect("B approves");
+        assert_eq!(
+            read_request(&mut write_txn, disabled_approval).state,
+            ApprovalRequestState::Pending
+        );
+        // C's rejection still counts: with B's, a majority can no longer be reached.
+        decide_as(&mut write_txn, b, disabled_rejection, reject(), ct).expect("B rejects");
+        assert_eq!(
+            read_request(&mut write_txn, disabled_rejection).state,
+            ApprovalRequestState::Rejected
+        );
+        // Deleted D's approval no longer counts either.
+        decide_as(&mut write_txn, e, deleted_approval, approve(), ct).expect("E approves");
+        assert_eq!(
+            read_request(&mut write_txn, deleted_approval).state,
+            ApprovalRequestState::Pending
+        );
+        decide_as(&mut write_txn, f, deleted_approval, approve(), ct).expect("F approves");
+        assert_eq!(
+            read_request(&mut write_txn, deleted_approval).state,
+            ApprovalRequestState::Approved
+        );
+        // A disabled approver can not decide.
+        assert_eq!(
+            decide_as(&mut write_txn, c, disabled_approval, approve(), ct),
+            Err(OperationError::AccessDenied)
+        );
+        // A stored approval stays approved, but can no longer be used.
+        assert_eq!(
+            read_request(&mut write_txn, approved).state,
+            ApprovalRequestState::Approved
+        );
+        assert_eq!(
+            consume_as(&mut write_txn, r, approved),
+            Err(OperationError::InvalidRequestState)
+        );
+
+        // Enabled again, A's approval counts again.
+        set_account_expire(&mut write_txn, a, None);
+        assert_eq!(
+            read_request(&mut write_txn, disabled_approval).state,
+            ApprovalRequestState::Approved
+        );
+        write_txn.commit().expect("failed to commit");
+    }
+
+    /// S5: decision records and requests are only written by the approval operations (as
+    /// the system), not by administrators nor by other internal identities, and not even
+    /// by someone an access control profile allows to.
+    #[qs_test]
+    async fn test_approval_entries_protected(server: &QueryServer) {
+        let ct = duration_from_epoch_now();
+        let mut write_txn = server.write(ct).await.unwrap();
+        let a = create_person(&mut write_txn, "approver_a");
+        let b = create_person(&mut write_txn, "approver_b");
+        let r = create_person(&mut write_txn, "requester_r");
+        let forger = create_person(&mut write_txn, "forger");
+        let forgers = create_group(&mut write_txn, "approval_forgers", &[forger]);
+        create_policy(&mut write_txn, "all_ab", ApprovalPattern::All, vec![a, b]);
+        let request = create_request(&mut write_txn, r, "all_ab", ct).unwrap();
+        decide_as(&mut write_txn, a, request, approve(), ct).expect("A approves");
+
+        // An access control profile allowing the forgers everything on approval entries.
+        let mut acp = entry_init!(
+            (Attribute::Class, EntryClass::Object.to_value()),
+            (
+                Attribute::Class,
+                EntryClass::AccessControlProfile.to_value()
+            ),
+            (
+                Attribute::Class,
+                EntryClass::AccessControlTargetScope.to_value()
+            ),
+            (
+                Attribute::Class,
+                EntryClass::AccessControlReceiverGroup.to_value()
+            ),
+            (Attribute::Class, EntryClass::AccessControlSearch.to_value()),
+            (Attribute::Class, EntryClass::AccessControlCreate.to_value()),
+            (Attribute::Class, EntryClass::AccessControlModify.to_value()),
+            (Attribute::Class, EntryClass::AccessControlDelete.to_value()),
+            (Attribute::Name, Value::new_iname("acp_approval_forgers")),
+            (Attribute::Uuid, Value::Uuid(Uuid::new_v4())),
+            (Attribute::AcpReceiverGroup, Value::ReferN(forgers)),
+            (
+                Attribute::AcpTargetScope,
+                Value::new_json_filter_s(
+                    r#"{"or":[{"eq":["class","approval_decision_record"]},{"eq":["class","approval_request"]}]}"#
+                )
+                .expect("filter")
+            ),
+            (Attribute::AcpCreateClass, EntryClass::Object.to_value()),
+            (
+                Attribute::AcpCreateClass,
+                EntryClass::ApprovalDecisionRecord.to_value()
+            )
+        );
+        for attr in [
+            Attribute::Class,
+            Attribute::Uuid,
+            Attribute::ApprovalRecordRequest,
+            Attribute::ApprovalDecision,
+            Attribute::ApprovalState,
+        ] {
+            acp.add_ava(Attribute::AcpSearchAttr, Value::new_iutf8n(attr.as_str()));
+            acp.add_ava(
+                Attribute::AcpModifyPresentAttr,
+                Value::new_iutf8n(attr.as_str()),
+            );
+            acp.add_ava(
+                Attribute::AcpModifyRemovedAttr,
+                Value::new_iutf8n(attr.as_str()),
+            );
+            acp.add_ava(Attribute::AcpCreateAttr, Value::new_iutf8n(attr.as_str()));
+        }
+        write_txn
+            .internal_create(vec![acp])
+            .expect("failed to create access control profile");
+        write_txn.commit().expect("failed to commit");
+
+        let mut write_txn = server.write(ct).await.unwrap();
+        let record_filter = filter!(f_and!([
+            f_eq(Attribute::Class, EntryClass::ApprovalDecisionRecord.into()),
+            f_eq(
+                Attribute::ApprovalRecordRequest,
+                PartialValue::Refer(request)
+            )
+        ]));
+        let request_filter = filter!(f_eq(Attribute::Uuid, PartialValue::Uuid(request)));
+        let records = write_txn.internal_search(record_filter.clone()).unwrap();
+        assert_eq!(records.len(), 1);
+        let record_json = records[0]
+            .get_ava_single_utf8(Attribute::ApprovalDecision)
+            .unwrap()
+            .to_string();
+        let forged = decision_json(
+            b,
+            ApprovalDecisionAction::Approve,
+            OffsetDateTime::UNIX_EPOCH + ct,
+            &[b],
+        );
+        let new_record = || {
+            entry_init!(
+                (Attribute::Class, EntryClass::Object.to_value()),
+                (
+                    Attribute::Class,
+                    EntryClass::ApprovalDecisionRecord.to_value()
+                ),
+                (Attribute::Uuid, Value::Uuid(Uuid::new_v4())),
+                (Attribute::ApprovalRecordRequest, Value::Refer(request)),
+                (Attribute::ApprovalDecision, Value::new_utf8s(&forged))
+            )
+        };
+        let attempts = |txn: &mut QueryServerWriteTransaction<'_>,
+                        ident: &Identity|
+         -> Vec<(&'static str, Result<(), OperationError>)> {
+            let ce = CreateEvent::new_impersonate_identity(ident.clone(), vec![new_record()]);
+            let create = txn.create(&ce).map(|_| ());
+            let modify_record = txn.impersonate_modify(
+                &record_filter,
+                &record_filter,
+                &ModifyList::new_purge_and_set(
+                    Attribute::ApprovalDecision,
+                    Value::new_utf8s(&forged),
+                ),
+                ident,
+            );
+            let modify_request = txn.impersonate_modify(
+                &request_filter,
+                &request_filter,
+                &ModifyList::new_purge_and_set(
+                    Attribute::ApprovalState,
+                    Value::new_iutf8("approved"),
+                ),
+                ident,
+            );
+            let de = DeleteEvent::new_impersonate_identity(ident.clone(), record_filter.clone());
+            let delete_record = txn.delete(&de);
+            let de = DeleteEvent::new_impersonate_identity(ident.clone(), request_filter.clone());
+            let delete_request = txn.delete(&de);
+            vec![
+                ("create record", create),
+                ("modify record", modify_record),
+                ("modify request", modify_request),
+                ("delete record", delete_record),
+                ("delete request", delete_request),
+            ]
+        };
+
+        // Access controls refuse administrators and the migration role ...
+        let admin = identity(&mut write_txn, UUID_ADMIN);
+        let idm_admin = identity(&mut write_txn, UUID_IDM_ADMIN);
+        for ident in [admin, idm_admin, Identity::migration()] {
+            for (what, result) in attempts(&mut write_txn, &ident) {
+                // An internal identity that finds nothing it may change succeeds silently.
+                if !(ident.is_internal() && what.starts_with("modify")) {
+                    assert!(result.is_err(), "{what} as {ident}");
+                }
+            }
+        }
+
+        // ... and where they allow it, the plugin refuses.
+        let forger = identity(&mut write_txn, forger);
+        assert_eq!(
+            write_txn
+                .impersonate_search(record_filter.clone(), record_filter.clone(), &forger)
+                .map(|entries| entries.len()),
+            Ok(1)
+        );
+        for (what, result) in attempts(&mut write_txn, &forger) {
+            assert_eq!(result, Err(OperationError::SystemProtectedObject), "{what}");
+        }
+
+        let records = write_txn.internal_search(record_filter).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].get_ava_single_utf8(Attribute::ApprovalDecision),
+            Some(record_json.as_str())
+        );
+        assert_eq!(
+            read_request(&mut write_txn, request).state,
+            ApprovalRequestState::Pending
+        );
+        assert_eq!(
+            stored_state(&mut write_txn, request).as_deref(),
+            Some("pending")
+        );
+    }
+
+    /// S5: in the tally, decisions by the requester and slots the approver could not hold
+    /// under the snapshot are dropped.
+    #[qs_test]
+    async fn test_approval_tally_drops_invalid_decisions(server: &QueryServer) {
+        let ct = duration_from_epoch_now();
+        let at = OffsetDateTime::UNIX_EPOCH + ct;
+        let mut write_txn = server.write(ct).await.unwrap();
+        let a = create_person(&mut write_txn, "approver_a");
+        let b = create_person(&mut write_txn, "approver_b");
+        let x = create_person(&mut write_txn, "outsider_x");
+        let r = create_person(&mut write_txn, "requester_r");
+        create_policy(&mut write_txn, "all_ab", ApprovalPattern::All, vec![a, b]);
+        let request = create_request(&mut write_txn, r, "all_ab", ct).unwrap();
+
+        // The requester, an outsider claiming A's slot, and a slot that is not in the
+        // snapshot at all.
+        add_decision_record(
+            &mut write_txn,
+            request,
+            &decision_json(r, ApprovalDecisionAction::Approve, at, &[a, b]),
+        );
+        add_decision_record(
+            &mut write_txn,
+            request,
+            &decision_json(x, ApprovalDecisionAction::Approve, at, &[a]),
+        );
+        add_decision_record(
+            &mut write_txn,
+            request,
+            &decision_json(b, ApprovalDecisionAction::Approve, at, &[b, Uuid::new_v4()]),
+        );
+        assert_eq!(
+            read_request(&mut write_txn, request).state,
+            ApprovalRequestState::Pending
+        );
+        decide_as(&mut write_txn, a, request, approve(), ct).expect("A approves");
+        assert_eq!(
+            read_request(&mut write_txn, request).state,
+            ApprovalRequestState::Approved
+        );
+    }
+
+    /// Backup approvers may decide once the escalation time has passed, whether or not the
+    /// sweep has recorded the escalation yet.
+    #[qs_test]
+    async fn test_approval_backup_decides_before_sweep(server: &QueryServer) {
+        let ct = duration_from_epoch_now();
+        let mut write_txn = server.write(ct).await.unwrap();
+        let idm_admin = identity(&mut write_txn, UUID_IDM_ADMIN);
+        let a = create_person(&mut write_txn, "approver_a");
+        let b = create_person(&mut write_txn, "approver_b");
+        let x = create_person(&mut write_txn, "backup_x");
+        let r = create_person(&mut write_txn, "requester_r");
+        let mut policy = policy_request("escalating", ApprovalPattern::All, vec![a, b]);
+        policy.backup_approvers = vec![x];
+        policy.escalation_timeout_seconds = Some(30);
+        write_txn
+            .approval_policy_create(&idm_admin, &policy)
+            .expect("failed to create approval policy");
+        let request = create_request(&mut write_txn, r, "escalating", ct).unwrap();
+        write_txn.commit().expect("failed to commit");
+
+        let ct_early = ct + Duration::from_secs(29);
+        let mut write_txn = server.write(ct_early).await.unwrap();
+        assert_eq!(
+            decide_as(&mut write_txn, x, request, approve(), ct_early),
+            Err(OperationError::AccessDenied)
+        );
+        drop(write_txn);
+
+        let ct_escalate = ct + Duration::from_secs(31);
+        let mut write_txn = server.write(ct_escalate).await.unwrap();
+        decide_as(&mut write_txn, x, request, approve(), ct_escalate)
+            .expect("backup approvers may decide after the escalation time");
+        decide_as(&mut write_txn, a, request, approve(), ct_escalate).expect("A approves");
+        let read = read_request(&mut write_txn, request);
+        assert_eq!(read.escalation_level, 0);
+        assert_eq!(read.state, ApprovalRequestState::Approved);
+        write_txn.commit().expect("failed to commit");
     }
 
     /// idm_approval_admins is high privilege, so it is protected from lower privileged

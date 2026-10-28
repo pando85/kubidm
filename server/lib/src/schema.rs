@@ -937,6 +937,8 @@ pub(crate) fn kubidm_schema_attributes() -> Vec<SchemaAttribute> {
             &dl14::SCHEMA_ATTR_APPROVAL_ESCALATION_LEVEL,
             &dl14::SCHEMA_ATTR_APPROVAL_EXPIRES,
             &dl14::SCHEMA_ATTR_APPROVAL_OPERATION_DETAILS,
+            &dl14::SCHEMA_ATTR_APPROVAL_QUORUM_SNAPSHOT,
+            &dl14::SCHEMA_ATTR_APPROVAL_RECORD_REQUEST,
         ]
         .into_iter()
         .map(|attr| SchemaAttribute::clone(attr)),

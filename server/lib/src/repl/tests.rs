@@ -4538,11 +4538,28 @@ async fn test_repl_increment_approval_decisions_union(
         .is_ok());
     drop(server_b_txn);
 
-    // A policy needing both idm_admin and admin, and a request from anonymous.
+    // A policy needing both of two persons, and a request from anonymous.
     let mut server_a_txn = server_a.write(ct).await.unwrap();
     let idm_admin = Identity::from_impersonate_entry_readwrite(
         server_a_txn.internal_search_uuid(UUID_IDM_ADMIN).unwrap(),
     );
+    let approver_one = Uuid::new_v4();
+    let approver_two = Uuid::new_v4();
+    for (uuid, name) in [
+        (approver_one, "approver_one"),
+        (approver_two, "approver_two"),
+    ] {
+        server_a_txn
+            .internal_create(vec![entry_init!(
+                (Attribute::Class, EntryClass::Object.to_value()),
+                (Attribute::Class, EntryClass::Account.to_value()),
+                (Attribute::Class, EntryClass::Person.to_value()),
+                (Attribute::Name, Value::new_iname(name)),
+                (Attribute::DisplayName, Value::new_utf8s(name)),
+                (Attribute::Uuid, Value::Uuid(uuid))
+            )])
+            .expect("failed to create approver");
+    }
     let anon = Identity::from_impersonate_entry_readwrite(
         server_a_txn.internal_search_uuid(UUID_ANONYMOUS).unwrap(),
     );
@@ -4553,7 +4570,7 @@ async fn test_repl_increment_approval_decisions_union(
                 name: "repl_policy".to_string(),
                 description: None,
                 operation_types: vec![ApprovalOperationType::SchemaModify],
-                approvers: vec![UUID_IDM_ADMIN, UUID_ADMIN],
+                approvers: vec![approver_one, approver_two],
                 backup_approvers: vec![],
                 pattern: ApprovalPattern::All,
                 timeout_seconds: 3600,
@@ -4584,22 +4601,22 @@ async fn test_repl_increment_approval_decisions_union(
         comment: None,
     };
 
-    // idm_admin approves on A, admin approves on B, before either replicates.
+    // One approves on A, the other on B, before either replicates.
     let mut server_a_txn = server_a.write(duration_from_epoch_now()).await.unwrap();
-    let idm_admin = Identity::from_impersonate_entry_readwrite(
-        server_a_txn.internal_search_uuid(UUID_IDM_ADMIN).unwrap(),
+    let one = Identity::from_impersonate_entry_readwrite(
+        server_a_txn.internal_search_uuid(approver_one).unwrap(),
     );
     server_a_txn
-        .approval_request_decision(&idm_admin, request_uuid, approve(), ct)
+        .approval_request_decision(&one, request_uuid, approve(), ct)
         .expect("failed to approve on A");
     server_a_txn.commit().expect("Failed to commit");
 
     let mut server_b_txn = server_b.write(duration_from_epoch_now()).await.unwrap();
-    let admin = Identity::from_impersonate_entry_readwrite(
-        server_b_txn.internal_search_uuid(UUID_ADMIN).unwrap(),
+    let two = Identity::from_impersonate_entry_readwrite(
+        server_b_txn.internal_search_uuid(approver_two).unwrap(),
     );
     server_b_txn
-        .approval_request_decision(&admin, request_uuid, approve(), ct)
+        .approval_request_decision(&two, request_uuid, approve(), ct)
         .expect("failed to approve on B");
     server_b_txn.commit().expect("Failed to commit");
 
@@ -4621,7 +4638,10 @@ async fn test_repl_increment_approval_decisions_union(
         let records = txn
             .internal_search(filter!(f_and!([
                 f_eq(Attribute::Class, EntryClass::ApprovalDecisionRecord.into()),
-                f_eq(Attribute::ApprovalTarget, PartialValue::Refer(request_uuid))
+                f_eq(
+                    Attribute::ApprovalRecordRequest,
+                    PartialValue::Refer(request_uuid)
+                )
             ])))
             .expect("failed to search decision records");
         assert_eq!(

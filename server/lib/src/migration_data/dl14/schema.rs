@@ -1866,17 +1866,16 @@ pub static SCHEMA_ATTR_APPROVAL_REQUEST_POLICY: LazyLock<SchemaAttribute> =
         ..Default::default()
     });
 
-pub static SCHEMA_ATTR_APPROVAL_TARGET: LazyLock<SchemaAttribute> = LazyLock::new(|| {
-    SchemaAttribute {
+pub static SCHEMA_ATTR_APPROVAL_TARGET: LazyLock<SchemaAttribute> =
+    LazyLock::new(|| SchemaAttribute {
         uuid: UUID_SCHEMA_ATTR_APPROVAL_TARGET,
         name: Attribute::ApprovalTarget,
-        description: "Reference to the entry that is the target of the approval request, or on an approval decision record, the request it decides"
+        description: "Reference to the entry that is the target of the approval request"
             .to_string(),
         indexed: true,
         syntax: SyntaxType::ReferenceUuid,
         ..Default::default()
-    }
-});
+    });
 
 pub static SCHEMA_ATTR_APPROVAL_REQUESTOR: LazyLock<SchemaAttribute> =
     LazyLock::new(|| SchemaAttribute {
@@ -1943,6 +1942,38 @@ pub static SCHEMA_ATTR_APPROVAL_OPERATION_DETAILS: LazyLock<SchemaAttribute> =
         ..Default::default()
     });
 
+/// Kubidm: what a request is decided against, fixed when it is created. A JSON object
+/// with the requester, the approver slots and backup approvers (each a person or a group),
+/// the pattern, the number of approved slots required and the escalation timeout.
+///
+/// The policy's `approver` and `backup_approver` are references, so referential integrity
+/// removes a deleted person or group from them. Counting decisions against the live policy
+/// would let deleting an approver change the outcome of a request (for example, deleting
+/// the only approver who rejected). The snapshot holds plain uuids that referential
+/// integrity does not touch, so the outcome is a function of the snapshot and the decision
+/// records only.
+pub static SCHEMA_ATTR_APPROVAL_QUORUM_SNAPSHOT: LazyLock<SchemaAttribute> = LazyLock::new(|| {
+    SchemaAttribute {
+        uuid: UUID_SCHEMA_ATTR_APPROVAL_QUORUM_SNAPSHOT,
+        name: Attribute::ApprovalQuorumSnapshot,
+        description: "The approvers, pattern and quorum an approval request is decided against, fixed at creation (JSON)".to_string(),
+        syntax: SyntaxType::Utf8String,
+        ..Default::default()
+    }
+});
+
+/// Kubidm: on an approval decision record, the request it decides.
+pub static SCHEMA_ATTR_APPROVAL_RECORD_REQUEST: LazyLock<SchemaAttribute> =
+    LazyLock::new(|| SchemaAttribute {
+        uuid: UUID_SCHEMA_ATTR_APPROVAL_RECORD_REQUEST,
+        name: Attribute::ApprovalRecordRequest,
+        description: "Reference to the approval request an approval decision record decides"
+            .to_string(),
+        indexed: true,
+        syntax: SyntaxType::ReferenceUuid,
+        ..Default::default()
+    });
+
 pub static SCHEMA_CLASS_APPROVAL_REQUEST: LazyLock<SchemaClass> = LazyLock::new(|| SchemaClass {
     uuid: UUID_SCHEMA_CLASS_APPROVAL_REQUEST,
     name: EntryClass::ApprovalRequest.into(),
@@ -1955,6 +1986,8 @@ pub static SCHEMA_CLASS_APPROVAL_REQUEST: LazyLock<SchemaClass> = LazyLock::new(
         Attribute::ApprovalRequestPolicy,
         Attribute::ApprovalTarget,
         Attribute::ApprovalRequestor,
+        // Written once at creation. A request without it is invalid.
+        Attribute::ApprovalQuorumSnapshot,
         // Legacy, no longer written or read: decisions are approval decision records.
         Attribute::ApprovalDecision,
         Attribute::ApprovalEscalationLevel,
@@ -1980,7 +2013,9 @@ pub static SCHEMA_CLASS_APPROVAL_DECISION_RECORD: LazyLock<SchemaClass> =
         description: "One decision on an approval request".to_string(),
         systemmust: vec![Attribute::ApprovalDecision],
         // The request it decides. Optional so that deleting the request is not blocked
-        // by referential integrity; a record without a request is ignored.
-        systemmay: vec![Attribute::ApprovalTarget],
+        // by referential integrity; a record without a request is ignored. Records
+        // written before `ApprovalRecordRequest` existed used `ApprovalTarget`; it is
+        // still allowed so that they stay valid, but no longer read.
+        systemmay: vec![Attribute::ApprovalRecordRequest, Attribute::ApprovalTarget],
         ..Default::default()
     });

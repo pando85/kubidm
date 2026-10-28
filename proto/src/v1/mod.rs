@@ -278,6 +278,9 @@ pub enum ApprovalRequestState {
     /// Kubidm: the policy, target or requester of a pending request has been deleted, so
     /// the request can no longer be decided. Never stored, only reported.
     Invalid,
+    /// Kubidm: an approved request whose operation has been carried out. Final: an
+    /// approval authorises its operation once.
+    Consumed,
 }
 
 impl fmt::Display for ApprovalRequestState {
@@ -296,6 +299,7 @@ impl ApprovalRequestState {
             ApprovalRequestState::Cancelled => "cancelled",
             ApprovalRequestState::Escalated => "escalated",
             ApprovalRequestState::Invalid => "invalid",
+            ApprovalRequestState::Consumed => "consumed",
         }
     }
 }
@@ -312,6 +316,7 @@ impl std::str::FromStr for ApprovalRequestState {
             "cancelled" => Ok(ApprovalRequestState::Cancelled),
             "escalated" => Ok(ApprovalRequestState::Escalated),
             "invalid" => Ok(ApprovalRequestState::Invalid),
+            "consumed" => Ok(ApprovalRequestState::Consumed),
             _ => Err("invalid approval request state"),
         }
     }
@@ -542,6 +547,7 @@ mod tests {
             ApprovalRequestState::Cancelled,
             ApprovalRequestState::Escalated,
             ApprovalRequestState::Invalid,
+            ApprovalRequestState::Consumed,
         ];
         for variant in variants {
             let restored = round_trip(&variant);
@@ -580,6 +586,11 @@ mod tests {
             ApprovalRequestState::from_str("invalid"),
             Ok(ApprovalRequestState::Invalid)
         );
+        assert_eq!(
+            ApprovalRequestState::from_str("consumed"),
+            Ok(ApprovalRequestState::Consumed)
+        );
+        assert_eq!(ApprovalRequestState::Consumed.as_str(), "consumed");
         assert!(ApprovalRequestState::from_str("bogus").is_err());
     }
 

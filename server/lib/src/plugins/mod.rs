@@ -13,6 +13,7 @@ use std::{
     sync::Arc,
 };
 
+mod approval;
 mod attrunique;
 mod base;
 mod cred_import;
@@ -257,6 +258,7 @@ impl Plugins {
         ce: &CreateEvent,
     ) -> Result<(), OperationError> {
         base::Base::pre_create_transform(qs, cand, ce)?;
+        approval::ApprovalProtect::pre_create_transform(qs, cand, ce)?;
         valuedeny::ValueDeny::pre_create_transform(qs, cand, ce)?;
 
         oauth2::OAuth2::pre_create_transform(qs, cand, ce)?;
@@ -310,6 +312,7 @@ impl Plugins {
         me: &ModifyEvent,
     ) -> Result<(), OperationError> {
         base::Base::pre_modify(qs, pre_cand, cand, me)?;
+        approval::ApprovalProtect::pre_modify(qs, pre_cand, cand, me)?;
         valuedeny::ValueDeny::pre_modify(qs, pre_cand, cand, me)?;
 
         oauth2::OAuth2::pre_modify(qs, pre_cand, cand, me)?;
@@ -348,6 +351,7 @@ impl Plugins {
         me: &BatchModifyEvent,
     ) -> Result<(), OperationError> {
         base::Base::pre_batch_modify(qs, pre_cand, cand, me)?;
+        approval::ApprovalProtect::pre_batch_modify(qs, pre_cand, cand, me)?;
         valuedeny::ValueDeny::pre_batch_modify(qs, pre_cand, cand, me)?;
 
         oauth2::OAuth2::pre_batch_modify(qs, pre_cand, cand, me)?;
@@ -394,6 +398,7 @@ impl Plugins {
         cand: &mut Vec<Entry<EntryInvalid, EntryCommitted>>,
         de: &DeleteEvent,
     ) -> Result<(), OperationError> {
+        approval::ApprovalProtect::pre_delete(qs, cand, de)?;
         memberof::MemberOf::pre_delete(qs, cand, de)
     }
 
