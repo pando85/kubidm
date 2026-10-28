@@ -14,8 +14,10 @@ use kubidm_utils_users::get_current_uid;
 use kubidmd_lib::maintenance::{
     maintenance_public_status, set_maintenance_error, set_maintenance_state,
     with_maintenance_write_bypass, FenceSatisfaction, MaintenanceCapabilities,
-    MaintenanceOperation, MaintenancePublicStatus, MaintenanceState, ReplicationFence,
+    MaintenancePublicStatus, MaintenanceState,
 };
+// The request types name these, so a client of the admin socket needs them too.
+pub use kubidmd_lib::maintenance::{MaintenanceOperation, ReplicationFence};
 use kubidmd_lib::prelude::{duration_from_epoch_now, IdmServer};
 use serde::{Deserialize, Serialize};
 use std::error::Error;

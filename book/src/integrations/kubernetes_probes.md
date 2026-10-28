@@ -279,6 +279,61 @@ In a multi-master replication setup:
 This design prioritizes availability while ensuring data consistency. A catching-up replica can still serve reads; it
 will eventually converge with peers.
 
+## Draining a Node for Maintenance
+
+The maintenance control plane is driven with `kubidmd maintenance` on the node itself. It talks to the root-only admin
+socket (`admin_bind_path` of the server configuration), so run it as root or as the server user, for example through
+`kubectl exec`. The commands are the building blocks an external orchestrator uses; Kubidm does not choose the replica
+to maintain or sequence the nodes itself. See the
+[maintenance control protocol](../developers/designs/maintenance_control_protocol.md) for the semantics.
+
+| Command                                                                                     | Effect                                                                         |
+| ------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
+| `kubidmd maintenance capabilities`                                                          | Show what this server version supports                                         |
+| `kubidmd maintenance status`                                                                | State, active operation ID and last error                                      |
+| `kubidmd maintenance drain --operation-id <uuid>`                                           | Stop serving, wait for in-flight writes and print the node's replication fence |
+| `kubidmd maintenance run --operation-id <uuid> <reindex\|verify>`                           | Run a maintenance operation on the drained node                                |
+| `kubidmd maintenance fence`                                                                 | Capture a fresh replication fence of this node                                 |
+| `kubidmd maintenance sync-until --operation-id <uuid> --fence <json> [--timeout-seconds N]` | Wait until this node has received the state of a fence from a peer             |
+| `kubidmd maintenance resume --operation-id <uuid>`                                          | Serve again and end the operation                                              |
+
+The operation ID is a UUID chosen by the caller, and every step of one operation uses the same one. Add `-o json` to
+print a single JSON object on stdout instead of text. Every command exits non-zero when the step did not succeed.
+
+A rolling maintenance of replica `B` with peer `A` looks like this:
+
+```bash
+OP=$(uuidgen)
+
+# On B: drain and keep the fence it prints.
+kubectl exec pod-b -- kubidmd maintenance -o json drain --operation-id "$OP" > drain.json
+FENCE_B=$(jq -c .output.fence drain.json)
+
+# On A: require A to have received everything B had when it was fenced.
+kubectl exec pod-a -- kubidmd maintenance sync-until --operation-id "$OP" --fence "$FENCE_B"
+
+# On B: run the operation, then wait for what A has now.
+kubectl exec pod-b -- kubidmd maintenance run --operation-id "$OP" reindex
+FENCE_A=$(kubectl exec pod-a -- kubidmd maintenance -o json fence | jq -c .output.fence)
+kubectl exec pod-b -- kubidmd maintenance sync-until --operation-id "$OP" --fence "$FENCE_A"
+
+# On B: only now let it serve again.
+kubectl exec pod-b -- kubidmd maintenance resume --operation-id "$OP"
+```
+
+Use `--fence-file <path>` instead of `--fence` to read the fence from a file.
+
+Handling failures:
+
+- **`busy`** means another step of the operation is still executing. It never changes any state and is always safe to
+  retry: repeat the same command with the same operation ID until it succeeds. In JSON output the error has
+  `"retryable": true`.
+- **`timed_out`** from `sync-until` means the fence was not satisfied within `--timeout-seconds` (60 by default, at most
+  one hour). Repeat the command to keep waiting.
+- **`domain_mismatch` and `generation_mismatch`** are hard failures: the fence belongs to another domain or replication
+  generation.
+- A `failed` state is recovered by repeating the `drain` or by `resume` with the same operation ID.
+
 ## Monitoring and Alerting
 
 The `/readyz` endpoint exposes state that can be monitored by polling the endpoint and parsing the JSON response.
@@ -319,8 +374,9 @@ Check the `/readyz` endpoint response to determine the cause:
    - Peer load
 
 5. **`message` reports maintenance:** The node is drained for a maintenance operation. Check `/maintenance` for the
-   state. A `failed` state needs the operator to retry or resume the operation; use the admin socket `MaintenanceStatus`
-   request for the operation ID and the last error.
+   state. A `failed` state needs the operator to retry or resume the operation; run `kubidmd maintenance status` on the
+   node for the operation ID and the last error (see
+   [Draining a Node for Maintenance](#draining-a-node-for-maintenance)).
 
 ### Replica Shows Ready But Not Serving Traffic
 

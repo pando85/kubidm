@@ -155,6 +155,116 @@ enum DomainSettingsCmds {
     Remigrate { level: Option<u32> },
 }
 
+/// How `kubidmd maintenance` prints the response of the server.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum MaintenanceOutput {
+    /// Human readable lines.
+    #[default]
+    Human,
+    /// One JSON object on stdout, for an orchestrator.
+    Json,
+}
+
+/// The native maintenance operations the server can run while the node is fenced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum MaintenanceRunOperation {
+    /// Rebuild the indexes of the database.
+    Reindex,
+    /// Verify the database and entry consistency.
+    Verify,
+}
+
+#[derive(Debug, Args)]
+struct MaintenanceOperationOpt {
+    /// The ID of the maintenance operation this step belongs to, chosen by the caller. Every
+    /// step of one operation uses the same ID. Use `maintenance status` to read the ID of
+    /// the active operation.
+    #[clap(long, value_name = "UUID")]
+    operation_id: Uuid,
+}
+
+#[derive(Debug, Args)]
+struct MaintenanceRunOpt {
+    #[command(flatten)]
+    operation_id: MaintenanceOperationOpt,
+
+    /// The maintenance operation to run. The node must be drained (fenced) first.
+    #[clap(value_enum)]
+    operation: MaintenanceRunOperation,
+}
+
+#[derive(Debug, Args)]
+#[group(required = true, multiple = false)]
+struct MaintenanceFenceSource {
+    /// The replication fence to wait for, as JSON. This is the `fence` that `maintenance
+    /// drain` or `maintenance fence` printed on the node to wait for.
+    #[clap(long, value_name = "JSON")]
+    fence: Option<String>,
+
+    /// Read the replication fence to wait for from this file, containing the same JSON as
+    /// --fence.
+    #[clap(long, value_name = "PATH")]
+    fence_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct MaintenanceSyncUntilOpt {
+    #[command(flatten)]
+    operation_id: MaintenanceOperationOpt,
+
+    #[command(flatten)]
+    fence: MaintenanceFenceSource,
+
+    /// How long this request waits for the fence to be satisfied. The server uses 60 seconds
+    /// when this is omitted and bounds the value between 1 second and 1 hour. Repeat the
+    /// command to wait longer.
+    #[clap(long, value_name = "SECONDS")]
+    timeout_seconds: Option<u64>,
+}
+
+/// The maintenance control plane of a running server, driven over its admin socket.
+///
+/// A `busy` error means another step of the operation is still executing. It never changes
+/// any state and is always safe to retry with the same operation ID.
+#[derive(Debug, Subcommand)]
+enum MaintenanceCmds {
+    /// Show the maintenance capabilities of this server.
+    #[clap(name = "capabilities")]
+    Capabilities,
+    /// Show the maintenance state, the active operation ID and the last error.
+    #[clap(name = "status")]
+    Status,
+    /// Drain this node: stop it serving, wait for in-flight writes and fence replication
+    ///
+    /// Repeating a completed drain with the same operation ID returns the same fence.
+    #[clap(name = "drain")]
+    Drain(MaintenanceOperationOpt),
+    /// Run a maintenance operation on this drained node.
+    #[clap(name = "run")]
+    Run(MaintenanceRunOpt),
+    /// Capture a fresh replication fence of this node.
+    #[clap(name = "fence")]
+    Fence,
+    /// Wait until this node has received the replication state of a fence captured on a peer
+    ///
+    /// Exits non-zero when the fence is not satisfied, which includes a timeout (retryable).
+    #[clap(name = "sync-until")]
+    SyncUntil(MaintenanceSyncUntilOpt),
+    /// Make this node serve again and end the operation.
+    #[clap(name = "resume")]
+    Resume(MaintenanceOperationOpt),
+}
+
+#[derive(Debug, Args)]
+struct MaintenanceOpt {
+    /// How to print the response.
+    #[clap(short, long, global = true, value_enum, default_value_t = MaintenanceOutput::Human)]
+    output: MaintenanceOutput,
+
+    #[clap(subcommand)]
+    commands: MaintenanceCmds,
+}
+
 #[derive(Debug, Subcommand)]
 enum DbCommands {
     #[clap(name = "vacuum")]
@@ -383,6 +493,11 @@ enum KubidmdOpt {
         #[clap(subcommand)]
         commands: DomainSettingsCmds,
     },
+
+    /// Drive the maintenance control plane (drain, fence, run, sync-until, resume) of the
+    /// running server through its admin socket.
+    #[clap(name = "maintenance")]
+    Maintenance(MaintenanceOpt),
 
     /// Print the program version and exit
     #[clap(name = "version")]

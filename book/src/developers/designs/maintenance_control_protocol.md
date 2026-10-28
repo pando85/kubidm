@@ -26,6 +26,9 @@ version-1 request set is:
 - `ReplicationSyncUntil { operation_id, fence, timeout_seconds }`
 - `MaintenanceResume { operation_id }`
 
+The `kubidmd maintenance` command sends these requests, see
+[Draining a Node for Maintenance](../../integrations/kubernetes_probes.md#draining-a-node-for-maintenance).
+
 Supported native maintenance operations are `reindex` and `verify`. `vacuum` and `restore` are intentionally reported as
 unsupported because they require stronger backend/recovery lifecycle semantics.
 
