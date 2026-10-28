@@ -1,5 +1,7 @@
 use crate::{ClientError, KubidmClient};
-use kubidm_proto::v1::Entry;
+use kubidm_proto::constants::{ATTR_MAX_GRANT_DURATION, ENTRYCLASS_TIME_BOUNDED_GRANT};
+use kubidm_proto::v1::{Entry, TimeBoundedMemberGrant, TimeBoundedMemberGrantRequest};
+use time::OffsetDateTime;
 
 impl KubidmClient {
     pub async fn idm_group_search(&self, id: &str) -> Result<Vec<Entry>, ClientError> {
@@ -203,6 +205,66 @@ impl KubidmClient {
         description: &str,
     ) -> Result<(), ClientError> {
         self.perform_put_request(&format!("/v1/group/{id}/_attr/description"), &[description])
+            .await
+    }
+
+    /// Kubidm: allow time-bounded membership grants on a group, optionally setting the
+    /// longest window (in seconds) that a grant may cover.
+    pub async fn idm_group_time_bounded_enable(
+        &self,
+        id: &str,
+        max_grant_duration: Option<u32>,
+    ) -> Result<(), ClientError> {
+        self.perform_post_request::<_, ()>(
+            &format!("/v1/group/{id}/_attr/class"),
+            vec![ENTRYCLASS_TIME_BOUNDED_GRANT.to_string()],
+        )
+        .await?;
+
+        if let Some(max_grant_duration) = max_grant_duration {
+            self.perform_put_request::<_, ()>(
+                &format!("/v1/group/{id}/_attr/{ATTR_MAX_GRANT_DURATION}"),
+                vec![max_grant_duration.to_string()],
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Kubidm: grant `member` a membership of a group from `valid_from` (or now) until
+    /// `valid_until`, replacing any existing grant of `member`.
+    pub async fn idm_group_time_bounded_member_grant(
+        &self,
+        id: &str,
+        member: &str,
+        valid_from: Option<OffsetDateTime>,
+        valid_until: OffsetDateTime,
+    ) -> Result<(), ClientError> {
+        let request = TimeBoundedMemberGrantRequest {
+            member: member.to_string(),
+            valid_from,
+            valid_until,
+        };
+        self.perform_post_request(&format!("/v1/group/{id}/_time_bounded_member"), request)
+            .await
+    }
+
+    /// Kubidm: revoke the time-bounded membership grant of `member` on a group.
+    pub async fn idm_group_time_bounded_member_revoke(
+        &self,
+        id: &str,
+        member: &str,
+    ) -> Result<(), ClientError> {
+        self.perform_delete_request(&format!("/v1/group/{id}/_time_bounded_member/{member}"))
+            .await
+    }
+
+    /// Kubidm: list the time-bounded membership grants of a group.
+    pub async fn idm_group_time_bounded_member_list(
+        &self,
+        id: &str,
+    ) -> Result<Vec<TimeBoundedMemberGrant>, ClientError> {
+        self.perform_get_request(&format!("/v1/group/{id}/_time_bounded_member"))
             .await
     }
 }

@@ -71,6 +71,8 @@ pub(crate) mod migrations;
 pub mod modify;
 pub(crate) mod recycle;
 pub mod scim;
+// Kubidm: administration of time-bounded group memberships.
+pub mod time_bounded;
 pub(crate) mod utils;
 
 const RESOLVE_FILTER_CACHE_MAX: usize = 256;

@@ -387,7 +387,10 @@ pub fn phase_7_builtin_access_control_profiles() -> Vec<EntryInitNew> {
 /// `phase_7_builtin_access_control_profiles`, and at DL >= 1.11 by the domain migrations
 /// after the upstream phase 7 entries.
 pub(crate) fn kubidm_builtin_access_control_profiles() -> Vec<EntryInitNew> {
-    vec![IDM_ACP_OAUTH2_FEDERATION_ADMIN.clone().into()]
+    vec![
+        IDM_ACP_OAUTH2_FEDERATION_ADMIN.clone().into(),
+        IDM_ACP_GROUP_TIME_BOUNDED_MANAGE.clone().into(),
+    ]
 }
 
 pub fn phase_8_delete_uuids() -> Vec<Uuid> {

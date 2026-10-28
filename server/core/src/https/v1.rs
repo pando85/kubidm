@@ -34,7 +34,8 @@ use kubidm_proto::{
         AccountUnixExtend, ApiTokenGenerate, ApprovalDecisionRequest, ApprovalPolicy,
         ApprovalPolicyCreateRequest, ApprovalRequest, ApprovalRequestCreateRequest,
         AuthIssueSession, AuthRequest, AuthResponse, AuthState as ProtoAuthState,
-        Entry as ProtoEntry, GroupUnixExtend, SingleStringRequest, UatStatus, UnixGroupToken,
+        Entry as ProtoEntry, GroupUnixExtend, SingleStringRequest, TimeBoundedMemberGrant,
+        TimeBoundedMemberGrantRequest, UatStatus, UnixGroupToken,
         UnixUserToken, WhoamiResponse,
     },
 };
@@ -2453,6 +2454,86 @@ pub async fn group_id_unix_token_get(
         .map_err(WebError::from)
 }
 
+/// Kubidm: grant a time-bounded membership of a group, replacing any existing grant of the
+/// same member. The group must have the `time_bounded_grant` class, and the caller must be
+/// allowed to modify the members of the group.
+#[utoipa::path(
+    post,
+    path = "/v1/group/{id}/_time_bounded_member",
+    request_body = TimeBoundedMemberGrantRequest,
+    responses(
+        DefaultApiResponse,
+    ),
+    security(("token_jwt" = [])),
+    tag = "group",
+    operation_id = "group_id_time_bounded_member_post",
+)]
+pub async fn group_id_time_bounded_member_post(
+    State(state): State<ServerState>,
+    Path(id): Path<String>,
+    Extension(kopid): Extension<KOpId>,
+    VerifiedClientInformation(client_auth_info): VerifiedClientInformation,
+    Json(request): Json<TimeBoundedMemberGrantRequest>,
+) -> Result<Json<()>, WebError> {
+    state
+        .qe_w_ref
+        .handle_group_time_bounded_member_grant(client_auth_info, id, request, kopid.eventid)
+        .await
+        .map(Json::from)
+        .map_err(WebError::from)
+}
+
+/// Kubidm: list the time-bounded membership grants of a group.
+#[utoipa::path(
+    get,
+    path = "/v1/group/{id}/_time_bounded_member",
+    responses(
+        (status=200, body=Vec<TimeBoundedMemberGrant>, content_type=APPLICATION_JSON),
+        ApiResponseWithout200,
+    ),
+    security(("token_jwt" = [])),
+    tag = "group",
+    operation_id = "group_id_time_bounded_member_get",
+)]
+pub async fn group_id_time_bounded_member_get(
+    State(state): State<ServerState>,
+    Path(id): Path<String>,
+    Extension(kopid): Extension<KOpId>,
+    VerifiedClientInformation(client_auth_info): VerifiedClientInformation,
+) -> Result<Json<Vec<TimeBoundedMemberGrant>>, WebError> {
+    state
+        .qe_r_ref
+        .handle_group_time_bounded_member_list(client_auth_info, id, kopid.eventid)
+        .await
+        .map(Json::from)
+        .map_err(WebError::from)
+}
+
+/// Kubidm: revoke the time-bounded membership grant of a member of a group.
+#[utoipa::path(
+    delete,
+    path = "/v1/group/{id}/_time_bounded_member/{member}",
+    responses(
+        DefaultApiResponse,
+    ),
+    security(("token_jwt" = [])),
+    tag = "group",
+    operation_id = "group_id_time_bounded_member_delete",
+)]
+pub async fn group_id_time_bounded_member_delete(
+    State(state): State<ServerState>,
+    Path((id, member)): Path<(String, String)>,
+    Extension(kopid): Extension<KOpId>,
+    VerifiedClientInformation(client_auth_info): VerifiedClientInformation,
+) -> Result<Json<()>, WebError> {
+    state
+        .qe_w_ref
+        .handle_group_time_bounded_member_revoke(client_auth_info, id, member, kopid.eventid)
+        .await
+        .map(Json::from)
+        .map_err(WebError::from)
+}
+
 #[utoipa::path(
     get,
     path = "/v1/domain",
@@ -3328,6 +3409,15 @@ pub(crate) fn route_setup(state: ServerState) -> Router<ServerState> {
         )
         .route("/v1/group/{id}/_unix/_token", get(group_id_unix_token_get))
         .route("/v1/group/{id}/_unix", post(group_id_unix_post))
+        // Kubidm: time-bounded membership grants.
+        .route(
+            "/v1/group/{id}/_time_bounded_member",
+            get(group_id_time_bounded_member_get).post(group_id_time_bounded_member_post),
+        )
+        .route(
+            "/v1/group/{id}/_time_bounded_member/{member}",
+            delete(group_id_time_bounded_member_delete),
+        )
         .route("/v1/group", get(group_get).post(group_post))
         .route("/v1/group/_search/{id}", get(group_search_id))
         .route(

@@ -16,6 +16,38 @@ fn parse_rfc3339(input: &str) -> Result<OffsetDateTime, time::error::Parse> {
     }
 }
 
+/// Kubidm: parse a duration for time-bounded membership: a number of seconds, or a number
+/// followed by one of `s`, `m`, `h`, `d` or `w` (for example `90m`, `8h`, `7d`).
+fn parse_grant_duration(input: &str) -> Result<u64, String> {
+    let input = input.trim();
+    let (number, unit) = match input.char_indices().last() {
+        Some((idx, c)) if c.is_ascii_alphabetic() => (&input[..idx], c.to_ascii_lowercase()),
+        _ => (input, 's'),
+    };
+    let multiplier: u64 = match unit {
+        's' => 1,
+        'm' => 60,
+        'h' => 60 * 60,
+        'd' => 24 * 60 * 60,
+        'w' => 7 * 24 * 60 * 60,
+        _ => return Err(format!("unknown duration unit '{unit}', expected s, m, h, d or w")),
+    };
+    let number: u64 = number
+        .trim()
+        .parse()
+        .map_err(|err| format!("invalid duration '{input}': {err}"))?;
+    number
+        .checked_mul(multiplier)
+        .filter(|secs| *secs > 0)
+        .ok_or_else(|| format!("invalid duration '{input}': must be positive and not too large"))
+}
+
+/// Kubidm: parse a maximum grant duration, which the server stores as 32 bit seconds.
+fn parse_max_grant_duration(input: &str) -> Result<u32, String> {
+    let secs = parse_grant_duration(input)?;
+    u32::try_from(secs).map_err(|_| format!("duration '{input}' is too large"))
+}
+
 #[derive(Debug, Args, Clone)]
 pub struct Named {
     pub name: String,
@@ -100,6 +132,26 @@ pub struct GroupNamedMembers {
     name: String,
     #[clap(required = true, num_args(1..))]
     members: Vec<String>,
+}
+
+/// Kubidm: grant a time-bounded (temporary) membership of a group.
+#[derive(Debug, Args, Clone)]
+#[clap(group(clap::ArgGroup::new("end").required(true).args(["until", "duration"])))]
+pub struct GroupGrantTemporaryOpt {
+    /// The name of the group
+    pub name: String,
+    /// The name, spn or uuid of the person, group or service account to grant
+    pub member: String,
+    /// When the membership ends, as an RFC 3339 datetime (for example 2026-12-31T18:00:00Z)
+    #[clap(long = "until", value_parser = parse_rfc3339)]
+    pub until: Option<OffsetDateTime>,
+    /// How long the membership lasts from its start: seconds, or a number followed by
+    /// s, m, h, d or w (for example 8h or 7d)
+    #[clap(long = "for", value_parser = parse_grant_duration)]
+    pub duration: Option<u64>,
+    /// When the membership starts, as an RFC 3339 datetime. Defaults to now.
+    #[clap(long = "from", value_parser = parse_rfc3339)]
+    pub from: Option<OffsetDateTime>,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -305,6 +357,31 @@ pub enum GroupOpt {
         #[clap(subcommand)]
         commands: GroupAccountPolicyOpt,
     },
+    /// Allow temporary (time-bounded) memberships of this group, and optionally set the
+    /// longest time a single grant may cover. Without a maximum, grants are capped at 90 days.
+    #[clap(name = "enable-temporary")]
+    EnableTemporary {
+        /// The name of the group
+        name: String,
+        /// The maximum duration of a grant: seconds, or a number followed by s, m, h, d or w
+        #[clap(long = "max", value_parser = parse_max_grant_duration)]
+        max: Option<u32>,
+    },
+    /// Grant a temporary (time-bounded) membership of this group, replacing any existing
+    /// temporary membership of the same member.
+    #[clap(name = "grant-temporary")]
+    GrantTemporary(GroupGrantTemporaryOpt),
+    /// Revoke the temporary membership of a member of this group.
+    #[clap(name = "revoke-temporary")]
+    RevokeTemporary {
+        /// The name of the group
+        name: String,
+        /// The name, spn or uuid of the member
+        member: String,
+    },
+    /// List the temporary memberships of this group.
+    #[clap(name = "list-temporary")]
+    ListTemporary(Named),
 }
 
 #[derive(Clone, Debug, ValueEnum)]

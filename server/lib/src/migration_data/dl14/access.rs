@@ -2232,3 +2232,37 @@ pub static IDM_ACP_OAUTH2_FEDERATION_ADMIN: LazyLock<BuiltinAcp> = LazyLock::new
     create_classes: vec![EntryClass::Object, EntryClass::OAuth2Federation],
     ..Default::default()
 });
+
+/// Kubidm: enable time-bounded membership on groups and set their cap. Granting and revoking
+/// is authorised by the right to change `member` (see `server::time_bounded`), but the cap
+/// is set by group administrators only, so that a group's entry managers can not raise it.
+/// Like `idm_acp_group_manage`, high privilege groups are excluded.
+pub static IDM_ACP_GROUP_TIME_BOUNDED_MANAGE: LazyLock<BuiltinAcp> = LazyLock::new(|| {
+    BuiltinAcp {
+    classes: vec![
+        EntryClass::Object,
+        EntryClass::AccessControlProfile,
+        EntryClass::AccessControlModify,
+        EntryClass::AccessControlSearch,
+    ],
+    name: "idm_acp_group_time_bounded_manage",
+    uuid: UUID_IDM_ACP_GROUP_TIME_BOUNDED_MANAGE,
+    description: "Builtin IDM Control for enabling time-bounded membership on groups and setting its maximum grant duration",
+    receiver: BuiltinAcpReceiver::Group(vec![UUID_IDM_GROUP_ADMINS]),
+    target: BuiltinAcpTarget::Filter(ProtoFilter::And(vec![
+        match_class_filter!(EntryClass::Group),
+        FILTER_ANDNOT_HP_OR_RECYCLED_OR_TOMBSTONE.clone(),
+    ])),
+    search_attrs: vec![
+        Attribute::Class,
+        Attribute::Name,
+        Attribute::Uuid,
+        Attribute::Spn,
+        Attribute::MaxGrantDuration,
+    ],
+    modify_present_attrs: vec![Attribute::Class, Attribute::MaxGrantDuration],
+    modify_removed_attrs: vec![Attribute::Class, Attribute::MaxGrantDuration],
+    modify_classes: vec![EntryClass::TimeBoundedGrant],
+    ..Default::default()
+}
+});

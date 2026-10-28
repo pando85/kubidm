@@ -12,9 +12,11 @@ use uuid::Uuid;
 
 mod auth;
 mod message;
+// Kubidm: time-bounded group membership.
+mod time_bounded;
 mod unix;
 
-pub use self::{auth::*, message::*, unix::*};
+pub use self::{auth::*, message::*, time_bounded::*, unix::*};
 
 /// The type of Account in use.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, ToSchema)]

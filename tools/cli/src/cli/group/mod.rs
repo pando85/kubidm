@@ -1,5 +1,11 @@
-use crate::{handle_client_error, GroupOpt, GroupPosix, KubidmClientParser, OpType, OutputMode};
+use crate::{
+    handle_client_error, GroupGrantTemporaryOpt, GroupOpt, GroupPosix, KubidmClientParser, OpType,
+    OutputMode,
+};
 use kubidm_proto::constants::ATTR_GIDNUMBER;
+use kubidm_proto::v1::TimeBoundedMemberGrant;
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
 
 mod account_policy;
 
@@ -251,6 +257,104 @@ impl GroupOpt {
                 }
             },
             GroupOpt::AccountPolicy { commands } => commands.exec(opt).await,
+            GroupOpt::EnableTemporary { name, max } => {
+                let client = opt.to_client(OpType::Write).await;
+                match client.idm_group_time_bounded_enable(name, *max).await {
+                    Err(e) => handle_client_error(e, opt.output_mode),
+                    Ok(_) => opt.output_mode.print_message(format!(
+                        "Successfully enabled temporary memberships for group {name}"
+                    )),
+                }
+            }
+            GroupOpt::GrantTemporary(gopt) => {
+                let Some(valid_until) = grant_valid_until(gopt) else {
+                    error!("Unable to determine when the membership ends");
+                    return;
+                };
+                let client = opt.to_client(OpType::Write).await;
+                match client
+                    .idm_group_time_bounded_member_grant(
+                        gopt.name.as_str(),
+                        gopt.member.as_str(),
+                        gopt.from,
+                        valid_until,
+                    )
+                    .await
+                {
+                    Err(e) => handle_client_error(e, opt.output_mode),
+                    Ok(_) => opt.output_mode.print_message(format!(
+                        "Successfully granted {} membership of group {} until {}",
+                        gopt.member,
+                        gopt.name,
+                        format_datetime(&valid_until)
+                    )),
+                }
+            }
+            GroupOpt::RevokeTemporary { name, member } => {
+                let client = opt.to_client(OpType::Write).await;
+                match client
+                    .idm_group_time_bounded_member_revoke(name, member)
+                    .await
+                {
+                    Err(e) => handle_client_error(e, opt.output_mode),
+                    Ok(_) => opt.output_mode.print_message(format!(
+                        "Successfully revoked the temporary membership of {member} in group {name}"
+                    )),
+                }
+            }
+            GroupOpt::ListTemporary(gcopt) => {
+                let client = opt.to_client(OpType::Read).await;
+                match client
+                    .idm_group_time_bounded_member_list(gcopt.name.as_str())
+                    .await
+                {
+                    Ok(grants) => match opt.output_mode {
+                        OutputMode::Json => println!(
+                            "{}",
+                            serde_json::to_string(&grants)
+                                .expect("Failed to serialise grants to JSON")
+                        ),
+                        OutputMode::Text => grants
+                            .iter()
+                            .for_each(|grant| println!("{}", format_grant(grant))),
+                    },
+                    Err(e) => handle_client_error(e, opt.output_mode),
+                }
+            }
         } // end match
     }
+}
+
+/// Kubidm: the end of a temporary membership, from `--until`, or `--for` after `--from` (or
+/// now).
+fn grant_valid_until(gopt: &GroupGrantTemporaryOpt) -> Option<OffsetDateTime> {
+    if let Some(until) = gopt.until {
+        return Some(until);
+    }
+
+    let secs = i64::try_from(gopt.duration?).ok()?;
+    #[allow(clippy::disallowed_methods)]
+    // Allowed as the grant is relative to the current time on the caller's machine.
+    let start = gopt.from.unwrap_or_else(OffsetDateTime::now_utc);
+    start.checked_add(time::Duration::seconds(secs))
+}
+
+fn format_datetime(odt: &OffsetDateTime) -> String {
+    odt.format(&Rfc3339).unwrap_or_else(|_| odt.to_string())
+}
+
+fn format_grant(grant: &TimeBoundedMemberGrant) -> String {
+    let member = grant
+        .member_spn
+        .clone()
+        .unwrap_or_else(|| grant.member.to_string());
+    let from = grant
+        .valid_from
+        .as_ref()
+        .map(format_datetime)
+        .unwrap_or_else(|| "-".to_string());
+    format!(
+        "{member}: from {from} until {}",
+        format_datetime(&grant.valid_until)
+    )
 }

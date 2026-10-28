@@ -250,3 +250,120 @@ async fn test_time_bounded_access_user_attributes(rsclient: &KubidmClient) {
     assert!(user.attrs.contains_key("memberof"));
     assert!(user.attrs.contains_key("directmemberof"));
 }
+
+fn is_member(memberof: &Option<Vec<String>>, group: &str) -> bool {
+    memberof
+        .as_ref()
+        .is_some_and(|groups| groups.iter().any(|g| g.starts_with(&format!("{group}@"))))
+}
+
+/// Kubidm: grant, list and revoke a time-bounded membership over HTTP.
+#[kubidmd_testkit::test]
+async fn test_time_bounded_grant_list_revoke_http(rsclient: &KubidmClient) {
+    use kubidm_client::ClientError;
+    use time::{Duration, OffsetDateTime};
+
+    rsclient
+        .auth_simple_password(ADMIN_TEST_USER, ADMIN_TEST_PASSWORD)
+        .await
+        .expect("Failed to authenticate");
+
+    rsclient
+        .idm_group_create("tb_http_group", None)
+        .await
+        .expect("Failed to create group");
+    create_user(rsclient, "tb_http_user", "tb_http_other").await;
+
+    #[allow(clippy::disallowed_methods)]
+    // Allowed as the server under test runs on the wall clock.
+    let now = OffsetDateTime::now_utc();
+    let until = now + Duration::hours(2);
+
+    // The group does not allow time-bounded grants yet.
+    let res = rsclient
+        .idm_group_time_bounded_member_grant("tb_http_group", "tb_http_user", None, until)
+        .await;
+    assert!(
+        matches!(res, Err(ClientError::Http(status, _, _)) if status == 400),
+        "{res:?}"
+    );
+
+    // Enable it, with a cap of one day.
+    rsclient
+        .idm_group_time_bounded_enable("tb_http_group", Some(86_400))
+        .await
+        .expect("Failed to enable time bounded grants");
+    let max = rsclient
+        .idm_group_get("tb_http_group")
+        .await
+        .expect("Failed to get group")
+        .and_then(|e| e.attrs.get("max_grant_duration").cloned());
+    assert_eq!(max, Some(vec!["86400".to_string()]));
+
+    // Exceeding the cap is rejected.
+    let res = rsclient
+        .idm_group_time_bounded_member_grant(
+            "tb_http_group",
+            "tb_http_user",
+            None,
+            now + Duration::days(2),
+        )
+        .await;
+    assert!(
+        matches!(res, Err(ClientError::Http(status, _, _)) if status == 400),
+        "{res:?}"
+    );
+
+    // Grant, and the membership is reflected immediately.
+    rsclient
+        .idm_group_time_bounded_member_grant("tb_http_group", "tb_http_user", None, until)
+        .await
+        .expect("Failed to grant");
+
+    let memberof = rsclient
+        .idm_person_account_get_attr("tb_http_user", "memberof")
+        .await
+        .expect("Failed to get memberof");
+    assert!(is_member(&memberof, "tb_http_group"), "{memberof:?}");
+
+    let grants = rsclient
+        .idm_group_time_bounded_member_list("tb_http_group")
+        .await
+        .expect("Failed to list grants");
+    assert_eq!(grants.len(), 1);
+    assert!(grants[0]
+        .member_spn
+        .as_deref()
+        .is_some_and(|spn| spn.starts_with("tb_http_user@")));
+    assert_eq!(grants[0].valid_from, None);
+    assert_eq!(
+        grants[0].valid_until.unix_timestamp(),
+        until.unix_timestamp()
+    );
+
+    // Revoke, and the membership is gone.
+    rsclient
+        .idm_group_time_bounded_member_revoke("tb_http_group", "tb_http_user")
+        .await
+        .expect("Failed to revoke");
+
+    let memberof = rsclient
+        .idm_person_account_get_attr("tb_http_user", "memberof")
+        .await
+        .expect("Failed to get memberof");
+    assert!(!is_member(&memberof, "tb_http_group"), "{memberof:?}");
+    assert!(rsclient
+        .idm_group_time_bounded_member_list("tb_http_group")
+        .await
+        .expect("Failed to list grants")
+        .is_empty());
+
+    // Revoking again finds nothing.
+    let res = rsclient
+        .idm_group_time_bounded_member_revoke("tb_http_group", "tb_http_user")
+        .await;
+    assert!(
+        matches!(res, Err(ClientError::Http(status, _, _)) if status == 404),
+        "{res:?}"
+    );
+}

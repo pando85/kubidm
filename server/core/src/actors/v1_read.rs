@@ -1533,6 +1533,35 @@ impl QueryServerReadV1 {
         .map(|responses| kubidm_proto::internal::BatchAuthorizationResponse { responses })
     }
 
+    /// Kubidm: list the time-bounded membership grants of a group.
+    #[instrument(
+        level = "info",
+        name = "group_time_bounded_member_list",
+        skip_all,
+        fields(uuid = ?eventid)
+    )]
+    pub async fn handle_group_time_bounded_member_list(
+        &self,
+        client_auth_info: ClientAuthInfo,
+        group: String,
+        eventid: Uuid,
+    ) -> Result<Vec<kubidm_proto::v1::TimeBoundedMemberGrant>, OperationError> {
+        let ct = duration_from_epoch_now();
+        let mut idms_prox_read = self.idms.proxy_read().await?;
+        let ident = idms_prox_read
+            .validate_client_auth_info_to_ident(client_auth_info, ct)
+            .map_err(|e| {
+                error!(?e, "Invalid identity");
+                e
+            })?;
+
+        let group_uuid = idms_prox_read.qs_read.name_to_uuid(group.as_str())?;
+
+        idms_prox_read
+            .qs_read
+            .time_bounded_member_list(&ident, group_uuid)
+    }
+
     #[instrument(
         level = "info",
         name = "approval_policy_list",

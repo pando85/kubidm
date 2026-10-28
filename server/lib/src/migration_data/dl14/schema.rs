@@ -1543,6 +1543,10 @@ pub static SCHEMA_CLASS_ASSERTION_NONCE: LazyLock<SchemaClass> = LazyLock::new(|
 // =========================================
 // Time-Bounded Access
 
+// Kubidm: `member_valid_from` and `member_valid_until` are reserved and unused. Grants keep
+// their window in the `time_bounded_member` values instead (see
+// `server::time_bounded`). They stay in the schema because removing an attribute is a
+// migration of its own, and their names and uuids must not be reused.
 pub static SCHEMA_ATTR_MEMBER_VALID_FROM: LazyLock<SchemaAttribute> =
     LazyLock::new(|| SchemaAttribute {
         uuid: UUID_SCHEMA_ATTR_MEMBER_VALID_FROM,
