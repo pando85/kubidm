@@ -51,13 +51,30 @@ pub(crate) enum ReplCtrl {
     /// [`peer_label`] names it) when given, otherwise from the first supplier task that
     /// takes the refresh. `Err` when `from` names no configured supplier. A refresh that
     /// has not started by `start_deadline`, or whose receiver was dropped (the requester
-    /// gave up), is not run.
+    /// gave up), is not run. The receiver gets [`RefreshProgress::Started`] as soon as a
+    /// task has started the refresh, then [`RefreshProgress::Done`] once it was applied.
     RefreshConsumer {
         from: Option<String>,
         start_deadline: Instant,
-        respond: oneshot::Sender<Result<mpsc::Receiver<()>, String>>,
+        respond: oneshot::Sender<Result<mpsc::Receiver<RefreshProgress>, String>>,
     },
 }
+
+/// What the supplier task that runs a refresh reports to the requester of the refresh.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RefreshProgress {
+    /// A task claimed the refresh and runs it now, from the supplier `supplier` (named as
+    /// [`peer_label`] names it). From here on the requester waits for the outcome, however
+    /// long it takes. If that task fails, another one may claim the refresh again before
+    /// its start deadline, and report this again.
+    Started { supplier: String },
+    /// The refresh was applied.
+    Done,
+}
+
+/// Whether a refresh is done, and the channel to its requester. Every supplier task that
+/// may run the refresh shares it, and the one that holds the lock runs it.
+pub(crate) type RefreshCoord = Mutex<(bool, mpsc::Sender<RefreshProgress>)>;
 
 #[derive(Debug, Clone)]
 enum ReplConsumerCtrl {
@@ -66,12 +83,13 @@ enum ReplConsumerCtrl {
     /// lock runs it, unless `from` restricts it to the task of one supplier (named as
     /// [`peer_label`] names it).
     ///
-    /// A manual refresh carries a `start_deadline`: the requester stops waiting for it, so
-    /// a task that only gets to it later (its supplier unreachable, the task busy) must not
-    /// run it then. It is also dropped once its receiver is gone. An automatic refresh has
-    /// no deadline, and its receiver lives until the refresh is done.
+    /// A manual refresh carries a `start_deadline`: unless a task has reported that it
+    /// started the refresh by then, the requester stops waiting for it, so a task that only
+    /// gets to it later (its supplier unreachable, the task busy) must not run it then. It
+    /// is also dropped once its receiver is gone. An automatic refresh has no deadline, and
+    /// its receiver lives until the refresh is done.
     Refresh {
-        refresh_coord: Arc<Mutex<(bool, mpsc::Sender<()>)>>,
+        refresh_coord: Arc<RefreshCoord>,
         from: Option<String>,
         start_deadline: Option<Instant>,
     },
@@ -79,11 +97,14 @@ enum ReplConsumerCtrl {
 
 /// Take the refresh lock of `refresh_coord`, and keep it only when the refresh must run
 /// now: not done yet by another task, still awaited by its requester (its receiver is not
-/// dropped), and not past its `start_deadline`.
-async fn claim_refresh(
-    refresh_coord: &Mutex<(bool, mpsc::Sender<()>)>,
+/// dropped), and not past its `start_deadline`. The requester is then told that the task of
+/// `supplier` started it, so that it waits for the outcome rather than give up at the
+/// deadline while the refresh still runs.
+pub(crate) async fn claim_refresh<'a>(
+    refresh_coord: &'a RefreshCoord,
     start_deadline: Option<Instant>,
-) -> Option<MutexGuard<'_, (bool, mpsc::Sender<()>)>> {
+    supplier: &str,
+) -> Option<MutexGuard<'a, (bool, mpsc::Sender<RefreshProgress>)>> {
     // Every replication consumer *should* end up here behind this lock, but only one can
     // proceed. This is what we want!
     let refresh_coord_guard = refresh_coord.lock().await;
@@ -105,7 +126,31 @@ async fn claim_refresh(
         return None;
     }
 
+    // The channel only waits on the requester when an earlier task reported its start and
+    // failed before the requester read that report. A requester that gives up meanwhile
+    // closes the channel, which ends the wait.
+    let started = RefreshProgress::Started {
+        supplier: supplier.to_string(),
+    };
+    if refresh_coord_guard.1.send(started).await.is_err() {
+        warn!("Refresh was abandoned by its requester before it could start, not refreshing.");
+        return None;
+    }
+
     Some(refresh_coord_guard)
+}
+
+/// The address a supplier task tries first after a refresh `outcome`: the one the refresh
+/// used, none after a failure, and the previous one when the task did not run the refresh.
+fn address_after_refresh(
+    previous: Option<SocketAddr>,
+    outcome: Result<Option<SocketAddr>, ()>,
+) -> Option<SocketAddr> {
+    match outcome {
+        Ok(Some(addr)) => Some(addr),
+        Ok(None) => previous,
+        Err(()) => None,
+    }
 }
 
 /// Whether the replication task of the supplier `peer_url` may run a refresh restricted to
@@ -395,7 +440,7 @@ async fn repl_consumer_disconnect_supplier(
     fields(eventid = Uuid::new_v4().to_string(), server_name = %server_name.to_str())
 )]
 async fn repl_run_consumer_refresh(
-    refresh_coord: Arc<Mutex<(bool, mpsc::Sender<()>)>>,
+    refresh_coord: Arc<RefreshCoord>,
     start_deadline: Option<Instant>,
     server_name: &ServerName<'static>,
     sock_addrs: &[SocketAddr],
@@ -406,7 +451,8 @@ async fn repl_run_consumer_refresh(
     peer_url: &str,
 ) -> Result<Option<SocketAddr>, ()> {
     // Take the refresh lock, unless it must not run (anymore).
-    let Some(refresh_coord_guard) = claim_refresh(&refresh_coord, start_deadline).await else {
+    let Some(refresh_coord_guard) = claim_refresh(&refresh_coord, start_deadline, peer_url).await
+    else {
         return Ok(None);
     };
 
@@ -449,7 +495,7 @@ async fn repl_run_consumer_refresh(
 async fn repl_run_consumer_refresh_inner(
     addr: SocketAddr,
     supplier_conn: &mut Framed<TlsStream<TcpStream>, codec::ConsumerCodec>,
-    mut refresh_coord_guard: MutexGuard<'_, (bool, mpsc::Sender<()>)>,
+    mut refresh_coord_guard: MutexGuard<'_, (bool, mpsc::Sender<RefreshProgress>)>,
     idms: &IdmServer,
     consumer_conn_settings: &ConsumerConnSettings,
     tracker: &ReplicationStateTracker,
@@ -509,6 +555,16 @@ async fn repl_run_consumer_refresh_inner(
         }
     };
 
+    // The requester may have given up between the claim and reading the report that the
+    // refresh started (it reached its start deadline first). It then closed its receiver
+    // and told the operator that the refresh did not start, so do not replace the content
+    // of this node behind its back. A requester that read the report keeps its receiver
+    // until the refresh is done, as does the requester of an automatic refresh.
+    if refresh_coord_guard.1.is_closed() {
+        warn!("Refresh was abandoned by its requester before it could be applied, not refreshing.");
+        return Err(());
+    }
+
     // Now apply the refresh if possible
     {
         // Scope the transaction.
@@ -534,7 +590,12 @@ async fn repl_run_consumer_refresh_inner(
 
     // Now mark the refresh as complete AND indicate it to the channel.
     refresh_coord_guard.0 = true;
-    if refresh_coord_guard.1.send(()).await.is_err() {
+    if refresh_coord_guard
+        .1
+        .send(RefreshProgress::Done)
+        .await
+        .is_err()
+    {
         warn!("Unable to signal to caller that refresh has completed.");
     }
 
@@ -754,12 +815,19 @@ async fn repl_run_consumer_inner(
                     error!("Unable to begin replication consumer refresh, tasks are unable to be notified.");
                 } else {
                     tokio::spawn(async move {
-                        match rx.recv().await {
-                            Some(()) => {
-                                info!("replication consumer refresh complete!")
-                            }
-                            None => {
-                                warn!("refresh task was lost with no response!")
+                        loop {
+                            match rx.recv().await {
+                                Some(RefreshProgress::Started { supplier }) => {
+                                    info!("replication consumer refresh started from {supplier}")
+                                }
+                                Some(RefreshProgress::Done) => {
+                                    info!("replication consumer refresh complete!");
+                                    break;
+                                }
+                                None => {
+                                    warn!("refresh task was lost with no response!");
+                                    break;
+                                }
                             }
                         }
                     });
@@ -913,7 +981,7 @@ async fn repl_task(
                             trace!("Refresh requested from another supplier, skipping.");
                             continue;
                         }
-                        last_working_address = (repl_run_consumer_refresh(
+                        let outcome = repl_run_consumer_refresh(
                             refresh_coord,
                             start_deadline,
                             &server_name,
@@ -924,7 +992,8 @@ async fn repl_task(
                             &tracker,
                             &peer_url,
                         )
-                        .await).unwrap_or_default();
+                        .await;
+                        last_working_address = address_after_refresh(last_working_address, outcome);
                     }
                 }
             }
@@ -1451,12 +1520,14 @@ async fn repl_acceptor(
 #[cfg(test)]
 mod tests {
     use super::{
-        claim_refresh, peer_label, refresh_is_for_peer, refresh_source, startup_sync_state,
-        supplier_peers,
+        address_after_refresh, claim_refresh, peer_label, refresh_is_for_peer, refresh_source,
+        startup_sync_state, supplier_peers, RefreshProgress,
     };
     use crate::repl::config::{RepNodeConfig, ReplicationConfiguration};
     use crypto_glue::{traits::DecodePem, x509::Certificate};
+    use std::net::SocketAddr;
     use std::str::FromStr;
+    use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::{mpsc, Mutex};
     use tokio::time::Instant;
@@ -1676,45 +1747,123 @@ ta41VMU3u9UQfHxF
         );
     }
 
+    const SUPPLIER: &str = "repl://pod-1.example.com:8444";
+
     #[tokio::test]
     async fn abandoned_or_late_refresh_is_not_run() {
         let later = Instant::now() + Duration::from_secs(60);
 
-        // A manual refresh still awaited before its deadline runs.
-        let (tx, _rx) = mpsc::channel(1);
+        // A manual refresh still awaited before its deadline runs, and its requester learns
+        // at once which supplier it runs from.
+        let (tx, mut rx) = mpsc::channel(1);
         let coord = Mutex::new((false, tx));
-        assert!(claim_refresh(&coord, Some(later)).await.is_some());
+        assert!(claim_refresh(&coord, Some(later), SUPPLIER).await.is_some());
+        assert_eq!(
+            rx.recv().await,
+            Some(RefreshProgress::Started {
+                supplier: SUPPLIER.to_string()
+            })
+        );
 
         // The requester gave up (it timed out and dropped its receiver): not run, even
         // before the deadline.
         let (tx, rx) = mpsc::channel(1);
         drop(rx);
         let coord = Mutex::new((false, tx));
-        assert!(claim_refresh(&coord, Some(later)).await.is_none());
-        assert!(claim_refresh(&coord, None).await.is_none());
+        assert!(claim_refresh(&coord, Some(later), SUPPLIER).await.is_none());
+        assert!(claim_refresh(&coord, None, SUPPLIER).await.is_none());
 
-        // Past its deadline: not run, even while its receiver is still there.
-        let (tx, _rx) = mpsc::channel(1);
+        // Past its deadline: not run, even while its receiver is still there, and its
+        // requester hears nothing.
+        let (tx, mut rx) = mpsc::channel(1);
         let coord = Mutex::new((false, tx));
         let past = Instant::now();
         tokio::time::sleep(Duration::from_millis(5)).await;
-        assert!(claim_refresh(&coord, Some(past)).await.is_none());
+        assert!(claim_refresh(&coord, Some(past), SUPPLIER).await.is_none());
+        assert!(rx.try_recv().is_err());
 
         // Already done by another task: not run again.
         let (tx, _rx) = mpsc::channel(1);
         let coord = Mutex::new((true, tx));
-        assert!(claim_refresh(&coord, Some(later)).await.is_none());
+        assert!(claim_refresh(&coord, Some(later), SUPPLIER).await.is_none());
 
         // An automatic refresh has no deadline and keeps its receiver: it runs, however
         // late a task gets to it.
         let (tx, mut rx) = mpsc::channel(1);
         let coord = Mutex::new((false, tx));
-        let mut guard = claim_refresh(&coord, None).await.expect("refresh runs");
+        let mut guard = claim_refresh(&coord, None, SUPPLIER)
+            .await
+            .expect("refresh runs");
         // The task that runs it reports completion to the receiver.
         guard.0 = true;
-        assert!(guard.1.send(()).await.is_ok());
+        assert!(matches!(
+            rx.recv().await,
+            Some(RefreshProgress::Started { .. })
+        ));
+        assert!(guard.1.send(RefreshProgress::Done).await.is_ok());
         drop(guard);
-        assert_eq!(rx.recv().await, Some(()));
+        assert_eq!(rx.recv().await, Some(RefreshProgress::Done));
+    }
+
+    #[tokio::test]
+    async fn retried_claim_waits_for_the_requester_to_read_the_first_start() {
+        // A first task reported its start and failed before the requester read the
+        // report: a second task reports its own start once the requester reads the first.
+        let later = Instant::now() + Duration::from_secs(60);
+        let (tx, mut rx) = mpsc::channel(1);
+        let coord = Arc::new(Mutex::new((false, tx)));
+        drop(claim_refresh(&coord, Some(later), "repl://a:8444").await);
+
+        let second = {
+            let coord = coord.clone();
+            tokio::spawn(async move {
+                claim_refresh(&coord, Some(later), "repl://b:8444")
+                    .await
+                    .is_some()
+            })
+        };
+        assert_eq!(
+            rx.recv().await,
+            Some(RefreshProgress::Started {
+                supplier: "repl://a:8444".to_string()
+            })
+        );
+        assert_eq!(
+            rx.recv().await,
+            Some(RefreshProgress::Started {
+                supplier: "repl://b:8444".to_string()
+            })
+        );
+        assert!(second.await.is_ok_and(|claimed| claimed));
+
+        // Had the requester given up instead, the second claim would not wait for it.
+        let (tx, rx) = mpsc::channel(1);
+        let coord = Mutex::new((false, tx));
+        drop(claim_refresh(&coord, Some(later), "repl://a:8444").await);
+        drop(rx);
+        assert!(claim_refresh(&coord, Some(later), "repl://b:8444")
+            .await
+            .is_none());
+    }
+
+    #[test]
+    fn refused_refresh_keeps_the_last_working_address() {
+        let previous: SocketAddr = "192.0.2.1:8444".parse().expect("valid address");
+        let used: SocketAddr = "192.0.2.2:8444".parse().expect("valid address");
+
+        // A task that did not run the refresh (not its supplier's turn, abandoned, late)
+        // keeps the address that worked last.
+        assert_eq!(
+            address_after_refresh(Some(previous), Ok(None)),
+            Some(previous)
+        );
+        assert_eq!(address_after_refresh(None, Ok(None)), None);
+        // One that ran it remembers the address it used, one that failed none.
+        assert_eq!(
+            address_after_refresh(Some(previous), Ok(Some(used))),
+            Some(used)
+        );
+        assert_eq!(address_after_refresh(Some(previous), Err(())), None);
     }
 
     #[test]

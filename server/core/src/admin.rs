@@ -1,6 +1,6 @@
 use crate::{
     actors::{QueryServerReadV1, QueryServerWriteV1},
-    repl::ReplCtrl,
+    repl::{RefreshProgress, ReplCtrl},
     CoreAction,
 };
 use bytes::{Buf, BufMut, BytesMut};
@@ -30,13 +30,22 @@ use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
-use tokio::time::{sleep, timeout, Instant};
+use tokio::time::{sleep, timeout, timeout_at, Instant};
 use tokio_util::codec::{Decoder, Encoder, Framed};
 use tracing::{span, Instrument, Level};
 use uuid::Uuid;
 
-/// Don't hang forever waiting for a response.
+/// Don't hang forever waiting for a response. Also how long a manual refresh may take to
+/// start: see [`start_consumer_refresh`].
 const REPL_CTRL_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long the requester of a refresh waits for it once a supplier task has started it.
+/// The refresh is applied locally and finishes regardless, so this only bounds how long the
+/// requester waits to learn the outcome.
+const REFRESH_COMPLETION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// The most bytes of one request the server buffers while it waits for the rest of it.
+const MAX_REQUEST_BYTES: usize = 64 * 1024;
+/// The most bytes of one response a client buffers while it waits for the rest of it.
+const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAINTENANCE_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const MAINTENANCE_RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_SYNC_UNTIL_TIMEOUT: Duration = Duration::from_secs(60);
@@ -60,8 +69,13 @@ pub enum AdminTaskRequest {
     RefreshReplicationConsumer,
     /// Refresh this node only from the supplier whose origin is `from`. A separate variant,
     /// so that the request without a source keeps its original wire form for servers and
-    /// clients of other versions, and a server that does not know this one refuses it
-    /// rather than refreshing from any supplier.
+    /// clients of other versions, and a server that does not know this one never refreshes
+    /// from any supplier instead. Servers up to 1.11 do not answer it at all (their codec
+    /// waits for more bytes forever), so a client must not wait on them without a limit.
+    ///
+    /// Only clients that know [`AdminTaskResponse::RefreshStarted`] send this, so the
+    /// server answers with it first once a supplier task started the refresh, then with
+    /// the outcome.
     RefreshReplicationConsumerFrom {
         from: String,
     },
@@ -178,6 +192,13 @@ pub enum AdminTaskResponse {
     ErrorMessage {
         message: String,
     },
+    /// Not a final response: the refresh asked for by
+    /// [`AdminTaskRequest::RefreshReplicationConsumerFrom`] started from `supplier`, and its
+    /// outcome follows. Never sent for any other request, so that clients of versions
+    /// without it never see it.
+    RefreshStarted {
+        supplier: String,
+    },
 }
 
 impl std::fmt::Debug for AdminTaskResponse {
@@ -253,6 +274,9 @@ impl std::fmt::Debug for AdminTaskResponse {
             AdminTaskResponse::ErrorMessage { message } => {
                 write!(f, "ErrorMessage {{ message: {:?} }}", message)
             }
+            AdminTaskResponse::RefreshStarted { supplier } => {
+                write!(f, "RefreshStarted {{ supplier: {:?} }}", supplier)
+            }
         }
     }
 }
@@ -264,8 +288,14 @@ impl std::fmt::Debug for AdminTaskResponse {
 /// (wait for more bytes) only while the value is incomplete, which serde_json reports as an
 /// end of input error. Any other error is final: malformed JSON, or a complete message this
 /// side does not know (sent by a client or server of another version). Waiting for more
-/// bytes then would hang both sides, so it is an `InvalidData` error instead.
-fn decode_json_frame<T: DeserializeOwned>(src: &mut BytesMut) -> Result<Option<T>, io::Error> {
+/// bytes then would hang both sides, so it is an `InvalidData` error instead. So is an
+/// incomplete message longer than `max_bytes`, rather than buffering it without a limit.
+///
+/// The error is logged here, at debug only: the decoder error can quote the message.
+fn decode_json_frame<T: DeserializeOwned>(
+    src: &mut BytesMut,
+    max_bytes: usize,
+) -> Result<Option<T>, io::Error> {
     let mut values = serde_json::Deserializer::from_slice(src).into_iter::<T>();
     match values.next() {
         Some(Ok(msg)) => {
@@ -274,9 +304,22 @@ fn decode_json_frame<T: DeserializeOwned>(src: &mut BytesMut) -> Result<Option<T
             src.advance(consumed);
             Ok(Some(msg))
         }
-        Some(Err(err)) if err.is_eof() => Ok(None),
+        Some(Err(err)) if err.is_eof() => {
+            if src.len() > max_bytes {
+                debug!(
+                    len = src.len(),
+                    max_bytes, "Admin socket message is too large, refusing it"
+                );
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "admin socket message is too large",
+                ))
+            } else {
+                Ok(None)
+            }
+        }
         Some(Err(err)) => {
-            error!(?err, "Unable to decode admin socket message");
+            debug!(?err, "Unable to decode admin socket message");
             Err(io::Error::new(io::ErrorKind::InvalidData, err))
         }
         // Nothing but whitespace.
@@ -296,7 +339,7 @@ impl Decoder for ClientCodec {
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
         trace!("Attempting to decode response ...");
-        decode_json_frame(src)
+        decode_json_frame(src, MAX_RESPONSE_BYTES)
     }
 }
 
@@ -323,7 +366,7 @@ impl Decoder for ServerCodec {
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
         trace!("Attempting to decode request ...");
-        decode_json_frame(src)
+        decode_json_frame(src, MAX_REQUEST_BYTES)
     }
 }
 
@@ -965,17 +1008,59 @@ async fn renew_replication_certificate(ctrl_tx: &mut mpsc::Sender<ReplCtrl>) -> 
     }
 }
 
+/// Refresh this node from a supplier (only from `from` when given), and wait for the outcome.
+/// `Err` is a message for the operator, also logged.
+///
+/// With `ack`, the client is sent [`AdminTaskResponse::RefreshStarted`] as soon as a
+/// supplier task started the refresh.
 async fn replication_consumer_refresh(
     ctrl_tx: &mut mpsc::Sender<ReplCtrl>,
     from: Option<String>,
-) -> AdminTaskResponse {
-    let (tx, rx) = oneshot::channel();
+    ack: Option<&mut Framed<UnixStream, ServerCodec>>,
+) -> Result<(), String> {
+    let progress = match start_consumer_refresh(ctrl_tx, from, REPL_CTRL_TIMEOUT).await? {
+        RefreshStart::Applied => return Ok(()),
+        RefreshStart::Running { supplier, progress } => {
+            if let Some(ack) = ack {
+                // The client stops waiting for this, but not for the outcome.
+                let started = AdminTaskResponse::RefreshStarted { supplier };
+                if ack.send(started).await.is_err() {
+                    warn!("Unable to tell the admin client that the refresh started, it continues regardless.");
+                }
+            }
+            progress
+        }
+    };
+    finish_consumer_refresh(progress, REFRESH_COMPLETION_TIMEOUT).await
+}
 
-    // This waits at least this long for the refresh to complete once it has its channel,
-    // so a refresh that starts before the deadline is still awaited. One that would start
-    // later (its supplier unreachable, its task busy) is dropped instead of running after
-    // the operator was told that it failed.
-    let start_deadline = Instant::now() + REPL_CTRL_TIMEOUT;
+/// A manual refresh that a supplier task has started.
+enum RefreshStart {
+    /// A task runs the refresh from `supplier`: its outcome comes through `progress`.
+    Running {
+        supplier: String,
+        progress: mpsc::Receiver<RefreshProgress>,
+    },
+    /// The refresh was already applied. Not expected: a task reports its start first.
+    Applied,
+}
+
+/// Ask the replication supervisor for a refresh, and wait until a supplier task has started
+/// it. `Err` is a message for the operator: the refresh was refused, or did not start.
+///
+/// A refresh must start within `start_timeout`. One that a task would only start later (its
+/// supplier unreachable, the task busy) is not run at all, rather than replacing the
+/// content of this node after the operator was told that it did not start: the requester
+/// drops its receiver, which every task checks before it claims the refresh and again
+/// before it applies it. Once a task reports that it started the refresh, the requester
+/// waits for the outcome without that limit (see [`finish_consumer_refresh`]).
+async fn start_consumer_refresh(
+    ctrl_tx: &mut mpsc::Sender<ReplCtrl>,
+    from: Option<String>,
+    start_timeout: Duration,
+) -> Result<RefreshStart, String> {
+    let start_deadline = Instant::now() + start_timeout;
+    let (tx, rx) = oneshot::channel();
 
     if ctrl_tx
         .send(ReplCtrl::RefreshConsumer {
@@ -986,33 +1071,83 @@ async fn replication_consumer_refresh(
         .await
         .is_err()
     {
-        error!("replication control channel has shutdown");
-        return AdminTaskResponse::Error;
+        let message = "Replication control channel has shut down, unable to refresh.";
+        error!("{message}");
+        return Err(message.to_string());
     }
 
-    match timeout(REPL_CTRL_TIMEOUT, rx).await {
-        Ok(Ok(Err(message))) => AdminTaskResponse::ErrorMessage { message },
-        Ok(Ok(Ok(mut refresh_rx))) => match timeout(REPL_CTRL_TIMEOUT, refresh_rx.recv()).await {
-            Ok(Some(())) => {
-                info!("Replication refresh success");
-                AdminTaskResponse::Success
-            }
-            Ok(None) => {
-                error!("Replication refresh failed. Please inspect the logs.");
-                AdminTaskResponse::Error
-            }
-            Err(_) => {
-                error!("timed out waiting for replication refresh completion.");
-                AdminTaskResponse::Error
-            }
-        },
+    let mut progress = match timeout_at(start_deadline, rx).await {
+        Ok(Ok(Ok(progress))) => progress,
+        Ok(Ok(Err(message))) => return Err(message),
         Ok(Err(_)) => {
-            error!("replication control channel did not respond with refresh status.");
-            AdminTaskResponse::Error
+            let message = "Replication control channel did not respond with refresh status.";
+            error!("{message}");
+            return Err(message.to_string());
         }
         Err(_) => {
-            error!("timed out waiting for replication refresh status.");
-            AdminTaskResponse::Error
+            let message = "Timed out waiting for replication refresh status, not refreshing.";
+            error!("{message}");
+            return Err(message.to_string());
+        }
+    };
+
+    match timeout_at(start_deadline, progress.recv()).await {
+        Ok(Some(RefreshProgress::Started { supplier })) => {
+            info!("Replication refresh started from {supplier}, waiting for it to complete.");
+            Ok(RefreshStart::Running { supplier, progress })
+        }
+        Ok(Some(RefreshProgress::Done)) => Ok(RefreshStart::Applied),
+        Ok(None) => {
+            let message =
+                "No replication supplier started the refresh, nothing was changed. Please inspect the logs.";
+            error!("{message}");
+            Err(message.to_string())
+        }
+        Err(_) => {
+            // Refuse any task that would start it from now on.
+            progress.close();
+            let message = format!(
+                "No replication supplier could start the refresh within {}s, nothing was changed. Please inspect the logs.",
+                start_timeout.as_secs()
+            );
+            error!("{message}");
+            Err(message)
+        }
+    }
+}
+
+/// Wait for the outcome of a refresh that a supplier task has started. The refresh is
+/// applied locally and finishes regardless of this wait, so `completion_timeout` only bounds
+/// how long the requester waits to learn the outcome: when it passes the outcome is unknown,
+/// not failed.
+async fn finish_consumer_refresh(
+    mut progress: mpsc::Receiver<RefreshProgress>,
+    completion_timeout: Duration,
+) -> Result<(), String> {
+    let completion_deadline = Instant::now() + completion_timeout;
+    loop {
+        match timeout_at(completion_deadline, progress.recv()).await {
+            Ok(Some(RefreshProgress::Done)) => {
+                info!("Replication refresh success");
+                return Ok(());
+            }
+            // The task that started it failed, and another one took it over.
+            Ok(Some(RefreshProgress::Started { supplier })) => {
+                info!("Replication refresh started again from {supplier}.");
+            }
+            Ok(None) => {
+                let message = "Replication refresh failed. Please inspect the logs.";
+                error!("{message}");
+                return Err(message.to_string());
+            }
+            Err(_) => {
+                let message = format!(
+                    "Replication refresh is still in progress after {}s, its outcome is unknown. Check the server logs, or `kubidmd domain show`, for the result.",
+                    completion_timeout.as_secs()
+                );
+                warn!("{message}");
+                return Err(message);
+            }
         }
     }
 }
@@ -1396,10 +1531,10 @@ async fn handle_client(
             Ok(req) => req,
             Err(err) if err.kind() == io::ErrorKind::InvalidData => {
                 // A request this server does not know, most likely from a kubidmd of another
-                // version. Answer so that the client does not wait forever, then disconnect:
-                // the stream can not be decoded past it.
+                // version, or one too large. Answer so that the client does not wait forever,
+                // then disconnect: the stream can not be decoded past it. The codec logged the
+                // details, which may quote the request.
                 error!(
-                    ?err,
                     "Unable to decode admin socket request, is the client the same version as this server?"
                 );
                 reqs.send(AdminTaskResponse::Error).await?;
@@ -1456,14 +1591,26 @@ async fn handle_client(
                     }
                 },
                 AdminTaskRequest::RefreshReplicationConsumer => match repl_ctrl_tx.as_mut() {
-                    Some(ctrl_tx) => replication_consumer_refresh(ctrl_tx, None).await,
+                    // Clients of any version send this one, so answer only with responses
+                    // they all know: the reason of a failure is in the server log.
+                    Some(ctrl_tx) => match replication_consumer_refresh(ctrl_tx, None, None).await {
+                        Ok(()) => AdminTaskResponse::Success,
+                        Err(_) => AdminTaskResponse::Error,
+                    },
                     None => {
                         error!("replication not configured, unable to refresh consumer.");
                         AdminTaskResponse::Error
                     }
                 },
                 AdminTaskRequest::RefreshReplicationConsumerFrom { from } => match repl_ctrl_tx.as_mut() {
-                    Some(ctrl_tx) => replication_consumer_refresh(ctrl_tx, Some(from)).await,
+                    Some(ctrl_tx) => {
+                        match replication_consumer_refresh(ctrl_tx, Some(from), Some(&mut reqs))
+                            .await
+                        {
+                            Ok(()) => AdminTaskResponse::Success,
+                            Err(message) => AdminTaskResponse::ErrorMessage { message },
+                        }
+                    }
                     None => {
                         error!("replication not configured, unable to refresh consumer.");
                         AdminTaskResponse::Error
@@ -1571,6 +1718,9 @@ async fn handle_client(
 #[cfg(test)]
 mod maintenance_protocol_tests {
     use super::*;
+    use crate::repl::claim_refresh;
+    use tokio::sync::Mutex as AsyncMutex;
+    use tokio::time::sleep_until;
 
     #[test]
     fn maintenance_request_json_round_trip_preserves_operation_id() {
@@ -1725,13 +1875,185 @@ mod maintenance_protocol_tests {
         let response = replication_consumer_refresh(
             &mut ctrl_tx,
             Some("repl://nope.example.com:8444".to_string()),
+            None,
         )
         .await;
-        assert!(matches!(
-            response,
-            AdminTaskResponse::ErrorMessage { ref message } if message == "not a supplier"
-        ));
+        assert_eq!(response, Err("not a supplier".to_string()));
         assert!(supervisor.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn refresh_started_near_its_deadline_is_awaited_to_completion() {
+        // Two suppliers, the first unreachable: the task of the second only claims the
+        // refresh just before its start deadline, and applies it well after that deadline.
+        let start_timeout = Duration::from_millis(300);
+        let (mut ctrl_tx, mut ctrl_rx) = mpsc::channel(1);
+        let supervisor = tokio::spawn(async move {
+            let Some(ReplCtrl::RefreshConsumer {
+                start_deadline,
+                respond,
+                ..
+            }) = ctrl_rx.recv().await
+            else {
+                panic!("expected a refresh request");
+            };
+            let (tx, rx) = mpsc::channel(1);
+            let coord = AsyncMutex::new((false, tx));
+            assert!(respond.send(Ok(rx)).is_ok());
+
+            sleep_until(start_deadline - Duration::from_millis(100)).await;
+            let mut guard = claim_refresh(&coord, Some(start_deadline), "repl://b:8444")
+                .await
+                .expect("claimed before the deadline");
+            sleep(start_timeout * 2).await;
+            // Right before the apply: the requester still waits.
+            assert!(!guard.1.is_closed());
+            guard.0 = true;
+            assert!(guard.1.send(RefreshProgress::Done).await.is_ok());
+        });
+
+        let began = Instant::now();
+        let Ok(RefreshStart::Running { supplier, progress }) =
+            start_consumer_refresh(&mut ctrl_tx, None, start_timeout).await
+        else {
+            panic!("the refresh started before its deadline");
+        };
+        assert_eq!(supplier, "repl://b:8444");
+        assert_eq!(
+            finish_consumer_refresh(progress, Duration::from_secs(30)).await,
+            Ok(())
+        );
+        // Success was reported after the start deadline, once the refresh was applied.
+        assert!(began.elapsed() > start_timeout * 2);
+        assert!(supervisor.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn refresh_not_started_by_its_deadline_fails_and_never_runs() {
+        let start_timeout = Duration::from_millis(100);
+        let (mut ctrl_tx, mut ctrl_rx) = mpsc::channel(1);
+        let supervisor = tokio::spawn(async move {
+            let Some(ReplCtrl::RefreshConsumer {
+                start_deadline,
+                respond,
+                ..
+            }) = ctrl_rx.recv().await
+            else {
+                panic!("expected a refresh request");
+            };
+            let (tx, rx) = mpsc::channel(1);
+            assert!(respond.send(Ok(rx)).is_ok());
+            // No task gets to it in time: hand the refresh to one that comes later.
+            (AsyncMutex::new((false, tx)), start_deadline)
+        });
+
+        let result = start_consumer_refresh(&mut ctrl_tx, None, start_timeout).await;
+        assert!(
+            matches!(result, Err(ref message) if message.contains("nothing was changed")),
+            "the operator is told that the refresh did not start"
+        );
+
+        // The late task is refused: past the deadline, and, deadline or not, its requester
+        // closed its receiver.
+        let (coord, start_deadline) = supervisor.await.expect("supervisor ran");
+        assert!(claim_refresh(&coord, Some(start_deadline), "repl://b:8444")
+            .await
+            .is_none());
+        assert!(claim_refresh(&coord, None, "repl://b:8444").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn started_refresh_outcome() {
+        // Not done within the (generous) wait: unknown, not failed.
+        let (tx, rx) = mpsc::channel(1);
+        let result = finish_consumer_refresh(rx, Duration::from_millis(50)).await;
+        assert!(
+            matches!(result, Err(ref message) if message.contains("still in progress")
+                && message.contains("domain show")
+                && !message.contains("failed")),
+            "{result:?}"
+        );
+        drop(tx);
+
+        // Every task that could run it gave up: failed.
+        let (tx, rx) = mpsc::channel(1);
+        drop(tx);
+        assert!(finish_consumer_refresh(rx, Duration::from_secs(30))
+            .await
+            .is_err_and(|message| message.contains("failed")));
+
+        // The first task failed and another one took it over and applied it.
+        let (tx, rx) = mpsc::channel(2);
+        let again = RefreshProgress::Started {
+            supplier: "repl://b:8444".to_string(),
+        };
+        assert!(tx.send(again).await.is_ok());
+        assert!(tx.send(RefreshProgress::Done).await.is_ok());
+        assert_eq!(
+            finish_consumer_refresh(rx, Duration::from_secs(30)).await,
+            Ok(())
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_from_acknowledges_its_start_to_the_client() {
+        let (server_sock, client_sock) = UnixStream::pair().expect("socket pair");
+        let mut server = Framed::new(server_sock, ServerCodec);
+        let mut client = Framed::new(client_sock, ClientCodec);
+
+        let (mut ctrl_tx, mut ctrl_rx) = mpsc::channel(1);
+        let supervisor = tokio::spawn(async move {
+            let Some(ReplCtrl::RefreshConsumer {
+                start_deadline,
+                respond,
+                ..
+            }) = ctrl_rx.recv().await
+            else {
+                panic!("expected a refresh request");
+            };
+            let (tx, rx) = mpsc::channel(1);
+            let coord = AsyncMutex::new((false, tx));
+            assert!(respond.send(Ok(rx)).is_ok());
+            let mut guard = claim_refresh(&coord, Some(start_deadline), "repl://b:8444")
+                .await
+                .expect("claimed");
+            guard.0 = true;
+            assert!(guard.1.send(RefreshProgress::Done).await.is_ok());
+        });
+
+        let result = replication_consumer_refresh(
+            &mut ctrl_tx,
+            Some("repl://b:8444".to_string()),
+            Some(&mut server),
+        )
+        .await;
+        assert_eq!(result, Ok(()));
+        assert!(supervisor.await.is_ok());
+        assert!(matches!(
+            client.next().await,
+            Some(Ok(AdminTaskResponse::RefreshStarted { ref supplier })) if supplier == "repl://b:8444"
+        ));
+    }
+
+    #[test]
+    fn codec_refuses_an_oversized_message() {
+        // An incomplete request is buffered up to its limit, not beyond.
+        let mut src = BytesMut::from(r#"{"RecoverAccount":{"name":""#);
+        src.extend_from_slice(&vec![b'a'; MAX_REQUEST_BYTES / 2]);
+        assert!(matches!(ServerCodec.decode(&mut src), Ok(None)));
+        src.extend_from_slice(&vec![b'a'; MAX_REQUEST_BYTES]);
+        assert!(ServerCodec
+            .decode(&mut src)
+            .is_err_and(|err| err.kind() == io::ErrorKind::InvalidData));
+
+        // Responses may be larger.
+        let mut src = BytesMut::from(r#"{"ErrorMessage":{"message":""#);
+        src.extend_from_slice(&vec![b'a'; MAX_REQUEST_BYTES * 2]);
+        assert!(matches!(ClientCodec.decode(&mut src), Ok(None)));
+        src.extend_from_slice(&vec![b'a'; MAX_RESPONSE_BYTES]);
+        assert!(ClientCodec
+            .decode(&mut src)
+            .is_err_and(|err| err.kind() == io::ErrorKind::InvalidData));
     }
 
     #[test]

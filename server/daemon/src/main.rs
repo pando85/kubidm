@@ -47,8 +47,9 @@ use kubidmd_core::{
 };
 use serde::Serialize;
 use sketching::{pipeline::TracingPipelineGuard, tracing_forest::util::*};
-use std::{fmt, io::Read, path::PathBuf, process::ExitCode};
+use std::{fmt, io, io::Read, path::PathBuf, process::ExitCode, time::Duration};
 use tokio::net::UnixStream;
+use tokio::time::{error::Elapsed, timeout};
 use tokio_util::codec::Framed;
 use uuid::Uuid;
 
@@ -106,6 +107,42 @@ where
     println!("{json_output}");
 }
 
+/// How long `refresh-replication-consumer --from` waits for the server to answer: with the
+/// news that the refresh started, or with its refusal. The server answers within 15
+/// seconds, the time it gives a supplier to start the refresh, and then waits for the
+/// outcome without that limit. Servers that predate `--from` never answer at all.
+const REFRESH_FROM_ANSWER_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// What the operator is told when the server did not answer within
+/// [`REFRESH_FROM_ANSWER_TIMEOUT`].
+const REFRESH_FROM_NO_ANSWER: &str = "The server did not answer: it may be older than this \
+     kubidmd and not support --from. Check the server version and its logs.";
+
+/// How long to wait for the first answer to `req`, when it is bounded at all.
+fn first_answer_timeout(req: &AdminTaskRequest) -> Option<Duration> {
+    matches!(req, AdminTaskRequest::RefreshReplicationConsumerFrom { .. })
+        .then_some(REFRESH_FROM_ANSWER_TIMEOUT)
+}
+
+/// Read the final response to a request. With `first_answer_timeout`, the server must answer
+/// within it, either with its final response or with [`AdminTaskResponse::RefreshStarted`],
+/// after which the final response follows without a limit.
+async fn read_admin_response(
+    reqs: &mut Framed<UnixStream, ClientCodec>,
+    first_answer_timeout: Option<Duration>,
+) -> Result<Option<Result<AdminTaskResponse, io::Error>>, Elapsed> {
+    let Some(first_answer_timeout) = first_answer_timeout else {
+        return Ok(reqs.next().await);
+    };
+    match timeout(first_answer_timeout, reqs.next()).await? {
+        Some(Ok(AdminTaskResponse::RefreshStarted { supplier })) => {
+            info!("Refresh started from {supplier}, waiting for it to complete ...");
+            Ok(reqs.next().await)
+        }
+        response => Ok(response),
+    }
+}
+
 async fn submit_admin_req_json(path: &str, req: AdminTaskRequest) -> ExitCode {
     // Connect to the socket.
     let stream = match UnixStream::connect(path).await {
@@ -118,6 +155,7 @@ async fn submit_admin_req_json(path: &str, req: AdminTaskRequest) -> ExitCode {
     };
 
     let mut reqs = Framed::new(stream, ClientCodec);
+    let answer_timeout = first_answer_timeout(&req);
 
     if let Err(err) = reqs.send(req).await {
         display_json_error(err, "Unable to connect to send request.");
@@ -131,7 +169,12 @@ async fn submit_admin_req_json(path: &str, req: AdminTaskRequest) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    match reqs.next().await {
+    let Ok(response) = read_admin_response(&mut reqs, answer_timeout).await else {
+        display_json_error("Timeout", REFRESH_FROM_NO_ANSWER);
+        return ExitCode::FAILURE;
+    };
+
+    match response {
         Some(Ok(AdminTaskResponse::RecoverAccount { password })) => {
             display_json_success_output(password)
         }
@@ -177,6 +220,7 @@ async fn submit_admin_req_human(path: &str, req: AdminTaskRequest) -> ExitCode {
     };
 
     let mut reqs = Framed::new(stream, ClientCodec);
+    let answer_timeout = first_answer_timeout(&req);
 
     if let Err(e) = reqs.send(req).await {
         error!(err = ?e, "Unable to send request");
@@ -190,7 +234,12 @@ async fn submit_admin_req_human(path: &str, req: AdminTaskRequest) -> ExitCode {
 
     trace!("flushed, waiting ...");
 
-    match reqs.next().await {
+    let Ok(response) = read_admin_response(&mut reqs, answer_timeout).await else {
+        error!("{REFRESH_FROM_NO_ANSWER}");
+        return ExitCode::FAILURE;
+    };
+
+    match response {
         Some(Ok(AdminTaskResponse::RecoverAccount { password })) => info!(new_password = ?password),
         Some(Ok(AdminTaskResponse::ShowReplicationCertificate { cert })) => {
             info!(certificate = ?cert)
@@ -315,6 +364,11 @@ async fn submit_admin_req_human(path: &str, req: AdminTaskRequest) -> ExitCode {
             // Only `kubidmd maintenance` sends maintenance requests, and it prints its own
             // responses, so seeing one here means the server answered the wrong request.
             error!("Unexpected maintenance response to a non maintenance request");
+            return ExitCode::FAILURE;
+        }
+        // Only ever the first answer to a refresh, which `read_admin_response` reads.
+        Some(Ok(AdminTaskResponse::RefreshStarted { .. })) => {
+            error!("Unexpected refresh started response");
             return ExitCode::FAILURE;
         }
         Some(Ok(AdminTaskResponse::Success)) => info!("success"),
@@ -1754,6 +1808,61 @@ mod tests {
             }
             _ => Err("not a refresh-replication-consumer command".to_string()),
         }
+    }
+
+    #[tokio::test]
+    async fn refresh_from_gives_up_on_a_server_that_does_not_answer() {
+        use tokio::io::AsyncWriteExt;
+
+        // Only a refresh from a given supplier waits for a bounded time.
+        assert_eq!(
+            first_answer_timeout(&AdminTaskRequest::RefreshReplicationConsumerFrom {
+                from: "repl://pod-1.example.com:8444".to_string(),
+            }),
+            Some(REFRESH_FROM_ANSWER_TIMEOUT)
+        );
+        assert_eq!(
+            first_answer_timeout(&AdminTaskRequest::RefreshReplicationConsumer),
+            None
+        );
+
+        // A server that predates --from: its codec waits for more bytes forever.
+        let (client_sock, _server_sock) = UnixStream::pair().expect("socket pair");
+        let mut client = Framed::new(client_sock, ClientCodec);
+        assert!(
+            read_admin_response(&mut client, Some(Duration::from_millis(50)))
+                .await
+                .is_err()
+        );
+
+        // A current one answers that the refresh started, then with its outcome once that
+        // is known, however long after the first answer.
+        let (client_sock, mut server_sock) = UnixStream::pair().expect("socket pair");
+        let mut client = Framed::new(client_sock, ClientCodec);
+        let server = tokio::spawn(async move {
+            let started = br#"{"RefreshStarted":{"supplier":"repl://pod-1.example.com:8444"}}"#;
+            server_sock.write_all(started).await.expect("write");
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            server_sock.write_all(br#""Success""#).await.expect("write");
+            server_sock
+        });
+        assert!(matches!(
+            read_admin_response(&mut client, Some(Duration::from_millis(50))).await,
+            Ok(Some(Ok(AdminTaskResponse::Success)))
+        ));
+        assert!(server.await.is_ok());
+
+        // Or refuses it at once.
+        let (client_sock, mut server_sock) = UnixStream::pair().expect("socket pair");
+        let mut client = Framed::new(client_sock, ClientCodec);
+        server_sock
+            .write_all(br#"{"ErrorMessage":{"message":"not a supplier"}}"#)
+            .await
+            .expect("write");
+        assert!(matches!(
+            read_admin_response(&mut client, Some(Duration::from_millis(50))).await,
+            Ok(Some(Ok(AdminTaskResponse::ErrorMessage { ref message }))) if message == "not a supplier"
+        ));
     }
 
     #[test]
