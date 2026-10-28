@@ -65,10 +65,7 @@ struct ProfileConfig {
     server_config_path: String,
     server_migration_path: String,
     server_ui_pkg_path: String,
-    // Still accepted, as `deny_unknown_fields` would otherwise reject the profiles that set
-    // it (developer.toml), but no longer read.
     #[serde(default)]
-    #[allow(dead_code)]
     server_ui_pkg_path_make_absolute: bool,
     client_config_path: String,
     resolver_config_path: String,
@@ -140,10 +137,17 @@ pub fn apply_profile() {
     }
     println!("cargo:rustc-env=KUBIDM_PROFILE_NAME={profile}");
     println!("cargo:rustc-env=KUBIDM_CPU_FLAGS={}", profile_cfg.cpu_flags);
-    println!(
-        "cargo:rustc-env=KUBIDM_SERVER_UI_PKG_PATH={}",
+    let server_ui_pkg_path = if profile_cfg.server_ui_pkg_path_make_absolute {
+        std::path::absolute(&profile_cfg.server_ui_pkg_path)
+            .map(|pkg_path| pkg_path.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| {
+                panic!("Failed to make server_ui_pkg_path absolute - {profile} - {contents}")
+            })
+    } else {
         profile_cfg.server_ui_pkg_path
-    );
+    };
+
+    println!("cargo:rustc-env=KUBIDM_SERVER_UI_PKG_PATH={server_ui_pkg_path}");
     println!(
         "cargo:rustc-env=KUBIDM_SERVER_ADMIN_BIND_PATH={}",
         profile_cfg.server_admin_bind_path
