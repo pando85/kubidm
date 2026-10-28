@@ -255,16 +255,12 @@ impl QueryServer {
         write_txn.reload()?;
 
         // Kubidm: the stored profiles that start up skipped because they are invalid, to
-        // report once start up succeeded. A skipped built-in profile is an error: the
-        // server is missing access it ships with, until the profile is fixed.
-        let skipped = write_txn.get_accesscontrols().get_skipped();
-        let skipped_builtin = skipped
-            .keys()
-            .any(|uuid| *uuid < DYNAMIC_RANGE_MINIMUM_UUID);
-        let skipped_acps: Vec<String> = skipped
-            .iter()
-            .map(|(uuid, name)| format!("{name} ({uuid})"))
-            .collect();
+        // report once start up succeeded. This is the only report of them at start up
+        // (reloads report newly skipped profiles only once the server is running). A
+        // skipped built-in profile is an error: the server is missing access it ships
+        // with, until the profile is fixed.
+        let (skipped_builtin, skipped_acps) =
+            super::acp_skipped_report(&write_txn.get_accesscontrols().get_skipped_profiles());
 
         // We are ready to run
         write_txn.set_phase(ServerPhase::Running);
@@ -322,6 +318,123 @@ impl QueryServerWriteTransaction<'_> {
         }
 
         Ok(())
+    }
+
+    /// Kubidm: [Self::internal_migrate_or_create_batch] for built-in access control
+    /// profiles. Before each profile is rewritten, the values of its stored entry that
+    /// the current parser always rejects are removed, see
+    /// [Self::kubidm_purge_unsupported_builtin_acp_values]. The generic rewrite keeps
+    /// extra stored values, so without this a built-in made invalid by such a value (say,
+    /// through replication) would stay skipped, and the values can not be removed in band
+    /// (`idm_acp_acp_manage` does not grant them).
+    fn kubidm_migrate_builtin_acp_batch(
+        &mut self,
+        msg: &str,
+        entries: Vec<EntryInitNew>,
+    ) -> Result<(), OperationError> {
+        let r: Result<(), _> = entries.into_iter().try_for_each(|entry| {
+            self.kubidm_purge_unsupported_builtin_acp_values(&entry)
+                .and_then(|()| self.internal_migrate_or_create(entry))
+        });
+
+        if let Err(err) = r {
+            error!(?err, msg);
+            debug_assert!(false);
+        }
+
+        Ok(())
+    }
+
+    /// Kubidm: remove from the stored entry of the built-in (system uuid range) access
+    /// control profile `builtin` the values that `AccessControlProfile::try_from` and the
+    /// per kind parsers (`access/profiles.rs`) always reject, unless the shipped
+    /// definition has them (a shipped definition that the parser rejects must still fail
+    /// loudly). These values can never be a working customisation:
+    ///
+    /// - `acp_reauth_max_age`, which is unsupported;
+    /// - the `access_control_receiver_delegated` class, which is unsupported, with
+    ///   `acp_receiver_delegated` and, unless the profile has a delegated target, the
+    ///   delegated scope attributes, which only that class allows. The class also
+    ///   excludes the group receiver of the shipped definition, so the rewrite would
+    ///   otherwise fail;
+    /// - `memberof` and `directmemberof` in `acp_create_attr`, which are server maintained
+    ///   (the rewrite also replaces `acp_create_attr` outright when the shipped definition
+    ///   has it).
+    ///
+    /// Any other stored value, valid or not, is left to the upstream rewrite, which keeps
+    /// administrator customisations of built-ins. The other parser rejections of a
+    /// built-in (a missing receiver group, target scope or name, or a target scope that
+    /// does not validate) are repaired by the rewrite of the shipped values.
+    fn kubidm_purge_unsupported_builtin_acp_values(
+        &mut self,
+        builtin: &EntryInitNew,
+    ) -> Result<(), OperationError> {
+        let Some(uuid) = builtin.get_uuid() else {
+            return Ok(());
+        };
+        if uuid >= DYNAMIC_RANGE_MINIMUM_UUID
+            || !builtin
+                .attribute_equality(Attribute::Class, &EntryClass::AccessControlProfile.into())
+        {
+            return Ok(());
+        }
+
+        let stored = match self.internal_search_uuid(uuid) {
+            Ok(stored) => stored,
+            Err(OperationError::NoMatchingEntries) => return Ok(()),
+            Err(err) => return Err(err),
+        };
+
+        let stored_only = |attr: &Attribute, pv: &PartialValue| {
+            stored.attribute_equality(attr, pv) && !builtin.attribute_equality(attr, pv)
+        };
+        let stored_only_attr =
+            |attr: &Attribute| stored.attribute_pres(attr) && !builtin.attribute_pres(attr);
+        let has_class = |class: EntryClass| {
+            let class = PartialValue::from(class);
+            stored.attribute_equality(Attribute::Class, &class)
+                || builtin.attribute_equality(Attribute::Class, &class)
+        };
+
+        let mut mods = Vec::new();
+        if stored_only_attr(&Attribute::AcpReauthMaxAge) {
+            mods.push(Modify::Purged(Attribute::AcpReauthMaxAge));
+        }
+        let receiver_delegated = PartialValue::from(EntryClass::AccessControlReceiverDelegated);
+        if stored_only(&Attribute::Class, &receiver_delegated) {
+            mods.push(Modify::Removed(Attribute::Class, receiver_delegated));
+            if !has_class(EntryClass::AccessControlTargetDelegatedScope) {
+                for attr in [
+                    Attribute::DelegatedScopeGroup,
+                    Attribute::DelegatedScopeFilter,
+                ] {
+                    if stored_only_attr(&attr) {
+                        mods.push(Modify::Purged(attr));
+                    }
+                }
+            }
+        }
+        if stored_only_attr(&Attribute::AcpReceiverDelegated) {
+            mods.push(Modify::Purged(Attribute::AcpReceiverDelegated));
+        }
+        for attr in [Attribute::MemberOf, Attribute::DirectMemberOf] {
+            let attr = PartialValue::new_iutf8(attr.as_str());
+            if stored_only(&Attribute::AcpCreateAttr, &attr) {
+                mods.push(Modify::Removed(Attribute::AcpCreateAttr, attr));
+            }
+        }
+
+        if mods.is_empty() {
+            return Ok(());
+        }
+
+        error!(
+            %uuid,
+            name = ?stored.get_ava_single_iname(Attribute::Name),
+            ?mods,
+            "Removing values that are never valid from a built-in access control profile"
+        );
+        self.internal_modify_uuid(uuid, &ModifyList::new_list(mods))
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -865,12 +978,12 @@ impl QueryServerWriteTransaction<'_> {
             migration_data::dl14::kubidm_builtin_entries()?,
         )?;
 
-        self.internal_migrate_or_create_batch(
+        self.kubidm_migrate_builtin_acp_batch(
             "phase 7 - builtin access control profiles",
             migration_data::dl15::phase_7_builtin_access_control_profiles(),
         )?;
 
-        self.internal_migrate_or_create_batch(
+        self.kubidm_migrate_builtin_acp_batch(
             "phase 7 - kubidm builtin access control profiles",
             migration_data::dl14::kubidm_builtin_access_control_profiles(),
         )?;
@@ -1107,12 +1220,12 @@ impl QueryServerWriteTransaction<'_> {
             migration_data::dl14::kubidm_builtin_entries()?,
         )?;
 
-        self.internal_migrate_or_create_batch(
+        self.kubidm_migrate_builtin_acp_batch(
             "phase 7 - builtin access control profiles",
             dl_target::phase_7_builtin_access_control_profiles(),
         )?;
 
-        self.internal_migrate_or_create_batch(
+        self.kubidm_migrate_builtin_acp_batch(
             "phase 7 - kubidm builtin access control profiles",
             migration_data::dl14::kubidm_builtin_access_control_profiles(),
         )?;
@@ -1242,6 +1355,8 @@ impl QueryServerReadTransaction<'_> {
 #[cfg(test)]
 mod tests {
     // use super::{ProtoDomainUpgradeCheckItem, ProtoDomainUpgradeCheckStatus};
+    use std::collections::BTreeSet;
+
     use crate::{prelude::*, value::CredentialType, valueset::ValueSetCredentialType};
 
     /// Kubidm: the migrations rewrite the built-in access control profiles in the start up
@@ -1265,7 +1380,7 @@ mod tests {
         let is_skipped = |write_txn: &QueryServerWriteTransaction<'_>| {
             write_txn
                 .get_accesscontrols()
-                .get_skipped()
+                .get_skipped_profiles()
                 .contains_key(&UUID_IDM_ACP_PEOPLE_READ_V1)
         };
 
@@ -1280,9 +1395,10 @@ mod tests {
         assert!(write_txn.is_changed_uuid(&UUID_IDM_ACP_PEOPLE_READ_V1));
         assert_eq!(
             write_txn.reload(),
-            Err(OperationError::InvalidAcpState(
-                crate::server::ACP_INVALID_MSG.to_string()
-            ))
+            Err(OperationError::InvalidAcpState(format!(
+                "{} is unsupported",
+                Attribute::AcpReauthMaxAge
+            )))
         );
         drop(write_txn);
 
@@ -1298,7 +1414,9 @@ mod tests {
         write_txn.commit().expect("commit");
 
         // ... is skipped by a mid migration reload before the rewrite, and by the reload
-        // after the rewrite, which keeps the extra attribute.
+        // after the generic rewrite, which keeps the extra attribute (the built-in
+        // profile migrations remove it, see
+        // `test_migrations_builtin_acp_unsupported_values_repaired`).
         let mut write_txn = server.write(ct).await.unwrap();
         write_txn.set_phase_bootstrap();
         write_txn.set_phase(ServerPhase::SchemaReady);
@@ -1313,7 +1431,9 @@ mod tests {
         assert!(is_skipped(&write_txn));
         drop(write_txn);
 
-        // A start up, which re-runs the migrations in a pre-release build, succeeds.
+        // A start up succeeds. A pre-release build re-runs the migrations of the current
+        // level on every start up, and the built-in profile migrations repair the
+        // built-in. Otherwise it stays skipped.
         let mut write_txn = server.write(ct).await.unwrap();
         write_txn.set_phase_bootstrap();
         write_txn.commit().expect("commit");
@@ -1322,7 +1442,133 @@ mod tests {
             .await
             .expect("start up");
         let write_txn = server.write(ct).await.unwrap();
-        assert!(is_skipped(&write_txn));
+        assert_eq!(
+            is_skipped(&write_txn),
+            option_env!("KUBIDM_PRE_RELEASE").is_none()
+        );
+    }
+
+    /// Kubidm: a built-in access control profile made invalid by values that the parser
+    /// always rejects (here through replication, which is lenient) is skipped, and can not
+    /// be repaired in band. The built-in profile migrations remove those values when they
+    /// rewrite it, so a (re)migration loads it again, while other customisations of the
+    /// built-in are kept.
+    #[qs_test]
+    async fn test_migrations_builtin_acp_unsupported_values_repaired(server: &QueryServer) {
+        use crate::server::ServerPhase;
+
+        let ct = duration_from_epoch_now();
+        let iutf8 = |attr: Attribute| Value::new_iutf8n(attr.as_str());
+        let builtins = [
+            UUID_IDM_ACP_PEOPLE_READ_V1,
+            UUID_IDM_ACP_PEOPLE_CREATE_V1,
+            UUID_IDM_ACP_PEOPLE_MANAGE_V1,
+        ];
+
+        let mut write_txn = server.write(ct).await.unwrap();
+        write_txn.replication_apply = true;
+        // An unsupported step-up maximum age, and a valid time restriction.
+        write_txn
+            .internal_modify_uuid(
+                UUID_IDM_ACP_PEOPLE_READ_V1,
+                &ModifyList::new_list(vec![
+                    Modify::Present(Attribute::AcpReauthMaxAge, Value::Uint32(300)),
+                    Modify::Present(
+                        Attribute::AcpTimeRestrictionEnd,
+                        Value::DateTime(
+                            time::OffsetDateTime::UNIX_EPOCH + time::Duration::days(36500),
+                        ),
+                    ),
+                ]),
+            )
+            .expect("modify");
+        // The server maintained memberof granted on create.
+        write_txn
+            .internal_modify_uuid(
+                UUID_IDM_ACP_PEOPLE_CREATE_V1,
+                &ModifyList::new_list(vec![
+                    Modify::Present(Attribute::AcpCreateAttr, iutf8(Attribute::MemberOf)),
+                    Modify::Present(Attribute::AcpCreateAttr, iutf8(Attribute::DirectMemberOf)),
+                ]),
+            )
+            .expect("modify");
+        // An unsupported delegated receiver, instead of the group receiver.
+        write_txn
+            .internal_modify_uuid(
+                UUID_IDM_ACP_PEOPLE_MANAGE_V1,
+                &ModifyList::new_list(vec![
+                    Modify::Removed(
+                        Attribute::Class,
+                        EntryClass::AccessControlReceiverGroup.into(),
+                    ),
+                    Modify::Purged(Attribute::AcpReceiverGroup),
+                    Modify::Present(
+                        Attribute::Class,
+                        EntryClass::AccessControlReceiverDelegated.to_value(),
+                    ),
+                    Modify::Present(
+                        Attribute::AcpReceiverDelegated,
+                        Value::Refer(UUID_IDM_ADMINS),
+                    ),
+                ]),
+            )
+            .expect("modify");
+        write_txn.commit().expect("commit");
+
+        // They are skipped.
+        let write_txn = server.write(ct).await.unwrap();
+        let skipped: BTreeSet<Uuid> = write_txn
+            .get_accesscontrols()
+            .get_skipped_profiles()
+            .into_keys()
+            .collect();
+        assert_eq!(skipped, BTreeSet::from(builtins));
+        drop(write_txn);
+
+        // A re-migration of the current level, as a pre-release build runs on start up,
+        // removes the unsupported values and loads them again.
+        let mut write_txn = server.write(ct).await.unwrap();
+        write_txn.set_phase_bootstrap();
+        write_txn.set_phase(ServerPhase::DomainInfoReady);
+        write_txn
+            .domain_remigrate(DOMAIN_PREVIOUS_TGT_LEVEL)
+            .expect("remigrate");
+        write_txn.reload().expect("re-migrate");
+        write_txn.set_phase(ServerPhase::Running);
+        write_txn.commit().expect("commit");
+
+        let mut write_txn = server.write(ct).await.unwrap();
+        crate::server::access::assert_builtin_acps_all_loaded(&mut write_txn);
+
+        let read = write_txn
+            .internal_search_uuid(UUID_IDM_ACP_PEOPLE_READ_V1)
+            .expect("acp");
+        assert!(!read.attribute_pres(Attribute::AcpReauthMaxAge));
+        assert!(read.attribute_pres(Attribute::AcpTimeRestrictionEnd));
+
+        let create = write_txn
+            .internal_search_uuid(UUID_IDM_ACP_PEOPLE_CREATE_V1)
+            .expect("acp");
+        let create_attrs: BTreeSet<&str> = create
+            .get_ava_iter_iutf8(Attribute::AcpCreateAttr)
+            .expect("create attrs")
+            .collect();
+        assert!(!create_attrs.contains(Attribute::MemberOf.as_str()));
+        assert!(!create_attrs.contains(Attribute::DirectMemberOf.as_str()));
+        assert!(create_attrs.contains(Attribute::DisplayName.as_str()));
+
+        let manage = write_txn
+            .internal_search_uuid(UUID_IDM_ACP_PEOPLE_MANAGE_V1)
+            .expect("acp");
+        assert!(!manage.attribute_equality(
+            Attribute::Class,
+            &EntryClass::AccessControlReceiverDelegated.into()
+        ));
+        assert!(!manage.attribute_pres(Attribute::AcpReceiverDelegated));
+        assert!(manage.attribute_equality(
+            Attribute::AcpReceiverGroup,
+            &PartialValue::Refer(UUID_IDM_PEOPLE_ADMINS)
+        ));
     }
 
     #[qs_test]
@@ -1442,6 +1688,9 @@ mod tests {
             Some(CredentialType::Any)
         );
 
+        // Kubidm: nothing is skipped, every built-in access control profile is loaded.
+        crate::server::access::assert_builtin_acps_all_loaded(&mut write_txn);
+
         write_txn.commit().expect("Unable to commit");
     }
 
@@ -1533,6 +1782,8 @@ mod tests {
                 .unwrap_or_else(|err| panic!("kubidm builtin entry {uuid} missing: {err:?}"));
         }
 
+        crate::server::access::assert_builtin_acps_all_loaded(&mut write_txn);
+
         write_txn.commit().expect("Unable to commit");
     }
 
@@ -1607,7 +1858,11 @@ mod tests {
         server
             .initialise_helper(curtime, DOMAIN_TGT_LEVEL)
             .await
-            .expect("Migration failed!!!!")
+            .expect("Migration failed!!!!");
+
+        // Kubidm: and nothing is skipped, every built-in access control profile is loaded.
+        let mut write_txn = server.write(curtime).await.unwrap();
+        crate::server::access::assert_builtin_acps_all_loaded(&mut write_txn);
     }
 
     #[qs_test(domain_level=DOMAIN_LEVEL_11)]
@@ -1905,6 +2160,9 @@ mod tests {
         // The in memory schema still serves the server.
         assert_person_create_works(&mut write_txn);
 
+        // Kubidm: no access control profile is skipped.
+        assert!(write_txn.get_accesscontrols().get_skipped().is_empty());
+
         write_txn.commit().expect("Unable to commit");
     }
 
@@ -1946,6 +2204,8 @@ mod tests {
         assert_db_stored_schema(&mut write_txn, false);
 
         assert_person_create_works(&mut write_txn);
+
+        crate::server::access::assert_builtin_acps_all_loaded(&mut write_txn);
 
         write_txn.commit().expect("Unable to commit");
     }
@@ -2023,6 +2283,9 @@ mod tests {
 
         // Must now have the A256GCM class
         assert!(oauth2_client_entry_pre.has_class(&EntryClass::KeyObjectJweA256GCM));
+
+        // Kubidm: nothing is skipped, every built-in access control profile is loaded.
+        crate::server::access::assert_builtin_acps_all_loaded(&mut write_txn);
 
         write_txn.commit().expect("Unable to commit");
     }

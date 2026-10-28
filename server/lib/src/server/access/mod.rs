@@ -58,6 +58,12 @@ mod search;
 mod utils;
 
 pub use self::create::CreateResult;
+
+/// Kubidm: the access control profiles that a reload skipped because they are invalid,
+/// keyed by the profile uuid and the kind it was skipped as (the access control class
+/// name, such as `access_control_search`), to the profile name. A profile of several
+/// kinds may be valid as one kind and invalid as another.
+pub type SkippedAcps = BTreeMap<(Uuid, &'static str), String>;
 pub use self::delete::{apply_delete_access, DeleteResult};
 pub use self::modify::{apply_modify_access, ModifyResult};
 pub use self::search::{apply_search_access, SearchResult};
@@ -163,9 +169,9 @@ struct AccessControlsInner {
     acps_modify: Vec<AccessControlModify>,
     acps_delete: Vec<AccessControlDelete>,
     sync_agreements: HashMap<Uuid, BTreeSet<Attribute>>,
-    /// Kubidm: the enabled profiles (uuid and name) that the last reload skipped because
-    /// they are invalid. They grant nothing until they are fixed or disabled.
-    skipped: BTreeMap<Uuid, String>,
+    /// Kubidm: the enabled profiles that the last reload skipped because they are invalid,
+    /// per kind. They grant nothing (as that kind) until they are fixed or disabled.
+    skipped: SkippedAcps,
     // Oauth2
     // Sync prov
 }
@@ -226,9 +232,18 @@ pub trait AccessControlsTransaction<'a> {
     fn get_modify(&self) -> &Vec<AccessControlModify>;
     fn get_delete(&self) -> &Vec<AccessControlDelete>;
     fn get_sync_agreements(&self) -> &HashMap<Uuid, BTreeSet<Attribute>>;
-    /// Kubidm: the enabled profiles (uuid to name) that the last reload skipped because
-    /// they are invalid.
-    fn get_skipped(&self) -> &BTreeMap<Uuid, String>;
+    /// Kubidm: the enabled profiles that the last reload skipped because they are
+    /// invalid, per kind, see [SkippedAcps].
+    fn get_skipped(&self) -> &SkippedAcps;
+
+    /// Kubidm: the enabled profiles (uuid to name) that the last reload skipped as any
+    /// kind.
+    fn get_skipped_profiles(&self) -> BTreeMap<Uuid, &str> {
+        self.get_skipped()
+            .iter()
+            .map(|((uuid, _), name)| (*uuid, name.as_str()))
+            .collect()
+    }
 
     #[allow(clippy::mut_from_ref)]
     fn get_acp_resolve_filter_cache(&self) -> &mut ResolveFilterCacheReadTxn<'a>;
@@ -1202,7 +1217,7 @@ impl AccessControlsWriteTransaction<'_> {
     }
 
     /// Kubidm: record the profiles the reload skipped, see [AccessControlsTransaction::get_skipped].
-    pub fn update_skipped(&mut self, mut skipped: BTreeMap<Uuid, String>) {
+    pub fn update_skipped(&mut self, mut skipped: SkippedAcps) {
         std::mem::swap(&mut skipped, &mut self.inner.deref_mut().skipped);
     }
 
@@ -1244,7 +1259,7 @@ impl<'a> AccessControlsTransaction<'a> for AccessControlsWriteTransaction<'a> {
         &self.inner.sync_agreements
     }
 
-    fn get_skipped(&self) -> &BTreeMap<Uuid, String> {
+    fn get_skipped(&self) -> &SkippedAcps {
         &self.inner.skipped
     }
 
@@ -1296,7 +1311,7 @@ impl<'a> AccessControlsTransaction<'a> for AccessControlsReadTransaction<'a> {
         &self.inner.sync_agreements
     }
 
-    fn get_skipped(&self) -> &BTreeMap<Uuid, String> {
+    fn get_skipped(&self) -> &SkippedAcps {
         &self.inner.skipped
     }
 
@@ -1364,6 +1379,88 @@ impl AccessControls {
             curtime: OffsetDateTime::UNIX_EPOCH + curtime,
         }
     }
+}
+
+/// Kubidm: assert that no access control profile is skipped, and that every built-in
+/// profile (of the latest migrations, and any other profile stored in the system uuid
+/// range) is stored, enabled and loaded as every kind it has.
+#[cfg(test)]
+pub(crate) fn assert_builtin_acps_all_loaded(
+    qs_write: &mut crate::server::QueryServerWriteTransaction<'_>,
+) {
+    // Nothing was skipped.
+    assert_eq!(
+        qs_write.get_accesscontrols().get_skipped(),
+        &SkippedAcps::new()
+    );
+
+    // The built-in profiles of the migrations ...
+    let mut builtin: BTreeSet<Uuid> =
+        crate::migration_data::latest::phase_7_builtin_access_control_profiles()
+            .into_iter()
+            .chain(crate::migration_data::dl14::kubidm_builtin_access_control_profiles())
+            .map(|entry| entry.get_uuid().expect("builtin acp uuid"))
+            .collect();
+    for uuid in builtin.iter() {
+        assert!(*uuid < DYNAMIC_RANGE_MINIMUM_UUID, "{uuid}");
+    }
+    // ... and any other profile in the system range.
+    let stored = qs_write
+        .internal_search(filter!(f_eq(
+            Attribute::Class,
+            EntryClass::AccessControlProfile.into()
+        )))
+        .expect("search");
+    let stored: BTreeMap<Uuid, _> = stored
+        .into_iter()
+        .map(|entry| (entry.get_uuid(), entry))
+        .filter(|(uuid, _)| *uuid < DYNAMIC_RANGE_MINIMUM_UUID)
+        .collect();
+    builtin.extend(stored.keys().copied());
+    assert!(builtin.len() > 40, "{}", builtin.len());
+
+    let acps = qs_write.get_accesscontrols();
+    let kinds: [(EntryClass, BTreeSet<Uuid>); 4] = [
+        (
+            EntryClass::AccessControlSearch,
+            acps.get_search().iter().map(|a| a.acp.uuid()).collect(),
+        ),
+        (
+            EntryClass::AccessControlCreate,
+            acps.get_create().iter().map(|a| a.acp.uuid()).collect(),
+        ),
+        (
+            EntryClass::AccessControlModify,
+            acps.get_modify().iter().map(|a| a.acp.uuid()).collect(),
+        ),
+        (
+            EntryClass::AccessControlDelete,
+            acps.get_delete().iter().map(|a| a.acp.uuid()).collect(),
+        ),
+    ];
+    let mut checked = 0;
+    for uuid in builtin {
+        let entry = stored.get(&uuid).expect("builtin acp is stored");
+        assert_ne!(
+            entry.get_ava_single_bool(Attribute::AcpEnable),
+            Some(false),
+            "{uuid}"
+        );
+        let mut has_kind = false;
+        for (kind, loaded) in kinds.iter() {
+            if entry.attribute_equality(Attribute::Class, &(*kind).into()) {
+                has_kind = true;
+                checked += 1;
+                assert!(
+                    loaded.contains(&uuid),
+                    "{} ({uuid}) is not loaded as {kind}",
+                    entry.get_display_id()
+                );
+            }
+        }
+        assert!(has_kind, "{uuid}");
+    }
+    assert!(checked > 40, "{checked}");
 }
 
 #[cfg(test)]
@@ -4823,16 +4920,18 @@ mod tests {
 
         // A local delete of the scope group is refused: referential integrity removes the
         // scope group from the profile in the same transaction, which leaves it invalid.
-        // The server log names the profile that blocks the delete, the caller is not told.
+        // The caller is told why, the server log also names the profile that blocks the
+        // delete.
         let mut qs_write = qs.write(ct).await.unwrap();
         qs_write
             .internal_delete_uuid(scope_uuid)
             .expect("delete scope group");
         assert_eq!(
             qs_write.commit(),
-            Err(OperationError::InvalidAcpState(
-                crate::server::ACP_INVALID_MSG.to_string()
-            ))
+            Err(OperationError::InvalidAcpState(format!(
+                "A delegated target requires {}",
+                Attribute::DelegatedScopeGroup
+            )))
         );
 
         // Nothing changed: the receiver still only administers the scope.
@@ -4858,8 +4957,8 @@ mod tests {
         assert!(!acp_entry.attribute_pres(Attribute::DelegatedScopeGroup));
         assert!(!dg_loaded_modify(&qs_write).contains("acp_delegated_deleted_scope"));
         assert_eq!(
-            qs_write.get_accesscontrols().get_skipped(),
-            &BTreeMap::from([(acp_uuid, "acp_delegated_deleted_scope".to_string())])
+            qs_write.get_accesscontrols().get_skipped_profiles(),
+            BTreeMap::from([(acp_uuid, "acp_delegated_deleted_scope")])
         );
         let admin = dg_ident(&mut qs_write, admin_uuid);
         for uuid in [outsider_uuid, target_uuid] {
@@ -5011,9 +5110,8 @@ mod tests {
             assert_eq!(
                 qs_write
                     .get_accesscontrols()
-                    .get_skipped()
-                    .get(&reauth_max_age_uuid)
-                    .is_some(),
+                    .get_skipped_profiles()
+                    .contains_key(&reauth_max_age_uuid),
                 reauth_max_age_enabled
             );
             let admin = dg_ident(qs_write, admin_uuid);
@@ -5090,106 +5188,69 @@ mod tests {
     async fn test_access_builtin_acps_all_loaded(qs: &QueryServer) {
         let ct = duration_from_epoch_now();
         let mut qs_write = qs.write(ct).await.unwrap();
-
-        // Nothing was skipped.
-        assert_eq!(
-            qs_write.get_accesscontrols().get_skipped(),
-            &BTreeMap::new()
-        );
-
-        // The built-in profiles of the migrations ...
-        let mut builtin: BTreeSet<Uuid> =
-            crate::migration_data::latest::phase_7_builtin_access_control_profiles()
-                .into_iter()
-                .chain(crate::migration_data::dl14::kubidm_builtin_access_control_profiles())
-                .map(|entry| entry.get_uuid().expect("builtin acp uuid"))
-                .collect();
-        for uuid in builtin.iter() {
-            assert!(*uuid < DYNAMIC_RANGE_MINIMUM_UUID, "{uuid}");
-        }
-        // ... and any other profile in the system range.
-        let stored = qs_write
-            .internal_search(filter!(f_eq(
-                Attribute::Class,
-                EntryClass::AccessControlProfile.into()
-            )))
-            .expect("search");
-        let stored: BTreeMap<Uuid, _> = stored
-            .into_iter()
-            .map(|entry| (entry.get_uuid(), entry))
-            .filter(|(uuid, _)| *uuid < DYNAMIC_RANGE_MINIMUM_UUID)
-            .collect();
-        builtin.extend(stored.keys().copied());
-        assert!(builtin.len() > 40, "{}", builtin.len());
-
-        let acps = qs_write.get_accesscontrols();
-        let kinds: [(EntryClass, BTreeSet<Uuid>); 4] = [
-            (
-                EntryClass::AccessControlSearch,
-                acps.get_search().iter().map(|a| a.acp.uuid()).collect(),
-            ),
-            (
-                EntryClass::AccessControlCreate,
-                acps.get_create().iter().map(|a| a.acp.uuid()).collect(),
-            ),
-            (
-                EntryClass::AccessControlModify,
-                acps.get_modify().iter().map(|a| a.acp.uuid()).collect(),
-            ),
-            (
-                EntryClass::AccessControlDelete,
-                acps.get_delete().iter().map(|a| a.acp.uuid()).collect(),
-            ),
-        ];
-        let mut checked = 0;
-        for uuid in builtin {
-            let entry = stored.get(&uuid).expect("builtin acp is stored");
-            assert_ne!(
-                entry.get_ava_single_bool(Attribute::AcpEnable),
-                Some(false),
-                "{uuid}"
-            );
-            let mut has_kind = false;
-            for (kind, loaded) in kinds.iter() {
-                if entry.attribute_equality(Attribute::Class, &(*kind).into()) {
-                    has_kind = true;
-                    checked += 1;
-                    assert!(
-                        loaded.contains(&uuid),
-                        "{} ({uuid}) is not loaded as {kind}",
-                        entry.get_display_id()
-                    );
-                }
-            }
-            assert!(has_kind, "{uuid}");
-        }
-        assert!(checked > 40, "{checked}");
+        super::assert_builtin_acps_all_loaded(&mut qs_write);
     }
 
     /// Kubidm: a built-in profile is validated strictly when it is changed in the
     /// transaction or was loaded before, in every phase. A built-in made invalid by
     /// replication is skipped (replication is lenient), and must not stop the server from
-    /// starting afterwards: it is skipped and reported at start up, while a local change
-    /// that leaves a built-in invalid is still refused.
+    /// starting afterwards (in the same process, or in a fresh one that never loaded it):
+    /// start up skips and reports it, or repairs it when it re-runs the migrations,
+    /// while a local change that leaves a built-in invalid is still refused.
     #[qs_test]
     async fn test_access_reload_strict_for_builtin_acp(qs: &QueryServer) {
         let ct = duration_from_epoch_now();
         let invalid =
             || ModifyList::new_purge_and_set(Attribute::AcpReauthMaxAge, Value::Uint32(300));
         let refused = || {
-            Err(OperationError::InvalidAcpState(
-                crate::server::ACP_INVALID_MSG.to_string(),
-            ))
+            Err(OperationError::InvalidAcpState(format!(
+                "{} is unsupported",
+                Attribute::AcpReauthMaxAge
+            )))
         };
+        // Skipped as the only kind it has.
         let builtin_skipped = || {
-            BTreeMap::from([(
-                UUID_IDM_ACP_PEOPLE_READ_V1,
+            super::SkippedAcps::from([(
+                (
+                    UUID_IDM_ACP_PEOPLE_READ_V1,
+                    EntryClass::AccessControlSearch.into(),
+                ),
                 "idm_acp_people_read".to_string(),
             )])
         };
+        let builtin_loaded = |qs_write: &QueryServerWriteTransaction<'_>| {
+            qs_write
+                .get_accesscontrols()
+                .get_search()
+                .iter()
+                .any(|a| a.acp.uuid() == UUID_IDM_ACP_PEOPLE_READ_V1)
+        };
+        let invalid_by_replication = |qs_write: &mut QueryServerWriteTransaction<'_>| {
+            qs_write.replication_apply = true;
+            qs_write
+                .internal_modify_uuid(UUID_IDM_ACP_PEOPLE_READ_V1, &invalid())
+                .expect("modify");
+        };
+        // A pre-release build re-runs the migrations of the current level on every start
+        // up, and the built-in profile migrations repair the built-in (see
+        // `test_migrations_builtin_acp_unsupported_values_repaired`). Otherwise start up
+        // skips it, and reports it.
+        let remigrates = option_env!("KUBIDM_PRE_RELEASE").is_some();
+        let check_started = |qs_write: &QueryServerWriteTransaction<'_>| {
+            if remigrates {
+                assert!(qs_write.get_accesscontrols().get_skipped().is_empty());
+                assert!(builtin_loaded(qs_write));
+            } else {
+                assert_eq!(
+                    qs_write.get_accesscontrols().get_skipped(),
+                    &builtin_skipped()
+                );
+                assert!(!builtin_loaded(qs_write));
+            }
+        };
 
-        // A local change that leaves it invalid is refused, without naming it to the
-        // caller.
+        // A local change that leaves it invalid is refused, with the reason but without
+        // naming it to the caller.
         let mut qs_write = qs.write(ct).await.unwrap();
         qs_write
             .internal_modify_uuid(UUID_IDM_ACP_PEOPLE_READ_V1, &invalid())
@@ -5198,21 +5259,14 @@ mod tests {
 
         // Through replication it is skipped, and the skip is recorded.
         let mut qs_write = qs.write(ct).await.unwrap();
-        qs_write.replication_apply = true;
-        qs_write
-            .internal_modify_uuid(UUID_IDM_ACP_PEOPLE_READ_V1, &invalid())
-            .expect("modify");
+        invalid_by_replication(&mut qs_write);
         qs_write.commit().expect("commit");
         let mut qs_write = qs.write(ct).await.unwrap();
         assert_eq!(
             qs_write.get_accesscontrols().get_skipped(),
             &builtin_skipped()
         );
-        assert!(!qs_write
-            .get_accesscontrols()
-            .get_search()
-            .iter()
-            .any(|a| a.acp.uuid() == UUID_IDM_ACP_PEOPLE_READ_V1));
+        assert!(!builtin_loaded(&qs_write));
 
         // An unrelated write that reloads the access controls is not blocked by it.
         qs_write
@@ -5223,7 +5277,7 @@ mod tests {
             .insert(crate::server::ChangeFlag::ACP);
         qs_write.commit().expect("commit");
 
-        // A restart succeeds, with the built-in skipped and reported.
+        // A restart succeeds.
         let mut qs_write = qs.write(ct).await.unwrap();
         qs_write.set_phase_bootstrap();
         qs_write.commit().expect("commit");
@@ -5231,13 +5285,61 @@ mod tests {
             .await
             .expect("restart");
         let qs_write = qs.write(ct).await.unwrap();
+        check_started(&qs_write);
+        drop(qs_write);
+
+        // So does the start up of a fresh process, which has neither loaded nor skipped
+        // any profile before: the built-in is not strict since it was not loaded, and the
+        // migration rewrite of it is lenient since the first start up reload skipped it.
+        let mut qs_write = qs.write(ct).await.unwrap();
+        invalid_by_replication(&mut qs_write);
+        qs_write.commit().expect("commit");
+        let mut qs_write = qs.write(ct).await.unwrap();
+        qs_write.set_phase_bootstrap();
+        qs_write
+            .accesscontrols
+            .update_search(Vec::new())
+            .expect("clear");
+        qs_write
+            .accesscontrols
+            .update_create(Vec::new())
+            .expect("clear");
+        qs_write
+            .accesscontrols
+            .update_modify(Vec::new())
+            .expect("clear");
+        qs_write
+            .accesscontrols
+            .update_delete(Vec::new())
+            .expect("clear");
+        qs_write
+            .accesscontrols
+            .update_skipped(super::SkippedAcps::new());
+        qs_write.commit().expect("commit");
+        let qs_write = qs.write(ct).await.unwrap();
+        let acps = qs_write.get_accesscontrols();
+        assert!(acps.get_search().is_empty() && acps.get_create().is_empty());
+        assert!(acps.get_modify().is_empty() && acps.get_delete().is_empty());
+        assert!(acps.get_skipped().is_empty());
+        drop(qs_write);
+        qs.initialise_helper(duration_from_epoch_now(), DOMAIN_TGT_LEVEL)
+            .await
+            .expect("fresh start up");
+        let qs_write = qs.write(ct).await.unwrap();
+        check_started(&qs_write);
+        assert!(qs_write.get_accesscontrols().get_search().len() > 10);
+        drop(qs_write);
+
+        // While it is skipped, a local change to it that leaves it invalid is refused.
+        let mut qs_write = qs.write(ct).await.unwrap();
+        invalid_by_replication(&mut qs_write);
+        qs_write.commit().expect("commit");
+        let qs_write = qs.write(ct).await.unwrap();
         assert_eq!(
             qs_write.get_accesscontrols().get_skipped(),
             &builtin_skipped()
         );
         drop(qs_write);
-
-        // A local change to it that leaves it invalid is refused.
         let mut qs_write = qs.write(ct).await.unwrap();
         qs_write
             .internal_modify_uuid(
@@ -5262,31 +5364,49 @@ mod tests {
         qs_write.commit().expect("commit");
         let mut qs_write = qs.write(ct).await.unwrap();
         assert!(qs_write.get_accesscontrols().get_skipped().is_empty());
-        assert!(qs_write
-            .get_accesscontrols()
-            .get_search()
-            .iter()
-            .any(|a| a.acp.uuid() == UUID_IDM_ACP_PEOPLE_READ_V1));
+        assert!(builtin_loaded(&qs_write));
         qs_write
             .internal_modify_uuid(UUID_IDM_ACP_PEOPLE_READ_V1, &invalid())
             .expect("modify");
         assert_eq!(qs_write.commit(), refused());
     }
 
-    /// Kubidm: the profiles a reload newly skips are the ones it reports, in every phase,
-    /// so a profile made invalid by replication is summarised once.
+    /// Kubidm: the profiles a running reload newly skips (as any kind) are the ones it
+    /// reports, so a profile made invalid by replication is summarised once. A skipped
+    /// built-in is reported as such.
     #[test]
     fn test_access_acp_newly_skipped() {
+        use crate::server::{acp_newly_skipped, acp_skipped_report};
+
         let a = Uuid::new_v4();
         let b = Uuid::new_v4();
-        let previous = BTreeMap::from([(a, "acp_a".to_string())]);
-        let current = BTreeMap::from([(a, "acp_a".to_string()), (b, "acp_b".to_string())]);
+        let search: &'static str = EntryClass::AccessControlSearch.into();
+        let modify: &'static str = EntryClass::AccessControlModify.into();
+        let previous = super::SkippedAcps::from([((a, search), "acp_a".to_string())]);
+        let current = super::SkippedAcps::from([
+            ((a, search), "acp_a".to_string()),
+            ((a, modify), "acp_a".to_string()),
+            ((b, search), "acp_b".to_string()),
+        ]);
+        // `a` is newly skipped as another kind.
         assert_eq!(
-            crate::server::acp_newly_skipped(&previous, &current),
-            vec![format!("acp_b ({b})")]
+            acp_newly_skipped(&previous, &current),
+            BTreeMap::from([(a, "acp_a"), (b, "acp_b")])
         );
-        assert!(crate::server::acp_newly_skipped(&current, &current).is_empty());
-        assert!(crate::server::acp_newly_skipped(&current, &previous).is_empty());
+        assert!(acp_newly_skipped(&current, &current).is_empty());
+        assert!(acp_newly_skipped(&current, &previous).is_empty());
+
+        assert_eq!(
+            acp_skipped_report(&BTreeMap::from([(b, "acp_b")])),
+            (false, vec![format!("acp_b ({b})")])
+        );
+        assert!(
+            acp_skipped_report(&BTreeMap::from([
+                (b, "acp_b"),
+                (UUID_IDM_ACP_PEOPLE_READ_V1, "idm_acp_people_read")
+            ]))
+            .0
+        );
     }
 
     /// Kubidm: a profile that was valid and loaded, and that a change in the transaction
@@ -5342,14 +5462,15 @@ mod tests {
                 .insert(crate::server::ChangeFlag::ACP);
         };
 
-        // A local change is refused (the server log names the profile).
+        // A local change is refused, with the parser's error (the server log names the
+        // profile).
         let mut qs_write = qs.write(ct).await.unwrap();
         remove_login_shell(&mut qs_write);
         assert!(!qs_write.is_changed_uuid(&acp_uuid));
         assert_eq!(
             qs_write.commit(),
-            Err(OperationError::InvalidAcpState(
-                crate::server::ACP_INVALID_MSG.to_string()
+            Err(OperationError::InvalidAttributeName(
+                Attribute::LoginShell.to_string()
             ))
         );
 
@@ -5366,8 +5487,8 @@ mod tests {
         let qs_write = qs.write(ct).await.unwrap();
         assert!(!dg_loaded_modify(&qs_write).contains("acp_login_shell_scope"));
         assert_eq!(
-            qs_write.get_accesscontrols().get_skipped(),
-            &BTreeMap::from([(acp_uuid, "acp_login_shell_scope".to_string())])
+            qs_write.get_accesscontrols().get_skipped_profiles(),
+            BTreeMap::from([(acp_uuid, "acp_login_shell_scope")])
         );
     }
 

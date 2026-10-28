@@ -8,7 +8,7 @@ use self::{
             AccessControlSearch,
         },
         AccessControls, AccessControlsReadTransaction, AccessControlsTransaction,
-        AccessControlsWriteTransaction,
+        AccessControlsWriteTransaction, SkippedAcps,
     },
     keys::{
         KeyObject, KeyProvider, KeyProviders, KeyProvidersReadTransaction, KeyProvidersTransaction,
@@ -2356,25 +2356,30 @@ impl QueryServer {
     }
 }
 
-/// Kubidm: the message of the error for a change that is rejected because it leaves an
-/// access control profile invalid. The caller may not be allowed to read the profile, so
-/// it is not named here: the server log names it (and keeps the reason), so that an
-/// administrator can tell which profile blocks the change (for example the delete of a
-/// group that a delegated profile is scoped to).
-pub(crate) const ACP_INVALID_MSG: &str =
-    "an access control profile would become invalid; see server logs";
-
-/// Kubidm: the newly skipped profiles of an access control reload, as "name (uuid)": the
-/// ones in `current` that are not in `previous`.
-pub(crate) fn acp_newly_skipped(
-    previous: &BTreeMap<Uuid, String>,
-    current: &BTreeMap<Uuid, String>,
-) -> Vec<String> {
+/// Kubidm: the profiles (uuid to name) of an access control reload that are newly
+/// skipped: skipped in `current` as a kind they were not skipped as in `previous`.
+pub(crate) fn acp_newly_skipped<'a>(
+    previous: &SkippedAcps,
+    current: &'a SkippedAcps,
+) -> BTreeMap<Uuid, &'a str> {
     current
         .iter()
-        .filter(|(uuid, _)| !previous.contains_key(uuid))
-        .map(|(uuid, name)| format!("{name} ({uuid})"))
+        .filter(|(key, _)| !previous.contains_key(key))
+        .map(|((uuid, _), name)| (*uuid, name.as_str()))
         .collect()
+}
+
+/// Kubidm: describe skipped profiles (uuid to name) for a report: whether any of them is
+/// a built-in profile (in the system uuid range), and each as "name (uuid)".
+pub(crate) fn acp_skipped_report(profiles: &BTreeMap<Uuid, &str>) -> (bool, Vec<String>) {
+    let builtin = profiles
+        .keys()
+        .any(|uuid| *uuid < DYNAMIC_RANGE_MINIMUM_UUID);
+    let profiles = profiles
+        .iter()
+        .map(|(uuid, name)| format!("{name} ({uuid})"))
+        .collect();
+    (builtin, profiles)
 }
 
 impl<'a> QueryServerWriteTransaction<'a> {
@@ -2602,7 +2607,7 @@ impl<'a> QueryServerWriteTransaction<'a> {
         let loaded_create = loaded(self.accesscontrols.get_create(), |a| &a.acp);
         let loaded_modify = loaded(self.accesscontrols.get_modify(), |a| &a.acp);
         let loaded_delete = loaded(self.accesscontrols.get_delete(), |a| &a.acp);
-        let mut skipped = BTreeMap::new();
+        let mut skipped = SkippedAcps::new();
 
         // Update search
         let search_acps = self.reload_acp_kind(
@@ -2660,15 +2665,27 @@ impl<'a> QueryServerWriteTransaction<'a> {
                 e
             })?;
 
-        // Kubidm: summarise the profiles that this reload newly skipped, in every phase, so
-        // that a profile made invalid by replication is reported once.
-        let newly_skipped = acp_newly_skipped(self.accesscontrols.get_skipped(), &skipped);
-        if !newly_skipped.is_empty() {
-            warn!(
-                count = newly_skipped.len(),
-                profiles = ?newly_skipped,
-                "Some access control profiles became invalid and are skipped, they grant nothing until they are fixed or disabled"
-            );
+        // Kubidm: summarise the profiles that this reload newly skipped once the server is
+        // running (say, made invalid by replication), so that each is reported once. Start
+        // up reports every skipped profile once, at its end (see `initialise_helper`). A
+        // newly skipped built-in profile is an error: the server is missing access it
+        // ships with, until the profile is fixed.
+        if *self.phase >= ServerPhase::Running {
+            let newly_skipped = acp_newly_skipped(self.accesscontrols.get_skipped(), &skipped);
+            let (builtin, profiles) = acp_skipped_report(&newly_skipped);
+            if builtin {
+                error!(
+                    count = profiles.len(),
+                    ?profiles,
+                    "Some access control profiles, including built-in ones, became invalid and are skipped, they grant nothing until they are fixed or disabled"
+                );
+            } else if !profiles.is_empty() {
+                warn!(
+                    count = profiles.len(),
+                    ?profiles,
+                    "Some access control profiles became invalid and are skipped, they grant nothing until they are fixed or disabled"
+                );
+            }
         }
         self.accesscontrols.update_skipped(skipped);
         Ok(())
@@ -2686,7 +2703,8 @@ impl<'a> QueryServerWriteTransaction<'a> {
     ///
     /// - once the server is `Running`, to every profile;
     /// - before that (start up and migrations), to a built-in profile (in the system uuid
-    ///   range) only, unless an earlier reload already skipped it as invalid. The
+    ///   range) only, unless an earlier reload already skipped it as invalid as this
+    ///   `kind` (skipped profiles are recorded per kind, like `loaded`). The
     ///   migrations rewrite every built-in profile in the start up transaction
     ///   (`internal_migrate_or_create` modifies the stored entry, which marks it changed,
     ///   even when nothing differs), and a built-in that was valid before is loaded, so a
@@ -2699,7 +2717,12 @@ impl<'a> QueryServerWriteTransaction<'a> {
     /// a node that can not start has no in-band recovery. While running, a profile that is
     /// neither changed nor loaded is skipped so that it never blocks unrelated writes. A
     /// replication refresh marks every entry as changed, and runs as replication.
-    fn acp_reload_rejects_invalid(&self, uuid: Uuid, loaded: &BTreeSet<Uuid>) -> bool {
+    fn acp_reload_rejects_invalid(
+        &self,
+        uuid: Uuid,
+        kind: EntryClass,
+        loaded: &BTreeSet<Uuid>,
+    ) -> bool {
         if self.replication_apply {
             return false;
         }
@@ -2711,24 +2734,31 @@ impl<'a> QueryServerWriteTransaction<'a> {
         }
         // The skipped profiles of the previous reload, as this reload records its own only
         // once it is done.
-        uuid < DYNAMIC_RANGE_MINIMUM_UUID && !self.accesscontrols.get_skipped().contains_key(&uuid)
+        uuid < DYNAMIC_RANGE_MINIMUM_UUID
+            && !self
+                .accesscontrols
+                .get_skipped()
+                .contains_key(&(uuid, kind.into()))
     }
 
     /// Kubidm: search and parse the enabled access control profiles of one kind.
     ///
     /// Parsing fails closed per profile: access control profiles only ever grant, so a
     /// profile that is skipped grants nothing. An invalid profile fails the reload when
-    /// [Self::acp_reload_rejects_invalid], so the offending change is rejected (the log
-    /// names the profile). Any other invalid profile is logged, added to `skipped`
-    /// and left out, so a stored profile that the current parser rejects never blocks
-    /// unrelated writes, start up or replication. `loaded` are the profiles of this kind
-    /// that were loaded before this reload.
+    /// [Self::acp_reload_rejects_invalid], so the offending change is rejected with the
+    /// parser's error, which gives the reason but not the profile: the caller may not be
+    /// allowed to read it. The log names the profile, so that an administrator can tell
+    /// which profile blocks the change (for example the delete of a group that a
+    /// delegated profile is scoped to). Any other invalid profile is logged, added to
+    /// `skipped` and left out, so a stored profile that the current parser rejects never
+    /// blocks unrelated writes, start up or replication. `loaded` are the profiles of this
+    /// kind that were loaded before this reload.
     fn reload_acp_kind<T>(
         &mut self,
         kind: EntryClass,
         parse: impl Fn(&mut Self, &EntrySealedCommitted) -> Result<T, OperationError>,
         loaded: &BTreeSet<Uuid>,
-        skipped: &mut BTreeMap<Uuid, String>,
+        skipped: &mut SkippedAcps,
     ) -> Result<Vec<T>, OperationError> {
         let filt = filter!(f_and!([
             f_eq(Attribute::Class, EntryClass::AccessControlProfile.into()),
@@ -2754,7 +2784,7 @@ impl<'a> QueryServerWriteTransaction<'a> {
                         .get_ava_single_iname(Attribute::Name)
                         .map(str::to_string)
                         .unwrap_or_else(|| entry.get_display_id());
-                    if self.acp_reload_rejects_invalid(uuid, loaded) {
+                    if self.acp_reload_rejects_invalid(uuid, kind, loaded) {
                         error!(
                             ?err,
                             %uuid,
@@ -2762,7 +2792,10 @@ impl<'a> QueryServerWriteTransaction<'a> {
                             %kind,
                             "Rejecting a change that leaves this access control profile invalid"
                         );
-                        return Err(OperationError::InvalidAcpState(ACP_INVALID_MSG.to_string()));
+                        // The parser's errors carry the reason only, never the profile
+                        // name or uuid. Any other error (say, from the backend) is passed
+                        // on unchanged too.
+                        return Err(err);
                     }
                     error!(
                         ?err,
@@ -2771,7 +2804,7 @@ impl<'a> QueryServerWriteTransaction<'a> {
                         %kind,
                         "Skipping invalid access control profile, it grants nothing until it is fixed or disabled"
                     );
-                    skipped.insert(uuid, name);
+                    skipped.insert((uuid, kind.into()), name);
                 }
             }
         }
