@@ -33,7 +33,7 @@ fn oauth2_federation_id(name: &str) -> Filter<FilterInvalid> {
     get,
     path = "/v1/federation/oauth2",
     responses(
-        (status = 200, content_type=APPLICATION_JSON, body=Vec<ProtoEntry>),
+        (status = 200, description = "Ok", content_type=APPLICATION_JSON, body=Vec<ProtoEntry>),
         ApiResponseWithout200,
     ),
     security(("token_jwt" = [])),
@@ -85,7 +85,7 @@ pub(crate) async fn oauth2_federation_post(
     get,
     path = "/v1/federation/oauth2/{name}",
     responses(
-        (status = 200, content_type=APPLICATION_JSON, body=ProtoEntry),
+        (status = 200, description = "Ok", content_type=APPLICATION_JSON, body=ProtoEntry),
         ApiResponseWithout200,
     ),
     security(("token_jwt" = [])),
