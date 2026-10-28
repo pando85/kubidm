@@ -404,6 +404,19 @@ pub struct ApprovalPolicyCreateRequest {
     pub escalation_timeout_seconds: Option<u32>,
 }
 
+/// Create an approval request. The requester is the calling identity.
+#[derive(Debug, Serialize, Deserialize, Clone, ToSchema)]
+pub struct ApprovalRequestCreateRequest {
+    /// Name of the (enabled) approval policy the request is filed under.
+    pub policy_name: String,
+    pub operation_type: ApprovalOperationType,
+    /// The entry the operation applies to, as a uuid, name or spn. It must be readable by the
+    /// requester: an unreadable entry is reported like one that does not exist.
+    pub target: String,
+    #[serde(default)]
+    pub operation_details: BTreeMap<String, String>,
+}
+
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ApprovalDecisionRequest {
     pub action: ApprovalDecisionAction,

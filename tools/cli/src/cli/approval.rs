@@ -1,8 +1,10 @@
 use crate::{ApprovalOpt, ApprovalPolicyOpt, ApprovalRequestOpt, KubidmClientParser};
 use kubidm_client::KubidmClient;
 use kubidm_proto::v1::{
-    ApprovalOperationType, ApprovalPattern, ApprovalPolicyCreateRequest, ApprovalRequestState,
+    ApprovalOperationType, ApprovalPattern, ApprovalPolicyCreateRequest,
+    ApprovalRequestCreateRequest, ApprovalRequestState,
 };
+use std::collections::BTreeMap;
 
 impl ApprovalOpt {
     pub async fn exec(&self, opt: KubidmClientParser) {
@@ -269,6 +271,43 @@ impl ApprovalRequestOpt {
                     if let Some(c) = &dec.comment {
                         println!("    Comment: {}", c);
                     }
+                }
+            }
+            ApprovalRequestOpt::Create(opts) => {
+                let operation_type = match opts.operation.parse::<ApprovalOperationType>() {
+                    Ok(o) => o,
+                    Err(_) => {
+                        error!("Invalid operation type: {}", opts.operation);
+                        return;
+                    }
+                };
+
+                let operation_details = match opts.details.as_deref() {
+                    Some(details) => {
+                        match serde_json::from_str::<BTreeMap<String, String>>(details) {
+                            Ok(d) => d,
+                            Err(e) => {
+                                error!(
+                                    "Invalid --details, expected a JSON object of string values: {}",
+                                    e
+                                );
+                                return;
+                            }
+                        }
+                    }
+                    None => BTreeMap::new(),
+                };
+
+                let request = ApprovalRequestCreateRequest {
+                    policy_name: opts.policy.to_string(),
+                    operation_type,
+                    target: opts.target.to_string(),
+                    operation_details,
+                };
+
+                match client.approval_request_create(&request).await {
+                    Ok(uuid) => println!("Approval request {} created successfully", uuid),
+                    Err(e) => error!("Failed to create approval request: {:?}", e),
                 }
             }
             ApprovalRequestOpt::Approve(opts) => {

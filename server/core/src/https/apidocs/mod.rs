@@ -219,6 +219,7 @@ impl Modify for SecurityAddon {
         super::v1::approval_policy_disable,
         super::v1::approval_request_list,
         super::v1::approval_request_get,
+        super::v1::approval_request_create,
         super::v1::approval_request_decision,
         super::v1::approval_request_cancel,
         super::v1::auth,

@@ -1891,6 +1891,48 @@ impl QueryServerWriteV1 {
 
     #[instrument(
         level = "info",
+        name = "approval_request_create",
+        skip_all,
+        fields(uuid = ?eventid)
+    )]
+    pub async fn handle_approval_request_create(
+        &self,
+        client_auth_info: ClientAuthInfo,
+        request: kubidm_proto::v1::ApprovalRequestCreateRequest,
+        eventid: Uuid,
+    ) -> Result<Uuid, OperationError> {
+        let ct = duration_from_epoch_now();
+        let mut idms_prox_write = self.idms.proxy_write(ct).await?;
+        let ident = idms_prox_write
+            .validate_client_auth_info_to_ident(client_auth_info, ct)
+            .map_err(|e| {
+                error!(?e, "Invalid identity");
+                e
+            })?;
+
+        let target_uuid = idms_prox_write
+            .qs_write
+            .approval_request_target_resolve(&ident, request.target.as_str())
+            .map_err(|e| {
+                error!(err = ?e, "Error resolving id to target");
+                e
+            })?;
+
+        idms_prox_write
+            .qs_write
+            .approval_request_create(
+                &ident,
+                &request.policy_name,
+                &request.operation_type,
+                target_uuid,
+                &request.operation_details,
+                ct,
+            )
+            .and_then(|uuid| idms_prox_write.commit().map(|_| uuid))
+    }
+
+    #[instrument(
+        level = "info",
         name = "approval_request_decision",
         skip_all,
         fields(uuid = ?eventid)

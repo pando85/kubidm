@@ -1,8 +1,9 @@
 use crate::{ClientError, KubidmClient};
 use kubidm_proto::v1::{
     ApprovalDecisionAction, ApprovalDecisionRequest, ApprovalPolicy, ApprovalPolicyCreateRequest,
-    ApprovalRequest, ApprovalRequestState,
+    ApprovalRequest, ApprovalRequestCreateRequest, ApprovalRequestState,
 };
+use uuid::Uuid;
 
 impl KubidmClient {
     pub async fn approval_policy_list(&self) -> Result<Vec<ApprovalPolicy>, ClientError> {
@@ -56,6 +57,15 @@ impl KubidmClient {
 
     pub async fn approval_request_get(&self, uuid: &str) -> Result<ApprovalRequest, ClientError> {
         self.perform_get_request(format!("/v1/approval/request/{}", uuid).as_str())
+            .await
+    }
+
+    /// Create an approval request as the calling identity. Returns the uuid of the request.
+    pub async fn approval_request_create(
+        &self,
+        request: &ApprovalRequestCreateRequest,
+    ) -> Result<Uuid, ClientError> {
+        self.perform_post_request("/v1/approval/request", request)
             .await
     }
 

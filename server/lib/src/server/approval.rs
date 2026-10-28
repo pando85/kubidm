@@ -1005,6 +1005,42 @@ impl QueryServerWriteTransaction<'_> {
         Ok(())
     }
 
+    /// Resolve the `target` (a uuid, name or spn) of an approval request to the uuid of an
+    /// entry that `ident` may see. An entry that does not exist and one that `ident` may not
+    /// see are indistinguishable: both are [OperationError::NoMatchingEntries]. The internal
+    /// system identity sees every entry.
+    pub fn approval_request_target_resolve(
+        &mut self,
+        ident: &Identity,
+        target: &str,
+    ) -> Result<Uuid, OperationError> {
+        if ident.is_internal() {
+            return self.name_to_uuid(target);
+        }
+
+        let target = target.trim();
+        let mut terms = vec![f_eq(Attribute::Name, PartialValue::new_iname(target))];
+        if let Some(spn) = PartialValue::new_spn_s(target) {
+            terms.push(f_eq(Attribute::Spn, spn));
+        }
+        if let Ok(uuid) = Uuid::parse_str(target) {
+            terms.push(f_eq(Attribute::Uuid, PartialValue::Uuid(uuid)));
+        }
+
+        let filter = filter!(f_or(terms));
+        let entries = self
+            .impersonate_search(filter.clone(), filter, ident)
+            .map_err(|err| {
+                error!(?err, "unable to resolve the approval request target");
+                OperationError::NoMatchingEntries
+            })?;
+
+        match entries.as_slice() {
+            [entry] => Ok(entry.get_uuid()),
+            _ => Err(OperationError::NoMatchingEntries),
+        }
+    }
+
     /// Create a pending approval request from `ident` for `operation_type` on `target_uuid`,
     /// under the enabled policy `policy_name` that must cover that operation type. The
     /// request expires after the policy timeout. Returns the uuid of the new request.
@@ -1017,8 +1053,14 @@ impl QueryServerWriteTransaction<'_> {
     /// policy that the operation requires. Filing under a laxer policy that covers the same
     /// operation type does not help.
     ///
-    /// Kubidm: nothing in the server calls this yet - no operation is gated on approval and
-    /// there is no API route to create requests. It is the entry point for those.
+    /// Kubidm: any identity with a read-write session may create a request (`POST
+    /// /v1/approval/request`); creating one grants nothing. No operation is gated on
+    /// approval yet, so a request only records intent and collects decisions.
+    ///
+    /// `target_uuid` is not checked against what `ident` may see, and a uuid that does not
+    /// exist fails referential integrity. A caller acting for a user must therefore get it
+    /// from [Self::approval_request_target_resolve], which only returns entries the user
+    /// may see, so that the outcome does not reveal whether an entry they can not see exists.
     pub fn approval_request_create(
         &mut self,
         ident: &Identity,

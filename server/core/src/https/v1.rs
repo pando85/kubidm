@@ -32,9 +32,10 @@ use kubidm_proto::{
     },
     v1::{
         AccountUnixExtend, ApiTokenGenerate, ApprovalDecisionRequest, ApprovalPolicy,
-        ApprovalPolicyCreateRequest, ApprovalRequest, AuthIssueSession, AuthRequest, AuthResponse,
-        AuthState as ProtoAuthState, Entry as ProtoEntry, GroupUnixExtend, SingleStringRequest,
-        UatStatus, UnixGroupToken, UnixUserToken, WhoamiResponse,
+        ApprovalPolicyCreateRequest, ApprovalRequest, ApprovalRequestCreateRequest,
+        AuthIssueSession, AuthRequest, AuthResponse, AuthState as ProtoAuthState,
+        Entry as ProtoEntry, GroupUnixExtend, SingleStringRequest, UatStatus, UnixGroupToken,
+        UnixUserToken, WhoamiResponse,
     },
 };
 use kubidmd_lib::{
@@ -3373,7 +3374,10 @@ pub(crate) fn route_setup(state: ServerState) -> Router<ServerState> {
             "/v1/approval/policy/{name}/_disable",
             post(approval_policy_disable),
         )
-        .route("/v1/approval/request", get(approval_request_list))
+        .route(
+            "/v1/approval/request",
+            get(approval_request_list).post(approval_request_create),
+        )
         .route(
             "/v1/approval/request/{uuid}",
             get(approval_request_get).delete(approval_request_cancel),
@@ -3582,6 +3586,35 @@ pub async fn approval_request_get(
     state
         .qe_r_ref
         .handle_approval_request_get(client_auth_info, uuid, kopid.eventid)
+        .await
+        .map(Json::from)
+        .map_err(WebError::from)
+}
+
+/// Create an approval request as the calling identity. Returns the uuid of the request.
+#[utoipa::path(
+    post,
+    path = "/v1/approval/request",
+    responses(
+        (status = 200, body=Uuid, content_type=APPLICATION_JSON),
+        (status = 404, description = "Unknown approval policy or target"),
+        (status = 422, description = "The policy can never be satisfied for this requester"),
+        ApiResponseWithout200,
+    ),
+    request_body=ApprovalRequestCreateRequest,
+    security(("token_jwt" = [])),
+    tag = "approval",
+    operation_id="approval_request_create"
+)]
+pub async fn approval_request_create(
+    State(state): State<ServerState>,
+    Extension(kopid): Extension<KOpId>,
+    VerifiedClientInformation(client_auth_info): VerifiedClientInformation,
+    Json(request): Json<kubidm_proto::v1::ApprovalRequestCreateRequest>,
+) -> Result<Json<Uuid>, WebError> {
+    state
+        .qe_w_ref
+        .handle_approval_request_create(client_auth_info, request, kopid.eventid)
         .await
         .map(Json::from)
         .map_err(WebError::from)

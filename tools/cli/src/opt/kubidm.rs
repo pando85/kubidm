@@ -1571,6 +1571,22 @@ pub struct ApprovalDecisionOpt {
     pub comment: Option<String>,
 }
 
+#[derive(Debug, Args, Clone)]
+pub struct ApprovalRequestCreateOpt {
+    /// Name of the approval policy to file the request under
+    #[clap(long = "policy")]
+    pub policy: String,
+    /// The operation type the request is for, e.g. privilege_grant
+    #[clap(long = "operation")]
+    pub operation: String,
+    /// The entry the operation applies to: a uuid, name or spn. It must be readable by the logged in account
+    #[clap(long = "target")]
+    pub target: String,
+    /// Operation details as a JSON object of string values, e.g. '{"group": "idm_admins"}'
+    #[clap(long = "details")]
+    pub details: Option<String>,
+}
+
 #[derive(Debug, Subcommand, Clone)]
 pub enum ApprovalPolicyOpt {
     #[clap(name = "list")]
@@ -1596,6 +1612,9 @@ pub enum ApprovalRequestOpt {
     },
     #[clap(name = "get")]
     Get(ApprovalRequestNamedOpt),
+    #[clap(name = "create")]
+    /// Create an approval request as the logged in account
+    Create(ApprovalRequestCreateOpt),
     #[clap(name = "approve")]
     Approve(ApprovalDecisionOpt),
     #[clap(name = "reject")]

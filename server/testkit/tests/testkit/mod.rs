@@ -1,4 +1,5 @@
 mod apidocs;
+mod approval_test;
 mod authorization_test;
 mod backup_common;
 mod backup_encryption_test;

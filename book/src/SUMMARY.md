@@ -40,6 +40,7 @@
   - [POSIX Accounts and Groups](accounts/posix_accounts_and_groups.md)
 
 - [Access Control](access_control/intro.md)
+  - [Approval Workflows](access_control/approvals.md)
 
 - [Service Integrations](integrations/readme.md)
   - [LDAP](integrations/ldap.md)
