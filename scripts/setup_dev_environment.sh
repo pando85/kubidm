@@ -98,37 +98,37 @@ echo "idm_admin pass: '${IDM_ADMIN_PASS}'"
 echo "login with idm_admin"
 ${KUBIDM} login -D "${IDM_ADMIN_USER}" --password "${IDM_ADMIN_PASS}"
 
-# create group test_users
-${KUBIDM} group create "${TEST_GROUP}" -D "${IDM_ADMIN_USER}"
+# create group test_users (ignore error if already exists)
+${KUBIDM} group create "${TEST_GROUP}" -D "${IDM_ADMIN_USER}" || echo "Group ${TEST_GROUP} already exists, continuing..."
 
-# create testuser (person)
-${KUBIDM} person create "${TEST_USER_NAME}" "${TEST_USER_DISPLAY}" -D "${IDM_ADMIN_USER}"
+# create testuser (person) (ignore error if already exists)
+${KUBIDM} person create "${TEST_USER_NAME}" "${TEST_USER_DISPLAY}" -D "${IDM_ADMIN_USER}" || echo "Person ${TEST_USER_NAME} already exists, continuing..."
 
 echo "Adding ${TEST_USER_NAME} to ${TEST_GROUP}"
-${KUBIDM} group add-members "${TEST_GROUP}" "${TEST_USER_NAME}" -D "${IDM_ADMIN_USER}"
+${KUBIDM} group add-members "${TEST_GROUP}" "${TEST_USER_NAME}" -D "${IDM_ADMIN_USER}" || echo "Member already exists, continuing..."
 
 echo "Enable experimental UI for admin idm_admin ${TEST_USER_NAME}"
-${KUBIDM} group add-members idm_ui_enable_experimental_features "${IDM_ADMIN_USER}" "${TEST_USER_NAME}" -D "${IDM_ADMIN_USER}"
+${KUBIDM} group add-members idm_ui_enable_experimental_features "${IDM_ADMIN_USER}" "${TEST_USER_NAME}" -D "${IDM_ADMIN_USER}" || echo "UI experimental features membership already set, continuing..."
 
 # create oauth2 rp for kubidm.com
 echo "Creating the kubidm.com OAuth2 RP"
-${KUBIDM} system oauth2 create "kubidm.com" "Kubidm.com" "https://kubidm.com" -D "${IDM_ADMIN_USER}"
+${KUBIDM} system oauth2 create "kubidm.com" "Kubidm.com" "https://kubidm.com" -D "${IDM_ADMIN_USER}" || echo "OAuth2 RP kubidm.com already exists, continuing..."
 echo "Creating the kubidm.com OAuth2 RP Scope Map"
-${KUBIDM} system oauth2 update-scope-map "kubidm.com" "${TEST_GROUP}" openid -D "${IDM_ADMIN_USER}"
+${KUBIDM} system oauth2 update-scope-map "kubidm.com" "${TEST_GROUP}" openid -D "${IDM_ADMIN_USER}" || true
 echo "Creating the kubidm.com OAuth2 RP Supplemental Scope Map"
-${KUBIDM} system oauth2 update-sup-scope-map "kubidm.com" "${TEST_GROUP}" admin -D "${IDM_ADMIN_USER}"
+${KUBIDM} system oauth2 update-sup-scope-map "kubidm.com" "${TEST_GROUP}" admin -D "${IDM_ADMIN_USER}" || true
 
 
 # create oauth2 rp for localhost:10443 - for oauth2 proxy testing
 echo "Creating the ${OAUTH2_RP_ID} OAuth2 RP"
-${KUBIDM} system oauth2 create "${OAUTH2_RP_ID}" "${OAUTH2_RP_DISPLAY}" "https://localhost:10443" -D "${IDM_ADMIN_USER}"
+${KUBIDM} system oauth2 create "${OAUTH2_RP_ID}" "${OAUTH2_RP_DISPLAY}" "https://localhost:10443" -D "${IDM_ADMIN_USER}" || echo "OAuth2 RP ${OAUTH2_RP_ID} already exists, continuing..."
 echo "Creating the ${OAUTH2_RP_ID} OAuth2 RP Scope Map - Group ${TEST_GROUP}"
-${KUBIDM} system oauth2 update-scope-map "${OAUTH2_RP_ID}" "${TEST_GROUP}" openid -D "${IDM_ADMIN_USER}"
+${KUBIDM} system oauth2 update-scope-map "${OAUTH2_RP_ID}" "${TEST_GROUP}" openid -D "${IDM_ADMIN_USER}" || true
 echo "Creating the ${OAUTH2_RP_ID} OAuth2 RP Supplemental Scope Map"
-${KUBIDM} system oauth2 update-sup-scope-map "${OAUTH2_RP_ID}" "${TEST_GROUP}" admin -D "${IDM_ADMIN_USER}"
+${KUBIDM} system oauth2 update-sup-scope-map "${OAUTH2_RP_ID}" "${TEST_GROUP}" admin -D "${IDM_ADMIN_USER}" || true
 
 echo "Creating a claim map for RS ${OAUTH2_RP_ID}"
-${KUBIDM} system oauth2 update-claim-map "${OAUTH2_RP_ID}" testclaim "${TEST_GROUP}" foo bar -D "${IDM_ADMIN_USER}"
+${KUBIDM} system oauth2 update-claim-map "${OAUTH2_RP_ID}" testclaim "${TEST_GROUP}" foo bar -D "${IDM_ADMIN_USER}" || true
 
 echo "Creating the OAuth2 RP Secondary Supplemental Crab-baite Scope Map.... wait, no that's not a thing."
 

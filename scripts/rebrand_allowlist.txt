@@ -57,7 +57,8 @@ kanidm[-_]hsm[-_]crypto
 ^book/src/developers/designs/node_drain_replication_fences_maintenance\.md$	fallback for Kanidm
 ^book/src/developers/designs/node_drain_replication_fences_maintenance\.md$	KanidmMaintenance
 
-# --- Historical artwork attribution --------------------------------------------
+# --- Artwork attribution -------------------------------------------------------
+# Historical attribution for original Kanidm artwork and maintainers.
 ^artwork/README\.md$	Kanidm-related
 ^artwork/README\.md$	Kanidm maintainers
 
