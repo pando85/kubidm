@@ -69,13 +69,23 @@
 //! replication has converged: a decision made concurrently on another replica (say, a
 //! rejection made earlier) can still change the outcome, and two replicas can each consume
 //! the same approval before they replicate.
+//!
+//! **Gated operations.** Adding a member to a high privilege group
+//! (`group_membership_high_privilege`) is gated while an enabled policy covers it:
+//! `plugins::approval_gate` refuses the direct write, and
+//! `QueryServerWriteTransaction::approval_request_execute` carries it out for the requester
+//! of an approved request. Disabling the policy turns the gate off; when no approval admin
+//! is left to do it, `kubidmd approval-policy disable` does it from the server's admin socket
+//! (`QueryServerWriteTransaction::approval_policy_disable_break_glass`).
 
 use crate::idm::account::Account;
+use crate::plugins::approval_gate::is_high_privilege_group;
 use crate::prelude::*;
+use crate::server::time_bounded::group_member_rights;
 use kubidm_proto::v1::{
-    ApprovalDecision, ApprovalDecisionAction, ApprovalDecisionRequest, ApprovalOperationType,
-    ApprovalPattern, ApprovalPolicy, ApprovalPolicyCreateRequest, ApprovalRequest,
-    ApprovalRequestState,
+    ApprovalDecision, ApprovalDecisionAction, ApprovalDecisionRequest, ApprovalOperationMember,
+    ApprovalOperationType, ApprovalPattern, ApprovalPolicy, ApprovalPolicyCreateRequest,
+    ApprovalRequest, ApprovalRequestState,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -763,32 +773,52 @@ impl QueryServerReadTransaction<'_> {
         let filter = filter!(f_eq(Attribute::Class, EntryClass::ApprovalRequest.into()));
         let entries = self.internal_search(filter)?;
 
-        Ok(approval_request_resolve_all(self, &entries, now)?
+        let mut requests: Vec<ApprovalRequest> = approval_request_resolve_all(self, &entries, now)?
             .into_iter()
             .map(|resolved| resolved.request)
             .filter(|request| state.is_none_or(|s| request.state == s))
-            .collect())
+            .collect();
+        for request in requests.iter_mut() {
+            request.operation_member = approval_operation_member(self, request);
+        }
+        Ok(requests)
     }
 
+    /// Read one approval request. Approval admins may read every request; Kubidm: the
+    /// requester may read their own (to see whether it was approved), without the details
+    /// of its member (`operation_member`), which only approval admins get. Anyone else gets
+    /// `AccessDenied` whether or not the request exists.
     pub fn approval_request_get(
         &mut self,
         ident: &Identity,
         uuid: Uuid,
     ) -> Result<ApprovalRequest, OperationError> {
-        approval_check_admin(ident, false)?;
-
         let now = self.get_accesscontrols().get_curtime();
         let filter = filter!(f_and!([
             f_eq(Attribute::Class, EntryClass::ApprovalRequest.into()),
             f_eq(Attribute::Uuid, PartialValue::Uuid(uuid))
         ]));
-        let entry = self
-            .internal_search(filter)?
-            .into_iter()
-            .next()
-            .ok_or(OperationError::NoMatchingEntries)?;
+        let entry = self.internal_search(filter)?.into_iter().next();
 
-        approval_request_resolve(self, &entry, now).map(|resolved| resolved.request)
+        // Authorise before revealing whether the request exists.
+        let is_requester = !ident.is_internal()
+            && entry
+                .as_ref()
+                .and_then(|e| e.get_ava_single_refer(Attribute::ApprovalRequestor))
+                == Some(ident.get_uuid());
+        let is_admin = if is_requester {
+            approval_check_admin(ident, false).is_ok()
+        } else {
+            approval_check_admin(ident, false)?;
+            true
+        };
+        let entry = entry.ok_or(OperationError::NoMatchingEntries)?;
+
+        let mut request = approval_request_resolve(self, &entry, now)?.request;
+        if is_admin {
+            request.operation_member = approval_operation_member(self, &request);
+        }
+        Ok(request)
     }
 }
 
@@ -862,6 +892,96 @@ impl QueryServerWriteTransaction<'_> {
         self.create(&create_event)?;
         // The write is internal, so record who made it.
         info!(ident = %ident, policy = %request.name, %uuid, "approval policy created");
+        self.approval_warn_duplicate_coverage(&request.name)?;
+        self.approval_warn_delegated_high_privilege(&request.name)
+    }
+
+    /// Kubidm: warn when the enabled policy `name` gates high privilege group membership
+    /// while a dynamic group, or a group owned by a sync agreement, is already nested in a
+    /// high privilege group. Their members are decided by a filter or by the sync connector,
+    /// not by member writes, so the gate does not control who joins through them.
+    fn approval_warn_delegated_high_privilege(&mut self, name: &str) -> Result<(), OperationError> {
+        let gates = self
+            .internal_search(filter!(f_and!([
+                f_eq(Attribute::Class, EntryClass::ApprovalPolicy.into()),
+                f_eq(Attribute::ApprovalPolicyName, PartialValue::new_iname(name)),
+                f_eq(
+                    Attribute::ApprovalOperationType,
+                    PartialValue::new_iutf8(
+                        ApprovalOperationType::GroupMembershipHighPrivilege.as_str()
+                    )
+                )
+            ])))?
+            .iter()
+            .any(|policy| {
+                policy
+                    .get_ava_single_bool(Attribute::ApprovalPolicyEnabled)
+                    .unwrap_or(true)
+            });
+        if !gates {
+            return Ok(());
+        }
+        let delegated = self.internal_search(filter!(f_and!([
+            f_eq(
+                Attribute::MemberOf,
+                PartialValue::Refer(UUID_IDM_HIGH_PRIVILEGE)
+            ),
+            f_eq(Attribute::Class, EntryClass::Group.into()),
+            f_or!([
+                f_eq(Attribute::Class, EntryClass::DynGroup.into()),
+                f_eq(Attribute::Class, EntryClass::SyncObject.into()),
+                f_pres(Attribute::SyncParentUuid)
+            ])
+        ])))?;
+        for group in delegated {
+            warn!(
+                policy = %name,
+                group = %group.get_display_id(),
+                "a dynamic or sync owned group is nested in a high privilege group: the approval gate does not control its members"
+            );
+        }
+        Ok(())
+    }
+
+    /// Kubidm: warn when the enabled policy `name` covers an operation type that another
+    /// enabled policy covers too. For an executable operation either policy is then accepted
+    /// (see [Self::approval_request_execute]), so the laxer one decides in practice.
+    fn approval_warn_duplicate_coverage(&mut self, name: &str) -> Result<(), OperationError> {
+        let policies = self.internal_search(filter!(f_eq(
+            Attribute::Class,
+            EntryClass::ApprovalPolicy.into()
+        )))?;
+        let mut coverage: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for policy in policies.iter().filter(|policy| {
+            policy
+                .get_ava_single_bool(Attribute::ApprovalPolicyEnabled)
+                .unwrap_or(true)
+        }) {
+            let policy_name = policy
+                .get_ava_single_iname(Attribute::ApprovalPolicyName)
+                .unwrap_or_default()
+                .to_string();
+            for operation_type in policy
+                .get_ava_iter_iutf8(Attribute::ApprovalOperationType)
+                .into_iter()
+                .flatten()
+            {
+                coverage
+                    .entry(operation_type.to_string())
+                    .or_default()
+                    .insert(policy_name.clone());
+            }
+        }
+        for (operation_type, names) in coverage {
+            if names.len() > 1 && names.contains(name) {
+                warn!(
+                    policy = %name,
+                    %operation_type,
+                    ?names,
+                    "several enabled approval policies cover this operation type: a request under any of them is accepted"
+                );
+            }
+        }
         Ok(())
     }
 
@@ -899,7 +1019,55 @@ impl QueryServerWriteTransaction<'_> {
         ]);
         self.internal_modify(&filter, &modlist)?;
         info!(ident = %ident, policy = %name, enable, "approval policy enabled state changed");
+        if enable {
+            self.approval_warn_duplicate_coverage(name)?;
+            self.approval_warn_delegated_high_privilege(name)?;
+        } else {
+            for policy in self.internal_search(filter)? {
+                self.approval_cancel_open_requests(policy.get_uuid())?;
+            }
+        }
         Ok(())
+    }
+
+    /// Kubidm: cancel the open (pending, escalated or approved) requests filed under the
+    /// policy `policy_uuid`, when it is disabled. Otherwise re-enabling the policy would make
+    /// approvals given before it was disabled usable again, possibly much later (they never
+    /// expire with a timeout of 0). Returns the number of requests cancelled.
+    fn approval_cancel_open_requests(
+        &mut self,
+        policy_uuid: Uuid,
+    ) -> Result<usize, OperationError> {
+        let open = self.internal_search(filter!(f_and!([
+            f_eq(Attribute::Class, EntryClass::ApprovalRequest.into()),
+            f_eq(
+                Attribute::ApprovalRequestPolicy,
+                PartialValue::Refer(policy_uuid)
+            ),
+            f_or!([
+                f_eq(
+                    Attribute::ApprovalState,
+                    PartialValue::new_iutf8(ApprovalRequestState::Pending.as_str())
+                ),
+                f_eq(
+                    Attribute::ApprovalState,
+                    PartialValue::new_iutf8(ApprovalRequestState::Escalated.as_str())
+                ),
+                f_eq(
+                    Attribute::ApprovalState,
+                    PartialValue::new_iutf8(ApprovalRequestState::Approved.as_str())
+                )
+            ])
+        ])))?;
+        for request in &open {
+            self.approval_request_set_state(request.get_uuid(), ApprovalRequestState::Cancelled)?;
+            info!(
+                request = %request.get_uuid(),
+                policy = %policy_uuid,
+                "approval request cancelled, its policy was disabled"
+            );
+        }
+        Ok(open.len())
     }
 
     /// Record whether each of `members` is a group, for the snapshot of a new request.
@@ -1054,8 +1222,10 @@ impl QueryServerWriteTransaction<'_> {
     /// operation type does not help.
     ///
     /// Kubidm: any identity with a read-write session may create a request (`POST
-    /// /v1/approval/request`); creating one grants nothing. No operation is gated on
-    /// approval yet, so a request only records intent and collects decisions.
+    /// /v1/approval/request`); creating one grants nothing. A request for an operation that
+    /// can be executed must name a valid target and details for it, see
+    /// [Self::approval_request_execute]; for other operation types a request only records
+    /// intent and collects decisions.
     ///
     /// `target_uuid` is not checked against what `ident` may see, and a uuid that does not
     /// exist fails referential integrity. A caller acting for a user must therefore get it
@@ -1094,12 +1264,48 @@ impl QueryServerWriteTransaction<'_> {
 
         if !policy.enabled {
             error!(policy = %policy.name, "approval policy is disabled");
-            return Err(OperationError::InvalidRequestState);
+            return Err(OperationError::AP0003ApprovalNotUsable);
         }
         if !policy.operation_types.contains(operation_type) {
             error!(policy = %policy.name, %operation_type, "approval policy does not cover this operation type");
-            return Err(OperationError::InvalidRequestState);
+            return Err(OperationError::AP0003ApprovalNotUsable);
         }
+
+        // Kubidm: operations that can be executed (`approval_request_execute`) define the
+        // target and details they need. Validate them now, rather than when the approval
+        // is used, and store the details in their canonical form, since the gate compares
+        // them exactly.
+        let canonical_details;
+        let operation_details = match operation_type {
+            ApprovalOperationType::GroupMembershipHighPrivilege => {
+                let member = approval_group_membership_member(operation_details, false)?;
+                let group = self.internal_search_uuid(target_uuid)?;
+                if !group.attribute_equality(Attribute::Class, &EntryClass::Group.into()) {
+                    return Err(OperationError::InvalidAttribute(format!(
+                        "the target of a {operation_type} request must be a group"
+                    )));
+                }
+                if !is_high_privilege_group(group.as_ref()) {
+                    return Err(OperationError::InvalidAttribute(format!(
+                        "the target of a {operation_type} request must be a high privilege group: \
+                         members of other groups are added directly"
+                    )));
+                }
+                if member == target_uuid {
+                    return Err(OperationError::InvalidAttribute(
+                        "a group can not be made a member of itself".to_string(),
+                    ));
+                }
+                self.approval_member_check(member)?;
+                // Record what a group member contains now: that is what is approved, and
+                // the request can not be executed once it changes.
+                let member_entry = self.internal_search_uuid(member)?;
+                let contents = approval_member_contents(self, &member_entry)?;
+                canonical_details = approval_group_membership_details(member, contents.as_ref());
+                &canonical_details
+            }
+            _ => operation_details,
+        };
 
         let slots = self.approval_member_kinds(&policy.approvers)?;
         let backups = self.approval_member_kinds(&policy.backup_approvers)?;
@@ -1274,17 +1480,17 @@ impl QueryServerWriteTransaction<'_> {
 
         if !policy.enabled {
             error!(policy = %policy.name, "approval policy is disabled");
-            return Err(OperationError::InvalidRequestState);
+            return Err(OperationError::AP0003ApprovalNotUsable);
         }
 
         if !resolved.is_valid() {
             error!(%request_uuid, "approval request target or requester was deleted, it can not be decided");
-            return Err(OperationError::InvalidRequestState);
+            return Err(OperationError::AP0003ApprovalNotUsable);
         }
 
         if resolved.request.state != ApprovalRequestState::Pending {
             error!(state = %resolved.request.state, "approval request is not pending");
-            return Err(OperationError::InvalidRequestState);
+            return Err(OperationError::AP0003ApprovalNotUsable);
         }
 
         if resolved
@@ -1293,7 +1499,7 @@ impl QueryServerWriteTransaction<'_> {
             .is_some_and(|expires_at| expires_at <= current_time)
         {
             error!("approval request has expired");
-            return Err(OperationError::InvalidRequestState);
+            return Err(OperationError::AP0003ApprovalNotUsable);
         }
 
         let approver_uuid = ident.get_uuid();
@@ -1303,7 +1509,7 @@ impl QueryServerWriteTransaction<'_> {
             .any(|d| d.approver_uuid == approver_uuid)
         {
             error!("approver has already decided on this approval request");
-            return Err(OperationError::InvalidRequestState);
+            return Err(OperationError::AP0003ApprovalNotUsable);
         }
 
         let action = request.action;
@@ -1337,7 +1543,7 @@ impl QueryServerWriteTransaction<'_> {
         if !tally.counted.contains(&approver_uuid) || !tally.counted.is_superset(&counted_before) {
             // For example a second member of a group whose slot is already decided.
             error!(%request_uuid, "every approver slot this approver can fill has already been decided");
-            return Err(OperationError::InvalidRequestState);
+            return Err(OperationError::AP0003ApprovalNotUsable);
         }
         let new_state = tally.state();
 
@@ -1395,12 +1601,16 @@ impl QueryServerWriteTransaction<'_> {
     /// - the operation type, target and operation details must match the request exactly;
     /// - the request then moves to the final `consumed` state.
     ///
+    /// A request that fails one of these checks is reported as `AP0003ApprovalNotUsable`;
+    /// a caller other than the requester (or the system) gets `AccessDenied`.
+    ///
     /// An approval is only final once replication has converged: a decision made
     /// concurrently on another replica can still change the outcome, and the same approval
     /// can be consumed once on each replica before they replicate. Callers must not decide
     /// on approvals any other way, in particular not from `approval_request_get`.
     ///
-    /// Kubidm: no operation calls this yet.
+    /// Kubidm: [Self::approval_request_execute] calls this for
+    /// `group_membership_high_privilege`.
     pub fn approval_request_check_and_consume(
         &mut self,
         ident: &Identity,
@@ -1429,7 +1639,7 @@ impl QueryServerWriteTransaction<'_> {
 
         let Some(snapshot) = resolved.snapshot.as_ref() else {
             error!(%request_uuid, "approval request has no quorum snapshot, it can not be used");
-            return Err(OperationError::InvalidRequestState);
+            return Err(OperationError::AP0003ApprovalNotUsable);
         };
         if !is_system && snapshot.requester != ident.get_uuid() {
             security_access!(ident = %ident, %request_uuid, "denied - only the requester may use an approval");
@@ -1438,7 +1648,7 @@ impl QueryServerWriteTransaction<'_> {
 
         if !resolved.is_valid() {
             error!(%request_uuid, "approval request policy, target or requester was deleted");
-            return Err(OperationError::InvalidRequestState);
+            return Err(OperationError::AP0003ApprovalNotUsable);
         }
         if resolved.request.state != ApprovalRequestState::Approved
             || resolved.derived_state != Some(ApprovalRequestState::Approved)
@@ -1450,7 +1660,7 @@ impl QueryServerWriteTransaction<'_> {
                 derived = ?resolved.derived_state,
                 "approval request is not approved"
             );
-            return Err(OperationError::InvalidRequestState);
+            return Err(OperationError::AP0003ApprovalNotUsable);
         }
 
         // Filed under the policy the operation requires, not just any policy covering the
@@ -1473,7 +1683,7 @@ impl QueryServerWriteTransaction<'_> {
                 policy = ?resolved.request.policy_name,
                 "denied - the approval request is not under the policy the operation requires"
             );
-            return Err(OperationError::InvalidRequestState);
+            return Err(OperationError::AP0003ApprovalNotUsable);
         }
 
         if resolved
@@ -1482,16 +1692,16 @@ impl QueryServerWriteTransaction<'_> {
             .is_some_and(|expires_at| expires_at <= now)
         {
             error!(%request_uuid, expires_at = ?resolved.request.expires_at, "approval request has expired");
-            return Err(OperationError::InvalidRequestState);
+            return Err(OperationError::AP0003ApprovalNotUsable);
         }
 
         let Some(policy) = resolved.policy.as_ref() else {
             error!(%request_uuid, "approval request policy was deleted");
-            return Err(OperationError::InvalidRequestState);
+            return Err(OperationError::AP0003ApprovalNotUsable);
         };
         if !policy.enabled {
             error!(%request_uuid, policy = %policy.name, "approval policy is disabled");
-            return Err(OperationError::InvalidRequestState);
+            return Err(OperationError::AP0003ApprovalNotUsable);
         }
         if !policy.operation_types.contains(operation_type) {
             error!(
@@ -1500,7 +1710,7 @@ impl QueryServerWriteTransaction<'_> {
                 %operation_type,
                 "approval policy no longer covers this operation type"
             );
-            return Err(OperationError::InvalidRequestState);
+            return Err(OperationError::AP0003ApprovalNotUsable);
         }
 
         if resolved.request.operation_type != *operation_type
@@ -1514,7 +1724,7 @@ impl QueryServerWriteTransaction<'_> {
                 target = %target_uuid,
                 "denied - the approval request is for a different operation"
             );
-            return Err(OperationError::InvalidRequestState);
+            return Err(OperationError::AP0003ApprovalNotUsable);
         }
 
         self.approval_request_set_state(request_uuid, ApprovalRequestState::Consumed)?;
@@ -1527,6 +1737,265 @@ impl QueryServerWriteTransaction<'_> {
             "approval request consumed"
         );
         Ok(())
+    }
+
+    /// Kubidm: carry out the operation of an approved request, as its requester. Only
+    /// `group_membership_high_privilege` can be executed: it adds the member named by the
+    /// request details (`{"member": "<uuid>"}`) to the target group. While an enabled
+    /// policy covers that operation, `plugins::approval_gate` refuses the same write made
+    /// directly, and this is the way to make it.
+    ///
+    /// - Only the requester may execute their request, with a read-write session
+    ///   (`AccessDenied` otherwise).
+    /// - The policy is chosen here, not by the requester: the request must have been filed
+    ///   under an enabled policy that covers the operation type. If several enabled
+    ///   policies cover it, any one of them is accepted (each is sufficient on its own). If
+    ///   none covers it, the gate is off and the request can not be executed: add the member
+    ///   directly instead.
+    /// - The target must still be a high privilege group, and the member must still exist
+    ///   and must not be a dynamic group, an entry owned by a sync agreement, or a group
+    ///   containing one (see `approval_member_check`). A group member must still contain
+    ///   exactly the nested members recorded when the request was created.
+    /// - The requester must still be allowed to add members to the group by the access
+    ///   controls, evaluated now as for a modify of its `member` attribute: an approval
+    ///   lifts the gate, it does not grant rights.
+    /// - [Self::approval_request_check_and_consume] then checks the approval and consumes it,
+    ///   and the member is added as the internal identity (so the gate does not apply), all
+    ///   in this transaction. A second execute finds the request consumed and fails.
+    ///
+    /// A request that can not be used in its current state (not approved, consumed,
+    /// expired, policy disabled, target no longer high privilege, member deleted, ...) is
+    /// reported as `AP0003ApprovalNotUsable`.
+    pub fn approval_request_execute(
+        &mut self,
+        ident: &Identity,
+        request_uuid: Uuid,
+    ) -> Result<(), OperationError> {
+        let not_usable = OperationError::AP0003ApprovalNotUsable;
+        if ident.is_internal() {
+            security_access!(ident = %ident, "denied - approval requests are executed by their requester");
+            return Err(OperationError::AccessDenied);
+        }
+        if ident.access_scope() != AccessScope::ReadWrite {
+            security_access!("approval request execution requires a read-write session");
+            return Err(OperationError::AccessDenied);
+        }
+
+        let entry = self
+            .internal_search(filter!(f_and!([
+                f_eq(Attribute::Class, EntryClass::ApprovalRequest.into()),
+                f_eq(Attribute::Uuid, PartialValue::Uuid(request_uuid))
+            ])))?
+            .into_iter()
+            .next();
+
+        // Authorise before revealing anything about the request.
+        let is_requester = entry
+            .as_ref()
+            .and_then(|e| e.get_ava_single_refer(Attribute::ApprovalRequestor))
+            == Some(ident.get_uuid());
+        if !is_requester {
+            security_access!(ident = %ident, %request_uuid, "denied - only the requester may execute an approval request");
+            return Err(OperationError::AccessDenied);
+        }
+        let entry = entry.ok_or(OperationError::NoMatchingEntries)?;
+
+        let operation_type = approval_request_operation_type(&entry)?;
+        if operation_type != ApprovalOperationType::GroupMembershipHighPrivilege {
+            error!(%request_uuid, %operation_type, "this approval request operation type can not be executed");
+            return Err(not_usable);
+        }
+        let Some(group) = entry.get_ava_single_refer(Attribute::ApprovalTarget) else {
+            error!(%request_uuid, "approval request target was deleted");
+            return Err(not_usable);
+        };
+        let operation_details = approval_request_operation_details(&entry)?;
+        let (member, approved_contents) = approval_group_membership_stored(&operation_details)?;
+        let request_policy = entry.get_ava_single_refer(Attribute::ApprovalRequestPolicy);
+
+        // The policy the operation requires, chosen on the server side.
+        let policy_name = approval_enabled_policies(self, &operation_type)?
+            .into_iter()
+            .find(|policy| Some(policy.get_uuid()) == request_policy)
+            .and_then(|policy| {
+                policy
+                    .get_ava_single_iname(Attribute::ApprovalPolicyName)
+                    .map(str::to_string)
+            });
+        let Some(policy_name) = policy_name else {
+            security_access!(
+                ident = %ident,
+                %request_uuid,
+                %operation_type,
+                "denied - the approval request is not under an enabled policy that covers its operation"
+            );
+            return Err(not_usable);
+        };
+
+        // The situation the approval was given for must still hold.
+        match self.internal_search_uuid(group) {
+            Ok(group_entry) if is_high_privilege_group(group_entry.as_ref()) => {}
+            Ok(_) => {
+                error!(%request_uuid, %group, "approval request target is no longer a high privilege group");
+                return Err(not_usable);
+            }
+            Err(OperationError::NoMatchingEntries) => {
+                error!(%request_uuid, %group, "approval request target was deleted");
+                return Err(not_usable);
+            }
+            Err(err) => return Err(err),
+        }
+        match self.approval_member_check(member) {
+            Ok(()) => {}
+            Err(OperationError::NoMatchingEntries) => {
+                error!(%request_uuid, %member, "approval request member was deleted");
+                return Err(not_usable);
+            }
+            Err(OperationError::InvalidAttribute(reason)) => {
+                error!(%request_uuid, %member, %reason, "approval request member can no longer be added");
+                return Err(not_usable);
+            }
+            Err(err) => return Err(err),
+        }
+        // A group member must still contain exactly what it contained when the request was
+        // created (and approved): otherwise entries added to it since would become high
+        // privilege without an approval.
+        let member_entry = self.internal_search_uuid(member)?;
+        let current_contents = approval_member_contents(self, &member_entry)?;
+        if current_contents.unwrap_or_default() != approved_contents.unwrap_or_default() {
+            security_access!(
+                ident = %ident,
+                %request_uuid,
+                %member,
+                "denied - the member's nested members changed since the request was created"
+            );
+            return Err(not_usable);
+        }
+
+        // The approval lifts the gate, it does not grant the right to add the member.
+        let (_, rights) = group_member_rights(self, ident, group)?;
+        if !rights.add {
+            security_access!(ident = %ident, %group, "denied - may not add members to this group");
+            return Err(OperationError::AccessDenied);
+        }
+
+        self.approval_request_check_and_consume(
+            ident,
+            request_uuid,
+            &policy_name,
+            &operation_type,
+            group,
+            &operation_details,
+        )?;
+
+        self.internal_modify_uuid(
+            group,
+            &ModifyList::new_append(Attribute::Member, Value::ReferN(member)),
+        )?;
+        security_info!(
+            ident = %ident,
+            request = %request_uuid,
+            policy = %policy_name,
+            %group,
+            %member,
+            "approved high privilege group member added"
+        );
+        Ok(())
+    }
+
+    /// Kubidm: can `member` be made a member of a high privilege group through an approval
+    /// request? It must exist ([OperationError::NoMatchingEntries] otherwise), and must not
+    /// be, or (transitively) contain, a dynamic group or an entry owned by a sync agreement
+    /// ([OperationError::InvalidAttribute]): their members are decided by a filter or by
+    /// the sync connector, so approving one would hand control over high privilege
+    /// membership to them.
+    fn approval_member_check(&mut self, member: Uuid) -> Result<(), OperationError> {
+        let entry = self.internal_search_uuid(member)?;
+        let delegated = |entry: &EntrySealedCommitted| {
+            entry.attribute_equality(Attribute::Class, &EntryClass::DynGroup.into())
+                || entry.attribute_equality(Attribute::Class, &EntryClass::SyncObject.into())
+                || entry
+                    .get_ava_single_refer(Attribute::SyncParentUuid)
+                    .is_some()
+        };
+        if delegated(&entry) {
+            return Err(OperationError::InvalidAttribute(
+                "the member is a dynamic group or is owned by a sync agreement, so its \
+                 membership is not under approval control"
+                    .to_string(),
+            ));
+        }
+        let nested = self.internal_search(filter!(f_and!([
+            f_eq(Attribute::MemberOf, PartialValue::Refer(member)),
+            f_or!([
+                f_eq(Attribute::Class, EntryClass::DynGroup.into()),
+                f_eq(Attribute::Class, EntryClass::SyncObject.into()),
+                f_pres(Attribute::SyncParentUuid)
+            ])
+        ])))?;
+        if nested.iter().any(|entry| delegated(entry)) {
+            return Err(OperationError::InvalidAttribute(
+                "the member contains a dynamic group or an entry owned by a sync agreement, so \
+                 its membership is not under approval control"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Kubidm: break-glass, for the server's admin socket (`kubidmd approval-policy
+    /// disable`): disable the approval policy `name`, or every enabled policy with `None`,
+    /// as the internal system identity, with no other authorisation. This turns off any
+    /// approval gate those policies enable, even when no one can act as an approval admin
+    /// any more. Returns the names of the policies disabled.
+    pub fn approval_policy_disable_break_glass(
+        &mut self,
+        name: Option<&str>,
+    ) -> Result<Vec<String>, OperationError> {
+        let mut terms = vec![f_eq(Attribute::Class, EntryClass::ApprovalPolicy.into())];
+        if let Some(name) = name {
+            terms.push(f_eq(
+                Attribute::ApprovalPolicyName,
+                PartialValue::new_iname(name),
+            ));
+        }
+        let policies = self.internal_search(filter!(f_and(terms)))?;
+        if name.is_some() && policies.is_empty() {
+            return Err(OperationError::NoMatchingEntries);
+        }
+        let mut disabled = Vec::new();
+        for policy in policies {
+            let enabled = policy
+                .get_ava_single_bool(Attribute::ApprovalPolicyEnabled)
+                .unwrap_or(true);
+            if !enabled {
+                continue;
+            }
+            // Internal writes run as the system identity, which `plugins::approval` allows.
+            self.internal_modify_uuid(
+                policy.get_uuid(),
+                &ModifyList::new_purge_and_set(
+                    Attribute::ApprovalPolicyEnabled,
+                    Value::Bool(false),
+                ),
+            )?;
+            self.approval_cancel_open_requests(policy.get_uuid())?;
+            disabled.push(
+                policy
+                    .get_ava_single_iname(Attribute::ApprovalPolicyName)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| policy.get_uuid().to_string()),
+            );
+        }
+        if disabled.is_empty() {
+            info!("break-glass: no enabled approval policy to disable");
+        } else {
+            warn!(
+                ?disabled,
+                "break-glass: approval policies disabled from the admin socket"
+            );
+        }
+        Ok(disabled)
     }
 
     pub fn approval_request_cancel(
@@ -1569,7 +2038,7 @@ impl QueryServerWriteTransaction<'_> {
             ApprovalRequestState::Pending | ApprovalRequestState::Invalid
         ) {
             error!(%state, "approval request is not pending");
-            return Err(OperationError::InvalidRequestState);
+            return Err(OperationError::AP0003ApprovalNotUsable);
         }
 
         self.approval_request_set_state(request_uuid, ApprovalRequestState::Cancelled)?;
@@ -1735,6 +2204,188 @@ impl QueryServerWriteTransaction<'_> {
         }
         Ok(resolved)
     }
+}
+
+/// Kubidm: the enabled approval policies that cover `operation_type`. An operation gated on
+/// approval is gated while this is not empty, see `plugins::approval_gate`.
+///
+/// This reads the attributes directly rather than through `approval_policy_from_entry`, so
+/// that a policy which is otherwise malformed still turns the gate on (failing closed). Such
+/// a policy also blocks executing requests filed under it (the gate,
+/// [QueryServerWriteTransaction::approval_request_check_and_consume], can not read it) until
+/// it is disabled or deleted.
+pub(crate) fn approval_enabled_policies<'a, T: QueryServerTransaction<'a>>(
+    qs: &mut T,
+    operation_type: &ApprovalOperationType,
+) -> Result<Vec<Arc<EntrySealedCommitted>>, OperationError> {
+    let entries = qs.internal_search(filter!(f_eq(
+        Attribute::Class,
+        EntryClass::ApprovalPolicy.into()
+    )))?;
+    Ok(entries
+        .into_iter()
+        .filter(|entry| {
+            entry
+                .get_ava_single_bool(Attribute::ApprovalPolicyEnabled)
+                .unwrap_or(true)
+                && entry
+                    .get_ava_iter_iutf8(Attribute::ApprovalOperationType)
+                    .is_some_and(|mut types| {
+                        types.any(|t| {
+                            t.parse::<ApprovalOperationType>().ok().as_ref() == Some(operation_type)
+                        })
+                    })
+        })
+        .collect())
+}
+
+/// Kubidm: the operation details key of a `group_membership_high_privilege` request, see
+/// [approval_group_membership_member].
+const APPROVAL_DETAIL_MEMBER: &str = "member";
+
+/// Kubidm: the member to add from the operation details of a
+/// `group_membership_high_privilege` request. The target of such a request is the group,
+/// and its details are exactly `{"member": "<uuid>"}`, with the uuid of the entry to add
+/// in its canonical (hyphenated, lower case) form. `approval_request_create` stores the
+/// details in that form, and `approval_request_execute` only accepts them in that form.
+fn approval_group_membership_member(
+    details: &BTreeMap<String, String>,
+    canonical: bool,
+) -> Result<Uuid, OperationError> {
+    let invalid = || {
+        OperationError::InvalidAttribute(format!(
+            "the details of a {} request must be exactly {{\"{APPROVAL_DETAIL_MEMBER}\": \"<uuid>\"}}",
+            ApprovalOperationType::GroupMembershipHighPrivilege
+        ))
+    };
+    let (Some(value), 1) = (details.get(APPROVAL_DETAIL_MEMBER), details.len()) else {
+        return Err(invalid());
+    };
+    let member = Uuid::parse_str(value.trim()).map_err(|_| invalid())?;
+    if member.is_nil() || (canonical && *value != member.to_string()) {
+        return Err(invalid());
+    }
+    Ok(member)
+}
+
+/// Kubidm: the operation details key, set by the server, that records what a group member
+/// of a `group_membership_high_privilege` request contained when the request was created:
+/// the uuids of its nested members (direct and indirect), sorted and comma separated. The
+/// request can only be executed while the group still contains exactly these, see
+/// [approval_group_membership_stored].
+const APPROVAL_DETAIL_MEMBER_CONTENTS: &str = "member_contents";
+
+/// Kubidm: the canonical operation details of a `group_membership_high_privilege` request
+/// that adds `member`, with the nested members of `member` when it is a group.
+fn approval_group_membership_details(
+    member: Uuid,
+    contents: Option<&BTreeSet<Uuid>>,
+) -> BTreeMap<String, String> {
+    let mut details = BTreeMap::from([(APPROVAL_DETAIL_MEMBER.to_string(), member.to_string())]);
+    if let Some(contents) = contents {
+        details.insert(
+            APPROVAL_DETAIL_MEMBER_CONTENTS.to_string(),
+            approval_member_contents_string(contents),
+        );
+    }
+    details
+}
+
+fn approval_member_contents_string(contents: &BTreeSet<Uuid>) -> String {
+    contents
+        .iter()
+        .map(Uuid::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Kubidm: the member and, for a group member, its recorded nested members, from the
+/// stored (canonical) operation details of a `group_membership_high_privilege` request.
+fn approval_group_membership_stored(
+    details: &BTreeMap<String, String>,
+) -> Result<(Uuid, Option<BTreeSet<Uuid>>), OperationError> {
+    let mut rest = details.clone();
+    let contents = match rest.remove(APPROVAL_DETAIL_MEMBER_CONTENTS) {
+        None => None,
+        Some(value) => {
+            let invalid = || {
+                OperationError::InvalidAttribute(format!(
+                    "the {APPROVAL_DETAIL_MEMBER_CONTENTS} of a {} request is malformed",
+                    ApprovalOperationType::GroupMembershipHighPrivilege
+                ))
+            };
+            let contents = if value.is_empty() {
+                BTreeSet::new()
+            } else {
+                value
+                    .split(',')
+                    .map(|uuid| Uuid::parse_str(uuid).map_err(|_| invalid()))
+                    .collect::<Result<BTreeSet<_>, _>>()?
+            };
+            if approval_member_contents_string(&contents) != value {
+                return Err(invalid());
+            }
+            Some(contents)
+        }
+    };
+    let member = approval_group_membership_member(&rest, true)?;
+    Ok((member, contents))
+}
+
+/// Kubidm: the nested members (direct and indirect) of `member` when it is a group, `None`
+/// otherwise.
+fn approval_member_contents<'a, T: QueryServerTransaction<'a>>(
+    qs: &mut T,
+    member: &EntrySealedCommitted,
+) -> Result<Option<BTreeSet<Uuid>>, OperationError> {
+    if !member.attribute_equality(Attribute::Class, &EntryClass::Group.into()) {
+        return Ok(None);
+    }
+    let nested = qs.internal_search(filter!(f_eq(
+        Attribute::MemberOf,
+        PartialValue::Refer(member.get_uuid())
+    )))?;
+    Ok(Some(nested.iter().map(|entry| entry.get_uuid()).collect()))
+}
+
+/// Kubidm: describe the member of a `group_membership_high_privilege` request for the
+/// approval admins reading it: its name, classes and, for a group, its number of direct
+/// members. `None` for other operation types or when the member no longer exists.
+fn approval_operation_member<'a, T: QueryServerTransaction<'a>>(
+    qs: &mut T,
+    request: &ApprovalRequest,
+) -> Option<ApprovalOperationMember> {
+    if request.operation_type != ApprovalOperationType::GroupMembershipHighPrivilege {
+        return None;
+    }
+    let (member, approved_members) =
+        approval_group_membership_stored(&request.operation_details).ok()?;
+    let entry = qs.internal_search_uuid(member).ok()?;
+    let current_members = approval_member_contents(qs, &entry).ok()?;
+    let members_changed = (approved_members.is_some() || current_members.is_some()).then(|| {
+        approved_members.clone().unwrap_or_default() != current_members.unwrap_or_default()
+    });
+    let classes: Vec<String> = entry
+        .get_ava_iter_iutf8(Attribute::Class)
+        .map(|classes| classes.map(str::to_string).collect())
+        .unwrap_or_default();
+    let member_count = entry
+        .attribute_equality(Attribute::Class, &EntryClass::Group.into())
+        .then(|| {
+            entry
+                .get_ava_refer(Attribute::Member)
+                .map_or(0, BTreeSet::len)
+        });
+    Some(ApprovalOperationMember {
+        uuid: member,
+        name: entry
+            .get_ava_single_iname(Attribute::Name)
+            .map(str::to_string),
+        classes,
+        member_count,
+        approved_members: approved_members.map(|members| members.into_iter().collect()),
+        members_changed,
+    })
 }
 
 fn approval_policy_from_entry(
@@ -1912,6 +2563,7 @@ fn approval_request_from_entry(
         escalation_level,
         required_decisions: snapshot.map(|s| s.required).unwrap_or(0),
         operation_details,
+        operation_member: None,
     })
 }
 
@@ -2532,7 +3184,7 @@ mod tests {
                 &details,
                 ct,
             ),
-            Err(OperationError::InvalidRequestState)
+            Err(OperationError::AP0003ApprovalNotUsable)
         );
 
         let request_uuid = write_txn
@@ -2572,11 +3224,26 @@ mod tests {
             .expect("failed to disable approval policy");
         assert_eq!(
             decide_as(&mut write_txn, a, request_uuid, approve(), ct),
-            Err(OperationError::InvalidRequestState)
+            Err(OperationError::AP0003ApprovalNotUsable)
         );
         write_txn
             .approval_policy_enable(&idm_admin, "approve_policy", true)
             .expect("failed to enable approval policy");
+        // Kubidm: disabling the policy cancelled the request, a new one is needed.
+        assert_eq!(
+            stored_state(&mut write_txn, request_uuid).as_deref(),
+            Some("cancelled")
+        );
+        let request_uuid = write_txn
+            .approval_request_create(
+                &admin,
+                "approve_policy",
+                &ApprovalOperationType::SchemaModify,
+                UUID_IDM_ADMINS,
+                &details,
+                ct,
+            )
+            .expect("failed to create approval request");
         // A missing request is indistinguishable from an unauthorised one, except to the
         // system identity.
         assert_eq!(
@@ -2657,11 +3324,11 @@ mod tests {
         let mut write_txn = server.write(ct).await.unwrap();
         assert_eq!(
             decide_as(&mut write_txn, a, request_uuid, reject(), ct),
-            Err(OperationError::InvalidRequestState)
+            Err(OperationError::AP0003ApprovalNotUsable)
         );
         assert_eq!(
             write_txn.approval_request_cancel(&idm_admin, request_uuid),
-            Err(OperationError::InvalidRequestState)
+            Err(OperationError::AP0003ApprovalNotUsable)
         );
     }
 
@@ -2704,7 +3371,7 @@ mod tests {
         decide_as(&mut write_txn, a, majority_request, approve(), ct).expect("failed to approve");
         assert_eq!(
             decide_as(&mut write_txn, a, majority_request, approve(), ct),
-            Err(OperationError::InvalidRequestState)
+            Err(OperationError::AP0003ApprovalNotUsable)
         );
         decide_as(
             &mut write_txn,
@@ -2936,7 +3603,7 @@ mod tests {
         // X can not override the rejection.
         assert_eq!(
             decide_as(&mut write_txn, x, rejected, approve(), ct_escalate),
-            Err(OperationError::InvalidRequestState)
+            Err(OperationError::AP0003ApprovalNotUsable)
         );
 
         decide_as(&mut write_txn, x, substituted, approve(), ct_escalate)
@@ -2997,7 +3664,7 @@ mod tests {
         decide_as(&mut write_txn, a, request, approve(), ct_escalate).expect("A approves");
         assert_eq!(
             decide_as(&mut write_txn, a, request, approve(), ct_escalate),
-            Err(OperationError::InvalidRequestState)
+            Err(OperationError::AP0003ApprovalNotUsable)
         );
         let state = read_request(&mut write_txn, request);
         assert_eq!(state.state, ApprovalRequestState::Pending);
@@ -3037,7 +3704,7 @@ mod tests {
         decide_as(&mut write_txn, m1, request, approve(), ct).expect("m1 approves");
         assert_eq!(
             decide_as(&mut write_txn, m2, request, approve(), ct),
-            Err(OperationError::InvalidRequestState)
+            Err(OperationError::AP0003ApprovalNotUsable)
         );
         assert_eq!(
             read_request(&mut write_txn, request).state,
@@ -3237,7 +3904,7 @@ mod tests {
         let mut write_txn = server.write(ct_expired).await.unwrap();
         assert_eq!(
             decide_as(&mut write_txn, a, request, approve(), ct_expired),
-            Err(OperationError::InvalidRequestState)
+            Err(OperationError::AP0003ApprovalNotUsable)
         );
         assert_eq!(write_txn.approval_sweep(), Ok(1));
         assert_eq!(write_txn.approval_sweep(), Ok(0));
@@ -3424,12 +4091,12 @@ mod tests {
                 target2,
                 &BTreeMap::new(),
             ),
-            Err(OperationError::InvalidRequestState)
+            Err(OperationError::AP0003ApprovalNotUsable)
         );
         for request in [lost_target, lost_requester] {
             assert_eq!(
                 decide_as(&mut write_txn, a, request, approve(), ct),
-                Err(OperationError::InvalidRequestState)
+                Err(OperationError::AP0003ApprovalNotUsable)
             );
         }
         // Without a policy there is nothing to be an approver of.
@@ -3541,7 +4208,7 @@ mod tests {
             assert_eq!(read.required_decisions, 3);
             assert_eq!(
                 consume_as(&mut write_txn, r, "all_abc", request),
-                Err(OperationError::InvalidRequestState)
+                Err(OperationError::AP0003ApprovalNotUsable)
             );
         }
         // ... and the majority still needs three of the four.
@@ -3550,7 +4217,7 @@ mod tests {
         assert_eq!(read.required_decisions, 3);
         assert_eq!(
             consume_as(&mut write_txn, r, "majority_abcd", majority),
-            Err(OperationError::InvalidRequestState)
+            Err(OperationError::AP0003ApprovalNotUsable)
         );
         assert_eq!(write_txn.approval_sweep(), Ok(1));
         assert_eq!(
@@ -3713,7 +4380,7 @@ mod tests {
                 UUID_IDM_ADMINS,
                 &details
             ),
-            Err(OperationError::InvalidRequestState)
+            Err(OperationError::AP0003ApprovalNotUsable)
         );
         decide_as(&mut write_txn, a, request, approve(), ct).expect("A approves");
 
@@ -3753,7 +4420,7 @@ mod tests {
         ] {
             assert_eq!(
                 consume(&mut write_txn, &requester, operation_type, target, details),
-                Err(OperationError::InvalidRequestState)
+                Err(OperationError::AP0003ApprovalNotUsable)
             );
         }
         assert_eq!(
@@ -3782,12 +4449,12 @@ mod tests {
                 UUID_IDM_ADMINS,
                 &details
             ),
-            Err(OperationError::InvalidRequestState)
+            Err(OperationError::AP0003ApprovalNotUsable)
         );
         // A consumed request is final.
         assert_eq!(
             write_txn.approval_request_cancel(&requester, request),
-            Err(OperationError::InvalidRequestState)
+            Err(OperationError::AP0003ApprovalNotUsable)
         );
 
         // The approval is computed from the decisions: a stored pending state that lags
@@ -3821,7 +4488,7 @@ mod tests {
             .expect("failed to set the state");
         assert_eq!(
             consume_as(&mut write_txn, r, "any_a", forged),
-            Err(OperationError::InvalidRequestState)
+            Err(OperationError::AP0003ApprovalNotUsable)
         );
         write_txn.commit().expect("failed to commit");
 
@@ -3861,7 +4528,7 @@ mod tests {
         for policy in ["strict", "no_such_policy"] {
             assert_eq!(
                 consume_as(&mut write_txn, r, policy, lax),
-                Err(OperationError::InvalidRequestState),
+                Err(OperationError::AP0003ApprovalNotUsable),
                 "{policy}"
             );
         }
@@ -3873,7 +4540,7 @@ mod tests {
         consume_as(&mut write_txn, r, "lax", lax).expect("approved under lax");
         assert_eq!(
             consume_as(&mut write_txn, r, "lax", lax),
-            Err(OperationError::InvalidRequestState)
+            Err(OperationError::AP0003ApprovalNotUsable)
         );
 
         // A request under the strict policy is used for the strict policy.
@@ -3882,7 +4549,7 @@ mod tests {
         decide_as(&mut write_txn, b, strict, approve(), ct).expect("B approves");
         assert_eq!(
             consume_as(&mut write_txn, r, "lax", strict),
-            Err(OperationError::InvalidRequestState)
+            Err(OperationError::AP0003ApprovalNotUsable)
         );
         consume_as(&mut write_txn, r, "strict", strict).expect("approved under strict");
         write_txn.commit().expect("failed to commit");
@@ -3910,7 +4577,6 @@ mod tests {
         let after_expiry = approved();
         let disabled = approved();
         let not_covered = approved();
-        let deleted = approved();
         write_txn.commit().expect("failed to commit");
 
         // The policy timeout is an hour: an approval is used before the request expires.
@@ -3918,7 +4584,7 @@ mod tests {
         let mut write_txn = server.write(ct + timeout).await.unwrap();
         assert_eq!(
             consume_as(&mut write_txn, r, "any_a", at_expiry),
-            Err(OperationError::InvalidRequestState)
+            Err(OperationError::AP0003ApprovalNotUsable)
         );
         drop(write_txn);
         let mut write_txn = server
@@ -3927,7 +4593,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             consume_as(&mut write_txn, r, "any_a", after_expiry),
-            Err(OperationError::InvalidRequestState)
+            Err(OperationError::AP0003ApprovalNotUsable)
         );
         drop(write_txn);
 
@@ -3936,18 +4602,6 @@ mod tests {
             .await
             .unwrap();
         consume_as(&mut write_txn, r, "any_a", before_expiry).expect("not expired yet");
-
-        // A disabled policy's approvals can not be used, until it is enabled again.
-        write_txn
-            .approval_policy_enable(&idm_admin, "any_a", false)
-            .expect("disable");
-        assert_eq!(
-            consume_as(&mut write_txn, r, "any_a", disabled),
-            Err(OperationError::InvalidRequestState)
-        );
-        write_txn
-            .approval_policy_enable(&idm_admin, "any_a", true)
-            .expect("enable");
 
         // A policy that no longer covers the operation type.
         write_txn
@@ -3961,7 +4615,7 @@ mod tests {
             .expect("failed to change the operation types");
         assert_eq!(
             consume_as(&mut write_txn, r, "any_a", not_covered),
-            Err(OperationError::InvalidRequestState)
+            Err(OperationError::AP0003ApprovalNotUsable)
         );
         write_txn
             .internal_modify_uuid(
@@ -3973,13 +4627,38 @@ mod tests {
             )
             .expect("failed to change the operation types");
 
+        // Kubidm: disabling a policy cancels its open requests, so its approvals can not
+        // be used, also once it is enabled again.
+        for request in [at_expiry, after_expiry, not_covered] {
+            assert_eq!(
+                stored_state(&mut write_txn, request).as_deref(),
+                Some("approved")
+            );
+        }
+        write_txn
+            .approval_policy_enable(&idm_admin, "any_a", false)
+            .expect("disable");
+        assert_eq!(
+            consume_as(&mut write_txn, r, "any_a", disabled),
+            Err(OperationError::AP0003ApprovalNotUsable)
+        );
+        write_txn
+            .approval_policy_enable(&idm_admin, "any_a", true)
+            .expect("enable");
+        assert_eq!(
+            consume_as(&mut write_txn, r, "any_a", disabled),
+            Err(OperationError::AP0003ApprovalNotUsable)
+        );
+        let deleted = create_request(&mut write_txn, r, "any_a", ct).expect("create");
+        decide_as(&mut write_txn, a, deleted, approve(), ct).expect("A approves");
+
         // A deleted policy.
         write_txn
             .approval_policy_delete(&idm_admin, "any_a")
             .expect("delete");
         assert_eq!(
             consume_as(&mut write_txn, r, "any_a", deleted),
-            Err(OperationError::InvalidRequestState)
+            Err(OperationError::AP0003ApprovalNotUsable)
         );
         write_txn.commit().expect("failed to commit");
 
@@ -3988,12 +4667,16 @@ mod tests {
             .write(ct + timeout - Duration::from_secs(1))
             .await
             .unwrap();
-        for request in [at_expiry, after_expiry, disabled, not_covered, deleted] {
+        for request in [at_expiry, after_expiry, disabled, not_covered] {
             assert_eq!(
                 stored_state(&mut write_txn, request).as_deref(),
-                Some("approved")
+                Some("cancelled")
             );
         }
+        assert_eq!(
+            stored_state(&mut write_txn, deleted).as_deref(),
+            Some("approved")
+        );
         assert_eq!(
             stored_state(&mut write_txn, before_expiry).as_deref(),
             Some("consumed")
@@ -4203,7 +4886,7 @@ mod tests {
         );
         assert_eq!(
             consume_as(&mut write_txn, r, "any_g", approved),
-            Err(OperationError::InvalidRequestState)
+            Err(OperationError::AP0003ApprovalNotUsable)
         );
 
         // Enabled again, A's approval counts again.
@@ -4666,5 +5349,936 @@ mod tests {
             .internal_search_uuid(UUID_IDM_APPROVAL_ADMINS)
             .unwrap()
             .attribute_equality(Attribute::Member, &PartialValue::Refer(group_admin_uuid)));
+    }
+
+    /// Kubidm: the fixture of the high privilege membership gate tests.
+    struct GateFixture {
+        /// Manages (as entry manager) every group below.
+        manager: Uuid,
+        approver: Uuid,
+        /// A person to add as a member.
+        target: Uuid,
+        /// A person with no rights over the groups.
+        outsider: Uuid,
+        /// Nested in idm_high_privilege through `parent`.
+        nested: Uuid,
+        /// A direct member of idm_high_privilege.
+        direct: Uuid,
+        /// Not high privilege.
+        plain: Uuid,
+    }
+
+    const GATE_POLICY: &str = "hp_members";
+
+    fn create_managed_group(
+        txn: &mut QueryServerWriteTransaction<'_>,
+        name: &str,
+        managers: Uuid,
+    ) -> Uuid {
+        let uuid = Uuid::new_v4();
+        txn.internal_create(vec![entry_init!(
+            (Attribute::Class, EntryClass::Object.to_value()),
+            (Attribute::Class, EntryClass::Group.to_value()),
+            (Attribute::Name, Value::new_iname(name)),
+            (Attribute::Uuid, Value::Uuid(uuid)),
+            (Attribute::EntryManagedBy, Value::Refer(managers))
+        )])
+        .expect("failed to create managed group");
+        uuid
+    }
+
+    fn internal_add_member(txn: &mut QueryServerWriteTransaction<'_>, group: Uuid, member: Uuid) {
+        txn.internal_modify_uuid(
+            group,
+            &ModifyList::new_append(Attribute::Member, Value::ReferN(member)),
+        )
+        .expect("failed to add member internally");
+    }
+
+    fn gate_setup(txn: &mut QueryServerWriteTransaction<'_>) -> GateFixture {
+        let manager = create_person(txn, "gate_manager");
+        let approver = create_person(txn, "gate_approver");
+        let target = create_person(txn, "gate_target");
+        let outsider = create_person(txn, "gate_outsider");
+        let managers = create_group(txn, "gate_managers", &[manager]);
+        let nested = create_managed_group(txn, "gate_nested", managers);
+        let direct = create_managed_group(txn, "gate_direct", managers);
+        let plain = create_managed_group(txn, "gate_plain", managers);
+        let parent = create_group(txn, "gate_parent", &[nested]);
+        internal_add_member(txn, UUID_IDM_HIGH_PRIVILEGE, parent);
+        internal_add_member(txn, UUID_IDM_HIGH_PRIVILEGE, direct);
+        GateFixture {
+            manager,
+            approver,
+            target,
+            outsider,
+            nested,
+            direct,
+            plain,
+        }
+    }
+
+    /// An enabled policy covering `group_membership_high_privilege`: this turns the gate on.
+    fn create_gate_policy(txn: &mut QueryServerWriteTransaction<'_>, name: &str, approver: Uuid) {
+        let idm_admin = identity(txn, UUID_IDM_ADMIN);
+        let mut request = policy_request(name, ApprovalPattern::AnyOne, vec![approver]);
+        request.operation_types = vec![ApprovalOperationType::GroupMembershipHighPrivilege];
+        txn.approval_policy_create(&idm_admin, &request)
+            .expect("failed to create approval policy");
+    }
+
+    fn set_policy_enabled(txn: &mut QueryServerWriteTransaction<'_>, name: &str, enable: bool) {
+        let idm_admin = identity(txn, UUID_IDM_ADMIN);
+        txn.approval_policy_enable(&idm_admin, name, enable)
+            .expect("failed to change the policy enabled state");
+    }
+
+    fn modify_member_as(
+        txn: &mut QueryServerWriteTransaction<'_>,
+        actor: Uuid,
+        group: Uuid,
+        modlist: &ModifyList<ModifyInvalid>,
+    ) -> Result<(), OperationError> {
+        let actor = identity(txn, actor);
+        let filter = filter!(f_eq(Attribute::Uuid, PartialValue::Uuid(group)));
+        txn.impersonate_modify(&filter, &filter, modlist, &actor)
+    }
+
+    fn add_member_as(
+        txn: &mut QueryServerWriteTransaction<'_>,
+        actor: Uuid,
+        group: Uuid,
+        member: Uuid,
+    ) -> Result<(), OperationError> {
+        modify_member_as(
+            txn,
+            actor,
+            group,
+            &ModifyList::new_append(Attribute::Member, Value::ReferN(member)),
+        )
+    }
+
+    /// The same addition through batch modify, the path SCIM writes take.
+    fn batch_add_member_as(
+        txn: &mut QueryServerWriteTransaction<'_>,
+        actor: Uuid,
+        group: Uuid,
+        member: Uuid,
+    ) -> Result<(), OperationError> {
+        let ident = identity(txn, actor);
+        let modlist = ModifyList::new_append(Attribute::Member, Value::ReferN(member))
+            .validate(txn.get_schema())
+            .expect("invalid modlist");
+        txn.batch_modify(&BatchModifyEvent {
+            ident,
+            modset: BTreeMap::from([(group, modlist)]),
+        })
+    }
+
+    fn is_member(txn: &mut QueryServerWriteTransaction<'_>, group: Uuid, member: Uuid) -> bool {
+        txn.internal_search_uuid(group)
+            .expect("group missing")
+            .attribute_equality(Attribute::Member, &PartialValue::Refer(member))
+    }
+
+    fn member_details(member: &str) -> BTreeMap<String, String> {
+        BTreeMap::from([("member".to_string(), member.to_string())])
+    }
+
+    fn create_gate_request(
+        txn: &mut QueryServerWriteTransaction<'_>,
+        requester: Uuid,
+        policy: &str,
+        group: Uuid,
+        details: &BTreeMap<String, String>,
+        ct: Duration,
+    ) -> Result<Uuid, OperationError> {
+        let requester = identity(txn, requester);
+        txn.approval_request_create(
+            &requester,
+            policy,
+            &ApprovalOperationType::GroupMembershipHighPrivilege,
+            group,
+            details,
+            ct,
+        )
+    }
+
+    fn execute_as(
+        txn: &mut QueryServerWriteTransaction<'_>,
+        actor: Uuid,
+        request: Uuid,
+    ) -> Result<(), OperationError> {
+        let actor = identity(txn, actor);
+        txn.approval_request_execute(&actor, request)
+    }
+
+    /// An approved request from the manager to add `member` to `group`.
+    fn approved_gate_request(
+        txn: &mut QueryServerWriteTransaction<'_>,
+        fx: &GateFixture,
+        policy: &str,
+        group: Uuid,
+        member: Uuid,
+        ct: Duration,
+    ) -> Uuid {
+        let request = create_gate_request(
+            txn,
+            fx.manager,
+            policy,
+            group,
+            &member_details(&member.to_string()),
+            ct,
+        )
+        .expect("failed to create request");
+        decide_as(txn, fx.approver, request, approve(), ct).expect("failed to approve");
+        assert_eq!(
+            read_request(txn, request).state,
+            ApprovalRequestState::Approved
+        );
+        request
+    }
+
+    /// Kubidm: without an enabled policy covering the operation, high privilege members are
+    /// added as before. A policy for another operation type, or a disabled one, does not
+    /// turn the gate on.
+    #[qs_test]
+    async fn test_approval_gate_off_without_policy(server: &QueryServer) {
+        let ct = duration_from_epoch_now();
+        let mut txn = server.write(ct).await.unwrap();
+        let fx = gate_setup(&mut txn);
+
+        add_member_as(&mut txn, fx.manager, fx.nested, fx.target)
+            .expect("no policy: the add must work");
+
+        create_policy(
+            &mut txn,
+            "other_type",
+            ApprovalPattern::AnyOne,
+            vec![fx.approver],
+        );
+        create_gate_policy(&mut txn, GATE_POLICY, fx.approver);
+        set_policy_enabled(&mut txn, GATE_POLICY, false);
+        add_member_as(&mut txn, fx.manager, fx.direct, fx.target)
+            .expect("disabled policy: the add must work");
+        batch_add_member_as(&mut txn, fx.manager, fx.nested, fx.outsider)
+            .expect("disabled policy: the batch add must work");
+        assert!(is_member(&mut txn, fx.nested, fx.target));
+        assert!(is_member(&mut txn, fx.direct, fx.target));
+        assert!(is_member(&mut txn, fx.nested, fx.outsider));
+        txn.commit().expect("failed to commit");
+    }
+
+    /// Kubidm: with an enabled policy, adding a member to a high privilege group (directly
+    /// or nested) is refused to non-internal identities on every modify path; internal
+    /// writes, removals and other groups are not gated, and disabling the policy turns the
+    /// gate off again.
+    #[qs_test]
+    async fn test_approval_gate_refuses_high_privilege_member_add(server: &QueryServer) {
+        let ct = duration_from_epoch_now();
+        let mut txn = server.write(ct).await.unwrap();
+        let fx = gate_setup(&mut txn);
+        internal_add_member(&mut txn, fx.nested, fx.outsider);
+        create_gate_policy(&mut txn, GATE_POLICY, fx.approver);
+
+        // Nested and direct members of idm_high_privilege are gated, on modify and on
+        // batch modify (SCIM).
+        for group in [fx.nested, fx.direct] {
+            assert_eq!(
+                add_member_as(&mut txn, fx.manager, group, fx.target),
+                Err(OperationError::AP0002ApprovalRequired)
+            );
+            assert_eq!(
+                batch_add_member_as(&mut txn, fx.manager, group, fx.target),
+                Err(OperationError::AP0002ApprovalRequired)
+            );
+            assert!(!is_member(&mut txn, group, fx.target));
+        }
+
+        // Replacing the members (purge and add) adds one too.
+        assert_eq!(
+            modify_member_as(
+                &mut txn,
+                fx.manager,
+                fx.nested,
+                &ModifyList::new_purge_and_set(Attribute::Member, Value::ReferN(fx.target)),
+            ),
+            Err(OperationError::AP0002ApprovalRequired)
+        );
+
+        // Someone without rights is still refused by the access controls first (here the
+        // group is not even visible to them).
+        assert_eq!(
+            add_member_as(&mut txn, fx.outsider, fx.direct, fx.target),
+            Err(OperationError::NoMatchingEntries)
+        );
+
+        // A group that is not high privilege is not gated.
+        add_member_as(&mut txn, fx.manager, fx.plain, fx.target)
+            .expect("a plain group is not gated");
+
+        // Removals are not gated.
+        modify_member_as(
+            &mut txn,
+            fx.manager,
+            fx.nested,
+            &ModifyList::new_remove(Attribute::Member, PartialValue::Refer(fx.outsider)),
+        )
+        .expect("a removal is not gated");
+        assert!(!is_member(&mut txn, fx.nested, fx.outsider));
+
+        // Internal writes are not gated.
+        internal_add_member(&mut txn, fx.nested, fx.target);
+        assert!(is_member(&mut txn, fx.nested, fx.target));
+
+        // Break-glass: an approval admin disables the policy (which is not itself gated),
+        // and direct adds work again.
+        set_policy_enabled(&mut txn, GATE_POLICY, false);
+        add_member_as(&mut txn, fx.manager, fx.direct, fx.target)
+            .expect("the gate is off once the policy is disabled");
+        assert!(is_member(&mut txn, fx.direct, fx.target));
+        txn.commit().expect("failed to commit");
+    }
+
+    /// Kubidm: the full flow: the add is refused, the requester files a request, it is
+    /// approved, and executing it adds the member once.
+    #[qs_test]
+    async fn test_approval_gate_execute_flow(server: &QueryServer) {
+        let ct = duration_from_epoch_now();
+        let mut txn = server.write(ct).await.unwrap();
+        let fx = gate_setup(&mut txn);
+        create_gate_policy(&mut txn, GATE_POLICY, fx.approver);
+
+        assert_eq!(
+            add_member_as(&mut txn, fx.manager, fx.nested, fx.target),
+            Err(OperationError::AP0002ApprovalRequired)
+        );
+
+        // A uuid in another form is stored canonically.
+        let request = create_gate_request(
+            &mut txn,
+            fx.manager,
+            GATE_POLICY,
+            fx.nested,
+            &member_details(&fx.target.to_string().to_uppercase()),
+            ct,
+        )
+        .expect("failed to create request");
+        assert_eq!(
+            read_request(&mut txn, request).operation_details,
+            member_details(&fx.target.to_string())
+        );
+
+        // Pending: nothing to execute yet.
+        assert_eq!(
+            execute_as(&mut txn, fx.manager, request),
+            Err(OperationError::AP0003ApprovalNotUsable)
+        );
+        decide_as(&mut txn, fx.approver, request, approve(), ct).expect("failed to approve");
+
+        // Only the requester may execute it.
+        for other in [fx.approver, fx.outsider] {
+            assert_eq!(
+                execute_as(&mut txn, other, request),
+                Err(OperationError::AccessDenied)
+            );
+        }
+        assert!(!is_member(&mut txn, fx.nested, fx.target));
+
+        execute_as(&mut txn, fx.manager, request).expect("failed to execute");
+        assert!(is_member(&mut txn, fx.nested, fx.target));
+        assert_eq!(
+            read_request(&mut txn, request).state,
+            ApprovalRequestState::Consumed
+        );
+
+        // An approval authorises its operation once.
+        assert_eq!(
+            execute_as(&mut txn, fx.manager, request),
+            Err(OperationError::AP0003ApprovalNotUsable)
+        );
+        txn.commit().expect("failed to commit");
+
+        // The member was committed.
+        let mut txn = server.write(ct).await.unwrap();
+        assert!(is_member(&mut txn, fx.nested, fx.target));
+        assert!(txn
+            .internal_search_uuid(fx.target)
+            .expect("target missing")
+            .attribute_equality(
+                Attribute::MemberOf,
+                &PartialValue::Refer(UUID_IDM_HIGH_PRIVILEGE)
+            ));
+    }
+
+    /// Kubidm: the target and details of a `group_membership_high_privilege` request are
+    /// validated when it is created and when it is executed.
+    #[qs_test]
+    async fn test_approval_gate_request_details(server: &QueryServer) {
+        let ct = duration_from_epoch_now();
+        let mut txn = server.write(ct).await.unwrap();
+        let fx = gate_setup(&mut txn);
+        create_gate_policy(&mut txn, GATE_POLICY, fx.approver);
+        let target = fx.target.to_string();
+
+        let invalid = |res: Result<Uuid, OperationError>| {
+            matches!(res, Err(OperationError::InvalidAttribute(_)))
+        };
+        for details in [
+            BTreeMap::new(),
+            BTreeMap::from([("group".to_string(), target.clone())]),
+            BTreeMap::from([
+                ("member".to_string(), target.clone()),
+                ("extra".to_string(), "x".to_string()),
+            ]),
+            member_details("gate_target"),
+            member_details(&Uuid::nil().to_string()),
+        ] {
+            assert!(
+                invalid(create_gate_request(
+                    &mut txn,
+                    fx.manager,
+                    GATE_POLICY,
+                    fx.nested,
+                    &details,
+                    ct
+                )),
+                "{details:?} must be refused"
+            );
+        }
+        // The target must be a high privilege group, other than the member.
+        for group in [fx.plain, fx.target] {
+            assert!(invalid(create_gate_request(
+                &mut txn,
+                fx.manager,
+                GATE_POLICY,
+                group,
+                &member_details(&target),
+                ct
+            )));
+        }
+        assert!(invalid(create_gate_request(
+            &mut txn,
+            fx.manager,
+            GATE_POLICY,
+            fx.nested,
+            &member_details(&fx.nested.to_string()),
+            ct
+        )));
+
+        // Details that no longer have the canonical form (only the system can write them)
+        // are refused on execute, and the approval is not consumed.
+        let request = approved_gate_request(&mut txn, &fx, GATE_POLICY, fx.nested, fx.target, ct);
+        txn.internal_modify_uuid(
+            request,
+            &ModifyList::new_purge_and_set(
+                Attribute::ApprovalOperationDetails,
+                Value::new_utf8(
+                    serde_json::to_string(&member_details(&target.to_uppercase()))
+                        .expect("serialise details"),
+                ),
+            ),
+        )
+        .expect("failed to rewrite the details");
+        assert!(matches!(
+            execute_as(&mut txn, fx.manager, request),
+            Err(OperationError::InvalidAttribute(_))
+        ));
+        assert!(!is_member(&mut txn, fx.nested, fx.target));
+        assert_eq!(
+            read_request(&mut txn, request).state,
+            ApprovalRequestState::Approved
+        );
+
+        // A request for another operation type can not be executed.
+        create_policy(
+            &mut txn,
+            "schema",
+            ApprovalPattern::AnyOne,
+            vec![fx.approver],
+        );
+        let other =
+            create_request(&mut txn, fx.manager, "schema", ct).expect("failed to create request");
+        decide_as(&mut txn, fx.approver, other, approve(), ct).expect("failed to approve");
+        assert_eq!(
+            execute_as(&mut txn, fx.manager, other),
+            Err(OperationError::AP0003ApprovalNotUsable)
+        );
+        txn.commit().expect("failed to commit");
+    }
+
+    /// Kubidm: an approval lifts the gate, it does not grant the right to add the member.
+    #[qs_test]
+    async fn test_approval_gate_execute_requires_add_rights(server: &QueryServer) {
+        let ct = duration_from_epoch_now();
+        let mut txn = server.write(ct).await.unwrap();
+        let fx = gate_setup(&mut txn);
+        create_gate_policy(&mut txn, GATE_POLICY, fx.approver);
+
+        // The outsider may file and get approval, and can see the group (access control
+        // admins read every group), but may not add members to it.
+        internal_add_member(&mut txn, UUID_IDM_ACCESS_CONTROL_ADMINS, fx.outsider);
+        let request = create_gate_request(
+            &mut txn,
+            fx.outsider,
+            GATE_POLICY,
+            fx.direct,
+            &member_details(&fx.outsider.to_string()),
+            ct,
+        )
+        .expect("failed to create request");
+        decide_as(&mut txn, fx.approver, request, approve(), ct).expect("failed to approve");
+
+        assert_eq!(
+            execute_as(&mut txn, fx.outsider, request),
+            Err(OperationError::AccessDenied)
+        );
+        assert!(!is_member(&mut txn, fx.direct, fx.outsider));
+        assert_eq!(
+            read_request(&mut txn, request).state,
+            ApprovalRequestState::Approved
+        );
+        txn.commit().expect("failed to commit");
+    }
+
+    /// Kubidm: the policy is chosen on the server side: the request must be under an
+    /// enabled policy covering the operation. With several, any of them will do.
+    #[qs_test]
+    async fn test_approval_gate_execute_policy_selection(server: &QueryServer) {
+        let ct = duration_from_epoch_now();
+        let mut txn = server.write(ct).await.unwrap();
+        let fx = gate_setup(&mut txn);
+        create_gate_policy(&mut txn, GATE_POLICY, fx.approver);
+        create_gate_policy(&mut txn, "hp_members_2", fx.approver);
+
+        let first = approved_gate_request(&mut txn, &fx, GATE_POLICY, fx.nested, fx.target, ct);
+        let second = approved_gate_request(&mut txn, &fx, "hp_members_2", fx.direct, fx.target, ct);
+
+        // The policy of the first request is disabled; the gate stays on through the
+        // second policy, which the first request was not filed under.
+        set_policy_enabled(&mut txn, GATE_POLICY, false);
+        assert_eq!(
+            add_member_as(&mut txn, fx.manager, fx.nested, fx.target),
+            Err(OperationError::AP0002ApprovalRequired)
+        );
+        assert_eq!(
+            execute_as(&mut txn, fx.manager, first),
+            Err(OperationError::AP0003ApprovalNotUsable)
+        );
+        assert!(!is_member(&mut txn, fx.nested, fx.target));
+
+        execute_as(&mut txn, fx.manager, second).expect("failed to execute");
+        assert!(is_member(&mut txn, fx.direct, fx.target));
+        txn.commit().expect("failed to commit");
+    }
+
+    /// Kubidm: the gate holds for adding a group to idm_high_privilege itself, and for
+    /// nesting a group that already has members (who would become high privilege).
+    #[qs_test]
+    async fn test_approval_gate_group_nesting(server: &QueryServer) {
+        let ct = duration_from_epoch_now();
+        let mut txn = server.write(ct).await.unwrap();
+        let fx = gate_setup(&mut txn);
+        // idm_high_privilege is managed by the access control admins.
+        internal_add_member(&mut txn, UUID_IDM_ACCESS_CONTROL_ADMINS, fx.manager);
+        internal_add_member(&mut txn, fx.plain, fx.target);
+        create_gate_policy(&mut txn, GATE_POLICY, fx.approver);
+
+        assert_eq!(
+            add_member_as(&mut txn, fx.manager, UUID_IDM_HIGH_PRIVILEGE, fx.plain),
+            Err(OperationError::AP0002ApprovalRequired)
+        );
+        assert_eq!(
+            add_member_as(&mut txn, fx.manager, fx.nested, fx.plain),
+            Err(OperationError::AP0002ApprovalRequired)
+        );
+        assert!(!is_member(&mut txn, UUID_IDM_HIGH_PRIVILEGE, fx.plain));
+        assert!(!is_member(&mut txn, fx.nested, fx.plain));
+        assert!(!txn
+            .internal_search_uuid(fx.target)
+            .expect("target missing")
+            .attribute_equality(
+                Attribute::MemberOf,
+                &PartialValue::Refer(UUID_IDM_HIGH_PRIVILEGE)
+            ));
+
+        // Without the gate the same nesting works.
+        set_policy_enabled(&mut txn, GATE_POLICY, false);
+        add_member_as(&mut txn, fx.manager, UUID_IDM_HIGH_PRIVILEGE, fx.plain)
+            .expect("the gate is off");
+        txn.commit().expect("failed to commit");
+    }
+
+    /// Kubidm: an approved request can not be executed once its situation changed: after
+    /// it expired, after its member was deleted, or once its target is no longer high
+    /// privilege. A read-only session can not execute it at all.
+    #[qs_test]
+    async fn test_approval_gate_execute_not_usable(server: &QueryServer) {
+        let ct = duration_from_epoch_now();
+        let mut txn = server.write(ct).await.unwrap();
+        let fx = gate_setup(&mut txn);
+        create_gate_policy(&mut txn, GATE_POLICY, fx.approver);
+        let doomed = create_person(&mut txn, "gate_doomed");
+
+        let expiring = approved_gate_request(&mut txn, &fx, GATE_POLICY, fx.nested, fx.target, ct);
+        let deleted_member =
+            approved_gate_request(&mut txn, &fx, GATE_POLICY, fx.nested, doomed, ct);
+        let unnested = approved_gate_request(&mut txn, &fx, GATE_POLICY, fx.direct, fx.target, ct);
+
+        // A read-only session.
+        let manager_entry = txn.internal_search_uuid(fx.manager).expect("manager");
+        let read_only = Identity::from_impersonate_entry_readonly(manager_entry);
+        assert_eq!(
+            txn.approval_request_execute(&read_only, unnested),
+            Err(OperationError::AccessDenied)
+        );
+
+        // The member was deleted.
+        txn.internal_delete_uuid(doomed)
+            .expect("failed to delete the member");
+        assert_eq!(
+            execute_as(&mut txn, fx.manager, deleted_member),
+            Err(OperationError::AP0003ApprovalNotUsable)
+        );
+
+        // The target is no longer high privilege.
+        txn.internal_modify_uuid(
+            UUID_IDM_HIGH_PRIVILEGE,
+            &ModifyList::new_remove(Attribute::Member, PartialValue::Refer(fx.direct)),
+        )
+        .expect("failed to un-nest");
+        assert_eq!(
+            execute_as(&mut txn, fx.manager, unnested),
+            Err(OperationError::AP0003ApprovalNotUsable)
+        );
+        assert!(!is_member(&mut txn, fx.direct, fx.target));
+        txn.commit().expect("failed to commit");
+
+        // The request expired (the policy timeout is an hour).
+        let later = ct + Duration::from_secs(2 * 3600);
+        let mut txn = server.write(later).await.unwrap();
+        assert_eq!(
+            execute_as(&mut txn, fx.manager, expiring),
+            Err(OperationError::AP0003ApprovalNotUsable)
+        );
+        assert!(!is_member(&mut txn, fx.nested, fx.target));
+    }
+
+    /// Kubidm: a request can not add a dynamic group, an entry owned by a sync agreement,
+    /// or a group containing either: their members are not under approval control.
+    #[qs_test]
+    async fn test_approval_gate_member_not_delegated(server: &QueryServer) {
+        let ct = duration_from_epoch_now();
+        let mut txn = server.write(ct).await.unwrap();
+        let fx = gate_setup(&mut txn);
+        create_gate_policy(&mut txn, GATE_POLICY, fx.approver);
+
+        let sync_account = Uuid::new_v4();
+        let synced = Uuid::new_v4();
+        txn.internal_create(vec![
+            entry_init!(
+                (Attribute::Class, EntryClass::Object.to_value()),
+                (Attribute::Class, EntryClass::SyncAccount.to_value()),
+                (Attribute::Name, Value::new_iname("gate_sync")),
+                (Attribute::Uuid, Value::Uuid(sync_account))
+            ),
+            entry_init!(
+                (Attribute::Class, EntryClass::Object.to_value()),
+                (Attribute::Class, EntryClass::Group.to_value()),
+                (Attribute::Class, EntryClass::SyncObject.to_value()),
+                (Attribute::Name, Value::new_iname("gate_synced")),
+                (Attribute::Uuid, Value::Uuid(synced)),
+                (Attribute::SyncParentUuid, Value::Refer(sync_account))
+            ),
+        ])
+        .expect("failed to create the synced group");
+        let holds_dyngroup = create_group(&mut txn, "gate_holds_dyn", &[UUID_IDM_ALL_PERSONS]);
+        let holds_synced = create_group(&mut txn, "gate_holds_synced", &[synced]);
+
+        for member in [UUID_IDM_ALL_PERSONS, synced, holds_dyngroup, holds_synced] {
+            assert!(
+                matches!(
+                    create_gate_request(
+                        &mut txn,
+                        fx.manager,
+                        GATE_POLICY,
+                        fx.nested,
+                        &member_details(&member.to_string()),
+                        ct,
+                    ),
+                    Err(OperationError::InvalidAttribute(_))
+                ),
+                "{member} must be refused"
+            );
+        }
+        // A member that does not exist is refused too.
+        assert_eq!(
+            create_gate_request(
+                &mut txn,
+                fx.manager,
+                GATE_POLICY,
+                fx.nested,
+                &member_details(&Uuid::new_v4().to_string()),
+                ct,
+            ),
+            Err(OperationError::NoMatchingEntries)
+        );
+
+        // A group that comes to contain a dynamic group after approval can not be executed.
+        let plain_member = create_group(&mut txn, "gate_plain_member", &[]);
+        let request =
+            approved_gate_request(&mut txn, &fx, GATE_POLICY, fx.nested, plain_member, ct);
+        internal_add_member(&mut txn, plain_member, UUID_IDM_ALL_PERSONS);
+        assert_eq!(
+            execute_as(&mut txn, fx.manager, request),
+            Err(OperationError::AP0003ApprovalNotUsable)
+        );
+        txn.commit().expect("failed to commit");
+    }
+
+    /// Kubidm: the requester may read their own request (without the member details);
+    /// approval admins see the member described; anyone else is refused whether or not the
+    /// request exists.
+    #[qs_test]
+    async fn test_approval_request_get_by_requester(server: &QueryServer) {
+        let ct = duration_from_epoch_now();
+        let mut txn = server.write(ct).await.unwrap();
+        let fx = gate_setup(&mut txn);
+        create_gate_policy(&mut txn, GATE_POLICY, fx.approver);
+        let request = approved_gate_request(&mut txn, &fx, GATE_POLICY, fx.nested, fx.target, ct);
+        let manager = identity(&mut txn, fx.manager);
+        let outsider = identity(&mut txn, fx.outsider);
+        let idm_admin = identity(&mut txn, UUID_IDM_ADMIN);
+        txn.commit().expect("failed to commit");
+
+        let mut read_txn = server.read().await.unwrap();
+        let own = read_txn
+            .approval_request_get(&manager, request)
+            .expect("the requester may read their request");
+        assert_eq!(own.state, ApprovalRequestState::Approved);
+        assert_eq!(own.operation_member, None);
+
+        for uuid in [request, Uuid::new_v4()] {
+            assert_eq!(
+                read_txn.approval_request_get(&outsider, uuid).err(),
+                Some(OperationError::AccessDenied)
+            );
+        }
+        // Not even the requester learns whether another uuid exists.
+        assert_eq!(
+            read_txn
+                .approval_request_get(&manager, Uuid::new_v4())
+                .err(),
+            Some(OperationError::AccessDenied)
+        );
+
+        let admin_view = read_txn
+            .approval_request_get(&idm_admin, request)
+            .expect("an approval admin may read the request");
+        let member = admin_view
+            .operation_member
+            .expect("the member is described to approval admins");
+        assert_eq!(member.uuid, fx.target);
+        assert_eq!(member.name.as_deref(), Some("gate_target"));
+        assert!(member.classes.iter().any(|c| c == "person"));
+        assert_eq!(member.member_count, None);
+        let listed = read_txn
+            .approval_request_list(&idm_admin, None)
+            .expect("failed to list");
+        assert!(listed
+            .iter()
+            .any(|r| r.uuid == request && r.operation_member.is_some()));
+    }
+
+    /// Kubidm: M1 lockout. With the gate on, the last idm_admin can remove themselves from
+    /// idm_admins (removals are not gated), after which no one may manage approval policies
+    /// and high privilege adds stay gated. The admin socket break-glass disables the policy
+    /// as the system and lifts the gate.
+    #[qs_test]
+    async fn test_approval_gate_lockout_break_glass(server: &QueryServer) {
+        let ct = duration_from_epoch_now();
+        let mut txn = server.write(ct).await.unwrap();
+        let fx = gate_setup(&mut txn);
+        create_gate_policy(&mut txn, GATE_POLICY, fx.approver);
+
+        modify_member_as(
+            &mut txn,
+            UUID_IDM_ADMIN,
+            UUID_IDM_ADMINS,
+            &ModifyList::new_remove(Attribute::Member, PartialValue::Refer(UUID_IDM_ADMIN)),
+        )
+        .expect("removing yourself is not gated");
+        let idm_admin = identity(&mut txn, UUID_IDM_ADMIN);
+        assert_eq!(
+            txn.approval_policy_enable(&idm_admin, GATE_POLICY, false),
+            Err(OperationError::AccessDenied)
+        );
+        assert_eq!(
+            add_member_as(&mut txn, fx.manager, fx.nested, fx.target),
+            Err(OperationError::AP0002ApprovalRequired)
+        );
+
+        assert_eq!(
+            txn.approval_policy_disable_break_glass(Some("no_such_policy")),
+            Err(OperationError::NoMatchingEntries)
+        );
+        assert_eq!(
+            txn.approval_policy_disable_break_glass(None),
+            Ok(vec![GATE_POLICY.to_string()])
+        );
+        // Nothing left to disable.
+        assert_eq!(txn.approval_policy_disable_break_glass(None), Ok(vec![]));
+        add_member_as(&mut txn, fx.manager, fx.nested, fx.target)
+            .expect("the gate is off after break-glass");
+
+        // By name, too (idm_admin is locked out, so re-enable as the system).
+        txn.approval_policy_enable(&Identity::from_internal(), GATE_POLICY, true)
+            .expect("failed to re-enable");
+        assert_eq!(
+            txn.approval_policy_disable_break_glass(Some(GATE_POLICY)),
+            Ok(vec![GATE_POLICY.to_string()])
+        );
+        txn.commit().expect("failed to commit");
+    }
+
+    /// Kubidm: S1. Reviving an entry restores its direct memberships; restoring one of a
+    /// high privilege group is gated like any other add for a non-internal reviver.
+    #[qs_test]
+    async fn test_approval_gate_revive(server: &QueryServer) {
+        let ct = duration_from_epoch_now();
+        let mut txn = server.write(ct).await.unwrap();
+        let fx = gate_setup(&mut txn);
+        let person = create_person(&mut txn, "gate_revived");
+        internal_add_member(&mut txn, UUID_IDM_ADMINS, person);
+        create_gate_policy(&mut txn, GATE_POLICY, fx.approver);
+        txn.internal_delete_uuid(person)
+            .expect("failed to delete the person");
+
+        let admin = txn.internal_search_uuid(UUID_ADMIN).expect("admin missing");
+        let revive = crate::event::ReviveRecycledEvent::new_impersonate_entry(
+            admin,
+            filter_all!(f_eq(Attribute::Uuid, PartialValue::Uuid(person))),
+        );
+        assert_eq!(
+            txn.revive_recycled(&revive),
+            Err(OperationError::AP0002ApprovalRequired)
+        );
+        txn.commit().expect("failed to commit");
+
+        let mut txn = server.write(ct).await.unwrap();
+        assert!(txn.internal_search_uuid(person).is_err(), "still recycled");
+        set_policy_enabled(&mut txn, GATE_POLICY, false);
+        txn.revive_recycled(&revive)
+            .expect("without the gate the revive restores the membership");
+        assert!(is_member(&mut txn, UUID_IDM_ADMINS, person));
+        txn.commit().expect("failed to commit");
+    }
+
+    /// Kubidm: M1. The nested members of a group member are recorded on the request and
+    /// shown to approvers. Once they change, also indirectly, executing is refused (and
+    /// the approval is kept); a group whose members did not change is added.
+    #[qs_test]
+    async fn test_approval_gate_member_group_contents(server: &QueryServer) {
+        let ct = duration_from_epoch_now();
+        let mut txn = server.write(ct).await.unwrap();
+        let fx = gate_setup(&mut txn);
+        create_gate_policy(&mut txn, GATE_POLICY, fx.approver);
+        let team = create_group(&mut txn, "gate_team", &[fx.target]);
+        let sub = create_group(&mut txn, "gate_team_sub", &[]);
+        let steady = create_group(&mut txn, "gate_steady", &[fx.target]);
+
+        let changed = approved_gate_request(&mut txn, &fx, GATE_POLICY, fx.direct, team, ct);
+        let unchanged = approved_gate_request(&mut txn, &fx, GATE_POLICY, fx.direct, steady, ct);
+
+        let read = read_request(&mut txn, changed);
+        let member =
+            super::approval_operation_member(&mut txn, &read).expect("the member is shown");
+        assert_eq!(member.approved_members, Some(vec![fx.target]));
+        assert_eq!(member.members_changed, Some(false));
+
+        // Entries join the group after the approval, through a nested group.
+        internal_add_member(&mut txn, team, sub);
+        internal_add_member(&mut txn, sub, fx.outsider);
+        let member =
+            super::approval_operation_member(&mut txn, &read).expect("the member is shown");
+        assert_eq!(member.approved_members, Some(vec![fx.target]));
+        assert_eq!(member.members_changed, Some(true));
+        assert_eq!(
+            execute_as(&mut txn, fx.manager, changed),
+            Err(OperationError::AP0003ApprovalNotUsable)
+        );
+        assert!(!is_member(&mut txn, fx.direct, team));
+        assert_eq!(
+            read_request(&mut txn, changed).state,
+            ApprovalRequestState::Approved
+        );
+
+        execute_as(&mut txn, fx.manager, unchanged).expect("unchanged members: execute works");
+        assert!(is_member(&mut txn, fx.direct, steady));
+
+        // A person member has no nested members to record.
+        let person = approved_gate_request(&mut txn, &fx, GATE_POLICY, fx.nested, fx.target, ct);
+        let read = read_request(&mut txn, person);
+        let member =
+            super::approval_operation_member(&mut txn, &read).expect("the member is shown");
+        assert_eq!(member.approved_members, None);
+        assert_eq!(member.members_changed, None);
+        execute_as(&mut txn, fx.manager, person).expect("person member: execute works");
+        txn.commit().expect("failed to commit");
+    }
+
+    /// Kubidm: S1. Disabling a policy, also through break-glass, cancels its open requests,
+    /// so re-enabling it does not make approvals given before usable again.
+    #[qs_test]
+    async fn test_approval_gate_disable_cancels_requests(server: &QueryServer) {
+        let ct = duration_from_epoch_now();
+        let mut txn = server.write(ct).await.unwrap();
+        let fx = gate_setup(&mut txn);
+        create_gate_policy(&mut txn, GATE_POLICY, fx.approver);
+
+        let approved = approved_gate_request(&mut txn, &fx, GATE_POLICY, fx.nested, fx.target, ct);
+        let pending = create_gate_request(
+            &mut txn,
+            fx.manager,
+            GATE_POLICY,
+            fx.direct,
+            &member_details(&fx.target.to_string()),
+            ct,
+        )
+        .expect("failed to create request");
+        set_policy_enabled(&mut txn, GATE_POLICY, false);
+        set_policy_enabled(&mut txn, GATE_POLICY, true);
+        for request in [approved, pending] {
+            assert_eq!(
+                read_request(&mut txn, request).state,
+                ApprovalRequestState::Cancelled
+            );
+        }
+        assert_eq!(
+            execute_as(&mut txn, fx.manager, approved),
+            Err(OperationError::AP0003ApprovalNotUsable)
+        );
+        assert!(!is_member(&mut txn, fx.nested, fx.target));
+
+        let again = approved_gate_request(&mut txn, &fx, GATE_POLICY, fx.nested, fx.target, ct);
+        assert_eq!(
+            txn.approval_policy_disable_break_glass(None),
+            Ok(vec![GATE_POLICY.to_string()])
+        );
+        set_policy_enabled(&mut txn, GATE_POLICY, true);
+        assert_eq!(
+            read_request(&mut txn, again).state,
+            ApprovalRequestState::Cancelled
+        );
+        assert_eq!(
+            execute_as(&mut txn, fx.manager, again),
+            Err(OperationError::AP0003ApprovalNotUsable)
+        );
+        assert!(!is_member(&mut txn, fx.nested, fx.target));
+
+        // Nothing left to disable.
+        set_policy_enabled(&mut txn, GATE_POLICY, false);
+        assert_eq!(txn.approval_policy_disable_break_glass(None), Ok(vec![]));
+        txn.commit().expect("failed to commit");
     }
 }

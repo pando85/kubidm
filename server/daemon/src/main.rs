@@ -277,6 +277,14 @@ async fn submit_admin_req_human(path: &str, req: AdminTaskRequest) -> ExitCode {
 
     match response {
         Some(Ok(AdminTaskResponse::RecoverAccount { password })) => info!(new_password = ?password),
+        Some(Ok(AdminTaskResponse::ApprovalPoliciesDisabled { names })) => {
+            if names.is_empty() {
+                info!("No enabled approval policy to disable");
+            }
+            for name in names {
+                info!("Approval policy disabled: {name}");
+            }
+        }
         Some(Ok(AdminTaskResponse::ShowReplicationCertificate { cert })) => {
             info!(certificate = ?cert)
         }
@@ -450,6 +458,15 @@ fn refresh_replication_consumer_request(
             from: from.to_owned(),
         },
     })
+}
+
+/// The admin socket request of `kubidmd approval-policy`.
+fn approval_policy_request(cmd: &ApprovalPolicyCmds) -> AdminTaskRequest {
+    match cmd {
+        ApprovalPolicyCmds::Disable { name, .. } => {
+            AdminTaskRequest::ApprovalPolicyDisable { name: name.clone() }
+        }
+    }
 }
 
 /// The `kubidmd maintenance` request a subcommand stands for. `Err` is a usage error that
@@ -1111,6 +1128,7 @@ async fn start_daemon(opt: KubidmdParser, config: Configuration) -> ExitCode {
         | KubidmdOpt::RefreshReplicationConsumer { .. }
         | KubidmdOpt::RecoverAccount { .. }
         | KubidmdOpt::DisableAccount { .. }
+        | KubidmdOpt::ApprovalPolicy { .. }
         | KubidmdOpt::Database {
             commands:
                 DbCommands::ListBackups { .. }
@@ -1616,6 +1634,18 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
             )
             .await;
         }
+        KubidmdOpt::ApprovalPolicy { commands } => {
+            info!("Running approval policy break-glass ...");
+
+            let code = submit_admin_req_human(
+                config.adminbindpath.as_str(),
+                approval_policy_request(commands),
+            )
+            .await;
+            if code != ExitCode::SUCCESS {
+                return code;
+            }
+        }
         KubidmdOpt::DisableAccount { name } => {
             info!("Running account disable ...");
 
@@ -1917,6 +1947,34 @@ mod tests {
             read_admin_response(&mut client, Some(Duration::from_millis(50))).await,
             Ok(Some(Ok(AdminTaskResponse::ErrorMessage { ref message }))) if message == "not a supplier"
         ));
+    }
+
+    fn approval_policy(args: &[&str]) -> Result<AdminTaskRequest, String> {
+        let mut argv = vec!["kubidmd", "approval-policy"];
+        argv.extend_from_slice(args);
+        match KubidmdParser::try_parse_from(argv)
+            .map_err(|err| err.to_string())?
+            .commands
+        {
+            KubidmdOpt::ApprovalPolicy { commands } => Ok(approval_policy_request(&commands)),
+            _ => Err("not an approval-policy command".to_string()),
+        }
+    }
+
+    #[test]
+    fn approval_policy_disable_maps_to_request() {
+        assert!(matches!(
+            approval_policy(&["disable", "high_priv_members"]),
+            Ok(AdminTaskRequest::ApprovalPolicyDisable { name: Some(ref name) })
+                if name == "high_priv_members"
+        ));
+        assert!(matches!(
+            approval_policy(&["disable", "--all"]),
+            Ok(AdminTaskRequest::ApprovalPolicyDisable { name: None })
+        ));
+        // A name or --all, not both and not neither.
+        assert!(approval_policy(&["disable"]).is_err());
+        assert!(approval_policy(&["disable", "high_priv_members", "--all"]).is_err());
     }
 
     #[test]

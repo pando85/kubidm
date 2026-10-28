@@ -1,7 +1,7 @@
 use crate::{ApprovalOpt, ApprovalPolicyOpt, ApprovalRequestOpt, KubidmClientParser};
 use kubidm_client::KubidmClient;
 use kubidm_proto::v1::{
-    ApprovalOperationType, ApprovalPattern, ApprovalPolicyCreateRequest,
+    ApprovalOperationType, ApprovalPattern, ApprovalPolicyCreateRequest, ApprovalRequest,
     ApprovalRequestCreateRequest, ApprovalRequestState,
 };
 use std::collections::BTreeMap;
@@ -124,7 +124,10 @@ impl ApprovalPolicyOpt {
                 };
 
                 match client.approval_policy_create(&request).await {
-                    Ok(_) => println!("Approval policy '{}' created successfully", opts.name),
+                    Ok(_) => {
+                        println!("Approval policy '{}' created successfully", opts.name);
+                        warn_duplicate_coverage(client, &opts.name).await;
+                    }
                     Err(e) => error!("Failed to create approval policy '{}': {:?}", opts.name, e),
                 }
             }
@@ -136,7 +139,10 @@ impl ApprovalPolicyOpt {
             }
             ApprovalPolicyOpt::Enable(named) => {
                 match client.approval_policy_enable(&named.name).await {
-                    Ok(_) => println!("Approval policy '{}' enabled successfully", named.name),
+                    Ok(_) => {
+                        println!("Approval policy '{}' enabled successfully", named.name);
+                        warn_duplicate_coverage(client, &named.name).await;
+                    }
                     Err(e) => error!("Failed to enable approval policy '{}': {:?}", named.name, e),
                 }
             }
@@ -149,6 +155,62 @@ impl ApprovalPolicyOpt {
                     ),
                 }
             }
+        }
+    }
+}
+
+/// Kubidm: warn when the enabled policy `name` covers an operation type that another
+/// enabled policy covers too: a request under either is then accepted.
+async fn warn_duplicate_coverage(client: &KubidmClient, name: &str) {
+    let Ok(policies) = client.approval_policy_list().await else {
+        return;
+    };
+    let enabled: Vec<_> = policies.iter().filter(|p| p.enabled).collect();
+    let Some(policy) = enabled.iter().find(|p| p.name == name) else {
+        return;
+    };
+    for operation_type in &policy.operation_types {
+        let others: Vec<&str> = enabled
+            .iter()
+            .filter(|p| p.name != name && p.operation_types.contains(operation_type))
+            .map(|p| p.name.as_str())
+            .collect();
+        if !others.is_empty() {
+            warn!(
+                "Warning: {} is also covered by the enabled policies {:?}; a request under any of them is accepted",
+                operation_type, others
+            );
+        }
+    }
+}
+
+fn print_operation_member(req: &ApprovalRequest, indent: &str) {
+    if let Some(member) = &req.operation_member {
+        println!(
+            "{indent}Member: {} ({}) classes: {}{}",
+            member.name.as_deref().unwrap_or("<no name>"),
+            member.uuid,
+            member.classes.join(", "),
+            member
+                .member_count
+                .map(|count| format!(", {count} direct members"))
+                .unwrap_or_default()
+        );
+        if let Some(approved) = &member.approved_members {
+            println!(
+                "{indent}Nested members when requested ({}): {}",
+                approved.len(),
+                approved
+                    .iter()
+                    .map(|uuid| uuid.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        if member.members_changed == Some(true) {
+            println!(
+                "{indent}Warning: the member's nested members changed since the request was created, it can not be executed"
+            );
         }
     }
 }
@@ -211,6 +273,7 @@ impl ApprovalRequestOpt {
                     if let Some(exp) = req.expires_at {
                         println!("  Expires: {:?}", exp);
                     }
+                    print_operation_member(&req, "  ");
                     println!("  Escalation Level: {}", req.escalation_level);
                     let approve_count = req
                         .decisions
@@ -262,6 +325,7 @@ impl ApprovalRequestOpt {
                 println!("Escalation Level: {}", req.escalation_level);
                 println!("Required Decisions: {}", req.required_decisions);
                 println!("Operation Details: {:?}", req.operation_details);
+                print_operation_member(&req, "");
                 println!("Decisions:");
                 for dec in &req.decisions {
                     println!(
@@ -332,6 +396,15 @@ impl ApprovalRequestOpt {
                 match client.approval_request_cancel(&named.uuid).await {
                     Ok(_) => println!("Approval request '{}' cancelled successfully", named.uuid),
                     Err(e) => error!("Failed to cancel request '{}': {:?}", named.uuid, e),
+                }
+            }
+            ApprovalRequestOpt::Execute(named) => {
+                match client.approval_request_execute(&named.uuid).await {
+                    Ok(_) => println!("Approval request '{}' executed successfully", named.uuid),
+                    Err(e) => {
+                        error!("Failed to execute request '{}': {:?}", named.uuid, e);
+                        std::process::exit(1);
+                    }
                 }
             }
         }

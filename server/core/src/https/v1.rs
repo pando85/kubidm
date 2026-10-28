@@ -3475,6 +3475,10 @@ pub(crate) fn route_setup(state: ServerState) -> Router<ServerState> {
             "/v1/approval/request/{uuid}/_decision",
             post(approval_request_decision),
         )
+        .route(
+            "/v1/approval/request/{uuid}/_execute",
+            post(approval_request_execute),
+        )
         .route("/v1/auth", post(auth))
         .route(V1_AUTH_VALID, get(auth_valid))
         .route("/v1/logout", get(logout))
@@ -3730,6 +3734,34 @@ pub async fn approval_request_decision(
     state
         .qe_w_ref
         .handle_approval_request_decision(client_auth_info, uuid, request, kopid.eventid)
+        .await
+        .map(Json::from)
+        .map_err(WebError::from)
+}
+
+/// Execute an approved approval request as its requester: the operation is carried out and
+/// the approval consumed, in one transaction. Only `group_membership_high_privilege`
+/// requests can be executed; they add the member named by the request details to the target
+/// group. The requester must still be allowed to add members to the group.
+#[utoipa::path(
+    post,
+    path = "/v1/approval/request/{uuid}/_execute",
+    responses(
+        DefaultApiResponse,
+    ),
+    security(("token_jwt" = [])),
+    tag = "approval",
+    operation_id="approval_request_execute"
+)]
+pub async fn approval_request_execute(
+    State(state): State<ServerState>,
+    Extension(kopid): Extension<KOpId>,
+    VerifiedClientInformation(client_auth_info): VerifiedClientInformation,
+    Path(uuid): Path<String>,
+) -> Result<Json<()>, WebError> {
+    state
+        .qe_w_ref
+        .handle_approval_request_execute(client_auth_info, uuid, kopid.eventid)
         .await
         .map(Json::from)
         .map_err(WebError::from)

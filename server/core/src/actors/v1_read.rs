@@ -1654,8 +1654,9 @@ impl QueryServerReadV1 {
                 e
             })?;
 
-        let request_uuid =
-            Uuid::parse_str(&uuid).map_err(|_| OperationError::InvalidRequestState)?;
+        let request_uuid = Uuid::parse_str(&uuid).map_err(|_| {
+            OperationError::InvalidAttribute("invalid approval request uuid".to_string())
+        })?;
 
         idms_prox_read
             .qs_read
