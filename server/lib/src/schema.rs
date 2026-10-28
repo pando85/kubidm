@@ -1036,9 +1036,13 @@ fn kubidm_bootstrap_schema_classes() -> Vec<SchemaClass> {
             uuid: UUID_SCHEMA_CLASS_ACCESS_CONTROL_TARGET_DELEGATED_SCOPE,
             description: String::from("System Access Control Profile Target - Delegated Scope"),
             systemmust: vec![],
+            // Kubidm: a delegation granted from a template (`server::delegation`) also
+            // records the template and who granted it.
             systemmay: vec![
                 Attribute::DelegatedScopeGroup,
                 Attribute::DelegatedScopeFilter,
+                Attribute::DelegatedRoleTemplate,
+                Attribute::DelegatedBy,
             ],
             systemsupplements: vec![EntryClass::AccessControlProfile.into()],
             systemexcludes: vec![EntryClass::AccessControlTargetScope.into()],

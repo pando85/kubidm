@@ -65,6 +65,8 @@ pub mod assert;
 pub mod authorization;
 pub mod batch_modify;
 pub mod create;
+// Kubidm: template driven delegated administration.
+pub mod delegation;
 pub mod delete;
 pub mod identity;
 pub(crate) mod keys;
@@ -255,6 +257,9 @@ pub struct QueryServerWriteTransaction<'a> {
     pub(super) changed_uuid: HashSet<Uuid>,
     // Kubidm: this transaction applies replicated changes (incremental or refresh).
     pub(crate) replication_apply: bool,
+    // Kubidm: while the access controls are reloaded, the entries excluded from every
+    // delegated target, computed once for the reload (see `access::profiles`).
+    pub(crate) delegation_excluded: Option<BTreeSet<Uuid>>,
     _db_ticket: SemaphorePermit<'a>,
     _write_ticket: SemaphorePermit<'a>,
     resolve_filter_cache_clear: bool,
@@ -2346,6 +2351,7 @@ impl QueryServer {
             changed_flags: ChangeFlag::empty(),
             changed_uuid: HashSet::new(),
             replication_apply: false,
+            delegation_excluded: None,
             _db_ticket: db_ticket,
             _write_ticket: write_ticket,
             resolve_filter_cache: self.resolve_filter_cache.read(),
@@ -2604,6 +2610,16 @@ impl<'a> QueryServerWriteTransaction<'a> {
 
     #[instrument(level = "debug", skip_all)]
     fn reload_accesscontrols(&mut self) -> Result<(), OperationError> {
+        // Kubidm: the entries excluded from every delegated target are derived once for
+        // the reload, rather than once per delegated profile parsed.
+        let excluded = crate::server::access::profiles::delegation_excluded_principals(self)?;
+        self.delegation_excluded = Some(excluded);
+        let result = self.reload_accesscontrols_inner();
+        self.delegation_excluded = None;
+        result
+    }
+
+    fn reload_accesscontrols_inner(&mut self) -> Result<(), OperationError> {
         // supply entries to the writable access controls to reload from.
         // This has to be done in FOUR passes - one for each type!
         //
@@ -3407,6 +3423,7 @@ impl<'a> QueryServerWriteTransaction<'a> {
             changed_flags,
             changed_uuid: _,
             replication_apply: _,
+            delegation_excluded: _,
             resolve_filter_cache: _,
             resolve_filter_cache_clear,
             mut resolve_filter_cache_write,

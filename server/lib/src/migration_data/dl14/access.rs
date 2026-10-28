@@ -2266,3 +2266,29 @@ pub static IDM_ACP_GROUP_TIME_BOUNDED_MANAGE: LazyLock<BuiltinAcp> = LazyLock::n
     ..Default::default()
 }
 });
+
+/// Kubidm: let the administrators who grant delegations (`idm_access_control_admins`, see
+/// `server::delegation`) read the built-in delegation templates (`delegated_role`
+/// entries), so that they can see which templates exist.
+pub static IDM_ACP_DELEGATED_ROLE_READ: LazyLock<BuiltinAcp> = LazyLock::new(|| BuiltinAcp {
+    classes: vec![
+        EntryClass::Object,
+        EntryClass::AccessControlProfile,
+        EntryClass::AccessControlSearch,
+    ],
+    name: "idm_acp_delegated_role_read",
+    uuid: UUID_IDM_ACP_DELEGATED_ROLE_READ,
+    description: "Builtin IDM Control for reading the delegated administration templates",
+    receiver: BuiltinAcpReceiver::Group(vec![UUID_IDM_ACCESS_CONTROL_ADMINS]),
+    target: BuiltinAcpTarget::Filter(ProtoFilter::And(vec![
+        match_class_filter!(EntryClass::DelegatedRole),
+        FILTER_ANDNOT_TOMBSTONE_OR_RECYCLED.clone(),
+    ])),
+    search_attrs: vec![
+        Attribute::Class,
+        Attribute::Name,
+        Attribute::Uuid,
+        Attribute::Description,
+    ],
+    ..Default::default()
+});

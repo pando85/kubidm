@@ -250,6 +250,7 @@ impl QueryServerWriteTransaction<'_> {
                 .chain(pre_cand.iter().map(|e| e.as_ref()))
                 .any(|e| {
                     e.attribute_equality(Attribute::Class, &EntryClass::AccessControlProfile.into())
+                        || crate::server::access::profiles::delegation_lateral_reach(e)
                 })
         {
             self.changed_flags.insert(ChangeFlag::ACP)

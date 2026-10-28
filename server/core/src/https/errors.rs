@@ -127,6 +127,20 @@ impl IntoResponse for WebError {
                     OperationError::AP0001ApprovalQuorumUnreachable => {
                         (StatusCode::UNPROCESSABLE_ENTITY, None)
                     }
+                    // Kubidm: a delegation request that is refused for what it asks for.
+                    OperationError::DG0001DelegationUnknownTemplate
+                    | OperationError::DG0002DelegationHighPrivilegeGroup
+                    | OperationError::DG0003DelegationBuiltinGroup
+                    | OperationError::DG0004DelegationNotAGroup
+                    | OperationError::DG0005DelegationReceiverIsScope
+                    | OperationError::DG0007DelegationScopeIsReceiver
+                    | OperationError::DG0008DelegationInvalidFilter
+                    | OperationError::DG0009DelegationEntryManaged
+                    | OperationError::DG0010DelegationDynamicGroup
+                    | OperationError::DG0011DelegationNotRevivable => {
+                        (StatusCode::BAD_REQUEST, None)
+                    }
+                    OperationError::DG0006DelegationAlreadyExists => (StatusCode::CONFLICT, None),
                     _ => (StatusCode::INTERNAL_SERVER_ERROR, None),
                 };
 
@@ -151,6 +165,31 @@ mod tests {
         let err =
             WebError::OperationError(OperationError::AttributeUniqueness(vec![Attribute::Uuid]));
         let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn test_delegation_error_responses() {
+        use super::*;
+        use axum::response::IntoResponse;
+
+        for err in [
+            OperationError::DG0001DelegationUnknownTemplate,
+            OperationError::DG0002DelegationHighPrivilegeGroup,
+            OperationError::DG0003DelegationBuiltinGroup,
+            OperationError::DG0004DelegationNotAGroup,
+            OperationError::DG0005DelegationReceiverIsScope,
+            OperationError::DG0007DelegationScopeIsReceiver,
+            OperationError::DG0008DelegationInvalidFilter,
+            OperationError::DG0009DelegationEntryManaged,
+            OperationError::DG0010DelegationDynamicGroup,
+            OperationError::DG0011DelegationNotRevivable,
+        ] {
+            let response = WebError::OperationError(err).into_response();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        let response =
+            WebError::OperationError(OperationError::DG0006DelegationAlreadyExists).into_response();
         assert_eq!(response.status(), StatusCode::CONFLICT);
     }
 

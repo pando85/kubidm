@@ -1626,6 +1626,53 @@ impl QueryServerReadV1 {
 
     #[instrument(
         level = "info",
+        name = "delegation_list",
+        skip_all,
+        fields(uuid = ?eventid)
+    )]
+    pub async fn handle_delegation_list(
+        &self,
+        client_auth_info: ClientAuthInfo,
+        eventid: Uuid,
+    ) -> Result<Vec<kubidm_proto::v1::DelegationGrant>, OperationError> {
+        let ct = duration_from_epoch_now();
+        let mut idms_prox_read = self.idms.proxy_read().await?;
+        let ident = idms_prox_read
+            .validate_client_auth_info_to_ident(client_auth_info, ct)
+            .map_err(|e| {
+                error!(?e, "Invalid identity");
+                e
+            })?;
+
+        idms_prox_read.qs_read.delegation_list(&ident)
+    }
+
+    #[instrument(
+        level = "info",
+        name = "delegation_get",
+        skip_all,
+        fields(uuid = ?eventid)
+    )]
+    pub async fn handle_delegation_get(
+        &self,
+        client_auth_info: ClientAuthInfo,
+        id: String,
+        eventid: Uuid,
+    ) -> Result<kubidm_proto::v1::DelegationGrant, OperationError> {
+        let ct = duration_from_epoch_now();
+        let mut idms_prox_read = self.idms.proxy_read().await?;
+        let ident = idms_prox_read
+            .validate_client_auth_info_to_ident(client_auth_info, ct)
+            .map_err(|e| {
+                error!(?e, "Invalid identity");
+                e
+            })?;
+
+        idms_prox_read.qs_read.delegation_get(&ident, &id)
+    }
+
+    #[instrument(
+        level = "info",
         name = "approval_policy_list",
         skip_all,
         fields(uuid = ?eventid)

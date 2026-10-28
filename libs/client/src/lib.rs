@@ -56,6 +56,7 @@ use webauthn_rs_proto::{
 
 mod application;
 mod approval;
+mod delegation;
 mod domain;
 mod group;
 mod message;

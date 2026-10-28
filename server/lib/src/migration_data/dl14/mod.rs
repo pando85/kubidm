@@ -390,17 +390,22 @@ pub(crate) fn kubidm_builtin_access_control_profiles() -> Vec<EntryInitNew> {
     vec![
         IDM_ACP_OAUTH2_FEDERATION_ADMIN.clone().into(),
         IDM_ACP_GROUP_TIME_BOUNDED_MANAGE.clone().into(),
+        IDM_ACP_DELEGATED_ROLE_READ.clone().into(),
     ]
 }
 
-/// Kubidm: fork changes to upstream builtin access control profiles, applied to each
+/// Kubidm: the fork's changes to upstream built-in access control profiles, applied to the
 /// shipped definition before it is migrated (see
-/// `QueryServerWriteTransaction::kubidm_migrate_builtin_acp_batch`), so they apply at
-/// every domain migration that rewrites builtin profiles, including 1.11 -> 1.12.
+/// `QueryServerWriteTransaction::kubidm_migrate_builtin_acp_batch`), at every level that
+/// migrates through it, including 1.11 -> 1.12.
 ///
 /// - `idm_acp_acp_manage` also grants search, modify and create of
 ///   `acp_receiver_pip_condition`, so that access control admins can manage PIP
 ///   conditions in band.
+/// - `idm_acp_acp_manage` does not target delegations (profiles with the
+///   `access_control_target_delegated_scope` class): they are only granted and revoked
+///   through `server::delegation`, which builds them from a template. Editing one through
+///   the generic operations would change what it grants behind the template's back.
 pub(crate) fn kubidm_patch_builtin_acp(entry: &mut EntryInitNew) {
     if entry.get_uuid() == Some(UUID_IDM_ACP_ACP_MANAGE_V1) {
         let attr = Attribute::AcpReceiverPipCondition.as_str();
@@ -411,6 +416,21 @@ pub(crate) fn kubidm_patch_builtin_acp(entry: &mut EntryInitNew) {
             Attribute::AcpCreateAttr,
         ] {
             entry.add_ava(grant, Value::new_iutf8n(attr));
+        }
+
+        if let Some(target) = entry
+            .get_ava_single_protofilter(Attribute::AcpTargetScope)
+            .cloned()
+        {
+            let target = ProtoFilter::And(vec![
+                target,
+                ProtoFilter::AndNot(Box::new(match_class_filter!(
+                    EntryClass::AccessControlTargetDelegatedScope
+                ))),
+            ]);
+            // set_ava merges into an existing value set of an init entry.
+            entry.remove_ava(&Attribute::AcpTargetScope);
+            entry.add_ava(Attribute::AcpTargetScope, Value::JsonFilt(target));
         }
     }
 }

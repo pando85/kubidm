@@ -3,6 +3,7 @@ use crate::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::filter::{Filter, FilterValid, FilterValidResolved};
+use crate::server::delegation::{DelegationTemplate, DelegationTemplateGrant};
 
 use kubidm_proto::internal::Filter as ProtoFilter;
 
@@ -44,6 +45,11 @@ impl AccessControlSearch {
             })?
             .map(Attribute::from)
             .collect();
+
+        // Kubidm: a delegated profile grants what its template grants, whatever is stored.
+        if let Some(grant) = delegated_template_grant(value)? {
+            attrs = grant.search_attrs.into_iter().collect();
+        }
 
         // Ability to search memberof, implies the ability to read directmemberof
         if attrs.contains(&Attribute::MemberOf) {
@@ -186,9 +192,13 @@ impl AccessControlDelete {
             ));
         }
 
-        Ok(AccessControlDelete {
-            acp: AccessControlProfile::try_from(qs, value)?,
-        })
+        let mut acp = AccessControlProfile::try_from(qs, value)?;
+        // Kubidm: a delegated profile grants delete only when its template does.
+        if delegated_template_grant(value)?.is_some_and(|grant| !grant.delete) {
+            acp.receiver = AccessControlReceiver::None;
+        }
+
+        Ok(AccessControlDelete { acp })
     }
 
     /// ⚠️  - Manually create a delete access profile from values.
@@ -288,8 +298,14 @@ impl AccessControlCreate {
             .map(|i| i.map(AttrString::from).collect())
             .unwrap_or_default();
 
+        let mut acp = AccessControlProfile::try_from(qs, value)?;
+        // Kubidm: no delegation template grants create.
+        if delegated_template_grant(value)?.is_some() {
+            acp.receiver = AccessControlReceiver::None;
+        }
+
         Ok(AccessControlCreate {
-            acp: AccessControlProfile::try_from(qs, value)?,
+            acp,
             classes,
             attrs,
         })
@@ -375,6 +391,18 @@ impl AccessControlModify {
             return Err(OperationError::InvalidAcpState(
                 "Missing access_control_modify".to_string(),
             ));
+        }
+
+        // Kubidm: a delegated profile grants what its template grants, whatever is stored:
+        // its attributes, and no classes.
+        if let Some(grant) = delegated_template_grant(value)? {
+            return Ok(AccessControlModify {
+                acp: AccessControlProfile::try_from(qs, value)?,
+                pres_classes: Vec::new(),
+                rem_classes: Vec::new(),
+                presattrs: grant.modify_attrs.clone(),
+                remattrs: grant.modify_attrs,
+            });
         }
 
         let presattrs = value
@@ -613,6 +641,21 @@ impl AccessControlProfile {
                 EntryClass::AccessControlReceiverEntryManager
             )));
         }
+        // A delegated target is administered by the receiver group its delegation
+        // names, never by entry managers, which a delegation does not control.
+        if target_delegated && !receiver_group {
+            admin_error!(
+                ?name,
+                "{} requires {}",
+                EntryClass::AccessControlTargetDelegatedScope,
+                EntryClass::AccessControlReceiverGroup
+            );
+            return Err(OperationError::InvalidAcpState(format!(
+                "{} requires {}",
+                EntryClass::AccessControlTargetDelegatedScope,
+                EntryClass::AccessControlReceiverGroup
+            )));
+        }
         if target_scope && target_delegated {
             admin_error!(
                 ?name,
@@ -649,67 +692,111 @@ impl AccessControlProfile {
             AccessControlReceiver::None
         };
 
-        let targetscope_f: Option<ProtoFilter> = if target_scope {
-            // targetscope, and turn to real filter
-            let targetscope_f: ProtoFilter = value
-                .get_ava_single_protofilter(Attribute::AcpTargetScope)
-                .cloned()
-                .ok_or_else(|| {
-                    admin_error!("Missing {}", Attribute::AcpTargetScope);
-                    OperationError::InvalidAcpState(format!(
-                        "Missing {}",
-                        Attribute::AcpTargetScope
-                    ))
-                })?;
-            Some(targetscope_f)
-        } else if target_delegated {
-            // The scope group is required. It is a reference, so referential integrity
-            // removes it when the group is deleted: the filter alone must then never
-            // become the scope, or the receivers would administer everything matching it.
-            let Some(group) = value.get_ava_single_refer(Attribute::DelegatedScopeGroup) else {
-                admin_error!(
-                    ?name,
-                    "A delegated target requires {}",
-                    Attribute::DelegatedScopeGroup
-                );
-                return Err(OperationError::InvalidAcpState(format!(
-                    "A delegated target requires {}",
-                    Attribute::DelegatedScopeGroup
-                )));
-            };
+        let targetscope_f: Option<ProtoFilter> =
+            if target_scope {
+                // targetscope, and turn to real filter
+                let targetscope_f: ProtoFilter = value
+                    .get_ava_single_protofilter(Attribute::AcpTargetScope)
+                    .cloned()
+                    .ok_or_else(|| {
+                        admin_error!("Missing {}", Attribute::AcpTargetScope);
+                        OperationError::InvalidAcpState(format!(
+                            "Missing {}",
+                            Attribute::AcpTargetScope
+                        ))
+                    })?;
+                Some(targetscope_f)
+            } else if target_delegated {
+                // The scope group is required. It is a reference, so referential integrity
+                // removes it when the group is deleted: the filter alone must then never
+                // become the scope, or the receivers would administer everything matching it.
+                let Some(group) = value.get_ava_single_refer(Attribute::DelegatedScopeGroup) else {
+                    admin_error!(
+                        ?name,
+                        "A delegated target requires {}",
+                        Attribute::DelegatedScopeGroup
+                    );
+                    return Err(OperationError::InvalidAcpState(format!(
+                        "A delegated target requires {}",
+                        Attribute::DelegatedScopeGroup
+                    )));
+                };
 
-            // The targets are the members of the delegated scope group ...
-            let mut target_terms = vec![ProtoFilter::Eq(
-                Attribute::MemberOf.to_string(),
-                group.to_string(),
-            )];
-            // ... that also match the delegated scope filter, if any ...
-            if let Some(scope_filter) = value
-                .get_ava_single_protofilter(Attribute::DelegatedScopeFilter)
-                .cloned()
-            {
-                target_terms.push(scope_filter);
-            }
-            // ... and are never high privilege, recycled or tombstoned, the same exclusion
-            // the upstream user management profiles apply.
-            target_terms.push(ProtoFilter::AndNot(Box::new(ProtoFilter::Or(vec![
-                ProtoFilter::Eq(
+                // The targets are the members of the delegated scope group ...
+                let mut target_terms = vec![ProtoFilter::Eq(
                     Attribute::MemberOf.to_string(),
-                    UUID_IDM_HIGH_PRIVILEGE.to_string(),
-                ),
-                ProtoFilter::Eq(
-                    Attribute::Class.to_string(),
-                    EntryClass::Recycled.to_string(),
-                ),
-                ProtoFilter::Eq(
-                    Attribute::Class.to_string(),
-                    EntryClass::Tombstone.to_string(),
-                ),
-            ]))));
-            Some(ProtoFilter::And(target_terms))
-        } else {
-            None
-        };
+                    group.to_string(),
+                )];
+                // ... that have the classes of the template, whatever the stored filter says
+                // (an unknown template is refused) ...
+                if let Some(grant) = delegated_template_grant(value)? {
+                    target_terms.extend(grant.target_classes.into_iter().map(|class| {
+                        ProtoFilter::Eq(Attribute::Class.to_string(), class.to_string())
+                    }));
+                }
+                // ... that also match the delegated scope filter, if any ...
+                if let Some(scope_filter) = value
+                    .get_ava_single_protofilter(Attribute::DelegatedScopeFilter)
+                    .cloned()
+                {
+                    target_terms.push(scope_filter);
+                }
+                // ... and are never high privilege, recycled or tombstoned, the same exclusion
+                // the upstream user management profiles apply, nor members of the privileged
+                // built-in groups listed in `DELEGATION_EXCLUDED_BUILTINS`. Nor are they the
+                // receivers of any delegated profile, so that the administrators of one
+                // delegation are never administered through another, and a profile's own
+                // administrators are never administered through it, even when a receiver group
+                // is nested into the scope group later.
+                let mut excluded = vec![
+                    ProtoFilter::Eq(
+                        Attribute::MemberOf.to_string(),
+                        UUID_IDM_HIGH_PRIVILEGE.to_string(),
+                    ),
+                    ProtoFilter::Eq(
+                        Attribute::Class.to_string(),
+                        EntryClass::Recycled.to_string(),
+                    ),
+                    ProtoFilter::Eq(
+                        Attribute::Class.to_string(),
+                        EntryClass::Tombstone.to_string(),
+                    ),
+                ];
+                // The receivers are derived from the delegated profiles themselves, each time
+                // the access controls are reloaded, which they are whenever a profile is
+                // created, changed, deleted or revived. So the exclusion can never drift from
+                // the profiles, as a separately maintained group could (say, under concurrent
+                // replicated grants). This profile's own receivers are always included.
+                // A change of an entry manager or approver anywhere also reloads them.
+                // Nor are they (members of) an entry manager or an approver of any entry:
+                // taking over such a person would reach what it manages or approves (say, a
+                // high privilege service account it manages), outside of the scope. Both
+                // sets are computed once per reload, see `delegation_excluded_principals`.
+                let mut receivers = match &qs.delegation_excluded {
+                    Some(excluded) => excluded.clone(),
+                    None => delegation_excluded_principals(qs)?,
+                };
+                if let AccessControlReceiver::Group(own) = &receiver {
+                    receivers.extend(own.iter().copied());
+                }
+                for excluded_uuid in receivers
+                    .into_iter()
+                    .chain(DELEGATION_EXCLUDED_BUILTINS.iter().copied())
+                {
+                    excluded.push(ProtoFilter::Eq(
+                        Attribute::Uuid.to_string(),
+                        excluded_uuid.to_string(),
+                    ));
+                    excluded.push(ProtoFilter::Eq(
+                        Attribute::MemberOf.to_string(),
+                        excluded_uuid.to_string(),
+                    ));
+                }
+                target_terms.push(ProtoFilter::AndNot(Box::new(ProtoFilter::Or(excluded))));
+                Some(ProtoFilter::And(target_terms))
+            } else {
+                None
+            };
 
         let target = if let Some(targetscope_f) = targetscope_f {
             let ident = Identity::from_internal();
@@ -887,4 +974,110 @@ impl AcpPipCondition {
                 .is_some_and(|have| values.is_subset(have))
         })
     }
+}
+
+/// Kubidm: the privileged built-in groups whose members (and which themselves) are never
+/// the targets of a delegated profile, whatever its scope: taking over one of their
+/// members would grant what the group grants (reading every mail address or the unix
+/// authentication data, sending mail, or changing one's own mail address).
+pub(crate) const DELEGATION_EXCLUDED_BUILTINS: [Uuid; 4] = [
+    UUID_IDM_ACCOUNT_MAIL_READ,
+    UUID_IDM_UNIX_AUTHENTICATION_READ,
+    UUID_IDM_MAIL_SERVERS,
+    UUID_IDM_PEOPLE_SELF_MAIL_WRITE,
+];
+
+/// Kubidm: the receiver groups of every delegated profile (enabled or not, valid or not),
+/// as stored now. Their members are excluded from every delegated target.
+pub(crate) fn delegated_receivers(
+    qs: &mut QueryServerWriteTransaction,
+) -> Result<BTreeSet<Uuid>, OperationError> {
+    let profiles = qs.internal_search(filter!(f_eq(
+        Attribute::Class,
+        EntryClass::AccessControlTargetDelegatedScope.into()
+    )))?;
+    Ok(profiles
+        .iter()
+        .filter_map(|profile| profile.get_ava_refer(Attribute::AcpReceiverGroup))
+        .flatten()
+        .copied()
+        .collect())
+}
+
+/// Kubidm: what the template of the delegated profile `value` grants, rebuilt from the
+/// template its `delegated_role_template` names, so that a profile changed behind the
+/// template's back (or granted by an older version of it) grants only what the template
+/// grants now. `None` for a profile that is not delegated, and an error for a delegated
+/// profile without a known template.
+fn delegated_template_grant(
+    value: &Entry<EntrySealed, EntryCommitted>,
+) -> Result<Option<DelegationTemplateGrant>, OperationError> {
+    if !value.attribute_equality(
+        Attribute::Class,
+        &EntryClass::AccessControlTargetDelegatedScope.into(),
+    ) {
+        return Ok(None);
+    }
+    value
+        .get_ava_single_refer(Attribute::DelegatedRoleTemplate)
+        .and_then(DelegationTemplate::from_role_uuid)
+        .map(|template| Some(template.grant()))
+        .ok_or_else(|| {
+            admin_error!(
+                "A delegated target requires a known {}",
+                Attribute::DelegatedRoleTemplate
+            );
+            OperationError::InvalidAcpState(format!(
+                "A delegated target requires a known {}",
+                Attribute::DelegatedRoleTemplate
+            ))
+        })
+}
+
+/// Kubidm: does `entry` name entry managers or approvers? A change of such an entry
+/// reloads the access controls, so that [`delegation_lateral_principals`] (and so every
+/// delegated target) follows it.
+pub(crate) fn delegation_lateral_reach<VALID, STATE>(entry: &Entry<VALID, STATE>) -> bool {
+    entry.attribute_pres(Attribute::EntryManagedBy)
+        || entry.attribute_pres(Attribute::Approver)
+        || entry.attribute_pres(Attribute::BackupApprover)
+}
+
+/// Kubidm: every entry manager (`entry_managed_by`) and approval policy approver
+/// (`approver`, `backup_approver`) of any entry, as stored now. They, and their members, are excluded from
+/// every delegated target: a delegation that could take over one of them would reach
+/// whatever it manages or approves.
+pub(crate) fn delegation_lateral_principals(
+    qs: &mut QueryServerWriteTransaction,
+) -> Result<BTreeSet<Uuid>, OperationError> {
+    let entries = qs.internal_search(filter!(f_or(vec![
+        f_pres(Attribute::EntryManagedBy),
+        f_pres(Attribute::Approver),
+        f_pres(Attribute::BackupApprover),
+    ])))?;
+    let mut principals = BTreeSet::new();
+    for entry in entries.iter() {
+        for attr in [
+            Attribute::EntryManagedBy,
+            Attribute::Approver,
+            Attribute::BackupApprover,
+        ] {
+            if let Some(refs) = entry.get_ava_refer(&attr) {
+                principals.extend(refs.iter().copied());
+            }
+            principals.extend(entry.get_ava_single_refer(&attr));
+        }
+    }
+    Ok(principals)
+}
+
+/// Kubidm: the receivers of every delegated profile, and every entry manager and
+/// approver: the entries that, with their members, are excluded from every delegated
+/// target.
+pub(crate) fn delegation_excluded_principals(
+    qs: &mut QueryServerWriteTransaction,
+) -> Result<BTreeSet<Uuid>, OperationError> {
+    let mut excluded = delegated_receivers(qs)?;
+    excluded.extend(delegation_lateral_principals(qs)?);
+    Ok(excluded)
 }
