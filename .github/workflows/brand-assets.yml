@@ -1,0 +1,29 @@
+name: Brand asset integrity
+on:
+  pull_request:
+    paths:
+      - 'artwork/brand/**'
+      - 'artwork/brand-tokens.*'
+      - 'server/core/static/img/logo*'
+      - 'server/core/static/img/favicon*'
+      - 'server/core/templates/base_icons.html'
+      - 'server/core/src/https/manifest.rs'
+      - 'pykubidm/docs/hooks/gen_files.py'
+      - 'book/theme/favicon*'
+      - 'README.md'
+      - 'RELEASE_NOTES.md'
+      - 'scripts/check-brand-assets.py'
+      - '.github/workflows/brand-assets.yml'
+  push:
+    branches: [master]
+    paths:
+      - 'artwork/brand/**'
+      - 'server/core/static/img/logo*'
+      - 'scripts/check-brand-assets.py'
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate brand references and assets
+        run: python3 scripts/check-brand-assets.py

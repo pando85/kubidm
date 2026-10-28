@@ -1,23 +1,28 @@
 {
   "name": "Kubidm",
-  "description": "Identity management core service for Kubidm",
+  "primary_mark": "artwork/brand/mark.svg",
   "colors": {
-    "navy": "#0D1A30",
-    "deep_navy": "#071228",
-    "orange": "#CB4F32",
-    "white": "#FFFFFF",
-    "warm_gray": "#CCABA5"
+    "ink": "#042D3A",
+    "teal": "#007E86",
+    "teal_dark": "#005B6A",
+    "teal_node": "#20A5AB",
+    "orange": "#FD760C",
+    "orange_dark": "#EA5B00",
+    "cream": "#F8F6F1",
+    "white": "#FFFFFF"
   },
-  "recommended_usage": {
-    "favicon": "web/favicon.ico",
-    "apple_touch_icon": "web/apple-touch-icon.png",
-    "pwa_manifest": "web/site.webmanifest",
-    "github_social_preview": "social/kubidm-github-social-preview-1280x640.png",
-    "readme_logo": "logo/png/kubidm-logo-full-white-bg.png",
-    "app_icon": "icons/png/kubidm-icon-512x512.png"
+  "applications": {
+    "readme": "artwork/brand/horizontal.svg",
+    "fallback_ui_logo": "server/core/static/img/logo-square.svg",
+    "navbar": "server/core/static/img/logo.svg",
+    "favicon": "server/core/static/img/favicon.svg",
+    "app_icon": "server/core/static/img/logo-192.png",
+    "maskable_icon": "server/core/static/img/logo-192-maskable.png",
+    "social_preview": "artwork/brand/social-preview.svg"
   },
   "notes": [
-    "SVG files named *embedded.svg contain raster PNG data embedded in SVG, not cleaned vector paths.",
-    "For production-grade print/vector usage, redraw the selected logo as native SVG paths from the generated concept."
+    "Canonical SVG is constructed from native SVG geometry with the approved T1.1 shape.",
+    "The mascot assets are a separate unchanged illustration system.",
+    "Historical original art is retained under its original license."
   ]
 }

@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 685 180" role="img" aria-label="Kubidm horizontal signature on dark"><title>Kubidm horizontal signature on dark</title>
+<defs>
+  <linearGradient id="t11Arc" x1="5%" y1="8%" x2="91%" y2="100%">
+    <stop offset="0" stop-color="#007E86"/>
+    <stop offset=".57" stop-color="#006D78"/>
+    <stop offset="1" stop-color="#005B6A"/>
+  </linearGradient>
+  <linearGradient id="t11Node" x1="10%" y1="0%" x2="88%" y2="100%">
+    <stop offset="0" stop-color="#2BB2B6"/>
+    <stop offset=".53" stop-color="#20A5AB"/>
+    <stop offset="1" stop-color="#1696A0"/>
+  </linearGradient>
+  <linearGradient id="t11Core" x1="12%" y1="10%" x2="88%" y2="99%">
+    <stop offset="0" stop-color="#FF8110"/>
+    <stop offset=".56" stop-color="#FD760C"/>
+    <stop offset="1" stop-color="#F16B06"/>
+  </linearGradient>
+</defs>
+<rect width="685" height="180" rx="22" fill="#042D3A"/><rect x="8" y="7" width="177" height="165" rx="25" fill="#F8F6F1"/><g transform="translate(16 15)"><g fill="none" stroke="url(#t11Arc)" stroke-linecap="round">
+  <path d="M 51 41 C 36 53 27 70 27 86" stroke-width="14"/>
+  <path d="M 109 41 C 125 53 132 71 130 86" stroke-width="14"/>
+  <path d="M 55 127 Q 80 141 106 127" stroke-width="13"/>
+</g>
+<g stroke="#042D3A" stroke-width="6">
+  <circle cx="80" cy="26" r="20" fill="url(#t11Node)"/>
+  <circle cx="27" cy="117" r="20" fill="url(#t11Node)"/>
+  <circle cx="131" cy="117" r="20" fill="url(#t11Node)"/>
+</g>
+<circle cx="80" cy="84" r="26" fill="url(#t11Core)" stroke="#EA5B00" stroke-width="6"/></g><text x="208" y="116" font-family="Inter, Arial, sans-serif" font-size="89" font-weight="800" letter-spacing="-3.3" fill="#FFFFFF">Kubidm</text>
+</svg>

@@ -18,7 +18,7 @@
 >
 > **Special thanks to** [@firstyear](https://github.com/firstyear) and [@yaleman](https://github.com/yaleman) for creating and maintaining Kanidm.
 
-![Kubidm Logo](artwork/logo-small.png)
+<img src="artwork/brand/horizontal.svg" alt="Kubidm" width="420">
 
 ## About
 

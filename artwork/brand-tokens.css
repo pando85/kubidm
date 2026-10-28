@@ -1,7 +1,14 @@
 :root {
+  --kubidm-ink: #042D3A;
+  --kubidm-teal: #007E86;
+  --kubidm-teal-dark: #005B6A;
+  --kubidm-node-teal: #20A5AB;
+  --kubidm-orange: #FD760C;
+  --kubidm-orange-dark: #EA5B00;
+  --kubidm-cream: #F8F6F1;
+  --kubidm-white: #FFFFFF;
+  /* Historical theme compatibility, not new design recommendations. */
   --kubidm-navy: #0D1A30;
   --kubidm-deep-navy: #071228;
-  --kubidm-orange: #CB4F32;
-  --kubidm-white: #FFFFFF;
   --kubidm-warm-gray: #CCABA5;
 }

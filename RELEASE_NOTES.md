@@ -1,6 +1,6 @@
 # Kubidm Release Notes
 
-![Kubidm Logo](artwork/logo-small.png)
+![Kubidm](artwork/brand/horizontal.svg)
 
 ## Getting Started
 
