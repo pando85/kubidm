@@ -4420,6 +4420,14 @@ mod tests {
             Attribute::AcpModifyRemovedAttr,
             Value::new_iutf8n(Attribute::DisplayName.as_str()),
         );
+        // A delegated profile grants what its template grants (here user_admin: no
+        // create), see `access::profiles`.
+        if matches!(target_class, EntryClass::AccessControlTargetDelegatedScope) {
+            entry.add_ava(
+                Attribute::DelegatedRoleTemplate,
+                Value::Refer(UUID_IDM_DELEGATED_USER_ADMIN),
+            );
+        }
         for (attr, value) in extra {
             entry.add_ava(attr, value);
         }

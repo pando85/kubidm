@@ -341,6 +341,7 @@ impl QueryServerWriteTransaction<'_> {
         entries: Vec<EntryInitNew>,
     ) -> Result<(), OperationError> {
         let r: Result<(), _> = entries.into_iter().try_for_each(|entry| {
+            let entry = migration_data::dl14::kubidm_patch_builtin_acp(entry);
             self.kubidm_purge_unsupported_builtin_acp_values(&entry)
                 .and_then(|()| self.internal_migrate_or_create(entry))
         });
@@ -378,8 +379,8 @@ impl QueryServerWriteTransaction<'_> {
     ///     which excludes the group receiver;
     ///   - on a built-in that targets a scope, the `access_control_target_delegated_scope`
     ///     class (a delegated target scope), which excludes the target scope;
-    /// - with either delegated class removed, the delegated scope attributes, unless a
-    ///   delegated class remains (only those classes allow them).
+    /// - with either delegated class removed, the delegated scope, template and grantor
+    ///   attributes, unless a delegated class remains (only those classes allow them).
     ///
     /// Any other stored value, valid or not, is left to the upstream rewrite, which keeps
     /// administrator customisations of built-ins that do not conflict with the shipped
@@ -455,6 +456,8 @@ impl QueryServerWriteTransaction<'_> {
             for attr in [
                 Attribute::DelegatedScopeGroup,
                 Attribute::DelegatedScopeFilter,
+                Attribute::DelegatedRoleTemplate,
+                Attribute::DelegatedBy,
             ] {
                 if stored_only_attr(&attr) {
                     mods.push(Modify::Purged(attr));
@@ -1643,6 +1646,11 @@ mod tests {
                         Attribute::DelegatedScopeGroup,
                         Value::Refer(UUID_IDM_PEOPLE_ADMINS),
                     ),
+                    // A delegated target parses only with a known template.
+                    Modify::Present(
+                        Attribute::DelegatedRoleTemplate,
+                        Value::Refer(UUID_IDM_DELEGATED_USER_ADMIN),
+                    ),
                     Modify::Present(
                         Attribute::DelegatedScopeFilter,
                         Value::JsonFilt(ProtoFilter::Eq(
@@ -1735,6 +1743,7 @@ mod tests {
         ));
         assert!(!people_delete.attribute_pres(Attribute::DelegatedScopeGroup));
         assert!(!people_delete.attribute_pres(Attribute::DelegatedScopeFilter));
+        assert!(!people_delete.attribute_pres(Attribute::DelegatedRoleTemplate));
         assert!(people_delete.attribute_equality(
             Attribute::Class,
             &EntryClass::AccessControlTargetScope.into()
@@ -1947,6 +1956,7 @@ mod tests {
             UUID_IDM_DELEGATED_USER_ADMIN,
             UUID_IDM_DELEGATED_GROUP_ADMIN,
             UUID_IDM_ACP_OAUTH2_FEDERATION_ADMIN,
+            UUID_IDM_ACP_DELEGATED_ROLE_READ,
         ] {
             write_txn
                 .internal_search_uuid(uuid)

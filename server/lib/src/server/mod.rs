@@ -65,6 +65,8 @@ pub mod assert;
 pub mod authorization;
 pub mod batch_modify;
 pub mod create;
+// Kubidm: template driven delegated administration.
+pub mod delegation;
 pub mod delete;
 pub mod identity;
 pub(crate) mod keys;

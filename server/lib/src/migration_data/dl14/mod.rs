@@ -390,7 +390,36 @@ pub(crate) fn kubidm_builtin_access_control_profiles() -> Vec<EntryInitNew> {
     vec![
         IDM_ACP_OAUTH2_FEDERATION_ADMIN.clone().into(),
         IDM_ACP_GROUP_TIME_BOUNDED_MANAGE.clone().into(),
+        IDM_ACP_DELEGATED_ROLE_READ.clone().into(),
     ]
+}
+
+/// Kubidm: the fork's changes to upstream built-in access control profiles, applied to the
+/// shipped definition before it is migrated (`kubidm_migrate_builtin_acp_batch`), at every
+/// level that migrates through it.
+///
+/// - `idm_acp_acp_manage` does not target delegations (profiles with the
+///   `access_control_target_delegated_scope` class): they are only granted and revoked
+///   through `server::delegation`, which builds them from a template. Editing one through
+///   the generic operations would change what it grants behind the template's back.
+pub(crate) fn kubidm_patch_builtin_acp(mut entry: EntryInitNew) -> EntryInitNew {
+    if entry.get_uuid() == Some(UUID_IDM_ACP_ACP_MANAGE_V1) {
+        if let Some(target) = entry
+            .get_ava_single_protofilter(Attribute::AcpTargetScope)
+            .cloned()
+        {
+            let target = ProtoFilter::And(vec![
+                target,
+                ProtoFilter::AndNot(Box::new(match_class_filter!(
+                    EntryClass::AccessControlTargetDelegatedScope
+                ))),
+            ]);
+            // set_ava merges into an existing value set of an init entry.
+            entry.remove_ava(&Attribute::AcpTargetScope);
+            entry.add_ava(Attribute::AcpTargetScope, Value::JsonFilt(target));
+        }
+    }
+    entry
 }
 
 pub fn phase_8_delete_uuids() -> Vec<Uuid> {

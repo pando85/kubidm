@@ -33,9 +33,10 @@ use kubidm_proto::{
     v1::{
         AccountUnixExtend, ApiTokenGenerate, ApprovalDecisionRequest, ApprovalPolicy,
         ApprovalPolicyCreateRequest, ApprovalRequest, ApprovalRequestCreateRequest,
-        AuthIssueSession, AuthRequest, AuthResponse, AuthState as ProtoAuthState,
-        Entry as ProtoEntry, GroupUnixExtend, SingleStringRequest, TimeBoundedMemberGrant,
-        TimeBoundedMemberGrantRequest, UatStatus, UnixGroupToken, UnixUserToken, WhoamiResponse,
+        AuthIssueSession, AuthRequest, AuthResponse, AuthState as ProtoAuthState, DelegationGrant,
+        DelegationGrantRequest, Entry as ProtoEntry, GroupUnixExtend, SingleStringRequest,
+        TimeBoundedMemberGrant, TimeBoundedMemberGrantRequest, UatStatus, UnixGroupToken,
+        UnixUserToken, WhoamiResponse,
     },
 };
 use kubidmd_lib::{
@@ -3475,6 +3476,15 @@ pub(crate) fn route_setup(state: ServerState) -> Router<ServerState> {
             "/v1/approval/request/{uuid}/_decision",
             post(approval_request_decision),
         )
+        // Kubidm: template driven delegated administration.
+        .route(
+            "/v1/delegation",
+            get(delegation_list).post(delegation_grant),
+        )
+        .route(
+            "/v1/delegation/{id}",
+            get(delegation_get).delete(delegation_revoke),
+        )
         .route("/v1/auth", post(auth))
         .route(V1_AUTH_VALID, get(auth_valid))
         .route("/v1/logout", get(logout))
@@ -3483,6 +3493,111 @@ pub(crate) fn route_setup(state: ServerState) -> Router<ServerState> {
         .layer(from_fn(dont_cache_me))
         .merge(cacheable_routes(state))
         .route("/v1/debug/ipinfo", get(debug_ipinfo))
+}
+
+/// List the delegations. Reserved to `idm_access_control_admins`.
+#[utoipa::path(
+    get,
+    path = "/v1/delegation",
+    responses(
+        (status = 200, body=Vec<DelegationGrant>, content_type=APPLICATION_JSON),
+        ApiResponseWithout200,
+    ),
+    security(("token_jwt" = [])),
+    tag = "delegation",
+    operation_id="delegation_list"
+)]
+pub async fn delegation_list(
+    State(state): State<ServerState>,
+    Extension(kopid): Extension<KOpId>,
+    VerifiedClientInformation(client_auth_info): VerifiedClientInformation,
+) -> Result<Json<Vec<kubidm_proto::v1::DelegationGrant>>, WebError> {
+    state
+        .qe_r_ref
+        .handle_delegation_list(client_auth_info, kopid.eventid)
+        .await
+        .map(Json::from)
+        .map_err(WebError::from)
+}
+
+/// Grant a delegation from a built-in template. Returns the delegation.
+#[utoipa::path(
+    post,
+    path = "/v1/delegation",
+    responses(
+        (status = 200, body=DelegationGrant, content_type=APPLICATION_JSON),
+        (status = 400, description = "Unknown template, or a receiver, scope or filter that is refused"),
+        (status = 409, description = "The delegation already exists"),
+        ApiResponseWithout200,
+    ),
+    request_body=DelegationGrantRequest,
+    security(("token_jwt" = [])),
+    tag = "delegation",
+    operation_id="delegation_grant"
+)]
+pub async fn delegation_grant(
+    State(state): State<ServerState>,
+    Extension(kopid): Extension<KOpId>,
+    VerifiedClientInformation(client_auth_info): VerifiedClientInformation,
+    Json(request): Json<kubidm_proto::v1::DelegationGrantRequest>,
+) -> Result<Json<kubidm_proto::v1::DelegationGrant>, WebError> {
+    state
+        .qe_w_ref
+        .handle_delegation_grant(client_auth_info, request, kopid.eventid)
+        .await
+        .map(Json::from)
+        .map_err(WebError::from)
+}
+
+/// Get a delegation by name or uuid.
+#[utoipa::path(
+    get,
+    path = "/v1/delegation/{id}",
+    responses(
+        (status = 200, body=DelegationGrant, content_type=APPLICATION_JSON),
+        ApiResponseWithout200,
+    ),
+    security(("token_jwt" = [])),
+    tag = "delegation",
+    operation_id="delegation_get"
+)]
+pub async fn delegation_get(
+    State(state): State<ServerState>,
+    Extension(kopid): Extension<KOpId>,
+    VerifiedClientInformation(client_auth_info): VerifiedClientInformation,
+    Path(id): Path<String>,
+) -> Result<Json<kubidm_proto::v1::DelegationGrant>, WebError> {
+    state
+        .qe_r_ref
+        .handle_delegation_get(client_auth_info, id, kopid.eventid)
+        .await
+        .map(Json::from)
+        .map_err(WebError::from)
+}
+
+/// Revoke a delegation, by name or uuid.
+#[utoipa::path(
+    delete,
+    path = "/v1/delegation/{id}",
+    responses(
+        DefaultApiResponse,
+    ),
+    security(("token_jwt" = [])),
+    tag = "delegation",
+    operation_id="delegation_revoke"
+)]
+pub async fn delegation_revoke(
+    State(state): State<ServerState>,
+    Extension(kopid): Extension<KOpId>,
+    VerifiedClientInformation(client_auth_info): VerifiedClientInformation,
+    Path(id): Path<String>,
+) -> Result<Json<()>, WebError> {
+    state
+        .qe_w_ref
+        .handle_delegation_revoke(client_auth_info, id, kopid.eventid)
+        .await
+        .map(Json::from)
+        .map_err(WebError::from)
 }
 
 #[utoipa::path(

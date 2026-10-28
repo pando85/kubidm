@@ -2063,4 +2063,62 @@ impl QueryServerWriteV1 {
             .approval_request_cancel(&ident, request_uuid)
             .and_then(|_| idms_prox_write.commit())
     }
+
+    #[instrument(
+        level = "info",
+        name = "delegation_grant",
+        skip_all,
+        fields(uuid = ?eventid)
+    )]
+    pub async fn handle_delegation_grant(
+        &self,
+        client_auth_info: ClientAuthInfo,
+        request: kubidm_proto::v1::DelegationGrantRequest,
+        eventid: Uuid,
+    ) -> Result<kubidm_proto::v1::DelegationGrant, OperationError> {
+        let ct = duration_from_epoch_now();
+        let mut idms_prox_write = self.idms.proxy_write(ct).await?;
+        let ident = idms_prox_write
+            .validate_client_auth_info_to_ident(client_auth_info, ct)
+            .map_err(|e| {
+                error!(?e, "Invalid identity");
+                e
+            })?;
+
+        let grant = idms_prox_write.qs_write.delegation_grant(
+            &ident,
+            &request.template,
+            &request.receiver,
+            &request.scope,
+            request.filter.as_ref(),
+        )?;
+        idms_prox_write.commit().map(|_| grant)
+    }
+
+    #[instrument(
+        level = "info",
+        name = "delegation_revoke",
+        skip_all,
+        fields(uuid = ?eventid)
+    )]
+    pub async fn handle_delegation_revoke(
+        &self,
+        client_auth_info: ClientAuthInfo,
+        id: String,
+        eventid: Uuid,
+    ) -> Result<(), OperationError> {
+        let ct = duration_from_epoch_now();
+        let mut idms_prox_write = self.idms.proxy_write(ct).await?;
+        let ident = idms_prox_write
+            .validate_client_auth_info_to_ident(client_auth_info, ct)
+            .map_err(|e| {
+                error!(?e, "Invalid identity");
+                e
+            })?;
+
+        idms_prox_write
+            .qs_write
+            .delegation_revoke(&ident, &id)
+            .and_then(|_| idms_prox_write.commit())
+    }
 }

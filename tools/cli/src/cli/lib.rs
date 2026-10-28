@@ -26,6 +26,7 @@ include!("../opt/kubidm.rs");
 
 mod approval;
 mod common;
+mod delegation;
 mod domain;
 mod graph;
 mod group;
@@ -173,6 +174,7 @@ impl KubidmClientParser {
             KubidmClientOpt::Person { commands } => commands.exec(self).await,
             KubidmClientOpt::ServiceAccount { commands } => commands.exec(self).await,
             KubidmClientOpt::Group { commands } => commands.exec(self).await,
+            KubidmClientOpt::Delegation { commands } => commands.exec(self).await,
             KubidmClientOpt::Graph(gops) => gops.exec(self).await,
             KubidmClientOpt::System { commands } => commands.exec(self).await,
             KubidmClientOpt::Schema {

@@ -181,6 +181,18 @@ pub enum OperationError {
     // Kubidm Approval Errors
     AP0001ApprovalQuorumUnreachable,
 
+    // Kubidm Delegation Errors
+    DG0001DelegationUnknownTemplate,
+    DG0002DelegationHighPrivilegeGroup,
+    DG0003DelegationBuiltinGroup,
+    DG0004DelegationNotAGroup,
+    DG0005DelegationReceiverIsScope,
+    DG0006DelegationAlreadyExists,
+    DG0007DelegationScopeIsReceiver,
+    DG0008DelegationInvalidFilter,
+    DG0009DelegationEntryManaged,
+    DG0010DelegationDynamicGroup,
+
     // Credential Update Errors
     CU0001WebauthnAttestationNotTrusted,
     CU0002WebauthnRegistrationError,
@@ -616,6 +628,16 @@ impl OperationError {
             Self::KU005ErrorCheckingAccount => Some("Error checking account".into()),
             Self::KU006OnlyRootAllowed => Some("Only root is allowed to perform this operation".into()),
             Self::AP0001ApprovalQuorumUnreachable => Some("The approval policy can never be satisfied for this request: too few approvers other than the requester".into()),
+            Self::DG0001DelegationUnknownTemplate => Some("Unknown delegation template, expected one of helpdesk, user_admin or group_admin".into()),
+            Self::DG0002DelegationHighPrivilegeGroup => Some("A delegation receiver or scope can not be a high privilege group, nor nested in one".into()),
+            Self::DG0003DelegationBuiltinGroup => Some("A delegation receiver or scope can not be a built-in group".into()),
+            Self::DG0004DelegationNotAGroup => Some("A delegation receiver or scope must be a group".into()),
+            Self::DG0005DelegationReceiverIsScope => Some("The receiver group of a delegation can not be its scope group, nor nested in it".into()),
+            Self::DG0006DelegationAlreadyExists => Some("This delegation already exists, revoke it first to change it".into()),
+            Self::DG0007DelegationScopeIsReceiver => Some("The scope group of a delegation can not be the receiver group of a delegation, nor nested in one".into()),
+            Self::DG0008DelegationInvalidFilter => Some("The delegation scope filter is invalid: it may not use self, and every entry it refers to must exist".into()),
+            Self::DG0009DelegationEntryManaged => Some("The receiver group, the scope group or a group nested in the scope has an entry manager that is not high privilege: entry managers of these groups bypass the delegation scope, remove them first".into()),
+            Self::DG0010DelegationDynamicGroup => Some("A delegation receiver or scope can not be a dynamic group, nor have one nested in it".into()),
             Self::LD0001AnonymousNotAllowed => Some("Anonymous is not allowed to access LDAP with this method.".into()),
             Self::MG0001InvalidReMigrationLevel => None,
             Self::MG0002RaiseDomainLevelExceedsMaximum => None,

@@ -32,6 +32,9 @@ short lived or isolated read-write token.
 A number of types in Kubidm allow permission delegation such as groups and service accounts. This allows entries to be
 assigned an entry manager who has write access to that entity but not all entities of the same class.
 
+Kubidm can also delegate a fixed set of rights, such as credential resets, over the members of a group to the members of
+another group. See [Delegated Administration](delegation.md).
+
 ## High Privilege Groups
 
 Kubidm has a special group called `idm_high_privilege`. This acts as a "taint" on its members to indicate that they have

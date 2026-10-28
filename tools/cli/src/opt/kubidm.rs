@@ -1714,6 +1714,45 @@ pub enum ApprovalOpt {
     },
 }
 
+#[derive(Debug, Args, Clone)]
+pub struct DelegationGrantOpt {
+    /// The template to grant: helpdesk, user_admin or group_admin
+    #[clap(long)]
+    pub template: String,
+    /// The group (name, spn or uuid) whose members receive the rights
+    #[clap(long)]
+    pub receiver: String,
+    /// The group (name, spn or uuid) whose members the rights apply to
+    #[clap(long)]
+    pub scope: String,
+    /// A JSON filter that narrows the scope, e.g. '{"pres":"mail"}'
+    #[clap(long)]
+    pub filter: Option<String>,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct DelegationNamedOpt {
+    /// The name or uuid of the delegation
+    #[clap(name = "name")]
+    pub name: String,
+}
+
+#[derive(Debug, Subcommand, Clone)]
+pub enum DelegationOpt {
+    /// List the delegations
+    #[clap(name = "list")]
+    List,
+    /// Show a delegation
+    #[clap(name = "get")]
+    Get(DelegationNamedOpt),
+    /// Grant the members of a group the rights of a built-in template over the members of another group
+    #[clap(name = "grant")]
+    Grant(DelegationGrantOpt),
+    /// Revoke a delegation
+    #[clap(name = "revoke")]
+    Revoke(DelegationNamedOpt),
+}
+
 #[derive(Debug, Subcommand, Clone)]
 #[clap(about = "Kubidm Client Utility")]
 pub enum KubidmClientOpt {
@@ -1743,6 +1782,11 @@ pub enum KubidmClientOpt {
     Group {
         #[clap(subcommand)]
         commands: GroupOpt,
+    },
+    /// Grant, list and revoke delegated administration
+    Delegation {
+        #[clap(subcommand)]
+        commands: DelegationOpt,
     },
     /// Actions to manage and view service accounts
     #[clap(name = "service-account")]
