@@ -19,6 +19,7 @@ use kubidmd_lib::maintenance::{
 // The request types name these, so a client of the admin socket needs them too.
 pub use kubidmd_lib::maintenance::{MaintenanceOperation, ReplicationFence};
 use kubidmd_lib::prelude::{duration_from_epoch_now, IdmServer};
+use kubidmd_lib::status::{DatabaseCheck, ReplicationStateTracker};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::io;
@@ -1302,9 +1303,12 @@ async fn replication_sync_until(
     }
 }
 
+/// Resume serving after a maintenance operation. The operator decided the node is fit to
+/// serve, so a failed verification of the operation no longer keeps it not ready.
 async fn maintenance_resume(
     controller: Arc<Mutex<MaintenanceController>>,
     operation_id: Uuid,
+    health: &ReplicationStateTracker,
 ) -> AdminTaskResponse {
     let (held, guard) = {
         let mut state = lock_controller(&controller);
@@ -1322,6 +1326,7 @@ async fn maintenance_resume(
     }
 
     guard.finish(|state| ((), state.finish_resume(operation_id)));
+    health.mark_database_healthy(DatabaseCheck::Verify);
     AdminTaskResponse::MaintenanceResume { operation_id }
 }
 
@@ -1462,7 +1467,12 @@ async fn handle_client(
                     .await
                 }
                 AdminTaskRequest::MaintenanceResume { operation_id } => {
-                    maintenance_resume(maintenance.clone(), operation_id).await
+                    maintenance_resume(
+                        maintenance.clone(),
+                        operation_id,
+                        &server_rw.idms.health_tracker(),
+                    )
+                    .await
                 }
                 AdminTaskRequest::Reload => match broadcast_tx.send(CoreAction::Reload) {
                     Ok(_) => AdminTaskResponse::Success,
@@ -2007,5 +2017,34 @@ mod maintenance_controller_tests {
         assert!(Instant::now()
             .checked_add(sync_until_timeout(Some(u64::MAX)))
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn resume_clears_a_failed_verification() {
+        use kubidmd_lib::status::DatabaseHealth;
+
+        let mut controller = MaintenanceController::default();
+        let operation_id = Uuid::new_v4();
+        drained(&mut controller, operation_id);
+        let controller = Arc::new(Mutex::new(controller));
+
+        let health = ReplicationStateTracker::new();
+        health.mark_database_failure(DatabaseCheck::Verify);
+
+        // A refused resume (another operation) leaves the failure in place.
+        let refused = maintenance_resume(controller.clone(), Uuid::new_v4(), &health).await;
+        assert!(!matches!(
+            refused,
+            AdminTaskResponse::MaintenanceResume { .. }
+        ));
+        assert_eq!(health.get_database_health(), DatabaseHealth::Unhealthy);
+
+        // Resuming publishes the serving state, which is also the process default.
+        let response = maintenance_resume(controller, operation_id, &health).await;
+        assert!(matches!(
+            response,
+            AdminTaskResponse::MaintenanceResume { operation_id: resumed } if resumed == operation_id
+        ));
+        assert_eq!(health.get_database_health(), DatabaseHealth::Healthy);
     }
 }

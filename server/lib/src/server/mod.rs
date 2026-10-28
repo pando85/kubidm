@@ -2110,14 +2110,30 @@ impl QueryServer {
         &self.health
     }
 
-    /// Kubidm: whether the replication update vector records changes that originated on
-    /// another server, i.e. this server has received a refresh or an incremental from a
-    /// supplier. A fresh server only records its own changes. Active servers write an
-    /// anchor every purge interval, so the RUV of a node that has synced keeps its peers
-    /// until they have been gone longer than the changelog.
-    pub async fn replication_has_peer_changes(&self) -> Result<bool, OperationError> {
+    /// Kubidm: whether the database shows that this server has synced from a replication
+    /// supplier before. This is decided without a separate marker, from two facts that the
+    /// sync itself writes in the same transaction:
+    ///
+    /// * The domain info entry was created by another server. A fresh server creates its
+    ///   own domain; a refresh replaces the whole content, domain entry and its creation
+    ///   change included, with the supplier's, and gives this server a new server uuid.
+    ///   The creation change of an entry is never trimmed, so this survives restarts,
+    ///   changelog trimming and backups. A server that is not in the supplier's domain can
+    ///   only sync through a refresh, so for a fresh replica this is the complete answer.
+    /// * The replication update vector records changes that originated on another server:
+    ///   an incremental was applied. This covers the server that created the domain, but
+    ///   is lost when every peer has been gone longer than the changelog.
+    pub async fn replication_has_synced(&self) -> Result<bool, OperationError> {
         let s_uuid = self.cid_max.read().s_uuid;
         let mut read_txn = self.read().await?;
+        let domain_creator = read_txn
+            .internal_search_uuid(UUID_DOMAIN_INFO)?
+            .get_changestate()
+            .at()
+            .s_uuid;
+        if domain_creator != s_uuid {
+            return Ok(true);
+        }
         let ReplRuvRange::V1 { ranges, .. } = read_txn.consumer_get_state()?;
         Ok(ranges.keys().any(|server| *server != s_uuid))
     }

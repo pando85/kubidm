@@ -282,10 +282,10 @@ impl IdmServer {
         self.qs.health().clone()
     }
 
-    /// Kubidm: whether this server has ever received changes from a replication supplier,
-    /// see [`QueryServer::replication_has_peer_changes`].
-    pub async fn replication_has_peer_changes(&self) -> Result<bool, OperationError> {
-        self.qs.replication_has_peer_changes().await
+    /// Kubidm: whether this server has synced from a replication supplier before, see
+    /// [`QueryServer::replication_has_synced`].
+    pub async fn replication_has_synced(&self) -> Result<bool, OperationError> {
+        self.qs.replication_has_synced().await
     }
 
     /// Read from the database, in a transaction.

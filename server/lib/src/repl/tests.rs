@@ -4,7 +4,7 @@ use crate::{
     prelude::*,
     repl::{
         entry::State,
-        proto::{ConsumerState, ReplIncrementalContext},
+        proto::{ConsumerState, ReplIncrementalContext, ReplRuvRange},
         ruv::{RangeDiffStatus, ReplicationUpdateVector, ReplicationUpdateVectorTransaction},
     },
     value::{AuthType, Session, SessionState},
@@ -194,15 +194,16 @@ async fn test_repl_refresh_basic(server_a: &QueryServer, server_b: &QueryServer)
 }
 
 // Test that adding an entry to one side replicates correctly.
-// Kubidm: a fresh server has only its own changes in its RUV, a server that received a
-// refresh or an incremental also has its supplier's. Startup readiness relies on this.
+// Kubidm: a fresh server has created its own domain and has only its own changes in its
+// RUV. A refreshed server holds a domain created elsewhere, a server that applied an
+// incremental has its supplier's changes in its RUV. Startup readiness relies on this.
 #[qs_pair_test]
-async fn test_repl_has_peer_changes_after_refresh_and_incremental(
+async fn test_repl_has_synced_after_refresh_and_incremental(
     server_a: &QueryServer,
     server_b: &QueryServer,
 ) {
-    assert_eq!(server_a.replication_has_peer_changes().await, Ok(false));
-    assert_eq!(server_b.replication_has_peer_changes().await, Ok(false));
+    assert_eq!(server_a.replication_has_synced().await, Ok(false));
+    assert_eq!(server_b.replication_has_synced().await, Ok(false));
 
     // Refresh a from b.
     let mut server_a_txn = server_a.write(duration_from_epoch_now()).await.unwrap();
@@ -212,8 +213,11 @@ async fn test_repl_has_peer_changes_after_refresh_and_incremental(
         .is_ok());
     drop(server_b_txn);
 
-    assert_eq!(server_a.replication_has_peer_changes().await, Ok(true));
-    assert_eq!(server_b.replication_has_peer_changes().await, Ok(false));
+    assert_eq!(server_a.replication_has_synced().await, Ok(true));
+    // b created the domain and has not pulled anything: its database can not tell it from
+    // a fresh replica. That is why a node without automatic_refresh is never treated as
+    // fresh.
+    assert_eq!(server_b.replication_has_synced().await, Ok(false));
 
     // A change made on a reaches b with an incremental.
     let mut server_a_txn = server_a.write(duration_from_epoch_now()).await.unwrap();
@@ -235,7 +239,47 @@ async fn test_repl_has_peer_changes_after_refresh_and_incremental(
     server_b_txn.commit().expect("Failed to commit");
     drop(server_a_txn);
 
-    assert_eq!(server_b.replication_has_peer_changes().await, Ok(true));
+    assert_eq!(server_b.replication_has_synced().await, Ok(true));
+}
+
+// Kubidm: a refreshed server whose supplier has been gone longer than the changelog loses
+// the supplier from its RUV, but still knows it has synced: it must stay ready on restart.
+#[qs_pair_test]
+async fn test_repl_has_synced_survives_ruv_trim(server_a: &QueryServer, server_b: &QueryServer) {
+    let ct = duration_from_epoch_now();
+
+    let mut server_b_txn = server_b.read().await.unwrap();
+    let ReplRuvRange::V1 {
+        ranges: b_ranges, ..
+    } = server_b_txn
+        .consumer_get_state()
+        .expect("Unable to access RUV range");
+    let b_servers: Vec<Uuid> = b_ranges.keys().copied().collect();
+    assert!(!b_servers.is_empty());
+
+    // Refresh a from b.
+    let mut server_a_txn = server_a.write(ct).await.unwrap();
+    assert!(repl_initialise(&mut server_b_txn, &mut server_a_txn)
+        .and_then(|_| server_a_txn.commit())
+        .is_ok());
+    drop(server_b_txn);
+
+    // b is gone for longer than the changelog: trimming removes it from a's RUV.
+    let ct = ct + Duration::from_secs(CHANGELOG_MAX_AGE * 4);
+    let mut server_a_txn = server_a.write(ct).await.unwrap();
+    assert!(server_a_txn.purge_tombstones().is_ok());
+    server_a_txn.commit().expect("Failed to commit");
+
+    let mut server_a_txn = server_a.read().await.unwrap();
+    let ReplRuvRange::V1 {
+        ranges: a_ranges, ..
+    } = server_a_txn
+        .consumer_get_state()
+        .expect("Unable to access RUV range");
+    drop(server_a_txn);
+    assert!(b_servers.iter().all(|b| !a_ranges.contains_key(b)));
+
+    assert_eq!(server_a.replication_has_synced().await, Ok(true));
 }
 
 #[qs_pair_test]

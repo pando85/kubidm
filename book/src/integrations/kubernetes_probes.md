@@ -149,76 +149,96 @@ true
 
 The `replication_state` field is derived from what the replication consumer tasks observe each time they sync with a
 supplier peer (every `task_poll_interval`, 15 seconds by default). It is evaluated when `/readyz` is requested, so a
-peer becomes stale even if its replication task stops reporting. The states are checked in this order, the first match
-wins:
+peer becomes stale even if its replication task stops reporting. Elapsed times are measured on the monotonic clock, so
+wall clock adjustments neither hide nor fake a stale peer. The states are checked in this order, the first match wins:
 
-| State              | Set when                                                                                                                                        | Ready? |
-| ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------- | ------ |
-| `refreshing`       | A full refresh from a supplier is being applied                                                                                                 | No     |
-| `refresh_required` | A supplier answered that this node must be refreshed (domain mismatch, or this node is older than the supplier's changelog)                     | No     |
-| `catching_up`      | Replication has supplier peers, but this node has never completed a refresh or incremental from one (a fresh replica)                           | No     |
-| `failed`           | Applying what the suppliers send has failed for 20 replication intervals (5 minutes by default) with no successful sync in between              | No     |
-| `degraded`         | At least one supplier peer had no successful sync for 4 replication intervals (1 minute by default): unreachable, or the exchange keeps failing | Yes    |
-| `healthy`          | Every supplier peer synced within the stale window, or replication is not configured, or this node has no supplier peers                        | Yes    |
+| State              | Set when                                                                                                                                                         | Ready? |
+| ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------ |
+| `refreshing`       | A full refresh from a supplier is being applied                                                                                                                  | No     |
+| `refresh_required` | A supplier answered that this node must be refreshed: this node is older than the supplier's changelog, or a domain mismatch this node can not blame on the peer | No     |
+| `catching_up`      | A supplier is configured with `automatic_refresh`, but this node has never completed a refresh or incremental from a supplier (a fresh replica)                  | No     |
+| `failed`           | Applying what the suppliers send has kept failing for 20 replication intervals (5 minutes by default), and the last failure is within the stale window           | No     |
+| `degraded`         | At least one supplier peer had no successful sync for 4 replication intervals (1 minute by default), or answered from another domain (see below)                 | Yes    |
+| `healthy`          | Every supplier peer synced within the stale window, or replication is not configured, or this node has no supplier peers                                         | Yes    |
 
 The stale and failed windows scale with `task_poll_interval`: a peer is stale after `4 × task_poll_interval` without a
-successful sync, and replication is failed after `20 × task_poll_interval` of continuous local apply failures.
+successful sync. Replication is failed after `20 × task_poll_interval` of local apply failures that are still ongoing: a
+run of failures ends when no new failure happens for the stale window, and a later failure starts a new run.
 
 ### Transitions
 
-- **Successful incremental from a peer:** the peer is fresh again, its `refresh_required` flag is cleared, the node
-  counts as synced, and any `failed` condition is cleared.
-- **Supplier reports a refresh is required:** the node is `refresh_required` until that supplier answers an incremental
-  normally again or a refresh succeeds. With `automatic_refresh` the refresh starts immediately.
-- **Refresh:** `refreshing` while it runs. On success every `refresh_required` flag is cleared and the node is synced. A
-  refresh is applied in a single transaction, so a failed refresh leaves the content unchanged and the state returns to
-  what it was before (`refresh_required`, `catching_up`, or `healthy` for an operator requested refresh of a synced
-  node).
+- **Successful incremental from a peer:** the peer is fresh again, its `refresh_required` and other domain flags are
+  cleared, the node counts as synced, and any run of apply failures ends.
+- **Supplier reports that this node is behind its changelog:** the node is `refresh_required` until that supplier
+  answers an incremental normally again or a refresh succeeds. With `automatic_refresh` the refresh starts immediately.
+- **Supplier answers from another domain:** if this node is synced and another supplier synced within the stale window,
+  the peer is the one out of the domain (a new replica not refreshed yet, or a rebuilt one). It is reported stale, the
+  node is `degraded` and keeps serving, an error is logged, and this node is never refreshed from that peer even with
+  `automatic_refresh`. Otherwise (this node has never synced, or no other supplier is in sync) the mismatch is treated
+  as `refresh_required`, as upstream does.
+- **Refresh:** `refreshing` while it runs. On success every `refresh_required` flag is cleared, the node is synced, and
+  a failed verification is cleared because the content was replaced. A refresh is applied in a single transaction, so a
+  failed refresh leaves the content unchanged and the state returns to what it was before (`refresh_required`,
+  `catching_up`, or `healthy` for an operator requested refresh of a synced node).
 - **Connection failure or failed exchange** (timeout, protocol or decode error, the supplier closed the connection): the
   peer keeps its last successful sync time and goes stale once the stale window passes, making the node `degraded`.
 - **Local apply failure** (this node could not read its replication state, or could not apply or commit what the
-  supplier sent): the node becomes `failed` if this continues for the failed window. A successful sync with any supplier
-  clears it.
+  supplier sent): the node becomes `failed` if such failures keep happening for the failed window. A successful sync
+  with any supplier, or the stale window passing without a new failure, ends the run.
 
-`failed` deliberately only covers failures to apply changes locally. Suppliers that are unreachable, however long, only
-make the node `degraded`: in a partition, or in a two node topology that lost one node, turning every survivor not ready
-would turn a replication problem into a full outage. Alert on `degraded` instead (see below).
+`failed` deliberately only covers ongoing failures to apply changes locally. Suppliers that are unreachable, however
+long, only make the node `degraded`, even after an earlier apply failure: in a partition, or in a two node topology that
+lost one node, turning every survivor not ready would turn a replication problem into a full outage. Alert on `degraded`
+instead (see below).
 
 ### Startup
 
-When the server starts with replication configured, it decides whether it holds the domain's content from its
-replication update vector (RUV):
+When the server starts with replication configured, it decides whether it must wait for a supplier before serving:
 
-- If the RUV records changes that originated on another server, the node has received a refresh or an incremental before
-  and starts `healthy` (ready). Active servers write an anchor into the RUV every purge interval, so a synced node keeps
-  its peers there.
-- If the RUV only records this node's own changes, the node is a fresh replica and starts `catching_up` (not ready)
-  until its first successful refresh or incremental. A fresh replica's first incremental is normally answered with a
-  domain mismatch, so it moves to `refresh_required` until it is refreshed (automatically with `automatic_refresh`, or
-  with `kubidmd refresh-replication-consumer`).
-- If replication is configured without supplier peers (an empty peer list, or only `allow-pull` consumers), there is
-  nothing to wait for: the node starts `healthy`.
+- A node with no supplier configured with `automatic_refresh` holds the domain's content by configuration and starts
+  `healthy` (ready). This covers the node that created the domain (for example pod-0 of a StatefulSet, whose peers do
+  not exist yet when it starts), a lone survivor whose peers are gone, and replication configured without supplier peers
+  (an empty peer list, or only `allow-pull` consumers).
+- A node with a supplier configured with `automatic_refresh` expects to receive its content from a supplier. It starts
+  `healthy` if its database shows that it has synced before, and `catching_up` (not ready) otherwise, until its first
+  successful refresh or incremental. A fresh replica's first incremental is answered with a domain mismatch, so it moves
+  to `refresh_required` and is refreshed automatically.
 
-A node whose RUV no longer names any other server because every peer has been gone for longer than the changelog (7
-days) is treated as fresh too, and is not ready until a supplier is reachable again.
+The database shows that a node has synced before when either:
+
+- its domain info entry was created by another server. A fresh server creates its own domain; a refresh replaces the
+  whole content, including the domain entry and its creation record, with the supplier's, in the same transaction. Entry
+  creation records are never trimmed, so this survives restarts, changelog trimming and backups. A server outside the
+  supplier's domain can only sync through a refresh, so for a fresh replica this is the complete answer; or
+- its replication update vector (RUV) records changes that originated on another server, i.e. it applied an incremental.
+  This covers a domain creator configured with `automatic_refresh` towards a peer, until every peer has been gone longer
+  than the changelog (7 days).
+
+If the database can not be read at startup, a node with an `automatic_refresh` supplier is treated as never synced and
+stays not ready until its first successful sync; an error is logged.
+
+Supplier peers must be configured by DNS name: replication refuses addresses because the TLS check needs a name. A peer
+configured by address is logged at startup, tracked under its address, and reported stale.
 
 When a new replica joins an existing topology, the existing nodes that pull from it are answered with a domain mismatch
-until the new replica has been refreshed, so they also report `refresh_required` for that window. To keep them serving,
-configure the new replica as an `allow-pull` consumer on the existing nodes first, refresh it, and only then switch them
-to `mutual-pull` (or `pull`) from it.
+until the new replica has been refreshed. As long as they are in sync with another supplier they only report it as a
+stale peer (`degraded`, still ready). An existing node whose only supplier is the new replica can not tell which side is
+out of the domain and reports `refresh_required`: refresh the new replica before adding it as the only supplier of an
+existing node.
 
 ## Database Health
 
 The `database_health` field is `unhealthy` (not ready) when either of these checks last failed:
 
-| Check  | Fails when                                                                                       | Recovers when                      |
-| ------ | ------------------------------------------------------------------------------------------------ | ---------------------------------- |
-| Commit | The backend commit of a write transaction fails (database or IO error, for example a full disk)  | The next write transaction commits |
-| Verify | The online consistency verification that ends every admin socket `MaintenanceRun` reports errors | The next verification reports none |
+| Check  | Fails when                                                                                       | Recovers when                                                                                                         |
+| ------ | ------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------- |
+| Commit | The backend commit of a write transaction fails (database or IO error, for example a full disk)  | The next write transaction commits                                                                                    |
+| Verify | The online consistency verification that ends every admin socket `MaintenanceRun` reports errors | The next verification reports none, the operator resumes the maintenance operation, or a replication refresh succeeds |
 
 Changes rejected by schema, access control or plugin validation never reach the backend commit and do not affect the
 database health. Search errors do not affect it either. The two checks recover independently: a successful write does
-not clear a corruption found by a verification.
+not clear a corruption found by a verification. Both results are kept in memory only, so a restart of the server also
+clears them.
 
 ## Readiness Decision Matrix
 
@@ -339,12 +359,13 @@ In a multi-master replication setup:
 1. **Synced replicas serve traffic** in the `healthy` and `degraded` states
 2. **Disconnections are tolerated** - a synced replica remains ready while its suppliers are unreachable, it only
    becomes `degraded`
-3. **Fresh replicas wait for their first sync** - a new replica is not ready until it has received the domain's content
+3. **Fresh replicas wait for their first sync** - a new replica configured with `automatic_refresh` is not ready until
+   it has received the domain's content; a node without `automatic_refresh` holds the content by configuration
 4. **Refresh operations take replicas offline** - when a replica needs or is performing a refresh, it reports as not
    ready
 5. **No quorum or leader election** - each replica makes independent readiness decisions based on local state
 
-This design prioritizes availability while ensuring a node never serves content it has not received from the domain.
+This design prioritizes availability while ensuring a replica never serves content it is still waiting to receive.
 
 ## Draining a Node for Maintenance
 
@@ -432,16 +453,17 @@ Check the `/readyz` endpoint response to determine the cause:
 
 2. **`database_health` is `unhealthy`:** A write transaction failed to commit in the backend, or the last online
    verification found consistency errors. Check the logs for `Database health check failed`. A commit failure clears
-   with the next successful write (check disk space and permissions); a verification failure clears with the next clean
-   verification, and may require a reindex, a refresh from a peer, or a restore from backup.
+   with the next successful write (check disk space and permissions). A verification failure clears with the next clean
+   verification, a successful refresh from a peer, or when the operator resumes the maintenance operation; repairing it
+   may require a reindex, a refresh, or a restore from backup. A restart also clears both, as they are kept in memory.
 
-3. **`replication_state` is `catching_up`:** The node has never synced from a supplier. Check that a supplier is
-   reachable, then refresh the node (automatically with `automatic_refresh`, or with
+3. **`replication_state` is `catching_up`:** The node expects its content from an `automatic_refresh` supplier and has
+   never synced from one. Check that the supplier is reachable; the refresh then happens automatically (or run
    `kubidmd refresh-replication-consumer`).
 
 4. **`replication_state` is `refresh_required`:** A supplier reported that this node's content must be refreshed: it is
-   a new replica, it has fallen further behind than the changelog, or a supplier is itself a new, not yet refreshed
-   replica. With `automatic_refresh` this happens automatically; if it persists, check:
+   a new replica, it has fallen further behind than the changelog, or its only in-sync supplier is itself a new, not yet
+   refreshed replica. With `automatic_refresh` this happens automatically; if it persists, check:
    - Network connectivity to peers
    - Peer availability
    - Replication configuration

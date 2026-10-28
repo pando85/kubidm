@@ -126,6 +126,31 @@ async fn test_readyz_replication_without_suppliers_is_ready(
 
 // A freshly created node configured to pull from a supplier has never received the
 // domain's content: it must not take traffic before its first successful sync.
+fn origin_replication() -> serde_json::Value {
+    replication_section(json!({
+        "repl://partner1.example.com:8444": {
+            "type": "mutual-pull",
+            "partner_cert": TEST_REPL_CERT,
+        },
+        "repl://partner2.example.com:8444": {
+            "type": "mutual-pull",
+            "partner_cert": TEST_REPL_CERT,
+        },
+    }))
+}
+
+// The first node of a new cluster created the domain and has never synced from its
+// partners, which do not exist yet. Without automatic_refresh it holds the domain's content
+// by configuration and must be ready, or an ordered rollout never starts the next node.
+#[kubidmd_testkit::test(repl_config = serde_json::from_value(origin_replication()).ok())]
+async fn test_readyz_domain_origin_is_ready(rsclient: &kubidm_client::KubidmClient) {
+    let (status, body) = get_readyz(rsclient).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["serving_ready"], "ready");
+    assert_eq!(body["replication_state"], "healthy");
+    assert_eq!(body["peers"]["total"], 2);
+}
+
 fn pull_replication() -> serde_json::Value {
     replication_section(json!({
         "repl://supplier.example.com:8444": {
@@ -204,13 +229,15 @@ fn test_database_health_serialization() {
 const T0: u64 = 1_000_000;
 const PEER: &str = "repl://peer1.example.com:8444";
 
-fn replicated_tracker(has_peer_changes: bool) -> ReplicationStateTracker {
+/// A replica configured with `automatic_refresh` from `PEER`.
+fn replicated_tracker(has_synced: bool) -> ReplicationStateTracker {
     let tracker = ReplicationStateTracker::new();
     tracker.mark_startup_complete(
         Some(ReplicationStartup {
             supplier_peers: vec![PEER.to_string()],
+            automatic_refresh: true,
             poll_interval: Duration::from_secs(15),
-            has_peer_changes,
+            has_synced,
         }),
         T0,
     );
@@ -348,8 +375,12 @@ fn test_tracker_unreachable_supplier_degrades_but_stays_ready() {
 #[test]
 fn test_tracker_apply_failures_fail_replication() {
     let tracker = replicated_tracker(true);
-    tracker.notify_replication_apply_failure(T0);
-    // Twenty 15 second intervals of failing to apply changes fail replication.
+    // Twenty 15 second intervals of ongoing failures to apply changes fail replication.
+    let mut now = T0;
+    while now < T0 + 300 {
+        tracker.notify_replication_apply_failure(now);
+        now += 15;
+    }
     assert_eq!(
         tracker.get_replication_state(T0 + 299),
         ReplicationState::Degraded
@@ -366,6 +397,25 @@ fn test_tracker_apply_failures_fail_replication() {
     tracker.notify_replication_incremental_success(PEER, T0 + 301);
     assert_eq!(
         tracker.compute_serving_readiness(T0 + 301),
+        ServingReadiness::Ready
+    );
+}
+
+#[test]
+fn test_tracker_one_apply_failure_then_unreachable_is_not_failed() {
+    let tracker = replicated_tracker(true);
+    tracker.notify_replication_apply_failure(T0);
+    let mut now = T0;
+    while now < T0 + 3600 {
+        now += 15;
+        tracker.notify_replication_connect_failure(PEER, now);
+    }
+    assert_eq!(
+        tracker.get_replication_state(now),
+        ReplicationState::Degraded
+    );
+    assert_eq!(
+        tracker.compute_serving_readiness(now),
         ServingReadiness::Ready
     );
 }

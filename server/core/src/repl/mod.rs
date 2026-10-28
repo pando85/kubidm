@@ -9,9 +9,9 @@ use kubidmd_lib::maintenance::{
 };
 use kubidmd_lib::prelude::duration_from_epoch_now;
 use kubidmd_lib::prelude::IdmServer;
-use kubidmd_lib::repl::proto::ConsumerState;
+use kubidmd_lib::repl::proto::{ConsumerState, ReplIncrementalContext};
 use kubidmd_lib::server::QueryServerTransaction;
-use kubidmd_lib::status::{ReplicationStartup, ReplicationStateTracker};
+use kubidmd_lib::status::{tracker_now, ReplicationStartup, ReplicationStateTracker};
 use rustls::{
     client::ClientConfig,
     pki_types::{CertificateDer, PrivateKeyDer, ServerName},
@@ -63,57 +63,76 @@ fn peer_label(origin: &Url) -> String {
     format!(
         "{}://{}{}",
         origin.scheme(),
-        origin.domain().unwrap_or("unknown"),
+        origin.host_str().unwrap_or("unknown"),
         origin.port().map(|p| format!(":{}", p)).unwrap_or_default()
     )
 }
 
-/// Seconds since the epoch, the clock of the health tracker.
+/// The clock of the health tracker.
 fn now_secs() -> u64 {
-    duration_from_epoch_now().as_secs()
+    tracker_now()
 }
 
-/// The peers this node pulls from, as named in the health tracker.
-fn supplier_peers(repl_config: &ReplicationConfiguration) -> Vec<String> {
-    repl_config
+/// The peers this node pulls from, as named in the health tracker, and whether any of them
+/// is configured with `automatic_refresh`.
+fn supplier_peers(repl_config: &ReplicationConfiguration) -> (Vec<String>, bool) {
+    let mut automatic = false;
+    let peers = repl_config
         .manual
         .iter()
-        .filter(|(_, node)| {
-            matches!(
-                node,
-                RepNodeConfig::Pull { .. } | RepNodeConfig::MutualPull { .. }
-            )
+        .filter_map(|(origin, node)| match node {
+            RepNodeConfig::Pull {
+                automatic_refresh, ..
+            }
+            | RepNodeConfig::MutualPull {
+                automatic_refresh, ..
+            } => {
+                if origin.domain().is_none() {
+                    warn!(
+                        "Replication supplier {origin} is not configured by DNS name. Replication \
+                         requires a DNS name for the TLS certificate check, so this peer will \
+                         never replicate and is reported as stale."
+                    );
+                }
+                automatic |= *automatic_refresh;
+                Some(peer_label(origin))
+            }
+            RepNodeConfig::AllowPull { .. } => None,
         })
-        .map(|(origin, _)| peer_label(origin))
-        .collect()
+        .collect();
+    (peers, automatic)
 }
 
 /// What the health tracker needs to know about replication at startup. The supplier
 /// peers are the `pull` and `mutual-pull` nodes: `allow-pull` nodes only pull from us.
-/// Whether this node has synced before comes from its replication update vector; when it
-/// can not be read the node is treated as never synced, so it stays not ready until its
-/// first successful sync rather than serving content it can not vouch for.
+/// Whether this node has synced before only matters when a supplier is configured with
+/// `automatic_refresh`. It comes from the database; when that can not be read the node is
+/// treated as never synced, so it stays not ready until its first successful sync rather
+/// than serving content it can not vouch for.
 pub(crate) async fn replication_startup(
     repl_config: &ReplicationConfiguration,
     idms: &IdmServer,
 ) -> ReplicationStartup {
-    let supplier_peers = supplier_peers(repl_config);
+    let (supplier_peers, automatic_refresh) = supplier_peers(repl_config);
 
-    let has_peer_changes = idms
-        .replication_has_peer_changes()
-        .await
-        .unwrap_or_else(|err| {
+    let has_synced = if automatic_refresh {
+        idms.replication_has_synced().await.unwrap_or_else(|err| {
             error!(
                 ?err,
-                "Unable to read the replication update vector, treating this node as never synced."
+                "Unable to read the replication state of the database, treating this node as \
+                 never synced."
             );
             false
-        });
+        })
+    } else {
+        false
+    };
 
     ReplicationStartup {
         supplier_peers,
+        automatic_refresh,
         poll_interval: repl_config.get_task_poll_interval(),
-        has_peer_changes,
+        has_synced,
     }
 }
 
@@ -542,6 +561,19 @@ async fn repl_run_consumer_inner(
             return None;
         }
     };
+
+    // A supplier in another domain while this node is in sync with other suppliers is the
+    // one that must be refreshed (for example a new replica): never refresh from it.
+    if matches!(changes, ReplIncrementalContext::DomainMismatch)
+        && !tracker.notify_replication_domain_mismatch(peer_url, now_secs())
+    {
+        error!(
+            "Supplier {peer_url} is in a different domain while this node is in sync with \
+             other suppliers. That supplier must be refreshed; this node will not be refreshed \
+             from it."
+        );
+        return None;
+    }
 
     // Now apply the changes if possible
     let consumer_state = {
@@ -1298,13 +1330,22 @@ ta41VMU3u9UQfHxF
             peer_label(&url("repl://node1.example.com")),
             "repl://node1.example.com"
         );
+        // Peers configured by address stay distinct.
+        assert_eq!(
+            peer_label(&url("repl://192.0.2.1:8444")),
+            "repl://192.0.2.1:8444"
+        );
+        assert_ne!(
+            peer_label(&url("repl://192.0.2.1:8444")),
+            peer_label(&url("repl://192.0.2.2:8444"))
+        );
     }
 
     #[test]
     fn supplier_peers_are_the_nodes_this_node_pulls_from() {
         let mut repl_config = ReplicationConfiguration::default();
         // Replication configured without peers: nothing to sync from.
-        assert!(supplier_peers(&repl_config).is_empty());
+        assert_eq!(supplier_peers(&repl_config), (vec![], false));
 
         // A node that only supplies others has nothing to sync from either.
         repl_config.manual.insert(
@@ -1313,15 +1354,10 @@ ta41VMU3u9UQfHxF
                 consumer_cert: cert(),
             },
         );
-        assert!(supplier_peers(&repl_config).is_empty());
+        assert_eq!(supplier_peers(&repl_config), (vec![], false));
 
-        repl_config.manual.insert(
-            url("repl://supplier.example.com:8444"),
-            RepNodeConfig::Pull {
-                supplier_cert: cert(),
-                automatic_refresh: true,
-            },
-        );
+        // The node that created the domain: it pulls from its partners, but never takes
+        // its content from them.
         repl_config.manual.insert(
             url("repl://partner.example.com:8444"),
             RepNodeConfig::MutualPull {
@@ -1331,10 +1367,26 @@ ta41VMU3u9UQfHxF
         );
         assert_eq!(
             supplier_peers(&repl_config),
-            vec![
-                "repl://partner.example.com:8444".to_string(),
-                "repl://supplier.example.com:8444".to_string(),
-            ]
+            (vec!["repl://partner.example.com:8444".to_string()], false)
+        );
+
+        // A replica that is refreshed from its supplier when needed.
+        repl_config.manual.insert(
+            url("repl://supplier.example.com:8444"),
+            RepNodeConfig::Pull {
+                supplier_cert: cert(),
+                automatic_refresh: true,
+            },
+        );
+        assert_eq!(
+            supplier_peers(&repl_config),
+            (
+                vec![
+                    "repl://partner.example.com:8444".to_string(),
+                    "repl://supplier.example.com:8444".to_string(),
+                ],
+                true
+            )
         );
     }
 }

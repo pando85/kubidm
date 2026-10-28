@@ -76,7 +76,7 @@ use kubidmd_lib::{
     idm::ldap::LdapServer,
     prelude::*,
     schema::Schema,
-    status::{ReplicationStateTracker, StatusActor},
+    status::{tracker_now, ReplicationStateTracker, StatusActor},
     value::CredentialType,
 };
 use regex::Regex;
@@ -1469,7 +1469,7 @@ async fn mark_startup_complete(
         Some(repl_config) => Some(repl::replication_startup(repl_config, idms).await),
         None => None,
     };
-    tracker.mark_startup_complete(replication, duration_from_epoch_now().as_secs());
+    tracker.mark_startup_complete(replication, tracker_now());
 }
 
 #[allow(clippy::too_many_arguments)]

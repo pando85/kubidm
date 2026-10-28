@@ -12,9 +12,9 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock, RwLock};
+use std::time::{Duration, Instant};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
@@ -22,8 +22,9 @@ use uuid::Uuid;
 /// intervals (`task_poll_interval`, 15 seconds by default, so one minute by default).
 pub const STALE_AFTER_INTERVALS: u64 = 4;
 
-/// Replication is failed when this node has been unable to apply what its suppliers send
-/// for this many replication intervals in a row (5 minutes by default).
+/// Replication is failed when this node has kept failing to apply what its suppliers send
+/// for this many replication intervals (5 minutes by default), with no successful sync and
+/// no gap longer than the stale window between the failures.
 pub const FAILED_AFTER_INTERVALS: u64 = 20;
 
 /// Replication state machine for a Kubidm replica.
@@ -36,9 +37,9 @@ pub enum ReplicationState {
     /// The node has synced, and every supplier peer synced within the stale window (or
     /// replication is not configured, or the node has no supplier peers).
     Healthy,
-    /// Replication is configured with supplier peers, but this node has never completed a
-    /// refresh or incremental sync from one: it is a fresh replica whose content is not yet
-    /// the domain's content.
+    /// A supplier peer is configured with `automatic_refresh`, but this node has never
+    /// completed a refresh or incremental sync from a supplier: it is a fresh replica whose
+    /// content is not yet the domain's content.
     CatchingUp,
     /// The node is synced, but at least one supplier peer has not synced within the stale
     /// window (unreachable, or the exchange with it keeps failing).
@@ -48,8 +49,9 @@ pub enum ReplicationState {
     RefreshRequired,
     /// Replica is currently performing a full refresh.
     Refreshing,
-    /// This node has been unable to apply replication changes it received for the failed
-    /// window, with no successful sync in between. Requires operator intervention.
+    /// This node has kept failing to apply replication changes it received for the failed
+    /// window, with no successful sync in between, and the failures are still ongoing (the
+    /// last one is within the stale window). Requires operator intervention.
     Failed,
 }
 
@@ -107,8 +109,8 @@ pub struct PeerInfo {
     pub url: String,
     /// Whether the last connection attempt to the peer succeeded.
     pub connected: bool,
-    /// Timestamp of the last successful sync (refresh or incremental) with the peer
-    /// (seconds since epoch).
+    /// When the last sync (refresh or incremental) with the peer succeeded, in seconds on
+    /// the monotonic clock of the tracker (see [`tracker_now`]), not since the epoch.
     pub last_success: Option<u64>,
     /// Whether no sync with the peer succeeded within the stale window.
     pub stale: bool,
@@ -193,9 +195,10 @@ pub struct StatusRequestEvent {
 /// turn into the `degraded` and `failed` states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReplicationTimings {
-    /// A supplier peer is stale once no sync with it succeeded for this long.
+    /// A supplier peer is stale once no sync with it succeeded for this long. Failures to
+    /// apply changes stop counting as ongoing after this long without a new one.
     pub stale_after: u64,
-    /// Replication is failed once applying changes has failed for this long.
+    /// Replication is failed once applying changes has kept failing for this long.
     pub failed_after: u64,
 }
 
@@ -211,17 +214,30 @@ impl ReplicationTimings {
     }
 }
 
+static TRACKER_CLOCK_START: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+/// The clock of the health tracker: whole seconds on the monotonic clock since the first
+/// tracker of the process was created. Every `now` argument of [`ReplicationStateTracker`]
+/// is read from here, so that wall clock jumps neither hide nor fake a stale peer.
+pub fn tracker_now() -> u64 {
+    TRACKER_CLOCK_START.elapsed().as_secs()
+}
+
 /// What the tracker needs to know about replication when the server finishes starting.
 #[derive(Debug, Clone)]
 pub struct ReplicationStartup {
     /// The peers this node pulls from (`pull` and `mutual-pull`). `allow-pull` peers only
     /// pull from this node, so their health is reported by themselves, not here.
     pub supplier_peers: Vec<String>,
+    /// Whether a supplier peer is configured with `automatic_refresh`: this node expects
+    /// to receive the domain's content from a supplier. Without one the node holds the
+    /// domain's content by configuration (for example the node that created the domain).
+    pub automatic_refresh: bool,
     /// The replication poll interval, the unit of the stale and failed thresholds.
     pub poll_interval: Duration,
-    /// Whether the replication update vector holds changes that originated on another
-    /// server, i.e. this node has received a refresh or an incremental before.
-    pub has_peer_changes: bool,
+    /// Whether the database shows that this node has synced from a supplier before, see
+    /// `QueryServer::replication_has_synced`.
+    pub has_synced: bool,
 }
 
 #[derive(Debug, Default)]
@@ -229,6 +245,9 @@ struct PeerRecord {
     connected: bool,
     last_success: Option<u64>,
     refresh_required: bool,
+    /// The peer answered with a domain mismatch while this node was in sync with another
+    /// supplier: the peer is the one that must be refreshed.
+    foreign_domain: bool,
 }
 
 #[derive(Debug)]
@@ -236,19 +255,30 @@ struct ReplicationTracking {
     timings: ReplicationTimings,
     /// When tracking started: the reference for peers that never synced.
     started_at: u64,
-    /// The node holds the domain's content: it has synced from a supplier, or it has no
-    /// supplier to sync from.
+    /// The node holds the domain's content: it has synced from a supplier, or it does not
+    /// expect to receive its content from one.
     synced: bool,
     refreshing: bool,
-    /// When applying replicated changes locally started failing, cleared by any success.
+    /// When the current run of failures to apply replicated changes started.
     apply_failing_since: Option<u64>,
+    /// The most recent failure to apply replicated changes.
+    last_apply_failure: Option<u64>,
+    last_success: Option<u64>,
+    last_failure: Option<u64>,
     peers: BTreeMap<String, PeerRecord>,
 }
 
 impl ReplicationTracking {
     fn peer_stale(&self, peer: &PeerRecord, now: u64) -> bool {
         let since = peer.last_success.unwrap_or(self.started_at);
-        now.saturating_sub(since) >= self.timings.stale_after
+        peer.foreign_domain || now.saturating_sub(since) >= self.timings.stale_after
+    }
+
+    /// Whether failures to apply changes are ongoing: the last one is within the stale
+    /// window. Otherwise an old failure is history, whatever happened since.
+    fn apply_failing(&self, now: u64) -> bool {
+        self.last_apply_failure
+            .is_some_and(|last| now.saturating_sub(last) < self.timings.stale_after)
     }
 
     fn state(&self, now: u64) -> ReplicationState {
@@ -258,9 +288,10 @@ impl ReplicationTracking {
             ReplicationState::RefreshRequired
         } else if !self.synced {
             ReplicationState::CatchingUp
-        } else if self
-            .apply_failing_since
-            .is_some_and(|since| now.saturating_sub(since) >= self.timings.failed_after)
+        } else if self.apply_failing(now)
+            && self
+                .apply_failing_since
+                .is_some_and(|since| now.saturating_sub(since) >= self.timings.failed_after)
         {
             ReplicationState::Failed
         } else if self.peers.values().any(|peer| self.peer_stale(peer, now)) {
@@ -282,21 +313,46 @@ impl ReplicationTracking {
             .collect()
     }
 
+    fn record_apply_failure(&mut self, now: u64) {
+        if !self.apply_failing(now) {
+            // The previous failures (if any) are over: this one starts a new run.
+            self.apply_failing_since = Some(now);
+        }
+        self.last_apply_failure = Some(now);
+        self.last_failure = Some(now);
+    }
+
     fn record_sync_success(&mut self, peer_url: &str, now: u64) {
         self.synced = true;
         self.apply_failing_since = None;
+        self.last_apply_failure = None;
+        self.last_success = Some(now);
         if let Some(peer) = self.peers.get_mut(peer_url) {
             peer.connected = true;
             peer.last_success = Some(now);
             peer.refresh_required = false;
+            peer.foreign_domain = false;
         }
+    }
+
+    /// Whether this node is in sync with a supplier other than `peer_url`: it holds the
+    /// domain's content and another supplier synced within the stale window.
+    fn synced_with_other_peer(&self, peer_url: &str, now: u64) -> bool {
+        self.synced
+            && self.peers.iter().any(|(url, peer)| {
+                url != peer_url
+                    && !peer.foreign_domain
+                    && peer
+                        .last_success
+                        .is_some_and(|last| now.saturating_sub(last) < self.timings.stale_after)
+            })
     }
 }
 
 /// Shared replication state tracker.
 ///
 /// This is updated by the replication subsystem and the query server, and read by the
-/// status endpoints. All time arguments are seconds since the epoch.
+/// status endpoints. All time arguments are read from [`tracker_now`].
 #[derive(Debug, Clone)]
 pub struct ReplicationStateTracker {
     inner: Arc<ReplicationStateInner>,
@@ -309,20 +365,18 @@ struct ReplicationStateInner {
     commit_failed: AtomicBool,
     verify_failed: AtomicBool,
     server_phase: RwLock<String>,
-    last_replication_success: AtomicU64,
-    last_replication_failure: AtomicU64,
 }
 
 impl ReplicationStateTracker {
     pub fn new() -> Self {
+        // Start the tracker clock no later than the first tracker.
+        LazyLock::force(&TRACKER_CLOCK_START);
         Self {
             inner: Arc::new(ReplicationStateInner {
                 replication: RwLock::new(None),
                 commit_failed: AtomicBool::new(false),
                 verify_failed: AtomicBool::new(false),
                 server_phase: RwLock::new("bootstrap".to_string()),
-                last_replication_success: AtomicU64::new(0),
-                last_replication_failure: AtomicU64::new(0),
             }),
         }
     }
@@ -330,16 +384,22 @@ impl ReplicationStateTracker {
     /// The server finished starting. `replication` is `None` when replication is not
     /// configured.
     ///
-    /// A node with supplier peers that has never received changes from another server
-    /// starts in `catching_up` (not ready) until its first successful sync. A node without
-    /// supplier peers has nothing to wait for and is ready.
+    /// A node that expects its content from a supplier (`automatic_refresh`) and has never
+    /// synced from one starts in `catching_up` (not ready) until its first successful
+    /// sync. Every other node holds the domain's content and is ready.
     pub fn mark_startup_complete(&self, replication: Option<ReplicationStartup>, now: u64) {
         let tracking = replication.map(|startup| {
-            let synced = startup.has_peer_changes || startup.supplier_peers.is_empty();
+            let synced = startup.has_synced || !startup.automatic_refresh;
             if !synced {
                 info!(
                     "This node has never synced from a replication supplier: it reports not \
                      ready until its first successful refresh or incremental replication."
+                );
+            } else if !startup.has_synced && !startup.supplier_peers.is_empty() {
+                info!(
+                    "This node has not synced from a replication supplier yet, but no supplier \
+                     is configured with automatic_refresh: it holds the domain's content and \
+                     reports ready."
                 );
             }
             ReplicationTracking {
@@ -348,6 +408,9 @@ impl ReplicationStateTracker {
                 synced,
                 refreshing: false,
                 apply_failing_since: None,
+                last_apply_failure: None,
+                last_success: None,
+                last_failure: None,
                 peers: startup
                     .supplier_peers
                     .into_iter()
@@ -361,12 +424,20 @@ impl ReplicationStateTracker {
         self.set_server_phase("running".to_string());
     }
 
-    fn with_replication(&self, f: impl FnOnce(&mut ReplicationTracking)) {
-        if let Ok(mut lock) = self.inner.replication.write() {
-            if let Some(tracking) = lock.as_mut() {
-                f(tracking);
-            }
-        }
+    fn with_replication<T>(&self, f: impl FnOnce(&mut ReplicationTracking) -> T) -> Option<T> {
+        self.inner
+            .replication
+            .write()
+            .ok()
+            .and_then(|mut lock| lock.as_mut().map(f))
+    }
+
+    fn read_replication<T>(&self, f: impl FnOnce(&ReplicationTracking) -> T) -> Option<T> {
+        self.inner
+            .replication
+            .read()
+            .ok()
+            .and_then(|lock| lock.as_ref().map(f))
     }
 
     fn with_peer(&self, peer_url: &str, f: impl FnOnce(&mut PeerRecord)) {
@@ -409,28 +480,28 @@ impl ReplicationStateTracker {
 
     /// The connection to a supplier peer could not be established.
     pub fn notify_replication_connect_failure(&self, peer_url: &str, now: u64) {
-        self.record_replication_failure(now);
-        self.with_peer(peer_url, |peer| peer.connected = false);
+        self.with_replication(|tracking| {
+            tracking.last_failure = Some(now);
+            if let Some(peer) = tracking.peers.get_mut(peer_url) {
+                peer.connected = false;
+            }
+        });
     }
 
     /// The exchange with a connected supplier peer failed (timeout, protocol or decode
     /// error, connection closed). The peer goes stale if this persists.
     pub fn notify_replication_exchange_failure(&self, now: u64) {
-        self.record_replication_failure(now);
+        self.with_replication(|tracking| tracking.last_failure = Some(now));
     }
 
     /// This node failed to apply what a supplier sent (or to read its own replication
-    /// state). Replication fails if this persists for the failed window.
+    /// state). Replication fails if such failures keep happening for the failed window.
     pub fn notify_replication_apply_failure(&self, now: u64) {
-        self.record_replication_failure(now);
-        self.with_replication(|tracking| {
-            tracking.apply_failing_since.get_or_insert(now);
-        });
+        self.with_replication(|tracking| tracking.record_apply_failure(now));
     }
 
     /// An incremental sync with a supplier peer succeeded.
     pub fn notify_replication_incremental_success(&self, peer_url: &str, now: u64) {
-        self.record_replication_success(now);
         self.with_replication(|tracking| tracking.record_sync_success(peer_url, now));
     }
 
@@ -442,13 +513,34 @@ impl ReplicationStateTracker {
         });
     }
 
+    /// A supplier peer answered that its domain differs from this node's. Returns whether
+    /// this node must be refreshed.
+    ///
+    /// When this node holds the domain's content and another supplier synced within the
+    /// stale window, the peer is the one out of the domain (a new replica not yet
+    /// refreshed, or a rebuilt one): it is marked stale, which degrades this node, and the
+    /// node must not be refreshed from it. Otherwise this node can not tell, and treats
+    /// the mismatch as a refresh requirement.
+    pub fn notify_replication_domain_mismatch(&self, peer_url: &str, now: u64) -> bool {
+        self.with_replication(|tracking| {
+            let peer_is_foreign = tracking.synced_with_other_peer(peer_url, now);
+            if let Some(peer) = tracking.peers.get_mut(peer_url) {
+                peer.connected = true;
+                peer.foreign_domain = peer_is_foreign;
+            }
+            !peer_is_foreign
+        })
+        .unwrap_or(true)
+    }
+
     pub fn notify_replication_refresh_started(&self) {
         self.with_replication(|tracking| tracking.refreshing = true);
     }
 
     /// A refresh from a supplier peer was applied: the node holds the domain's content.
+    /// The refresh replaced the whole content, so an earlier failed verification no longer
+    /// applies.
     pub fn notify_replication_refresh_success(&self, peer_url: &str, now: u64) {
-        self.record_replication_success(now);
         self.with_replication(|tracking| {
             tracking.refreshing = false;
             tracking
@@ -457,13 +549,16 @@ impl ReplicationStateTracker {
                 .for_each(|peer| peer.refresh_required = false);
             tracking.record_sync_success(peer_url, now);
         });
+        self.mark_database_healthy(DatabaseCheck::Verify);
     }
 
     /// A refresh failed. The refresh is applied in a single transaction, so the content
     /// is unchanged and the state returns to what it was before the refresh started.
     pub fn notify_replication_refresh_failed(&self, now: u64) {
-        self.record_replication_failure(now);
-        self.with_replication(|tracking| tracking.refreshing = false);
+        self.with_replication(|tracking| {
+            tracking.refreshing = false;
+            tracking.last_failure = Some(now);
+        });
     }
 
     /// The replication state at `now`.
@@ -503,41 +598,19 @@ impl ReplicationStateTracker {
 
     /// The supplier peers at `now`, `None` when replication is not configured.
     pub fn get_peers(&self, now: u64) -> Option<Vec<PeerInfo>> {
-        self.inner
-            .replication
-            .read()
-            .ok()
-            .and_then(|lock| lock.as_ref().map(|tracking| tracking.peer_infos(now)))
+        self.read_replication(|tracking| tracking.peer_infos(now))
     }
 
-    fn record_replication_success(&self, now: u64) {
-        self.inner
-            .last_replication_success
-            .store(now, Ordering::SeqCst);
-    }
-
-    fn record_replication_failure(&self, now: u64) {
-        self.inner
-            .last_replication_failure
-            .store(now, Ordering::SeqCst);
-    }
-
+    /// When a sync with a supplier last succeeded, on the [`tracker_now`] clock.
     pub fn get_last_replication_success(&self) -> Option<u64> {
-        let ts = self.inner.last_replication_success.load(Ordering::SeqCst);
-        if ts == 0 {
-            None
-        } else {
-            Some(ts)
-        }
+        self.read_replication(|tracking| tracking.last_success)
+            .flatten()
     }
 
+    /// When replicating from a supplier last failed, on the [`tracker_now`] clock.
     pub fn get_last_replication_failure(&self) -> Option<u64> {
-        let ts = self.inner.last_replication_failure.load(Ordering::SeqCst);
-        if ts == 0 {
-            None
-        } else {
-            Some(ts)
-        }
+        self.read_replication(|tracking| tracking.last_failure)
+            .flatten()
     }
 
     /// Compute serving readiness at `now`.
@@ -609,14 +682,6 @@ pub struct StatusActor {
 }
 
 impl StatusActor {
-    pub fn start() -> &'static Self {
-        let tracker = ReplicationStateTracker::new();
-        let x = Box::new(StatusActor { tracker });
-
-        let x_ptr = Box::into_raw(x);
-        unsafe { &(*x_ptr) }
-    }
-
     pub fn start_with_tracker(tracker: ReplicationStateTracker) -> &'static Self {
         let x = Box::new(StatusActor { tracker });
 
@@ -637,7 +702,7 @@ impl StatusActor {
         self.tracker.clone()
     }
 
-    /// The readiness status at `now` (seconds since the epoch).
+    /// The readiness status at `now`, read from [`tracker_now`].
     pub fn get_readiness_status(&self, now: u64) -> ReadinessStatus {
         self.tracker.build_readiness_status(now)
     }
@@ -659,13 +724,24 @@ mod tests {
     const STALE: u64 = 10 * STALE_AFTER_INTERVALS;
     const FAILED: u64 = 10 * FAILED_AFTER_INTERVALS;
 
-    fn replicated(peers: &[&str], has_peer_changes: bool) -> ReplicationStateTracker {
+    /// A node with `peers` as suppliers, configured with `automatic_refresh` when it has
+    /// any (a replica that expects its content from a supplier).
+    fn replicated(peers: &[&str], has_synced: bool) -> ReplicationStateTracker {
+        replicated_with(peers, !peers.is_empty(), has_synced)
+    }
+
+    fn replicated_with(
+        peers: &[&str],
+        automatic_refresh: bool,
+        has_synced: bool,
+    ) -> ReplicationStateTracker {
         let tracker = ReplicationStateTracker::new();
         tracker.mark_startup_complete(
             Some(ReplicationStartup {
                 supplier_peers: peers.iter().map(|peer| peer.to_string()).collect(),
+                automatic_refresh,
                 poll_interval: INTERVAL,
-                has_peer_changes,
+                has_synced,
             }),
             T0,
         );
@@ -1141,6 +1217,151 @@ mod tests {
             status.message,
             "Replication state 'catching_up' does not allow serving"
         );
+    }
+
+    #[test]
+    fn test_origin_without_automatic_refresh_is_ready_before_any_sync() {
+        // The node that created the domain (pod-0 of a new cluster) has only its own
+        // changes, but no supplier it would take its content from: it is ready, even if
+        // every peer is still missing.
+        let tracker = replicated_with(&[PEER_1, PEER_2], false, false);
+        assert_state(
+            &tracker,
+            T0,
+            ReplicationState::Healthy,
+            ServingReadiness::Ready,
+        );
+        assert_state(
+            &tracker,
+            T0 + 10 * FAILED,
+            ReplicationState::Degraded,
+            ServingReadiness::Ready,
+        );
+    }
+
+    #[test]
+    fn test_synced_replica_with_automatic_refresh_is_ready_on_restart() {
+        // has_synced comes from the durable domain origin, not from the trimmable RUV.
+        let tracker = replicated_with(&[PEER_1], true, true);
+        assert_state(
+            &tracker,
+            T0,
+            ReplicationState::Healthy,
+            ServingReadiness::Ready,
+        );
+    }
+
+    #[test]
+    fn test_single_apply_failure_then_unreachable_never_fails() {
+        let tracker = replicated(&[PEER_1], true);
+        tracker.notify_replication_incremental_success(PEER_1, T0);
+        tracker.notify_replication_apply_failure(T0 + 10);
+        let mut now = T0 + 10;
+        while now < T0 + 10 * FAILED {
+            now += 10;
+            tracker.notify_replication_connect_failure(PEER_1, now);
+            assert_ne!(tracker.get_replication_state(now), ReplicationState::Failed);
+        }
+        assert_state(
+            &tracker,
+            now,
+            ReplicationState::Degraded,
+            ServingReadiness::Ready,
+        );
+
+        // A later failure starts a new run: failed only after a full window of it.
+        tracker.notify_replication_apply_failure(now);
+        assert_eq!(
+            tracker.get_replication_state(now),
+            ReplicationState::Degraded
+        );
+        let restart = now;
+        while now < restart + FAILED {
+            now += 10;
+            tracker.notify_replication_apply_failure(now);
+        }
+        assert_eq!(tracker.get_replication_state(now), ReplicationState::Failed);
+        // And it stops being failed once the failures stop for the stale window.
+        assert_eq!(
+            tracker.get_replication_state(now + STALE),
+            ReplicationState::Degraded
+        );
+    }
+
+    #[test]
+    fn test_domain_mismatch_from_new_peer_degrades_synced_node() {
+        let tracker = replicated(&[PEER_1, PEER_2], true);
+        tracker.notify_replication_incremental_success(PEER_1, T0 + 10);
+        // Peer 2 is a new replica, not yet refreshed: this node must not be refreshed.
+        assert!(!tracker.notify_replication_domain_mismatch(PEER_2, T0 + 11));
+        assert_state(
+            &tracker,
+            T0 + 11,
+            ReplicationState::Degraded,
+            ServingReadiness::Ready,
+        );
+        assert_eq!(
+            tracker.build_readiness_status(T0 + 11).peers,
+            Some(PeerSummary {
+                total: 2,
+                healthy: 1,
+                stale: 1,
+            })
+        );
+
+        // Once refreshed, peer 2 answers normally.
+        tracker.notify_replication_incremental_success(PEER_1, T0 + 20);
+        tracker.notify_replication_incremental_success(PEER_2, T0 + 21);
+        assert_state(
+            &tracker,
+            T0 + 21,
+            ReplicationState::Healthy,
+            ServingReadiness::Ready,
+        );
+    }
+
+    #[test]
+    fn test_domain_mismatch_without_other_synced_peer_requires_refresh() {
+        // Unsynced: the fresh replica is the one out of the domain.
+        let tracker = replicated(&[PEER_1, PEER_2], false);
+        assert!(tracker.notify_replication_domain_mismatch(PEER_2, T0 + 1));
+        assert!(tracker.notify_replication_domain_mismatch(PEER_1, T0 + 1));
+
+        // Synced, but no other supplier synced within the stale window: can not tell.
+        let tracker = replicated(&[PEER_1, PEER_2], true);
+        tracker.notify_replication_incremental_success(PEER_1, T0);
+        assert!(tracker.notify_replication_domain_mismatch(PEER_2, T0 + STALE));
+
+        // A single supplier: nobody to compare with.
+        let tracker = replicated(&[PEER_1], true);
+        tracker.notify_replication_incremental_success(PEER_1, T0);
+        assert!(tracker.notify_replication_domain_mismatch(PEER_1, T0 + 1));
+
+        // Without replication tracking the upstream behaviour is kept.
+        let tracker = ReplicationStateTracker::new();
+        assert!(tracker.notify_replication_domain_mismatch(PEER_1, T0));
+    }
+
+    #[test]
+    fn test_refresh_success_clears_failed_verification() {
+        let tracker = replicated(&[PEER_1], false);
+        tracker.mark_database_failure(DatabaseCheck::Verify);
+        tracker.notify_replication_refresh_started();
+        tracker.notify_replication_refresh_success(PEER_1, T0 + 1);
+        assert_eq!(tracker.get_database_health(), DatabaseHealth::Healthy);
+        assert_state(
+            &tracker,
+            T0 + 1,
+            ReplicationState::Healthy,
+            ServingReadiness::Ready,
+        );
+    }
+
+    #[test]
+    fn test_tracker_clock_is_monotonic() {
+        let first = tracker_now();
+        let second = tracker_now();
+        assert!(second >= first);
     }
 
     #[test]
