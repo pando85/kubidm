@@ -1,6 +1,6 @@
 [package]
-name = "kanidm_templating"
-description = "A constrained templating library for Kanidm"
+name = "kubidm_templating"
+description = "A constrained templating library for Kubidm"
 
 version = { workspace = true }
 authors = { workspace = true }

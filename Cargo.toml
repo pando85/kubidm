@@ -21,7 +21,7 @@ members = [
     "tools/orca",
     "unix_integration/common",
     "unix_integration/nss_sparkle_common",
-    "unix_integration/nss_kanidm",
+    "unix_integration/nss_kubidm",
     "unix_integration/nss_sparkle",
     "unix_integration/pam_sparkle_common",
     "unix_integration/pam_kubidm",

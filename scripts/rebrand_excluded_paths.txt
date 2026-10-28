@@ -1,0 +1,14 @@
+# Paths (extended regexes, matched against `git ls-files` output) that
+# scripts/check_rebrand.sh does not scan at all. One regex per line.
+
+# Upstream release history is quoted verbatim.
+^RELEASE_NOTES\.md$
+# The sync skill documents the rebrand map and therefore names kanidm everywhere.
+^\.opencode/skills/upstream-sync/
+# The guard itself and its allow-lists.
+^scripts/check_rebrand\.sh$
+^scripts/rebrand_allowlist\.txt$
+^scripts/rebrand_excluded_paths\.txt$
+# Binary artwork only (grep -I skips it too; listed so the intent is explicit). Text
+# files under artwork/ (svg, css, md, json) ARE scanned.
+^artwork/.*\.(png|jpe?g|gif|ico|webp|xcf|woff2?|ttf|otf|eot|pdf)$

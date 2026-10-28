@@ -1,10 +1,10 @@
 # Account Signup
 
-Kanidm is going to be used in applications in future where public users need to be able to self-signup
+Kubidm is going to be used in applications in future where public users need to be able to self-signup
 without the intervention of an admin. We have already had multiple requests for this feature, and there
 have been multiple community-indepedent implementations of this.
 
-This now makes accounts signup an internal component of Kanidm.
+This now makes accounts signup an internal component of Kubidm.
 
 ## Considerations
 

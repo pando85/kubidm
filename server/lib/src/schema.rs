@@ -1300,7 +1300,7 @@ mod tests {
         prelude::*,
         schema::{Schema, SchemaAttribute, SchemaClass, SchemaTransaction, SyntaxType},
     };
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use uuid::Uuid;
 
     macro_rules! validate_schema {
@@ -2191,5 +2191,102 @@ mod tests {
 
         // Assert that no syntax type has both single or multivalue types! Yay!
         assert!(pass);
+    }
+
+    /// Check that every fork attribute and class is in the in-memory schema of a server
+    /// bootstrapped at `level`, with the definition the fork declares.
+    ///
+    /// Classes are compared on `systemmay` and `systemmust` as well as the uuid: upstream's
+    /// `AccessControlProfile` shares the fork's uuid but lacks the step-up reauth and
+    /// time restriction attributes, so a uuid-only comparison would not notice upstream's
+    /// definition overriding the fork's.
+    async fn assert_kubidm_extras_registered(server: &QueryServer, level: DomainVersion) {
+        let read_txn = server
+            .read()
+            .await
+            .expect("Failed to start read transaction");
+
+        let schema_txn = read_txn.get_schema();
+        let schema_attrs = schema_txn.get_attributes();
+        let schema_classes = schema_txn.get_classes();
+
+        let fork_attrs = super::kubidm_schema_attributes();
+        let fork_classes = super::kubidm_schema_classes();
+        // Guard against the lists silently becoming empty.
+        assert!(!fork_attrs.is_empty());
+        assert!(!fork_classes.is_empty());
+
+        let mut missing = Vec::new();
+        for attr in fork_attrs {
+            match schema_attrs.get(&attr.name) {
+                Some(loaded) if loaded.uuid == attr.uuid && loaded.syntax == attr.syntax => {}
+                Some(_) => missing.push(format!("attribute {} (definition differs)", attr.name)),
+                None => missing.push(format!("attribute {}", attr.name)),
+            }
+        }
+        for class in fork_classes {
+            match schema_classes.get(&class.name) {
+                Some(loaded)
+                    if loaded.uuid == class.uuid
+                        && loaded.systemmay.iter().collect::<BTreeSet<_>>()
+                            == class.systemmay.iter().collect::<BTreeSet<_>>()
+                        && loaded.systemmust.iter().collect::<BTreeSet<_>>()
+                            == class.systemmust.iter().collect::<BTreeSet<_>>() => {}
+                Some(_) => missing.push(format!("class {} (definition differs)", class.name)),
+                None => missing.push(format!("class {}", class.name)),
+            }
+        }
+
+        assert!(
+            missing.is_empty(),
+            "fork schema missing at domain level {level}: {missing:?}"
+        );
+    }
+
+    /// Kubidm guard: the fork-only schema is not part of the upstream migration data, so a
+    /// domain level that does not chain `kubidm_schema_attributes` and
+    /// `kubidm_schema_classes` silently loses it (the gap that #511 fixed for DL 1.11).
+    /// After a bootstrap at `DOMAIN_TGT_LEVEL` every fork attribute and class must be in
+    /// the in-memory schema, with the definition the fork declares.
+    #[qs_test]
+    async fn test_schema_kubidm_extras_registered_at_target_level(server: &QueryServer) {
+        assert_kubidm_extras_registered(server, DOMAIN_TGT_LEVEL).await;
+    }
+
+    /// As above for DL 1.11, which loads the schema through `migrate_schema_1_11` (and
+    /// `reload_schema`) rather than `migrate_schema_1_12`. The fork chains the same
+    /// attribute and class lists at both levels, so the full set is expected here too.
+    #[qs_test(domain_level=DOMAIN_LEVEL_1_11)]
+    async fn test_schema_kubidm_extras_registered_at_dl_1_11(server: &QueryServer) {
+        assert_kubidm_extras_registered(server, DOMAIN_LEVEL_1_11).await;
+    }
+
+    /// Kubidm guard: the bootstrap schema (`generate_in_memory`) must carry the fork's
+    /// bootstrap-safe attributes and classes, as it is what the server reads its first
+    /// entries with.
+    #[test]
+    fn test_schema_kubidm_extras_in_bootstrap_schema() {
+        sketching::test_init();
+
+        let schema = Schema::new().expect("failed to create schema");
+        let schema_txn = schema.write_blocking();
+
+        let schema_attrs = schema_txn.get_attributes();
+        let schema_classes = schema_txn.get_classes();
+
+        for attr in super::kubidm_schema_attributes() {
+            assert!(
+                schema_attrs.contains_key(&attr.name),
+                "attribute {} missing from the bootstrap schema",
+                attr.name
+            );
+        }
+        for class in super::kubidm_bootstrap_schema_classes() {
+            assert!(
+                schema_classes.contains_key(&class.name),
+                "class {} missing from the bootstrap schema",
+                class.name
+            );
+        }
     }
 }

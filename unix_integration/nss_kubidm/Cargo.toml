@@ -1,5 +1,5 @@
 [package]
-name = "nss_kanidm"
+name = "nss_kubidm"
 description = "Kubidm NSS module"
 
 version = { workspace = true }
@@ -11,7 +11,7 @@ homepage = { workspace = true }
 repository = { workspace = true }
 
 [lib]
-name = "nss_kanidm"
+name = "nss_kubidm"
 crate-type = ["cdylib"]
 path = "src/lib.rs"
 
@@ -27,16 +27,16 @@ cc = "^1.2.63"
 
 ## Debian packaging
 [package.metadata.deb]
-name = "libnss-kanidm"
+name = "libnss-kubidm"
 maintainer = "James Hodgkinson <james@terminaloutcomes.com>"
 depends = ""
 section = "network"
 priority = "optional"
 assets = [
     [
-        "target/release/libnss_kanidm.so",
+        "target/release/libnss_kubidm.so",
         # This is not the final path as cargo-deb needs to be run with --multiarch=foreign
-        "usr/lib/libnss_kanidm.so.2",
+        "usr/lib/libnss_kubidm.so.2",
         "644",
     ],
 ]

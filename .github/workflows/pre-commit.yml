@@ -16,6 +16,11 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Check rebrand and forbidden patterns
+        run: |
+          scripts/check_rebrand.sh
+          scripts/check_forbidden_patterns.sh
+
       - name: Set up Python
         uses: actions/setup-python@v7
         with:

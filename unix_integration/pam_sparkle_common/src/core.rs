@@ -627,7 +627,7 @@ pub fn sm_chauthtok<P: PamHandler>(_pamh: &P, _opts: &ModuleOptions) -> PamResul
 pub fn sm_setcred<P: PamHandler>(pamh: &P, _opts: &ModuleOptions) -> PamResultCode {
     // We can set values here into the users session.
     /*
-    if let Err(err) = pamh.set_env("KANIDM_TEST_VAR=test") {
+    if let Err(err) = pamh.set_env("KUBIDM_TEST_VAR=test") {
         error!(?err, "set_env");
     };
     */

@@ -18,10 +18,10 @@ RUN \
     libfreeradius-dev \
     && rm -rf /var/lib/apt/lists/*
 
-RUN mkdir -p /src/kanidm
-COPY . /src/kanidm/
+RUN mkdir -p /src/kubidm
+COPY . /src/kubidm/
 
-WORKDIR /src/kanidm/
+WORKDIR /src/kubidm/
 
 # TEMPORARY
 RUN cp rlm_kanidm/module/include/automask.h /usr/include/freeradius/
@@ -41,7 +41,7 @@ RUN --mount=type=cache,id=cargo,target=/cargo \
     export CC="/usr/bin/clang" && \
     cargo build --locked -p rlm_kanidm --features extern-freeradius-module --lib --release && \
     cargo build --locked -p kanidm_radiusd --bin kanidm_radiusd --release && \
-    cp /src/kanidm/target/release/librlm_kanidm.so /src/kanidm/target/release/rlm_kanidm.so && \
+    cp /src/kubidm/target/release/librlm_kanidm.so /src/kubidm/target/release/rlm_kanidm.so && \
     sccache -s
 
 # ======================
@@ -69,8 +69,8 @@ RUN mkdir -p /etc/raddb/mods-enabled /etc/raddb/sites-enabled && \
     ln -s /etc/raddb/mods-available/kanidm_rust /etc/raddb/mods-enabled/kanidm && \
     ln -s /etc/raddb/sites-available/check-eap-tls /etc/raddb/sites-enabled/check-eap-tls
 
-COPY --from=builder /src/kanidm/target/release/rlm_kanidm.so /usr/lib/freeradius/rlm_kanidm.so
-COPY --from=builder /src/kanidm/target/release/kanidm_radiusd /usr/local/bin/kanidm_radiusd
+COPY --from=builder /src/kubidm/target/release/rlm_kanidm.so /usr/lib/freeradius/rlm_kanidm.so
+COPY --from=builder /src/kubidm/target/release/kanidm_radiusd /usr/local/bin/kanidm_radiusd
 
 # # disable auth via methods we don't support!
 RUN rm -f /etc/raddb/mods-available/sql && \

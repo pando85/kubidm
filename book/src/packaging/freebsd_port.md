@@ -11,7 +11,7 @@
 
 ```
 cd /usr/ports
-git checkout -b kanidm-update
+git checkout -b kubidm-update
 cd security/kanidm
 
 # Change the port file as needed.

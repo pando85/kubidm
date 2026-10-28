@@ -1408,6 +1408,51 @@ mod tests {
 
     use crate::{prelude::*, value::CredentialType, valueset::ValueSetCredentialType};
 
+    /// Kubidm guard: the fork-only builtin entries (delegated roles, approval admins, the
+    /// high privilege membership) are not part of the upstream phase 6 lists, so every
+    /// domain level migration has to chain `kubidm_builtin_entries`. After a bootstrap at
+    /// `DOMAIN_TGT_LEVEL` every one of them must exist.
+    #[qs_test]
+    async fn test_migrations_kubidm_builtin_entries_exist(server: &QueryServer) {
+        let mut read_txn = server
+            .read()
+            .await
+            .expect("Failed to start read transaction");
+
+        let entries = crate::migration_data::dl14::kubidm_builtin_entries()
+            .expect("failed to build the kubidm builtin entries");
+        assert!(!entries.is_empty());
+
+        let mut missing = Vec::new();
+        for entry in entries {
+            let uuid = entry.get_uuid().expect("builtin entry without a uuid");
+            if !read_txn
+                .internal_exists_uuid(uuid)
+                .expect("failed to search for a builtin entry")
+            {
+                missing.push(uuid);
+            }
+        }
+
+        assert!(
+            missing.is_empty(),
+            "kubidm builtin entries missing at DOMAIN_TGT_LEVEL ({DOMAIN_TGT_LEVEL}): {missing:?}"
+        );
+
+        // `idm_high_privilege` exists upstream, so the existence check above passes even
+        // when the fork's partial membership entry was never applied. Check the member.
+        let high_privilege = read_txn
+            .internal_search_uuid(UUID_IDM_HIGH_PRIVILEGE)
+            .expect("idm_high_privilege missing");
+        assert!(
+            high_privilege.attribute_equality(
+                Attribute::Member,
+                &PartialValue::Refer(UUID_IDM_APPROVAL_ADMINS)
+            ),
+            "idm_high_privilege does not have idm_approval_admins as a member"
+        );
+    }
+
     /// Kubidm: the migrations rewrite the built-in access control profiles in the start up
     /// transaction, which marks them changed, so a rewrite that leaves a valid built-in
     /// invalid (a shipped definition or parser bug) fails strictly, even before the server

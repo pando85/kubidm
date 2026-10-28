@@ -115,7 +115,7 @@ pub struct PamServiceInfo {
 impl Default for PamServiceInfo {
     fn default() -> Self {
         PamServiceInfo {
-            service: "kanidm:default".into(),
+            service: "kubidm:default".into(),
             tty: None,
             rhost: None,
         }

@@ -162,7 +162,7 @@ updates:
       time: "06:00"
       timezone: Australia/Brisbane
   - package-ecosystem: cargo
-    directory: "/unix_integration/nss_kanidm"
+    directory: "/unix_integration/nss_kubidm"
     schedule:
       interval: weekly
       time: "06:00"

@@ -1,7 +1,7 @@
 [package]
-name = "kanidm_actors"
-description = "Kanidm Actors"
-documentation = "https://docs.rs/kanidm_actors/latest/kanidm_actors/"
+name = "kubidm_actors"
+description = "Kubidm Actors"
+documentation = "https://docs.rs/kubidm_actors/latest/kubidm_actors/"
 
 version = { workspace = true }
 authors = { workspace = true }
