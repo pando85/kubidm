@@ -11,7 +11,7 @@ use kubidmd_lib::prelude::duration_from_epoch_now;
 use kubidmd_lib::prelude::IdmServer;
 use kubidmd_lib::repl::proto::ConsumerState;
 use kubidmd_lib::server::QueryServerTransaction;
-use kubidmd_lib::status::ReplicationStateTracker;
+use kubidmd_lib::status::{ReplicationStartup, ReplicationStateTracker};
 use rustls::{
     client::ClientConfig,
     pki_types::{CertificateDer, PrivateKeyDer, ServerName},
@@ -58,6 +58,65 @@ pub(crate) struct ReplicationServerHandles {
     pub ctrl_tx: mpsc::Sender<ReplCtrl>,
 }
 
+/// The name of a replication peer in the health tracker: its origin without any path.
+fn peer_label(origin: &Url) -> String {
+    format!(
+        "{}://{}{}",
+        origin.scheme(),
+        origin.domain().unwrap_or("unknown"),
+        origin.port().map(|p| format!(":{}", p)).unwrap_or_default()
+    )
+}
+
+/// Seconds since the epoch, the clock of the health tracker.
+fn now_secs() -> u64 {
+    duration_from_epoch_now().as_secs()
+}
+
+/// The peers this node pulls from, as named in the health tracker.
+fn supplier_peers(repl_config: &ReplicationConfiguration) -> Vec<String> {
+    repl_config
+        .manual
+        .iter()
+        .filter(|(_, node)| {
+            matches!(
+                node,
+                RepNodeConfig::Pull { .. } | RepNodeConfig::MutualPull { .. }
+            )
+        })
+        .map(|(origin, _)| peer_label(origin))
+        .collect()
+}
+
+/// What the health tracker needs to know about replication at startup. The supplier
+/// peers are the `pull` and `mutual-pull` nodes: `allow-pull` nodes only pull from us.
+/// Whether this node has synced before comes from its replication update vector; when it
+/// can not be read the node is treated as never synced, so it stays not ready until its
+/// first successful sync rather than serving content it can not vouch for.
+pub(crate) async fn replication_startup(
+    repl_config: &ReplicationConfiguration,
+    idms: &IdmServer,
+) -> ReplicationStartup {
+    let supplier_peers = supplier_peers(repl_config);
+
+    let has_peer_changes = idms
+        .replication_has_peer_changes()
+        .await
+        .unwrap_or_else(|err| {
+            error!(
+                ?err,
+                "Unable to read the replication update vector, treating this node as never synced."
+            );
+            false
+        });
+
+    ReplicationStartup {
+        supplier_peers,
+        poll_interval: repl_config.get_task_poll_interval(),
+        has_peer_changes,
+    }
+}
+
 pub(crate) async fn create_repl_server(
     idms: Arc<IdmServer>,
     repl_config: &ReplicationConfiguration,
@@ -82,22 +141,6 @@ pub(crate) async fn create_repl_server(
         "Starting replication interface https://{} ...",
         repl_config.bindaddress
     );
-
-    let peer_urls: Vec<String> = repl_config
-        .manual
-        .keys()
-        .filter_map(|url| {
-            url.domain().map(|d| {
-                format!(
-                    "{}://{}{}",
-                    url.scheme(),
-                    d,
-                    url.port().map(|p| format!(":{}", p)).unwrap_or_default()
-                )
-            })
-        })
-        .collect();
-    tracker.init_peers_from_config(peer_urls);
 
     let repl_handle: JoinHandle<()> = tokio::spawn(repl_acceptor(
         listener,
@@ -205,6 +248,7 @@ async fn repl_consumer_disconnect_supplier(
 }
 
 /// This returns the socket address that worked, so you can try that first next time
+#[allow(clippy::too_many_arguments)]
 #[instrument(
     level="info",
     skip(refresh_coord, tls_connector, idms, consumer_conn_settings, tracker),
@@ -218,6 +262,7 @@ async fn repl_run_consumer_refresh(
     idms: &IdmServer,
     consumer_conn_settings: &ConsumerConnSettings,
     tracker: &ReplicationStateTracker,
+    peer_url: &str,
 ) -> Result<Option<SocketAddr>, ()> {
     // Take the refresh lock. Note that every replication consumer *should* end up here
     // behind this lock, but only one can proceed. This is what we want!
@@ -239,9 +284,10 @@ async fn repl_run_consumer_refresh(
     )
     .await
     .ok_or_else(|| {
-        tracker.notify_replication_refresh_failed();
+        tracker.notify_replication_connect_failure(peer_url, now_secs());
     })?;
 
+    tracker.notify_replication_connected(peer_url);
     tracker.notify_replication_refresh_started();
 
     let result = repl_run_consumer_refresh_inner(
@@ -250,6 +296,7 @@ async fn repl_run_consumer_refresh(
         refresh_coord_guard,
         idms,
         consumer_conn_settings,
+        tracker,
     )
     .await;
 
@@ -257,8 +304,8 @@ async fn repl_run_consumer_refresh(
     repl_consumer_disconnect_supplier(supplier_conn, consumer_conn_settings).await;
 
     match &result {
-        Ok(_) => tracker.notify_replication_refresh_success(),
-        Err(_) => tracker.notify_replication_refresh_failed(),
+        Ok(_) => tracker.notify_replication_refresh_success(peer_url, now_secs()),
+        Err(_) => tracker.notify_replication_refresh_failed(now_secs()),
     }
 
     result
@@ -270,9 +317,11 @@ async fn repl_run_consumer_refresh_inner(
     mut refresh_coord_guard: MutexGuard<'_, (bool, mpsc::Sender<()>)>,
     idms: &IdmServer,
     consumer_conn_settings: &ConsumerConnSettings,
+    tracker: &ReplicationStateTracker,
 ) -> Result<Option<SocketAddr>, ()> {
     // If we fail at any point, just RETURN because this leaves the next task to attempt, or
     // the channel drops and that tells the caller this failed.
+    let exchange_failed = || tracker.notify_replication_exchange_failure(now_secs());
 
     match timeout(
         consumer_conn_settings.replica_connect_timeout,
@@ -283,10 +332,12 @@ async fn repl_run_consumer_refresh_inner(
         Ok(Ok(())) => {}
         Ok(Err(err)) => {
             error!(?err, "consumer encode error, unable to continue.");
+            exchange_failed();
             return Err(());
         }
         Err(_) => {
             error!("consumer request timeout error, unable to continue.");
+            exchange_failed();
             return Err(());
         }
     };
@@ -303,18 +354,22 @@ async fn repl_run_consumer_refresh_inner(
         }
         Ok(Some(Ok(SupplierResponse::Pong))) | Ok(Some(Ok(SupplierResponse::Incremental(_)))) => {
             error!("Supplier Response contains invalid State");
+            exchange_failed();
             return Err(());
         }
         Ok(Some(Err(codec_err))) => {
             error!(?codec_err, "Consumer decode error, unable to continue.");
+            exchange_failed();
             return Err(());
         }
         Ok(None) => {
             error!("Connection closed");
+            exchange_failed();
             return Err(());
         }
         Err(_) => {
             error!("consumer response timeout error, unable to continue.");
+            exchange_failed();
             return Err(());
         }
     };
@@ -336,7 +391,10 @@ async fn repl_run_consumer_refresh_inner(
                     .consumer_apply_refresh(refresh)
                     .and_then(|cs| write_txn.commit().map(|()| cs))
             })
-            .map_err(|err| error!(?err, "Consumer was not able to apply refresh."))?;
+            .map_err(|err| {
+                error!(?err, "Consumer was not able to apply refresh.");
+                tracker.notify_replication_apply_failure(now_secs());
+            })?;
     }
 
     // Now mark the refresh as complete AND indicate it to the channel.
@@ -378,21 +436,11 @@ async fn repl_run_consumer(
 
     let (socket_addr, mut supplier_conn) = match connect_result {
         Some(r) => {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            tracker.notify_replication_connect_success();
-            tracker.update_peer_connected(peer_url, now);
+            tracker.notify_replication_connected(peer_url);
             r
         }
         None => {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            tracker.notify_replication_connect_failure(now);
-            tracker.update_peer_disconnected(peer_url);
+            tracker.notify_replication_connect_failure(peer_url, now_secs());
             return None;
         }
     };
@@ -405,6 +453,7 @@ async fn repl_run_consumer(
         consumer_conn_settings,
         task_tx,
         tracker,
+        peer_url,
     )
     .await;
 
@@ -413,6 +462,7 @@ async fn repl_run_consumer(
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn repl_run_consumer_inner(
     socket_addr: SocketAddr,
     supplier_conn: &mut Framed<TlsStream<TcpStream>, codec::ConsumerCodec>,
@@ -421,7 +471,10 @@ async fn repl_run_consumer_inner(
     consumer_conn_settings: &ConsumerConnSettings,
     task_tx: &mut broadcast::Sender<ReplConsumerCtrl>,
     tracker: &ReplicationStateTracker,
+    peer_url: &str,
 ) -> Option<SocketAddr> {
+    let exchange_failed = || tracker.notify_replication_exchange_failure(now_secs());
+
     // Perform incremental.
     let consumer_ruv_range = {
         let consumer_state = idms
@@ -435,6 +488,7 @@ async fn repl_run_consumer_inner(
                     ?err,
                     "consumer ruv range could not be accessed, unable to continue."
                 );
+                tracker.notify_replication_apply_failure(now_secs());
                 return None;
             }
         }
@@ -449,10 +503,12 @@ async fn repl_run_consumer_inner(
         Ok(Ok(())) => {}
         Ok(Err(err)) => {
             error!(?err, "consumer encode error, unable to continue.");
+            exchange_failed();
             return None;
         }
         Err(_) => {
             error!("consumer request timeout, unable to continue");
+            exchange_failed();
             return None;
         }
     };
@@ -466,19 +522,23 @@ async fn repl_run_consumer_inner(
         Ok(Some(Ok(SupplierResponse::Incremental(changes)))) => changes,
         Ok(Some(Ok(SupplierResponse::Pong))) | Ok(Some(Ok(SupplierResponse::Refresh(_)))) => {
             error!("Supplier Response contains invalid state");
+            exchange_failed();
             return None;
         }
         Ok(Some(Err(err))) => {
             error!(?err, "Consumer decode error, unable to continue.");
+            exchange_failed();
             return None;
         }
         Ok(None) => {
             error!("Consumer connection closed, unable to continue.");
+            exchange_failed();
             return None;
         }
 
         Err(_) => {
             error!("consumer response timeout, unable to continue");
+            exchange_failed();
             return None;
         }
     };
@@ -501,6 +561,7 @@ async fn repl_run_consumer_inner(
             Ok(state) => state,
             Err(err) => {
                 error!(?err, "Consumer was not able to apply changes.");
+                tracker.notify_replication_apply_failure(now_secs());
                 return None;
             }
         }
@@ -509,16 +570,12 @@ async fn repl_run_consumer_inner(
     match consumer_state {
         ConsumerState::Ok => {
             info!("Incremental Replication Success");
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            tracker.notify_replication_incremental_success(now);
+            tracker.notify_replication_incremental_success(peer_url, now_secs());
             // return to bypass the failure message.
             Some(socket_addr)
         }
         ConsumerState::RefreshRequired => {
-            tracker.notify_replication_refresh_required();
+            tracker.notify_replication_refresh_required(peer_url);
             if automatic_refresh {
                 warn!("Consumer is out of date and must be refreshed. This will happen *now*.");
 
@@ -622,6 +679,8 @@ async fn repl_task(
 
     let mut repl_interval = interval(consumer_conn_settings.task_poll_interval);
 
+    let peer_url = peer_label(&origin);
+
     info!("Replica task for {} has started.", origin);
 
     // we keep track of the "last known good" socketaddr so we can try that first next time.
@@ -675,16 +734,10 @@ async fn repl_task(
             warn!(
                 "No replication addresses available, delaying replication operation for '{origin}'"
             );
+            tracker.notify_replication_connect_failure(&peer_url, now_secs());
             repl_interval.tick().await;
             continue;
         }
-
-        let peer_url = format!(
-            "{}://{}{}",
-            origin.scheme(),
-            origin.domain().unwrap_or("unknown"),
-            origin.port().map(|p| format!(":{}", p)).unwrap_or_default()
-        );
 
         tokio::select! {
             Ok(task) = task_rx.recv() => {
@@ -699,6 +752,7 @@ async fn repl_task(
                             &idms,
                             &consumer_conn_settings,
                             &tracker,
+                            &peer_url,
                         )
                         .await).unwrap_or_default();
                     }
@@ -1197,4 +1251,90 @@ async fn repl_acceptor(
     }
 
     info!("Stopped {}", super::TaskName::ReplicationSupervisor);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{peer_label, supplier_peers};
+    use crate::repl::config::{RepNodeConfig, ReplicationConfiguration};
+    use crypto_glue::{traits::DecodePem, x509::Certificate};
+    use std::str::FromStr;
+    use url::Url;
+
+    // Test only certificate, a self-signed server cert. Only its presence matters here.
+    const TEST_X509_CERT_DATA: &str = r#"-----BEGIN CERTIFICATE-----
+MIICeDCCAh6gAwIBAgIBAjAKBggqhkjOPQQDAjCBhDELMAkGA1UEBhMCQVUxDDAK
+BgNVBAgMA1FMRDEPMA0GA1UECgwGS2FuaWRtMRwwGgYDVQQDDBNLYW5pZG0gR2Vu
+ZXJhdGVkIENBMTgwNgYDVQQLDC9EZXZlbG9wbWVudCBhbmQgRXZhbHVhdGlvbiAt
+IE5PVCBGT1IgUFJPRFVDVElPTjAeFw0yNTA3MjkwMzMxMDNaFw0yNTA4MDMwMzMx
+MDNaMHoxCzAJBgNVBAYTAkFVMQwwCgYDVQQIDANRTEQxDzANBgNVBAoMBkthbmlk
+bTESMBAGA1UEAwwJbG9jYWxob3N0MTgwNgYDVQQLDC9EZXZlbG9wbWVudCBhbmQg
+RXZhbHVhdGlvbiAtIE5PVCBGT1IgUFJPRFVDVElPTjBZMBMGByqGSM49AgEGCCqG
+SM49AwEHA0IABPFkpVzFH+feItm9JFFm/noge+BlZLpdGWOuSUvfoivAzCgPr7Kr
+nGd8kUzIyJermePzu2SVQLaEt/7GY8Ha+2ujgYkwgYYwCQYDVR0TBAIwADAOBgNV
+HQ8BAf8EBAMCBaAwEwYDVR0lBAwwCgYIKwYBBQUHAwEwHQYDVR0OBBYEFOjucEtX
+mj/wQ7npVaMOyDtLU6dUMB8GA1UdIwQYMBaAFNo5o+5ea0sNMlW/75VgGJCv2AcJ
+MBQGA1UdEQQNMAuCCWxvY2FsaG9zdDAKBggqhkjOPQQDAgNIADBFAiEA1TACf4eS
+g07LRiKhlMgA+6xxztxiZCuV6LakRp7FZdECIFp0rFSiFJdkLEO9IyqYc+zPW770
+ta41VMU3u9UQfHxF
+-----END CERTIFICATE-----
+"#;
+
+    fn cert() -> Certificate {
+        Certificate::from_pem(TEST_X509_CERT_DATA).expect("Unable to parse test X509 cert data")
+    }
+
+    fn url(s: &str) -> Url {
+        Url::from_str(s).expect("Invalid url")
+    }
+
+    #[test]
+    fn peer_label_drops_the_path() {
+        assert_eq!(
+            peer_label(&url("repl://node1.example.com:8444/some/path")),
+            "repl://node1.example.com:8444"
+        );
+        assert_eq!(
+            peer_label(&url("repl://node1.example.com")),
+            "repl://node1.example.com"
+        );
+    }
+
+    #[test]
+    fn supplier_peers_are_the_nodes_this_node_pulls_from() {
+        let mut repl_config = ReplicationConfiguration::default();
+        // Replication configured without peers: nothing to sync from.
+        assert!(supplier_peers(&repl_config).is_empty());
+
+        // A node that only supplies others has nothing to sync from either.
+        repl_config.manual.insert(
+            url("repl://consumer.example.com:8444"),
+            RepNodeConfig::AllowPull {
+                consumer_cert: cert(),
+            },
+        );
+        assert!(supplier_peers(&repl_config).is_empty());
+
+        repl_config.manual.insert(
+            url("repl://supplier.example.com:8444"),
+            RepNodeConfig::Pull {
+                supplier_cert: cert(),
+                automatic_refresh: true,
+            },
+        );
+        repl_config.manual.insert(
+            url("repl://partner.example.com:8444"),
+            RepNodeConfig::MutualPull {
+                partner_cert: cert(),
+                automatic_refresh: false,
+            },
+        );
+        assert_eq!(
+            supplier_peers(&repl_config),
+            vec![
+                "repl://partner.example.com:8444".to_string(),
+                "repl://supplier.example.com:8444".to_string(),
+            ]
+        );
+    }
 }

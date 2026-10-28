@@ -10,7 +10,7 @@ use axum::{Extension, Json};
 use kubidmd_lib::maintenance::{
     maintenance_public_status, MaintenanceHttpStatus, MaintenanceState,
 };
-use kubidmd_lib::prelude::APPLICATION_JSON;
+use kubidmd_lib::prelude::{duration_from_epoch_now, APPLICATION_JSON};
 use kubidmd_lib::status::{LivenessStatus, ReadinessStatus, ServingReadiness, StatusRequestEvent};
 use sha2::{Digest, Sha256};
 use url::Url;
@@ -88,7 +88,9 @@ pub async fn maintenance_status() -> Json<MaintenanceHttpStatus> {
 /// Readiness probe endpoint for Kubernetes. Returns 200 if the replica is ready to serve traffic,
 /// 503 otherwise. Includes detailed replication state and database health information.
 pub async fn readyz(State(state): State<ServerState>) -> impl IntoResponse {
-    let mut status = state.status_ref.get_readiness_status();
+    let mut status = state
+        .status_ref
+        .get_readiness_status(duration_from_epoch_now().as_secs());
     let maintenance = maintenance_public_status();
 
     // Serving readiness and administrative maintenance readiness answer different

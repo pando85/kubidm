@@ -277,6 +277,17 @@ impl IdmServer {
         self.qs.d_info.read()
     }
 
+    /// Kubidm: the health and readiness tracker of the query server.
+    pub fn health_tracker(&self) -> crate::status::ReplicationStateTracker {
+        self.qs.health().clone()
+    }
+
+    /// Kubidm: whether this server has ever received changes from a replication supplier,
+    /// see [`QueryServer::replication_has_peer_changes`].
+    pub async fn replication_has_peer_changes(&self) -> Result<bool, OperationError> {
+        self.qs.replication_has_peer_changes().await
+    }
+
     /// Read from the database, in a transaction.
     #[instrument(level = "debug", skip_all)]
     pub async fn proxy_read(&self) -> Result<IdmServerProxyReadTransaction<'_>, OperationError> {

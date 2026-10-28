@@ -51,7 +51,7 @@ The feature is deliberately node-local. Kaniop or another orchestrator decides w
 
 ### Serving readiness
 
-Whether a node is safe enough to receive normal production traffic. Existing `healthy`, `catching_up`, and some `degraded` states may be serving-ready.
+Whether a node is safe enough to receive normal production traffic. Only the `healthy` and `degraded` replication states are serving-ready, see [Kubernetes probes](../../integrations/kubernetes_probes.md#readiness-decision-matrix).
 
 ### Drain
 

@@ -194,6 +194,50 @@ async fn test_repl_refresh_basic(server_a: &QueryServer, server_b: &QueryServer)
 }
 
 // Test that adding an entry to one side replicates correctly.
+// Kubidm: a fresh server has only its own changes in its RUV, a server that received a
+// refresh or an incremental also has its supplier's. Startup readiness relies on this.
+#[qs_pair_test]
+async fn test_repl_has_peer_changes_after_refresh_and_incremental(
+    server_a: &QueryServer,
+    server_b: &QueryServer,
+) {
+    assert_eq!(server_a.replication_has_peer_changes().await, Ok(false));
+    assert_eq!(server_b.replication_has_peer_changes().await, Ok(false));
+
+    // Refresh a from b.
+    let mut server_a_txn = server_a.write(duration_from_epoch_now()).await.unwrap();
+    let mut server_b_txn = server_b.read().await.unwrap();
+    assert!(repl_initialise(&mut server_b_txn, &mut server_a_txn)
+        .and_then(|_| server_a_txn.commit())
+        .is_ok());
+    drop(server_b_txn);
+
+    assert_eq!(server_a.replication_has_peer_changes().await, Ok(true));
+    assert_eq!(server_b.replication_has_peer_changes().await, Ok(false));
+
+    // A change made on a reaches b with an incremental.
+    let mut server_a_txn = server_a.write(duration_from_epoch_now()).await.unwrap();
+    assert!(server_a_txn
+        .internal_create(vec![entry_init!(
+            (Attribute::Class, EntryClass::Object.to_value()),
+            (Attribute::Class, EntryClass::Account.to_value()),
+            (Attribute::Class, EntryClass::Person.to_value()),
+            (Attribute::Name, Value::new_iname("testperson1")),
+            (Attribute::Uuid, Value::Uuid(Uuid::new_v4())),
+            (Attribute::DisplayName, Value::new_utf8s("testperson1"))
+        ),])
+        .is_ok());
+    server_a_txn.commit().expect("Failed to commit");
+
+    let mut server_b_txn = server_b.write(duration_from_epoch_now()).await.unwrap();
+    let mut server_a_txn = server_a.read().await.unwrap();
+    repl_incremental(&mut server_a_txn, &mut server_b_txn);
+    server_b_txn.commit().expect("Failed to commit");
+    drop(server_a_txn);
+
+    assert_eq!(server_b.replication_has_peer_changes().await, Ok(true));
+}
+
 #[qs_pair_test]
 async fn test_repl_increment_basic_entry_add(server_a: &QueryServer, server_b: &QueryServer) {
     let mut server_a_txn = server_a.write(duration_from_epoch_now()).await.unwrap();

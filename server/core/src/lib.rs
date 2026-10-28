@@ -76,7 +76,7 @@ use kubidmd_lib::{
     idm::ldap::LdapServer,
     prelude::*,
     schema::Schema,
-    status::StatusActor,
+    status::{ReplicationStateTracker, StatusActor},
     value::CredentialType,
 };
 use regex::Regex;
@@ -1458,6 +1458,20 @@ pub async fn create_server_core(
     }
 }
 
+/// Record in the health tracker that the server finished starting, with what it needs to
+/// know about replication when replication is configured.
+async fn mark_startup_complete(
+    tracker: &ReplicationStateTracker,
+    config: &Configuration,
+    idms: &IdmServer,
+) {
+    let replication = match &config.repl_config {
+        Some(repl_config) => Some(repl::replication_startup(repl_config, idms).await),
+        None => None,
+    };
+    tracker.mark_startup_complete(replication, duration_from_epoch_now().as_secs());
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn launch_server_tasks(
     handles: &mut Vec<(TaskName, task::JoinHandle<()>)>,
@@ -1480,7 +1494,9 @@ async fn launch_server_tasks(
     backup_verify: Arc<BackupVerifyJob>,
     backup_lock: Arc<tokio::sync::Mutex<()>>,
 ) -> Result<(), ()> {
-    let status_ref = StatusActor::start();
+    // The query server owns the tracker: its write commits and verifications record the
+    // database health there, the replication tasks the replication state.
+    let status_ref = StatusActor::start_with_tracker(idms_arc.health_tracker());
     let tracker = status_ref.get_tracker_clone();
 
     // Delayed actions
@@ -1595,8 +1611,7 @@ async fn launch_server_tasks(
         let eventid = Uuid::new_v4();
         migration_apply(eventid, server_write_ref, migration_path.as_path()).await;
 
-        let replication_configured = config.repl_config.is_some();
-        tracker.mark_startup_complete(replication_configured);
+        mark_startup_complete(&tracker, config, &idms_arc).await;
 
         // Skip all these handles in integration test mode.
 
@@ -1676,8 +1691,7 @@ async fn launch_server_tasks(
 
         handles.push((TaskName::AdminSocket, admin_handle));
     } else {
-        let replication_configured = config.repl_config.is_some();
-        tracker.mark_startup_complete(replication_configured);
+        mark_startup_complete(&tracker, config, &idms_arc).await;
     }
 
     // The scheduled verification of the newest backup. It only reads backups and restores

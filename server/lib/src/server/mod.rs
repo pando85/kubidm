@@ -32,6 +32,7 @@ use crate::{
         Schema, SchemaAttribute, SchemaClass, SchemaReadTransaction, SchemaTransaction,
         SchemaWriteTransaction,
     },
+    status::{DatabaseCheck, ReplicationStateTracker},
     value::{CredentialType, EXTRACT_VAL_DN},
     valueset::*,
 };
@@ -188,6 +189,8 @@ pub struct QueryServer {
     dyngroup_cache: Arc<CowCell<DynGroupCache>>,
     cid_max: Arc<CowCell<Cid>>,
     key_providers: Arc<KeyProviders>,
+    // Kubidm: the health and readiness tracker, fed by commits and verifications.
+    health: ReplicationStateTracker,
 }
 
 pub struct QueryServerReadTransaction<'a> {
@@ -207,6 +210,7 @@ pub struct QueryServerReadTransaction<'a> {
     // cid_max: CowCellReadTxn<Cid>,
     trim_cid: Cid,
     txn_name_to_uuid: BTreeMap<String, Uuid>,
+    pub(crate) health: &'a ReplicationStateTracker,
 }
 
 unsafe impl Sync for QueryServerReadTransaction<'_> {}
@@ -268,6 +272,7 @@ pub struct QueryServerWriteTransaction<'a> {
     >,
     dyngroup_cache: CowCellWriteTxn<'a, DynGroupCache>,
     txn_name_to_uuid: BTreeMap<String, Uuid>,
+    health: &'a ReplicationStateTracker,
 }
 
 impl QueryServerWriteTransaction<'_> {
@@ -2094,7 +2099,27 @@ impl QueryServer {
             dyngroup_cache,
             cid_max,
             key_providers,
+            health: ReplicationStateTracker::new(),
         })
+    }
+
+    /// Kubidm: the health and readiness tracker of this server. Write commits and online
+    /// verifications record the database health in it, the replication tasks the
+    /// replication state.
+    pub fn health(&self) -> &ReplicationStateTracker {
+        &self.health
+    }
+
+    /// Kubidm: whether the replication update vector records changes that originated on
+    /// another server, i.e. this server has received a refresh or an incremental from a
+    /// supplier. A fresh server only records its own changes. Active servers write an
+    /// anchor every purge interval, so the RUV of a node that has synced keeps its peers
+    /// until they have been gone longer than the changelog.
+    pub async fn replication_has_peer_changes(&self) -> Result<bool, OperationError> {
+        let s_uuid = self.cid_max.read().s_uuid;
+        let mut read_txn = self.read().await?;
+        let ReplRuvRange::V1 { ranges, .. } = read_txn.consumer_get_state()?;
+        Ok(ranges.keys().any(|server| *server != s_uuid))
     }
 
     pub fn try_quiesce(&self) {
@@ -2190,6 +2215,7 @@ impl QueryServer {
             resolve_filter_cache: self.resolve_filter_cache.read(),
             trim_cid,
             txn_name_to_uuid: Default::default(),
+            health: &self.health,
         })
     }
 
@@ -2312,6 +2338,7 @@ impl QueryServer {
             dyngroup_cache: self.dyngroup_cache.write(),
             key_providers: self.key_providers.write(),
             txn_name_to_uuid: Default::default(),
+            health: &self.health,
         })
     }
 
@@ -3368,6 +3395,7 @@ impl<'a> QueryServerWriteTransaction<'a> {
             resolve_filter_cache_clear,
             mut resolve_filter_cache_write,
             txn_name_to_uuid: _,
+            health,
         } = self;
         debug_assert!(!committed);
 
@@ -3378,7 +3406,9 @@ impl<'a> QueryServerWriteTransaction<'a> {
 
         // Write the cid to the db. If this fails, we can't assume replication
         // will be stable, so return if it fails.
-        be_txn.set_db_ts_max(cid.ts)?;
+        be_txn.set_db_ts_max(cid.ts).inspect_err(|_| {
+            health.mark_database_failure(DatabaseCheck::Commit);
+        })?;
         // The WAL archive records this transaction's changes under its CID.
         be_txn.set_wal_cid(&cid);
         cid.commit();
@@ -3401,7 +3431,16 @@ impl<'a> QueryServerWriteTransaction<'a> {
             .map(|_| dyngroup_cache.commit())
             .and_then(|_| key_providers.commit())
             .and_then(|_| accesscontrols.commit())
-            .and_then(|_| be_txn.commit())
+            .and_then(|_| {
+                // Kubidm: only the backend commit itself decides the database health. The
+                // logical validations above reject a change, they do not break the database.
+                let committed = be_txn.commit();
+                match committed {
+                    Ok(()) => health.mark_database_healthy(DatabaseCheck::Commit),
+                    Err(_) => health.mark_database_failure(DatabaseCheck::Commit),
+                }
+                committed
+            })
     }
 
     pub(crate) fn get_txn_cid(&self) -> &Cid {

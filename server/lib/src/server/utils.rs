@@ -1,6 +1,7 @@
 use crate::{
     maintenance::{QueryServerMaintenanceWriteFence, ReplicationFence},
     prelude::*,
+    status::DatabaseCheck,
     valueset::{ValueSetDateTime, ValueSetEmailAddress, ValueSetIutf8N, ValueSetMessage},
 };
 use kubidm_proto::internal::ConsistencyError;
@@ -62,7 +63,141 @@ impl QueryServerReadTransaction<'_> {
 
     /// Run the normal full QueryServer consistency verification without the
     /// process-exiting behaviour of the offline CLI helper.
+    ///
+    /// Kubidm: the result is recorded as the database health of the server: errors make
+    /// it unhealthy (not ready) until a later verification is clean.
     pub fn maintenance_verify(&mut self) -> Vec<Result<(), ConsistencyError>> {
-        self.verify()
+        let results = self.verify();
+        if results.iter().all(Result::is_ok) {
+            self.health.mark_database_healthy(DatabaseCheck::Verify);
+        } else {
+            self.health.mark_database_failure(DatabaseCheck::Verify);
+        }
+        results
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::prelude::*;
+    use crate::status::{DatabaseCheck, DatabaseHealth};
+
+    /// Replace the memberof attributes of `uuid` behind the back of the plugins.
+    fn set_memberof_unchecked(
+        server_txn: &mut QueryServerWriteTransaction,
+        uuid: Uuid,
+        memberof: Option<&(ValueSet, ValueSet)>,
+    ) -> Option<(ValueSet, ValueSet)> {
+        let mut work_set = server_txn
+            .internal_search_writeable(&filter!(f_eq(Attribute::Uuid, PartialValue::Uuid(uuid))))
+            .expect("Unable to search the entry");
+        let mut previous = None;
+        for (pre, entry) in work_set.iter_mut() {
+            previous = pre
+                .get_ava_set(Attribute::MemberOf)
+                .cloned()
+                .zip(pre.get_ava_set(Attribute::DirectMemberOf).cloned());
+            entry.purge_ava(Attribute::MemberOf);
+            entry.purge_ava(Attribute::DirectMemberOf);
+            if let Some((mo, dmo)) = memberof {
+                entry.set_ava_set(&Attribute::MemberOf, mo.clone());
+                entry.set_ava_set(&Attribute::DirectMemberOf, dmo.clone());
+            }
+        }
+        server_txn
+            .internal_apply_writable(work_set)
+            .expect("Unable to apply the entry");
+        previous
+    }
+
+    #[qs_test]
+    async fn test_maintenance_verify_records_database_health(server: &QueryServer) {
+        let person_uuid = Uuid::new_v4();
+        let mut server_txn = server.write(duration_from_epoch_now()).await.unwrap();
+        server_txn
+            .internal_create(vec![
+                entry_init!(
+                    (Attribute::Class, EntryClass::Object.to_value()),
+                    (Attribute::Class, EntryClass::Account.to_value()),
+                    (Attribute::Class, EntryClass::Person.to_value()),
+                    (Attribute::Name, Value::new_iname("testperson1")),
+                    (Attribute::Uuid, Value::Uuid(person_uuid)),
+                    (Attribute::DisplayName, Value::new_utf8s("testperson1"))
+                ),
+                entry_init!(
+                    (Attribute::Class, EntryClass::Object.to_value()),
+                    (Attribute::Class, EntryClass::Group.to_value()),
+                    (Attribute::Name, Value::new_iname("testgroup1")),
+                    (Attribute::Uuid, Value::Uuid(Uuid::new_v4())),
+                    (Attribute::Member, Value::ReferN(person_uuid))
+                ),
+            ])
+            .unwrap();
+        server_txn.commit().unwrap();
+
+        let mut server_read = server.read().await.unwrap();
+        assert!(server_read.maintenance_verify().iter().all(Result::is_ok));
+        drop(server_read);
+        assert_eq!(
+            server.health().get_database_health(),
+            DatabaseHealth::Healthy
+        );
+
+        // Corrupt the derived memberof of the person: the verification finds it and the
+        // database is unhealthy.
+        let mut server_txn = server.write(duration_from_epoch_now()).await.unwrap();
+        let original = set_memberof_unchecked(&mut server_txn, person_uuid, None);
+        assert!(original.is_some());
+        server_txn.commit().unwrap();
+
+        let mut server_read = server.read().await.unwrap();
+        assert!(server_read.maintenance_verify().iter().any(Result::is_err));
+        drop(server_read);
+        assert_eq!(
+            server.health().get_database_health(),
+            DatabaseHealth::Unhealthy
+        );
+
+        // A successful write does not prove the corruption is gone.
+        let mut server_txn = server.write(duration_from_epoch_now()).await.unwrap();
+        set_memberof_unchecked(&mut server_txn, person_uuid, original.as_ref());
+        server_txn.commit().unwrap();
+        assert_eq!(
+            server.health().get_database_health(),
+            DatabaseHealth::Unhealthy
+        );
+
+        // The next clean verification does.
+        let mut server_read = server.read().await.unwrap();
+        assert!(server_read.maintenance_verify().iter().all(Result::is_ok));
+        drop(server_read);
+        assert_eq!(
+            server.health().get_database_health(),
+            DatabaseHealth::Healthy
+        );
+    }
+
+    #[qs_test]
+    async fn test_commit_success_recovers_database_health(server: &QueryServer) {
+        server.health().mark_database_failure(DatabaseCheck::Commit);
+        assert_eq!(
+            server.health().get_database_health(),
+            DatabaseHealth::Unhealthy
+        );
+
+        // An aborted write transaction is not a recovery.
+        let server_txn = server.write(duration_from_epoch_now()).await.unwrap();
+        drop(server_txn);
+        assert_eq!(
+            server.health().get_database_health(),
+            DatabaseHealth::Unhealthy
+        );
+
+        let server_txn = server.write(duration_from_epoch_now()).await.unwrap();
+        server_txn.commit().unwrap();
+        assert_eq!(
+            server.health().get_database_health(),
+            DatabaseHealth::Healthy
+        );
     }
 }
