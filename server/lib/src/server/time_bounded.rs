@@ -168,7 +168,7 @@ fn list_time_bounded_members<'a, T: QueryServerTransaction<'a>>(
                 member_spn,
                 valid_from: grant.valid_from,
                 valid_until: grant.valid_until,
-                state: grant_state(&grant, suppressed, now),
+                state: Some(grant_state(&grant, suppressed, now)),
             })
         })
         .collect()
@@ -519,7 +519,7 @@ mod tests {
             .is_some_and(|spn| spn.starts_with("tb_target@")));
         assert_eq!(grants[0].valid_from, None);
         assert_eq!(grants[0].valid_until, until);
-        assert_eq!(grants[0].state, TimeBoundedMemberGrantState::Active);
+        assert_eq!(grants[0].state, Some(TimeBoundedMemberGrantState::Active));
 
         // A second grant replaces the first: a future start removes the membership.
         let from = odt(ct + secs(600));
@@ -534,7 +534,7 @@ mod tests {
         assert_eq!(grants.len(), 1);
         assert_eq!(grants[0].valid_from, Some(from));
         assert_eq!(grants[0].valid_until, until);
-        assert_eq!(grants[0].state, TimeBoundedMemberGrantState::Pending);
+        assert_eq!(grants[0].state, Some(TimeBoundedMemberGrantState::Pending));
 
         // Back to an active grant, then revoke it.
         server_txn
@@ -1268,7 +1268,7 @@ mod tests {
         assert_eq!(grants.len(), 2);
         assert!(grants
             .iter()
-            .all(|grant| grant.state == TimeBoundedMemberGrantState::Suppressed));
+            .all(|grant| grant.state == Some(TimeBoundedMemberGrantState::Suppressed)));
 
         // The grants can still be revoked.
         server_txn
@@ -1292,7 +1292,7 @@ mod tests {
             .expect("list");
         assert_eq!(grants.len(), 1);
         assert_eq!(grants[0].member, UUID_TB_OUTSIDER);
-        assert_eq!(grants[0].state, TimeBoundedMemberGrantState::Active);
+        assert_eq!(grants[0].state, Some(TimeBoundedMemberGrantState::Active));
         assert!(!is_memberof(&mut server_txn, UUID_TB_TARGET, UUID_TB_GROUP));
         server_txn.commit().expect("commit");
     }
@@ -1700,7 +1700,7 @@ mod tests {
             grants
                 .iter()
                 .find(|grant| grant.member == member)
-                .map(|grant| grant.state)
+                .and_then(|grant| grant.state)
         };
 
         // Through a read transaction, at the time given.

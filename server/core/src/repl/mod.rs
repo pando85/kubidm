@@ -18,13 +18,18 @@ use rustls::{
     server::{ServerConfig, WebPkiClientVerifier},
     RootCertStore,
 };
-use std::{collections::VecDeque, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeSet, VecDeque},
+    net::SocketAddr,
+    sync::Arc,
+    time::Duration,
+};
 use tokio::{
     io::AsyncWriteExt,
     net::{TcpListener, TcpStream},
     sync::{broadcast, mpsc, oneshot, Mutex, MutexGuard},
     task::JoinHandle,
-    time::{interval, sleep, timeout},
+    time::{interval, sleep, timeout, Instant},
 };
 use tokio_rustls::{client::TlsStream, TlsAcceptor, TlsConnector};
 use tokio_util::codec::{Framed, FramedRead, FramedWrite};
@@ -44,9 +49,12 @@ pub(crate) enum ReplCtrl {
     },
     /// Refresh this node from a supplier: from the supplier `from` (its origin, matched as
     /// [`peer_label`] names it) when given, otherwise from the first supplier task that
-    /// takes the refresh. `Err` when `from` names no configured supplier.
+    /// takes the refresh. `Err` when `from` names no configured supplier. A refresh that
+    /// has not started by `start_deadline`, or whose receiver was dropped (the requester
+    /// gave up), is not run.
     RefreshConsumer {
         from: Option<String>,
+        start_deadline: Instant,
         respond: oneshot::Sender<Result<mpsc::Receiver<()>, String>>,
     },
 }
@@ -57,10 +65,47 @@ enum ReplConsumerCtrl {
     /// Refresh this node. Every supplier task receives it, and the first one that takes the
     /// lock runs it, unless `from` restricts it to the task of one supplier (named as
     /// [`peer_label`] names it).
+    ///
+    /// A manual refresh carries a `start_deadline`: the requester stops waiting for it, so
+    /// a task that only gets to it later (its supplier unreachable, the task busy) must not
+    /// run it then. It is also dropped once its receiver is gone. An automatic refresh has
+    /// no deadline, and its receiver lives until the refresh is done.
     Refresh {
         refresh_coord: Arc<Mutex<(bool, mpsc::Sender<()>)>>,
         from: Option<String>,
+        start_deadline: Option<Instant>,
     },
+}
+
+/// Take the refresh lock of `refresh_coord`, and keep it only when the refresh must run
+/// now: not done yet by another task, still awaited by its requester (its receiver is not
+/// dropped), and not past its `start_deadline`.
+async fn claim_refresh(
+    refresh_coord: &Mutex<(bool, mpsc::Sender<()>)>,
+    start_deadline: Option<Instant>,
+) -> Option<MutexGuard<'_, (bool, mpsc::Sender<()>)>> {
+    // Every replication consumer *should* end up here behind this lock, but only one can
+    // proceed. This is what we want!
+    let refresh_coord_guard = refresh_coord.lock().await;
+
+    // Simple case - task is already done.
+    if refresh_coord_guard.0 {
+        trace!("Refresh already completed by another task, return.");
+        return None;
+    }
+
+    // The requester gave up: running it now would refresh this node long after the
+    // operator was told it failed, from a supplier that may since have changed.
+    if refresh_coord_guard.1.is_closed() {
+        warn!("Refresh was abandoned by its requester before it could start, not refreshing.");
+        return None;
+    }
+    if start_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        warn!("Refresh could not start before its deadline, not refreshing.");
+        return None;
+    }
+
+    Some(refresh_coord_guard)
 }
 
 /// Whether the replication task of the supplier `peer_url` may run a refresh restricted to
@@ -70,10 +115,11 @@ fn refresh_is_for_peer(from: Option<&str>, peer_url: &str) -> bool {
 }
 
 /// The supplier a manual refresh asked for with `--from`, named as [`peer_label`] names it.
-/// `Err` is a message for the operator: the origin is not a URL, or is not a configured
-/// supplier (`pull` or `mutual-pull`) of this node.
+/// `Err` is a message for the operator: the origin is not a URL, is not a configured
+/// supplier (`pull` or `mutual-pull`) of this node, or matches more than one of them.
 fn refresh_source(repl_config: &ReplicationConfiguration, from: &str) -> Result<String, String> {
-    let suppliers: Vec<String> = repl_config
+    // Origins that differ only in their path name the same supplier.
+    let suppliers: BTreeSet<String> = repl_config
         .manual
         .iter()
         .filter(|(_, node)| !matches!(node, RepNodeConfig::AllowPull { .. }))
@@ -82,19 +128,33 @@ fn refresh_source(repl_config: &ReplicationConfiguration, from: &str) -> Result<
 
     // Host names are not case sensitive, but the url crate keeps the case of the host of a
     // `repl://` url: compare without it, and name the supplier as its task does.
-    let wanted = Url::parse(from.trim()).map(|origin| peer_label(&origin));
-    let found = wanted.ok().and_then(|wanted| {
-        suppliers
-            .iter()
-            .find(|supplier| supplier.eq_ignore_ascii_case(&wanted))
-            .cloned()
-    });
-    match found {
-        Some(supplier) => Ok(supplier),
-        None => Err(format!(
+    let found: Vec<&String> = match Url::parse(from.trim()) {
+        Ok(origin) => {
+            let wanted = peer_label(&origin);
+            suppliers
+                .iter()
+                .filter(|supplier| supplier.eq_ignore_ascii_case(&wanted))
+                .collect()
+        }
+        Err(_) => Vec::new(),
+    };
+    match found.as_slice() {
+        [supplier] => Ok((*supplier).clone()),
+        [] => Err(format!(
             "'{from}' is not a replication supplier of this node, refusing to refresh. The \
              configured suppliers (pull or mutual-pull) are: [{}]",
-            suppliers.join(", ")
+            suppliers.iter().cloned().collect::<Vec<_>>().join(", ")
+        )),
+        // Configured more than once, with the host in another case: each is its own
+        // replication task, and which one the operator means can not be told.
+        matches => Err(format!(
+            "'{from}' matches more than one replication supplier of this node, refusing to \
+             refresh. Matching suppliers: [{}]. Configure each supplier once.",
+            matches
+                .iter()
+                .map(|supplier| supplier.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         )),
     }
 }
@@ -336,6 +396,7 @@ async fn repl_consumer_disconnect_supplier(
 )]
 async fn repl_run_consumer_refresh(
     refresh_coord: Arc<Mutex<(bool, mpsc::Sender<()>)>>,
+    start_deadline: Option<Instant>,
     server_name: &ServerName<'static>,
     sock_addrs: &[SocketAddr],
     tls_connector: &TlsConnector,
@@ -344,16 +405,10 @@ async fn repl_run_consumer_refresh(
     tracker: &ReplicationStateTracker,
     peer_url: &str,
 ) -> Result<Option<SocketAddr>, ()> {
-    // Take the refresh lock. Note that every replication consumer *should* end up here
-    // behind this lock, but only one can proceed. This is what we want!
-
-    let refresh_coord_guard = refresh_coord.lock().await;
-
-    // Simple case - task is already done.
-    if refresh_coord_guard.0 {
-        trace!("Refresh already completed by another task, return.");
+    // Take the refresh lock, unless it must not run (anymore).
+    let Some(refresh_coord_guard) = claim_refresh(&refresh_coord, start_deadline).await else {
         return Ok(None);
-    }
+    };
 
     // Okay, we need to proceed. Open the connection.
     let (addr, mut supplier_conn) = repl_consumer_connect_supplier(
@@ -691,6 +746,8 @@ async fn repl_run_consumer_inner(
                     .send(ReplConsumerCtrl::Refresh {
                         refresh_coord,
                         from: None,
+                        // The receiver below waits for it, however long it takes.
+                        start_deadline: None,
                     })
                     .is_err()
                 {
@@ -850,7 +907,7 @@ async fn repl_task(
             Ok(task) = task_rx.recv() => {
                 match task {
                     ReplConsumerCtrl::Stop => break,
-                    ReplConsumerCtrl::Refresh { refresh_coord, from } => {
+                    ReplConsumerCtrl::Refresh { refresh_coord, from, start_deadline } => {
                         // A refresh restricted to another supplier is not ours to run.
                         if !refresh_is_for_peer(from.as_deref(), &peer_url) {
                             trace!("Refresh requested from another supplier, skipping.");
@@ -858,6 +915,7 @@ async fn repl_task(
                         }
                         last_working_address = (repl_run_consumer_refresh(
                             refresh_coord,
+                            start_deadline,
                             &server_name,
                             &sorted_socket_addrs,
                             &tls_connector,
@@ -1290,6 +1348,7 @@ async fn repl_acceptor(
                         }
                         ReplCtrl::RefreshConsumer {
                             from,
+                            start_deadline,
                             respond
                         } => {
                             // Only the task of the requested supplier may run the refresh.
@@ -1322,7 +1381,11 @@ async fn repl_acceptor(
                                 )
                             );
 
-                            if task_tx.send(ReplConsumerCtrl::Refresh { refresh_coord, from }).is_err() {
+                            if task_tx.send(ReplConsumerCtrl::Refresh {
+                                refresh_coord,
+                                from,
+                                start_deadline: Some(start_deadline),
+                            }).is_err() {
                                 error!("Unable to begin replication consumer refresh, tasks are unable to be notified.");
                             }
 
@@ -1388,11 +1451,15 @@ async fn repl_acceptor(
 #[cfg(test)]
 mod tests {
     use super::{
-        peer_label, refresh_is_for_peer, refresh_source, startup_sync_state, supplier_peers,
+        claim_refresh, peer_label, refresh_is_for_peer, refresh_source, startup_sync_state,
+        supplier_peers,
     };
     use crate::repl::config::{RepNodeConfig, ReplicationConfiguration};
     use crypto_glue::{traits::DecodePem, x509::Certificate};
     use std::str::FromStr;
+    use std::time::Duration;
+    use tokio::sync::{mpsc, Mutex};
+    use tokio::time::Instant;
     use url::Url;
 
     // Test only certificate, a self-signed server cert. Only its presence matters here.
@@ -1560,6 +1627,94 @@ ta41VMU3u9UQfHxF
             refresh_source(&ReplicationConfiguration::default(), "repl://a.example.com")
                 .is_err_and(|err| err.ends_with("[]"))
         );
+    }
+
+    #[test]
+    fn refresh_source_rejects_an_ambiguous_origin() {
+        // The same host configured twice, in another case: two replication tasks.
+        let mut repl_config = refresh_config();
+        repl_config.manual.insert(
+            url("repl://POD-1.example.com:8444"),
+            RepNodeConfig::Pull {
+                supplier_cert: cert(),
+                automatic_refresh: false,
+            },
+        );
+        for from in [
+            "repl://pod-1.example.com:8444",
+            "repl://POD-1.example.com:8444",
+            "repl://Pod-1.Example.com:8444/",
+        ] {
+            let err = refresh_source(&repl_config, from).expect_err(from);
+            assert!(
+                err.contains("matches more than one replication supplier"),
+                "{err}"
+            );
+            // Both matches are listed, nothing else.
+            assert!(err.contains("repl://pod-1.example.com:8444"), "{err}");
+            assert!(err.contains("repl://POD-1.example.com:8444"), "{err}");
+            assert!(!err.contains("pod-0"), "{err}");
+        }
+        // Other suppliers are still unambiguous.
+        assert_eq!(
+            refresh_source(&repl_config, "repl://pod-0.example.com:8444"),
+            Ok("repl://pod-0.example.com:8444".to_string())
+        );
+
+        // Origins that differ only in their path are one supplier, not ambiguous.
+        let mut repl_config = refresh_config();
+        repl_config.manual.insert(
+            url("repl://pod-1.example.com:8444/other"),
+            RepNodeConfig::Pull {
+                supplier_cert: cert(),
+                automatic_refresh: false,
+            },
+        );
+        assert_eq!(
+            refresh_source(&repl_config, "repl://pod-1.example.com:8444"),
+            Ok("repl://pod-1.example.com:8444".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn abandoned_or_late_refresh_is_not_run() {
+        let later = Instant::now() + Duration::from_secs(60);
+
+        // A manual refresh still awaited before its deadline runs.
+        let (tx, _rx) = mpsc::channel(1);
+        let coord = Mutex::new((false, tx));
+        assert!(claim_refresh(&coord, Some(later)).await.is_some());
+
+        // The requester gave up (it timed out and dropped its receiver): not run, even
+        // before the deadline.
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let coord = Mutex::new((false, tx));
+        assert!(claim_refresh(&coord, Some(later)).await.is_none());
+        assert!(claim_refresh(&coord, None).await.is_none());
+
+        // Past its deadline: not run, even while its receiver is still there.
+        let (tx, _rx) = mpsc::channel(1);
+        let coord = Mutex::new((false, tx));
+        let past = Instant::now();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert!(claim_refresh(&coord, Some(past)).await.is_none());
+
+        // Already done by another task: not run again.
+        let (tx, _rx) = mpsc::channel(1);
+        let coord = Mutex::new((true, tx));
+        assert!(claim_refresh(&coord, Some(later)).await.is_none());
+
+        // An automatic refresh has no deadline and keeps its receiver: it runs, however
+        // late a task gets to it.
+        let (tx, mut rx) = mpsc::channel(1);
+        let coord = Mutex::new((false, tx));
+        let mut guard = claim_refresh(&coord, None).await.expect("refresh runs");
+        // The task that runs it reports completion to the receiver.
+        guard.0 = true;
+        assert!(guard.1.send(()).await.is_ok());
+        drop(guard);
+        assert_eq!(rx.recv().await, Some(()));
     }
 
     #[test]

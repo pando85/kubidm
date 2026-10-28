@@ -40,6 +40,9 @@ pub enum TimeBoundedMemberGrantState {
     /// (`idm_high_privilege`, or nested in it). It applies again, within its window, once
     /// the group is no longer high privilege. It can still be revoked.
     Suppressed,
+    /// A state this client does not know, sent by a newer server.
+    #[serde(other)]
+    Unknown,
 }
 
 impl std::fmt::Display for TimeBoundedMemberGrantState {
@@ -49,6 +52,7 @@ impl std::fmt::Display for TimeBoundedMemberGrantState {
             Self::Pending => write!(f, "pending"),
             Self::Expired => write!(f, "expired"),
             Self::Suppressed => write!(f, "suppressed"),
+            Self::Unknown => write!(f, "unknown"),
         }
     }
 }
@@ -65,8 +69,10 @@ pub struct TimeBoundedMemberGrant {
     #[serde(with = "time::serde::rfc3339")]
     #[schema(value_type = String, format = DateTime)]
     pub valid_until: OffsetDateTime,
-    /// Whether the grant currently makes its member a member of the group.
-    pub state: TimeBoundedMemberGrantState,
+    /// Whether the grant currently makes its member a member of the group. Absent from
+    /// servers that predate it.
+    #[serde(default)]
+    pub state: Option<TimeBoundedMemberGrantState>,
 }
 
 #[cfg(test)]
@@ -101,8 +107,33 @@ mod tests {
         let json = r#"{"member":"00000000-0000-0000-0000-000000000001","member_spn":null,"valid_until":"2030-01-02T03:04:05Z","state":"suppressed"}"#;
         let grant: TimeBoundedMemberGrant =
             serde_json::from_str(json).expect("Failed to deserialise");
-        assert_eq!(grant.state, TimeBoundedMemberGrantState::Suppressed);
-        assert_eq!(grant.state.to_string(), "suppressed");
+        assert_eq!(grant.state, Some(TimeBoundedMemberGrantState::Suppressed));
+
+        // A server that predates the state does not send it.
+        let json = r#"{"member":"00000000-0000-0000-0000-000000000001","member_spn":null,"valid_until":"2030-01-02T03:04:05Z"}"#;
+        let grant: TimeBoundedMemberGrant =
+            serde_json::from_str(json).expect("Failed to deserialise");
+        assert_eq!(grant.state, None);
+
+        // A newer server may send a state this client does not know.
+        let json = r#"{"member":"00000000-0000-0000-0000-000000000001","member_spn":null,"valid_until":"2030-01-02T03:04:05Z","state":"revoked_later"}"#;
+        let grant: TimeBoundedMemberGrant =
+            serde_json::from_str(json).expect("Failed to deserialise");
+        assert_eq!(grant.state, Some(TimeBoundedMemberGrantState::Unknown));
+        assert_eq!(TimeBoundedMemberGrantState::Unknown.to_string(), "unknown");
+
+        // A listing round trips.
+        let grant = TimeBoundedMemberGrant {
+            member: Uuid::nil(),
+            member_spn: Some("alice@example.com".to_string()),
+            valid_from: None,
+            valid_until: OffsetDateTime::UNIX_EPOCH,
+            state: Some(TimeBoundedMemberGrantState::Pending),
+        };
+        let json = serde_json::to_string(&grant).expect("Failed to serialise");
+        let again: TimeBoundedMemberGrant =
+            serde_json::from_str(&json).expect("Failed to deserialise");
+        assert_eq!(grant, again);
 
         for state in [
             TimeBoundedMemberGrantState::Active,

@@ -348,8 +348,13 @@ fn refresh_replication_consumer_request(
     if !proceed {
         return Err("Unwilling to proceed. Check --help.".to_string());
     }
-    Ok(AdminTaskRequest::RefreshReplicationConsumer {
-        from: from.map(str::to_owned),
+    // Without a source, the request released versions know; with one, a request that a
+    // server without `--from` refuses rather than refreshing from any supplier.
+    Ok(match from {
+        None => AdminTaskRequest::RefreshReplicationConsumer,
+        Some(from) => AdminTaskRequest::RefreshReplicationConsumerFrom {
+            from: from.to_owned(),
+        },
     })
 }
 
@@ -1755,7 +1760,7 @@ mod tests {
     fn refresh_replication_consumer_maps_to_request() {
         assert!(matches!(
             refresh_request(&["--i-want-to-refresh-this-servers-database"]),
-            Ok(AdminTaskRequest::RefreshReplicationConsumer { from: None })
+            Ok(AdminTaskRequest::RefreshReplicationConsumer)
         ));
         assert!(matches!(
             refresh_request(&[
@@ -1763,7 +1768,7 @@ mod tests {
                 "--from",
                 "repl://pod-1.example.com:8444",
             ]),
-            Ok(AdminTaskRequest::RefreshReplicationConsumer { from: Some(ref from) })
+            Ok(AdminTaskRequest::RefreshReplicationConsumerFrom { ref from })
                 if from == "repl://pod-1.example.com:8444"
         ));
         // Nothing is sent without the acknowledgement, with or without a source.

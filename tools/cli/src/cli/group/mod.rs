@@ -353,9 +353,50 @@ fn format_grant(grant: &TimeBoundedMemberGrant) -> String {
         .as_ref()
         .map(format_datetime)
         .unwrap_or_else(|| "-".to_string());
+    // A server that predates the state does not send it: show nothing then.
+    let state = grant
+        .state
+        .map(|state| format!(" ({state})"))
+        .unwrap_or_default();
     format!(
-        "{member}: from {from} until {} ({})",
-        format_datetime(&grant.valid_until),
-        grant.state
+        "{member}: from {from} until {}{state}",
+        format_datetime(&grant.valid_until)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_grant;
+    use kubidm_proto::v1::{TimeBoundedMemberGrant, TimeBoundedMemberGrantState};
+    use time::OffsetDateTime;
+    use uuid::Uuid;
+
+    #[test]
+    fn format_grant_shows_the_state_when_known() {
+        let mut grant = TimeBoundedMemberGrant {
+            member: Uuid::nil(),
+            member_spn: Some("alice@example.com".to_string()),
+            valid_from: None,
+            valid_until: OffsetDateTime::UNIX_EPOCH,
+            state: Some(TimeBoundedMemberGrantState::Suppressed),
+        };
+        assert_eq!(
+            format_grant(&grant),
+            "alice@example.com: from - until 1970-01-01T00:00:00Z (suppressed)"
+        );
+
+        // A state from a newer server.
+        grant.state = Some(TimeBoundedMemberGrantState::Unknown);
+        assert_eq!(
+            format_grant(&grant),
+            "alice@example.com: from - until 1970-01-01T00:00:00Z (unknown)"
+        );
+
+        // A server that predates the state.
+        grant.state = None;
+        assert_eq!(
+            format_grant(&grant),
+            "alice@example.com: from - until 1970-01-01T00:00:00Z"
+        );
+    }
 }

@@ -5,7 +5,62 @@ use crate::{
 };
 use kubidm_proto::scim_v1::{client::ScimDateTime, JsonValue};
 use smolset::SmolSet;
-use time::OffsetDateTime;
+use time::{Date, Month, OffsetDateTime, Time, UtcOffset};
+
+/// Kubidm: the latest UTC time that RFC 3339 can store, `9999-12-31T23:59:59.999999999Z`.
+///
+/// Built from its date rather than taken from `PrimitiveDateTime::MAX`, which is in year
+/// 999999 when the `large-dates` feature of the `time` crate is enabled by any crate in
+/// the build. Evaluated at compile time: a component out of range fails the build.
+const STORABLE_MAX: OffsetDateTime = match Date::from_calendar_date(9999, Month::December, 31) {
+    Ok(date) => date.with_time(Time::MAX).assume_utc(),
+    Err(_) => unreachable!(),
+};
+
+/// Kubidm: the earliest UTC time that RFC 3339 can store, `0000-01-01T00:00:00Z`. As
+/// [`STORABLE_MAX`], evaluated at compile time.
+const STORABLE_MIN: OffsetDateTime = match Date::from_calendar_date(0, Month::January, 1) {
+    Ok(date) => date.midnight().assume_utc(),
+    Err(_) => unreachable!(),
+};
+
+/// Kubidm: `odt` in UTC, clamped to the range RFC 3339 can store (years 0 to 9999), and
+/// whether it had to be clamped.
+fn clamp_to_storable_utc(odt: OffsetDateTime) -> (OffsetDateTime, bool) {
+    match odt.checked_to_offset(UtcOffset::UTC) {
+        Some(utc) if utc > STORABLE_MAX => (STORABLE_MAX, true),
+        Some(utc) if utc < STORABLE_MIN => (STORABLE_MIN, true),
+        Some(utc) => (utc, false),
+        // Only a negative offset can push a time past the end of the representable range,
+        // only a positive one before its start.
+        None if odt.offset().is_negative() => (STORABLE_MAX, true),
+        None => (STORABLE_MIN, true),
+    }
+}
+
+/// Kubidm: format `odt` as RFC 3339 in UTC, as it is stored and indexed.
+///
+/// RFC 3339 formatting fails only for a year outside 0 to 9999 or an offset that is not a
+/// whole number of minutes (or 24 hours or more). The value formatted here is in UTC and
+/// clamped to [`STORABLE_MIN`]..=[`STORABLE_MAX`], so it can not fail. Every value of the
+/// set already is (loads clamp, every other path normalises to UTC); clamping again here
+/// keeps a value from any other path from panicking. Should formatting still fail, the
+/// nearest bound is written: never a panic, and never a string that can not be loaded.
+fn format_storable_utc(odt: &OffsetDateTime) -> String {
+    debug_assert_eq!(odt.offset(), UtcOffset::UTC);
+    let (utc, clamped) = clamp_to_storable_utc(*odt);
+    if clamped {
+        error!(value = %odt, clamped = %utc, "DateTime is out of the storable range, clamping it");
+    }
+    utc.format(&Rfc3339).unwrap_or_else(|err| {
+        error!(?err, value = %odt, "Unable to format DateTime as RFC 3339");
+        if utc < OffsetDateTime::UNIX_EPOCH {
+            "0000-01-01T00:00:00Z".to_string()
+        } else {
+            "9999-12-31T23:59:59.999999999Z".to_string()
+        }
+    })
+}
 
 /// Kubidm: load a stored RFC 3339 time, normalised to UTC.
 ///
@@ -21,26 +76,14 @@ fn load_utc_clamped(s: &str) -> Result<OffsetDateTime, OperationError> {
         OperationError::InvalidValueState
     })?;
 
-    // The latest and earliest UTC times that RFC 3339 can store (years 0 to 9999).
-    let max = time::PrimitiveDateTime::MAX.assume_utc();
-    let min = time::Date::from_ordinal_date(0, 1)
-        .map(|date| date.midnight().assume_utc())
-        .map_err(|_| OperationError::InvalidState)?;
-
-    let utc = match odt.checked_to_offset(time::UtcOffset::UTC) {
-        Some(utc) if utc > max => max,
-        Some(utc) if utc < min => min,
-        Some(utc) => return Ok(utc),
-        // Only a negative offset can push a time past the end of the representable range,
-        // only a positive one before its start.
-        None if odt.offset().is_negative() => max,
-        None => min,
-    };
-    error!(
-        stored = %s,
-        clamped = %utc,
-        "Stored DateTime can not be expressed in UTC within the storable range, clamping it"
-    );
+    let (utc, clamped) = clamp_to_storable_utc(odt);
+    if clamped {
+        error!(
+            stored = %s,
+            clamped = %utc,
+            "Stored DateTime can not be expressed in UTC within the storable range, clamping it"
+        );
+    }
     Ok(utc)
 }
 
@@ -158,15 +201,7 @@ impl ValueSetT for ValueSetDateTime {
     }
 
     fn generate_idx_eq_keys(&self) -> Vec<String> {
-        self.set
-            .iter()
-            .map(|odt| {
-                debug_assert_eq!(odt.offset(), time::UtcOffset::UTC);
-                #[allow(clippy::expect_used)]
-                odt.format(&Rfc3339)
-                    .expect("Failed to format timestamp into RFC3339")
-            })
-            .collect()
+        self.set.iter().map(format_storable_utc).collect()
     }
 
     fn syntax(&self) -> SyntaxType {
@@ -178,12 +213,7 @@ impl ValueSetT for ValueSetDateTime {
     }
 
     fn to_proto_string_clone_iter(&self) -> Box<dyn Iterator<Item = String> + '_> {
-        Box::new(self.set.iter().map(|odt| {
-            debug_assert_eq!(odt.offset(), time::UtcOffset::UTC);
-            #[allow(clippy::expect_used)]
-            odt.format(&Rfc3339)
-                .expect("Failed to format timestamp into RFC3339")
-        }))
+        Box::new(self.set.iter().map(format_storable_utc))
     }
 
     fn to_scim_value(&self) -> Option<ScimResolveStatus> {
@@ -191,17 +221,7 @@ impl ValueSetT for ValueSetDateTime {
     }
 
     fn to_db_valueset_v2(&self) -> DbValueSetV2 {
-        DbValueSetV2::DateTime(
-            self.set
-                .iter()
-                .map(|odt| {
-                    debug_assert_eq!(odt.offset(), time::UtcOffset::UTC);
-                    #[allow(clippy::expect_used)]
-                    odt.format(&Rfc3339)
-                        .expect("Failed to format timestamp into RFC3339")
-                })
-                .collect(),
-        )
+        DbValueSetV2::DateTime(self.set.iter().map(format_storable_utc).collect())
     }
 
     fn to_partialvalue_iter(&self) -> Box<dyn Iterator<Item = PartialValue> + '_> {
@@ -309,7 +329,9 @@ mod tests {
         };
 
         // Past the end of year 9999 in UTC: the latest storable time.
-        let max = time::PrimitiveDateTime::MAX.assume_utc();
+        let max = OffsetDateTime::parse("9999-12-31T23:59:59.999999999Z", &Rfc3339)
+            .expect("latest storable time");
+        assert_eq!(super::STORABLE_MAX, max);
         assert_eq!(load("9999-12-31T23:59:59-23:59"), Some(max));
         assert_eq!(load("9999-12-31T23:00:00-01:00"), Some(max));
         assert!(matches!(
@@ -332,5 +354,40 @@ mod tests {
             OffsetDateTime::parse("9999-12-31T23:59:59Z", &Rfc3339).ok()
         );
         assert_eq!(load("0000-01-01T00:00:00Z"), min);
+        assert_eq!(Some(super::STORABLE_MIN), min);
+    }
+
+    /// Kubidm: formatting a value for storage, indexing or display never panics, even for a
+    /// value outside the storable range that did not come from a load: it is clamped.
+    #[test]
+    fn test_datetime_out_of_storable_range_formats_clamped() {
+        use crate::valueset::DbValueSetV2;
+        use time::{Date, Month};
+
+        let before_year_0 = Date::from_calendar_date(-5, Month::June, 1)
+            .expect("valid date")
+            .midnight()
+            .assume_utc();
+        let vs: ValueSet = ValueSetDateTime::new(before_year_0);
+        assert!(matches!(
+            vs.to_db_valueset_v2(),
+            DbValueSetV2::DateTime(ref v) if v == &["0000-01-01T00:00:00Z"]
+        ));
+        assert_eq!(vs.generate_idx_eq_keys(), vec!["0000-01-01T00:00:00Z"]);
+        assert_eq!(
+            vs.to_proto_string_clone_iter().collect::<Vec<_>>(),
+            vec!["0000-01-01T00:00:00Z"]
+        );
+
+        // The bounds themselves format as they are.
+        for (bound, expected) in [
+            (super::STORABLE_MAX, "9999-12-31T23:59:59.999999999Z"),
+            (super::STORABLE_MIN, "0000-01-01T00:00:00Z"),
+        ] {
+            assert!(matches!(
+                (ValueSetDateTime::new(bound) as ValueSet).to_db_valueset_v2(),
+                DbValueSetV2::DateTime(ref v) if v == &[expected]
+            ));
+        }
     }
 }

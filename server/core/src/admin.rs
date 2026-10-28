@@ -3,7 +3,7 @@ use crate::{
     repl::ReplCtrl,
     CoreAction,
 };
-use bytes::{BufMut, BytesMut};
+use bytes::{Buf, BufMut, BytesMut};
 use crypto_glue::x509::x509b64;
 use futures::{SinkExt, StreamExt};
 pub use kubidm_proto::internal::{
@@ -20,7 +20,7 @@ use kubidmd_lib::maintenance::{
 pub use kubidmd_lib::maintenance::{MaintenanceOperation, ReplicationFence};
 use kubidmd_lib::prelude::{duration_from_epoch_now, IdmServer};
 use kubidmd_lib::status::{DatabaseCheck, ReplicationStateTracker};
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::error::Error;
 use std::io;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -56,11 +56,14 @@ pub enum AdminTaskRequest {
     ShowReplicationCertificate,
     ShowReplicationCertificateMetadata,
     RenewReplicationCertificate,
-    /// Refresh this node from a supplier: only from the supplier whose origin is `from`
-    /// when given, otherwise from whichever supplier answers first.
-    RefreshReplicationConsumer {
-        #[serde(default)]
-        from: Option<String>,
+    /// Refresh this node from whichever supplier answers first.
+    RefreshReplicationConsumer,
+    /// Refresh this node only from the supplier whose origin is `from`. A separate variant,
+    /// so that the request without a source keeps its original wire form for servers and
+    /// clients of other versions, and a server that does not know this one refuses it
+    /// rather than refreshing from any supplier.
+    RefreshReplicationConsumerFrom {
+        from: String,
     },
     DomainShow,
     DomainUpgradeCheck,
@@ -254,6 +257,36 @@ impl std::fmt::Debug for AdminTaskResponse {
     }
 }
 
+/// Decode one message of the admin socket from `src`.
+///
+/// A message is a bare JSON value (an object, or a string for a request without fields),
+/// with no length prefix or delimiter: it ends where its JSON value ends. So `Ok(None)`
+/// (wait for more bytes) only while the value is incomplete, which serde_json reports as an
+/// end of input error. Any other error is final: malformed JSON, or a complete message this
+/// side does not know (sent by a client or server of another version). Waiting for more
+/// bytes then would hang both sides, so it is an `InvalidData` error instead.
+fn decode_json_frame<T: DeserializeOwned>(src: &mut BytesMut) -> Result<Option<T>, io::Error> {
+    let mut values = serde_json::Deserializer::from_slice(src).into_iter::<T>();
+    match values.next() {
+        Some(Ok(msg)) => {
+            // Keep any bytes after this message for the next one.
+            let consumed = values.byte_offset();
+            src.advance(consumed);
+            Ok(Some(msg))
+        }
+        Some(Err(err)) if err.is_eof() => Ok(None),
+        Some(Err(err)) => {
+            error!(?err, "Unable to decode admin socket message");
+            Err(io::Error::new(io::ErrorKind::InvalidData, err))
+        }
+        // Nothing but whitespace.
+        None => {
+            src.clear();
+            Ok(None)
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct ClientCodec;
 
@@ -262,14 +295,8 @@ impl Decoder for ClientCodec {
     type Item = AdminTaskResponse;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        trace!("Attempting to decode request ...");
-        match serde_json::from_slice::<AdminTaskResponse>(src) {
-            Ok(msg) => {
-                src.clear();
-                Ok(Some(msg))
-            }
-            _ => Ok(None),
-        }
+        trace!("Attempting to decode response ...");
+        decode_json_frame(src)
     }
 }
 
@@ -296,13 +323,7 @@ impl Decoder for ServerCodec {
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
         trace!("Attempting to decode request ...");
-        match serde_json::from_slice::<AdminTaskRequest>(src) {
-            Ok(msg) => {
-                src.clear();
-                Ok(Some(msg))
-            }
-            _ => Ok(None),
-        }
+        decode_json_frame(src)
     }
 }
 
@@ -950,8 +971,18 @@ async fn replication_consumer_refresh(
 ) -> AdminTaskResponse {
     let (tx, rx) = oneshot::channel();
 
+    // This waits at least this long for the refresh to complete once it has its channel,
+    // so a refresh that starts before the deadline is still awaited. One that would start
+    // later (its supplier unreachable, its task busy) is dropped instead of running after
+    // the operator was told that it failed.
+    let start_deadline = Instant::now() + REPL_CTRL_TIMEOUT;
+
     if ctrl_tx
-        .send(ReplCtrl::RefreshConsumer { from, respond: tx })
+        .send(ReplCtrl::RefreshConsumer {
+            from,
+            start_deadline,
+            respond: tx,
+        })
         .await
         .is_err()
     {
@@ -1360,7 +1391,26 @@ async fn handle_client(
     let mut reqs = Framed::new(sock, ServerCodec);
 
     trace!("Waiting for requests ...");
-    while let Some(Ok(req)) = reqs.next().await {
+    while let Some(req) = reqs.next().await {
+        let req = match req {
+            Ok(req) => req,
+            Err(err) if err.kind() == io::ErrorKind::InvalidData => {
+                // A request this server does not know, most likely from a kubidmd of another
+                // version. Answer so that the client does not wait forever, then disconnect:
+                // the stream can not be decoded past it.
+                error!(
+                    ?err,
+                    "Unable to decode admin socket request, is the client the same version as this server?"
+                );
+                reqs.send(AdminTaskResponse::Error).await?;
+                reqs.flush().await?;
+                break;
+            }
+            Err(err) => {
+                debug!(?err, "Admin socket read failed");
+                break;
+            }
+        };
         let eventid = Uuid::new_v4();
         let nspan = span!(Level::INFO, "handle_admin_client_request", uuid = ?eventid);
 
@@ -1405,8 +1455,15 @@ async fn handle_client(
                         AdminTaskResponse::Error
                     }
                 },
-                AdminTaskRequest::RefreshReplicationConsumer { from } => match repl_ctrl_tx.as_mut() {
-                    Some(ctrl_tx) => replication_consumer_refresh(ctrl_tx, from).await,
+                AdminTaskRequest::RefreshReplicationConsumer => match repl_ctrl_tx.as_mut() {
+                    Some(ctrl_tx) => replication_consumer_refresh(ctrl_tx, None).await,
+                    None => {
+                        error!("replication not configured, unable to refresh consumer.");
+                        AdminTaskResponse::Error
+                    }
+                },
+                AdminTaskRequest::RefreshReplicationConsumerFrom { from } => match repl_ctrl_tx.as_mut() {
+                    Some(ctrl_tx) => replication_consumer_refresh(ctrl_tx, Some(from)).await,
                     None => {
                         error!("replication not configured, unable to refresh consumer.");
                         AdminTaskResponse::Error
@@ -1532,29 +1589,114 @@ mod maintenance_protocol_tests {
     }
 
     #[test]
-    fn refresh_request_json_round_trip_preserves_source() {
-        for from in [None, Some("repl://pod-1.example.com:8444".to_string())] {
-            let encoded = serde_json::to_vec(&AdminTaskRequest::RefreshReplicationConsumer {
-                from: from.clone(),
-            })
-            .expect("refresh request should serialize");
-            let decoded: AdminTaskRequest =
-                serde_json::from_slice(&encoded).expect("refresh request should deserialize");
-            match decoded {
-                AdminTaskRequest::RefreshReplicationConsumer { from: decoded } => {
-                    assert_eq!(decoded, from)
-                }
-                other => panic!("unexpected decoded request: {other:?}"),
-            }
-        }
-
-        // A request without the source refreshes from any supplier.
-        let decoded: AdminTaskRequest =
-            serde_json::from_str(r#"{"RefreshReplicationConsumer":{}}"#)
-                .expect("refresh request should deserialize");
+    fn refresh_request_wire_forms() {
+        // The request without a source keeps the wire form of released versions, so that
+        // their clients and servers still understand it.
+        assert_eq!(
+            serde_json::to_string(&AdminTaskRequest::RefreshReplicationConsumer)
+                .expect("refresh request should serialize"),
+            r#""RefreshReplicationConsumer""#
+        );
+        let decoded: AdminTaskRequest = serde_json::from_str(r#""RefreshReplicationConsumer""#)
+            .expect("old refresh request should deserialize");
         assert!(matches!(
             decoded,
-            AdminTaskRequest::RefreshReplicationConsumer { from: None }
+            AdminTaskRequest::RefreshReplicationConsumer
+        ));
+
+        // With a source, a distinct variant that round trips.
+        let from = "repl://pod-1.example.com:8444".to_string();
+        let encoded = serde_json::to_string(&AdminTaskRequest::RefreshReplicationConsumerFrom {
+            from: from.clone(),
+        })
+        .expect("refresh request should serialize");
+        assert_eq!(
+            encoded,
+            r#"{"RefreshReplicationConsumerFrom":{"from":"repl://pod-1.example.com:8444"}}"#
+        );
+        let decoded: AdminTaskRequest =
+            serde_json::from_str(&encoded).expect("refresh request should deserialize");
+        assert!(matches!(
+            decoded,
+            AdminTaskRequest::RefreshReplicationConsumerFrom { from: ref decoded } if decoded == &from
+        ));
+
+        // The source can not be left out of it: that would refresh from any supplier.
+        assert!(serde_json::from_str::<AdminTaskRequest>(
+            r#"{"RefreshReplicationConsumerFrom":{}}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn codec_waits_for_an_incomplete_message_only() {
+        let complete = serde_json::to_vec(&AdminTaskRequest::RefreshReplicationConsumerFrom {
+            from: "repl://pod-1.example.com:8444".to_string(),
+        })
+        .expect("refresh request should serialize");
+
+        // Every proper prefix of a message is incomplete: wait for more bytes.
+        for len in 0..complete.len() {
+            let mut src = BytesMut::from(&complete[..len]);
+            assert!(
+                matches!(ServerCodec.decode(&mut src), Ok(None)),
+                "prefix of {len} bytes"
+            );
+        }
+
+        // The whole message decodes, and is consumed.
+        let mut src = BytesMut::from(complete.as_slice());
+        assert!(matches!(
+            ServerCodec.decode(&mut src),
+            Ok(Some(
+                AdminTaskRequest::RefreshReplicationConsumerFrom { .. }
+            ))
+        ));
+        assert!(src.is_empty());
+
+        // Two messages in one read decode one after the other.
+        let mut src = BytesMut::from(r#""RefreshReplicationConsumer" "DomainShow""#);
+        assert!(matches!(
+            ServerCodec.decode(&mut src),
+            Ok(Some(AdminTaskRequest::RefreshReplicationConsumer))
+        ));
+        assert!(matches!(
+            ServerCodec.decode(&mut src),
+            Ok(Some(AdminTaskRequest::DomainShow))
+        ));
+        assert!(matches!(ServerCodec.decode(&mut src), Ok(None)));
+    }
+
+    #[test]
+    fn codec_rejects_a_complete_message_it_does_not_know() {
+        // A request of another version, a request that is not JSON, and the struct form
+        // of the refresh request that an unreleased version sent: errors, not a wait for
+        // bytes that never come.
+        for bad in [
+            r#"{"RefreshReplicationConsumerFromTheFuture":{"from":"x"}}"#,
+            r#""NoSuchRequest""#,
+            r#"{"RefreshReplicationConsumer":{"from":null}}"#,
+            "not json",
+            "}",
+        ] {
+            let mut src = BytesMut::from(bad);
+            assert!(
+                ServerCodec
+                    .decode(&mut src)
+                    .is_err_and(|err| err.kind() == io::ErrorKind::InvalidData),
+                "{bad}"
+            );
+        }
+
+        // The client side too: a response of a newer server.
+        let mut src = BytesMut::from(r#"{"ResponseFromTheFuture":{}}"#);
+        assert!(ClientCodec
+            .decode(&mut src)
+            .is_err_and(|err| err.kind() == io::ErrorKind::InvalidData));
+        let mut src = BytesMut::from(r#"{"ErrorMessage":{"message":"x"}}"#);
+        assert!(matches!(
+            ClientCodec.decode(&mut src),
+            Ok(Some(AdminTaskResponse::ErrorMessage { .. }))
         ));
     }
 
@@ -1565,8 +1707,15 @@ mod maintenance_protocol_tests {
         let (mut ctrl_tx, mut ctrl_rx) = mpsc::channel(1);
         let supervisor = tokio::spawn(async move {
             match ctrl_rx.recv().await {
-                Some(ReplCtrl::RefreshConsumer { from, respond }) => {
+                Some(ReplCtrl::RefreshConsumer {
+                    from,
+                    start_deadline,
+                    respond,
+                }) => {
                     assert_eq!(from.as_deref(), Some("repl://nope.example.com:8444"));
+                    // The refresh must start while the requester still waits for it.
+                    assert!(start_deadline > Instant::now());
+                    assert!(start_deadline <= Instant::now() + REPL_CTRL_TIMEOUT);
                     let _ = respond.send(Err("not a supplier".to_string()));
                 }
                 _ => panic!("expected a refresh request"),
