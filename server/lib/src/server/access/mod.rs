@@ -4823,18 +4823,16 @@ mod tests {
 
         // A local delete of the scope group is refused: referential integrity removes the
         // scope group from the profile in the same transaction, which leaves it invalid.
-        // The error names the profile that blocks the delete.
+        // The server log names the profile that blocks the delete, the caller is not told.
         let mut qs_write = qs.write(ct).await.unwrap();
         qs_write
             .internal_delete_uuid(scope_uuid)
             .expect("delete scope group");
         assert_eq!(
             qs_write.commit(),
-            Err(OperationError::InvalidAcpState(format!(
-                "access control profile acp_delegated_deleted_scope ({acp_uuid}) is invalid: \
-                 A delegated target requires {}",
-                Attribute::DelegatedScopeGroup
-            )))
+            Err(OperationError::InvalidAcpState(
+                crate::server::ACP_INVALID_MSG.to_string()
+            ))
         );
 
         // Nothing changed: the receiver still only administers the scope.
@@ -5168,64 +5166,92 @@ mod tests {
         assert!(checked > 40, "{checked}");
     }
 
-    /// Kubidm: a built-in profile is validated strictly, even where another profile would
-    /// be skipped (on a write that does not change it, and at start up), except when it is
-    /// applied through replication.
+    /// Kubidm: a built-in profile is validated strictly when it is changed in the
+    /// transaction or was loaded before, in every phase. A built-in made invalid by
+    /// replication is skipped (replication is lenient), and must not stop the server from
+    /// starting afterwards: it is skipped and reported at start up, while a local change
+    /// that leaves a built-in invalid is still refused.
     #[qs_test]
     async fn test_access_reload_strict_for_builtin_acp(qs: &QueryServer) {
         let ct = duration_from_epoch_now();
         let invalid =
             || ModifyList::new_purge_and_set(Attribute::AcpReauthMaxAge, Value::Uint32(300));
+        let refused = || {
+            Err(OperationError::InvalidAcpState(
+                crate::server::ACP_INVALID_MSG.to_string(),
+            ))
+        };
+        let builtin_skipped = || {
+            BTreeMap::from([(
+                UUID_IDM_ACP_PEOPLE_READ_V1,
+                "idm_acp_people_read".to_string(),
+            )])
+        };
 
-        // A local change that leaves it invalid is refused, naming it.
+        // A local change that leaves it invalid is refused, without naming it to the
+        // caller.
         let mut qs_write = qs.write(ct).await.unwrap();
         qs_write
             .internal_modify_uuid(UUID_IDM_ACP_PEOPLE_READ_V1, &invalid())
             .expect("modify");
-        assert!(matches!(
-            qs_write.commit(),
-            Err(OperationError::InvalidAcpState(msg))
-                if msg.contains("idm_acp_people_read")
-                    && msg.contains(&UUID_IDM_ACP_PEOPLE_READ_V1.to_string())
-        ));
+        assert_eq!(qs_write.commit(), refused());
 
-        // Through replication it is skipped.
+        // Through replication it is skipped, and the skip is recorded.
         let mut qs_write = qs.write(ct).await.unwrap();
         qs_write.replication_apply = true;
         qs_write
             .internal_modify_uuid(UUID_IDM_ACP_PEOPLE_READ_V1, &invalid())
             .expect("modify");
         qs_write.commit().expect("commit");
-        let qs_write = qs.write(ct).await.unwrap();
-        assert!(qs_write
-            .get_accesscontrols()
-            .get_skipped()
-            .contains_key(&UUID_IDM_ACP_PEOPLE_READ_V1));
-        drop(qs_write);
-
-        // Not on a write that does not change it, nor at start up: both fail.
         let mut qs_write = qs.write(ct).await.unwrap();
+        assert_eq!(
+            qs_write.get_accesscontrols().get_skipped(),
+            &builtin_skipped()
+        );
+        assert!(!qs_write
+            .get_accesscontrols()
+            .get_search()
+            .iter()
+            .any(|a| a.acp.uuid() == UUID_IDM_ACP_PEOPLE_READ_V1));
+
+        // An unrelated write that reloads the access controls is not blocked by it.
         qs_write
             .internal_create(vec![dg_group("strict_builtin_group", Uuid::new_v4(), &[])])
             .expect("create");
         qs_write
             .changed_flags
             .insert(crate::server::ChangeFlag::ACP);
-        assert!(matches!(
-            qs_write.commit(),
-            Err(OperationError::InvalidAcpState(_))
-        ));
+        qs_write.commit().expect("commit");
 
+        // A restart succeeds, with the built-in skipped and reported.
         let mut qs_write = qs.write(ct).await.unwrap();
         qs_write.set_phase_bootstrap();
         qs_write.commit().expect("commit");
-        assert!(matches!(
-            qs.initialise_helper(duration_from_epoch_now(), DOMAIN_TGT_LEVEL)
-                .await,
-            Err(OperationError::InvalidAcpState(_))
-        ));
+        qs.initialise_helper(duration_from_epoch_now(), DOMAIN_TGT_LEVEL)
+            .await
+            .expect("restart");
+        let qs_write = qs.write(ct).await.unwrap();
+        assert_eq!(
+            qs_write.get_accesscontrols().get_skipped(),
+            &builtin_skipped()
+        );
+        drop(qs_write);
 
-        // Fixing it lets the server start again.
+        // A local change to it that leaves it invalid is refused.
+        let mut qs_write = qs.write(ct).await.unwrap();
+        qs_write
+            .internal_modify_uuid(
+                UUID_IDM_ACP_PEOPLE_READ_V1,
+                &ModifyList::new_purge_and_set(
+                    Attribute::Description,
+                    Value::new_utf8s("still invalid"),
+                ),
+            )
+            .expect("modify");
+        assert_eq!(qs_write.commit(), refused());
+
+        // Fixing it loads it again, and a local change that makes a loaded built-in
+        // invalid is refused.
         let mut qs_write = qs.write(ct).await.unwrap();
         qs_write
             .internal_modify_uuid(
@@ -5234,11 +5260,33 @@ mod tests {
             )
             .expect("modify");
         qs_write.commit().expect("commit");
-        qs.initialise_helper(duration_from_epoch_now(), DOMAIN_TGT_LEVEL)
-            .await
-            .expect("restart");
-        let qs_write = qs.write(ct).await.unwrap();
+        let mut qs_write = qs.write(ct).await.unwrap();
         assert!(qs_write.get_accesscontrols().get_skipped().is_empty());
+        assert!(qs_write
+            .get_accesscontrols()
+            .get_search()
+            .iter()
+            .any(|a| a.acp.uuid() == UUID_IDM_ACP_PEOPLE_READ_V1));
+        qs_write
+            .internal_modify_uuid(UUID_IDM_ACP_PEOPLE_READ_V1, &invalid())
+            .expect("modify");
+        assert_eq!(qs_write.commit(), refused());
+    }
+
+    /// Kubidm: the profiles a reload newly skips are the ones it reports, in every phase,
+    /// so a profile made invalid by replication is summarised once.
+    #[test]
+    fn test_access_acp_newly_skipped() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let previous = BTreeMap::from([(a, "acp_a".to_string())]);
+        let current = BTreeMap::from([(a, "acp_a".to_string()), (b, "acp_b".to_string())]);
+        assert_eq!(
+            crate::server::acp_newly_skipped(&previous, &current),
+            vec![format!("acp_b ({b})")]
+        );
+        assert!(crate::server::acp_newly_skipped(&current, &current).is_empty());
+        assert!(crate::server::acp_newly_skipped(&current, &previous).is_empty());
     }
 
     /// Kubidm: a profile that was valid and loaded, and that a change in the transaction
@@ -5294,15 +5342,16 @@ mod tests {
                 .insert(crate::server::ChangeFlag::ACP);
         };
 
-        // A local change is refused, naming the profile.
+        // A local change is refused (the server log names the profile).
         let mut qs_write = qs.write(ct).await.unwrap();
         remove_login_shell(&mut qs_write);
         assert!(!qs_write.is_changed_uuid(&acp_uuid));
-        assert!(matches!(
+        assert_eq!(
             qs_write.commit(),
-            Err(OperationError::InvalidAcpState(msg))
-                if msg.contains("acp_login_shell_scope") && msg.contains(&acp_uuid.to_string())
-        ));
+            Err(OperationError::InvalidAcpState(
+                crate::server::ACP_INVALID_MSG.to_string()
+            ))
+        );
 
         let qs_write = qs.write(ct).await.unwrap();
         assert!(dg_loaded_modify(&qs_write).contains("acp_login_shell_scope"));

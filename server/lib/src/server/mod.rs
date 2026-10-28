@@ -2356,18 +2356,25 @@ impl QueryServer {
     }
 }
 
-/// Kubidm: the error for a change that is rejected because it leaves an access control
-/// profile invalid. It names the profile, so that an administrator can tell which profile
-/// blocks the change (for example the delete of a group that a delegated profile is scoped
-/// to), and keeps the reason.
-fn acp_invalid_error(name: &str, uuid: Uuid, err: OperationError) -> OperationError {
-    let reason = match err {
-        OperationError::InvalidAcpState(reason) => reason,
-        err => err.to_string(),
-    };
-    OperationError::InvalidAcpState(format!(
-        "access control profile {name} ({uuid}) is invalid: {reason}"
-    ))
+/// Kubidm: the message of the error for a change that is rejected because it leaves an
+/// access control profile invalid. The caller may not be allowed to read the profile, so
+/// it is not named here: the server log names it (and keeps the reason), so that an
+/// administrator can tell which profile blocks the change (for example the delete of a
+/// group that a delegated profile is scoped to).
+pub(crate) const ACP_INVALID_MSG: &str =
+    "an access control profile would become invalid; see server logs";
+
+/// Kubidm: the newly skipped profiles of an access control reload, as "name (uuid)": the
+/// ones in `current` that are not in `previous`.
+pub(crate) fn acp_newly_skipped(
+    previous: &BTreeMap<Uuid, String>,
+    current: &BTreeMap<Uuid, String>,
+) -> Vec<String> {
+    current
+        .iter()
+        .filter(|(uuid, _)| !previous.contains_key(uuid))
+        .map(|(uuid, name)| format!("{name} ({uuid})"))
+        .collect()
 }
 
 impl<'a> QueryServerWriteTransaction<'a> {
@@ -2653,6 +2660,16 @@ impl<'a> QueryServerWriteTransaction<'a> {
                 e
             })?;
 
+        // Kubidm: summarise the profiles that this reload newly skipped, in every phase, so
+        // that a profile made invalid by replication is reported once.
+        let newly_skipped = acp_newly_skipped(self.accesscontrols.get_skipped(), &skipped);
+        if !newly_skipped.is_empty() {
+            warn!(
+                count = newly_skipped.len(),
+                profiles = ?newly_skipped,
+                "Some access control profiles became invalid and are skipped, they grant nothing until they are fixed or disabled"
+            );
+        }
         self.accesscontrols.update_skipped(skipped);
         Ok(())
     }
@@ -2661,38 +2678,48 @@ impl<'a> QueryServerWriteTransaction<'a> {
     /// change that made it invalid), rather than skipped?
     ///
     /// Never while applying replicated changes: the content was already accepted by the
-    /// supplier, and failing here would block replication. Otherwise, it is an error for:
+    /// supplier, and failing here would block replication. Otherwise, it is an error only
+    /// for a profile created or modified in this transaction (including changes made by
+    /// referential integrity, such as deleting a delegated scope group), or one that was
+    /// loaded before this reload (`loaded`), so a change that breaks a valid profile
+    /// indirectly (say, a schema change) is rejected too. This applies:
     ///
-    /// - a built-in profile (in the system uuid range), always, including during start up
-    ///   and migrations. Built-in profiles come with the server, so one that the parser
-    ///   rejects is a bug, which must fail loudly rather than silently grant nothing;
-    /// - once the server is `Running`, a profile created or modified in this transaction
-    ///   (including changes made by referential integrity, such as deleting a delegated
-    ///   scope group), or one that was loaded before this reload (`loaded`), so a change
-    ///   that breaks a valid profile indirectly (say, a schema change) is rejected too.
+    /// - once the server is `Running`, to every profile;
+    /// - before that (start up and migrations), to a built-in profile (in the system uuid
+    ///   range) only, unless an earlier reload already skipped it as invalid. The
+    ///   migrations rewrite every built-in profile in the start up transaction
+    ///   (`internal_migrate_or_create` modifies the stored entry, which marks it changed,
+    ///   even when nothing differs), and a built-in that was valid before is loaded, so a
+    ///   shipped definition or parser change that breaks a built-in fails bootstrap and
+    ///   upgrades loudly rather than silently granting nothing.
     ///
-    /// Any other invalid profile is skipped: during start up (the server phase is not yet
-    /// `Running`), so that a stored profile that an older version accepted never stops the
-    /// server from starting, and while running, so that such a profile never blocks
-    /// unrelated writes. A replication refresh marks every entry as changed, and runs as
-    /// replication.
+    /// Any other invalid profile is skipped and reported, including a stored built-in that
+    /// is invalid before start up rewrites it (say, made invalid by replicated content):
+    /// pre-release builds re-run the migrations of the current level on every start, and
+    /// a node that can not start has no in-band recovery. While running, a profile that is
+    /// neither changed nor loaded is skipped so that it never blocks unrelated writes. A
+    /// replication refresh marks every entry as changed, and runs as replication.
     fn acp_reload_rejects_invalid(&self, uuid: Uuid, loaded: &BTreeSet<Uuid>) -> bool {
         if self.replication_apply {
             return false;
         }
-        if uuid < DYNAMIC_RANGE_MINIMUM_UUID {
+        if !(self.is_changed_uuid(&uuid) || loaded.contains(&uuid)) {
+            return false;
+        }
+        if *self.phase >= ServerPhase::Running {
             return true;
         }
-        *self.phase >= ServerPhase::Running
-            && (self.is_changed_uuid(&uuid) || loaded.contains(&uuid))
+        // The skipped profiles of the previous reload, as this reload records its own only
+        // once it is done.
+        uuid < DYNAMIC_RANGE_MINIMUM_UUID && !self.accesscontrols.get_skipped().contains_key(&uuid)
     }
 
     /// Kubidm: search and parse the enabled access control profiles of one kind.
     ///
     /// Parsing fails closed per profile: access control profiles only ever grant, so a
     /// profile that is skipped grants nothing. An invalid profile fails the reload when
-    /// [Self::acp_reload_rejects_invalid], so the offending change is rejected with an
-    /// error naming the profile. Any other invalid profile is logged, added to `skipped`
+    /// [Self::acp_reload_rejects_invalid], so the offending change is rejected (the log
+    /// names the profile). Any other invalid profile is logged, added to `skipped`
     /// and left out, so a stored profile that the current parser rejects never blocks
     /// unrelated writes, start up or replication. `loaded` are the profiles of this kind
     /// that were loaded before this reload.
@@ -2735,7 +2762,7 @@ impl<'a> QueryServerWriteTransaction<'a> {
                             %kind,
                             "Rejecting a change that leaves this access control profile invalid"
                         );
-                        return Err(acp_invalid_error(&name, uuid, err));
+                        return Err(OperationError::InvalidAcpState(ACP_INVALID_MSG.to_string()));
                     }
                     error!(
                         ?err,

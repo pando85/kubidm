@@ -248,17 +248,20 @@ impl QueryServer {
         }
 
         // Kubidm: apply any pending reloads while still in the start up phase, where an
-        // invalid stored access control profile is skipped rather than failing start up
-        // (built-in profiles excepted, see `acp_reload_rejects_invalid`). From `Running`
-        // on, profiles changed in a transaction are validated strictly, and every profile
-        // was "changed" by the migrations above.
+        // invalid stored access control profile is skipped rather than failing start up,
+        // unless it is a built-in that was valid before the migrations above rewrote it,
+        // see `acp_reload_rejects_invalid`. From `Running` on, every profile changed in a
+        // transaction is validated strictly.
         write_txn.reload()?;
 
         // Kubidm: the stored profiles that start up skipped because they are invalid, to
-        // report once start up succeeded.
-        let skipped_acps: Vec<String> = write_txn
-            .get_accesscontrols()
-            .get_skipped()
+        // report once start up succeeded. A skipped built-in profile is an error: the
+        // server is missing access it ships with, until the profile is fixed.
+        let skipped = write_txn.get_accesscontrols().get_skipped();
+        let skipped_builtin = skipped
+            .keys()
+            .any(|uuid| *uuid < DYNAMIC_RANGE_MINIMUM_UUID);
+        let skipped_acps: Vec<String> = skipped
             .iter()
             .map(|(uuid, name)| format!("{name} ({uuid})"))
             .collect();
@@ -270,7 +273,13 @@ impl QueryServer {
         // since we already did all the needed loads above.
         write_txn.commit()?;
 
-        if !skipped_acps.is_empty() {
+        if skipped_builtin {
+            error!(
+                count = skipped_acps.len(),
+                profiles = ?skipped_acps,
+                "Some access control profiles, including built-in ones, are invalid and were skipped, they grant nothing until they are fixed or disabled"
+            );
+        } else if !skipped_acps.is_empty() {
             warn!(
                 count = skipped_acps.len(),
                 profiles = ?skipped_acps,
@@ -1234,6 +1243,87 @@ impl QueryServerReadTransaction<'_> {
 mod tests {
     // use super::{ProtoDomainUpgradeCheckItem, ProtoDomainUpgradeCheckStatus};
     use crate::{prelude::*, value::CredentialType, valueset::ValueSetCredentialType};
+
+    /// Kubidm: the migrations rewrite the built-in access control profiles in the start up
+    /// transaction, which marks them changed, so a rewrite that leaves a valid built-in
+    /// invalid (a shipped definition or parser bug) fails strictly, even before the server
+    /// is `Running`. A stored built-in that was already invalid before the rewrite (say,
+    /// from replication) is skipped instead, through the rewrite too, so the node starts.
+    #[qs_test]
+    async fn test_migrations_builtin_acp_rewrite_strict(server: &QueryServer) {
+        use crate::server::{ChangeFlag, ServerPhase};
+
+        let ct = duration_from_epoch_now();
+        let builtin = || {
+            crate::migration_data::latest::phase_7_builtin_access_control_profiles()
+                .into_iter()
+                .find(|entry| entry.get_uuid() == Some(UUID_IDM_ACP_PEOPLE_READ_V1))
+                .expect("builtin acp")
+        };
+        let mut invalid_builtin = builtin();
+        invalid_builtin.add_ava(Attribute::AcpReauthMaxAge, Value::Uint32(300));
+        let is_skipped = |write_txn: &QueryServerWriteTransaction<'_>| {
+            write_txn
+                .get_accesscontrols()
+                .get_skipped()
+                .contains_key(&UUID_IDM_ACP_PEOPLE_READ_V1)
+        };
+
+        // Mid migration (before `Running`), the phase 7 rewrite of a valid built-in with
+        // invalid content is refused.
+        let mut write_txn = server.write(ct).await.unwrap();
+        write_txn.set_phase_bootstrap();
+        write_txn.set_phase(ServerPhase::SchemaReady);
+        write_txn
+            .internal_migrate_or_create(invalid_builtin)
+            .expect("migrate");
+        assert!(write_txn.is_changed_uuid(&UUID_IDM_ACP_PEOPLE_READ_V1));
+        assert_eq!(
+            write_txn.reload(),
+            Err(OperationError::InvalidAcpState(
+                crate::server::ACP_INVALID_MSG.to_string()
+            ))
+        );
+        drop(write_txn);
+
+        // Stored invalid content (from replication) ...
+        let mut write_txn = server.write(ct).await.unwrap();
+        write_txn.replication_apply = true;
+        write_txn
+            .internal_modify_uuid(
+                UUID_IDM_ACP_PEOPLE_READ_V1,
+                &ModifyList::new_purge_and_set(Attribute::AcpReauthMaxAge, Value::Uint32(300)),
+            )
+            .expect("modify");
+        write_txn.commit().expect("commit");
+
+        // ... is skipped by a mid migration reload before the rewrite, and by the reload
+        // after the rewrite, which keeps the extra attribute.
+        let mut write_txn = server.write(ct).await.unwrap();
+        write_txn.set_phase_bootstrap();
+        write_txn.set_phase(ServerPhase::SchemaReady);
+        write_txn.changed_flags.insert(ChangeFlag::ACP);
+        write_txn.reload().expect("reload");
+        assert!(is_skipped(&write_txn));
+        write_txn
+            .internal_migrate_or_create(builtin())
+            .expect("migrate");
+        assert!(write_txn.is_changed_uuid(&UUID_IDM_ACP_PEOPLE_READ_V1));
+        write_txn.reload().expect("reload");
+        assert!(is_skipped(&write_txn));
+        drop(write_txn);
+
+        // A start up, which re-runs the migrations in a pre-release build, succeeds.
+        let mut write_txn = server.write(ct).await.unwrap();
+        write_txn.set_phase_bootstrap();
+        write_txn.commit().expect("commit");
+        server
+            .initialise_helper(ct, DOMAIN_TGT_LEVEL)
+            .await
+            .expect("start up");
+        let write_txn = server.write(ct).await.unwrap();
+        assert!(is_skipped(&write_txn));
+    }
 
     #[qs_test]
     async fn test_init_idempotent_schema_core(server: &QueryServer) {

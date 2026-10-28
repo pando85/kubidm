@@ -17,6 +17,11 @@
 //! only applied to non-internal identities, while this must also exclude the internal roles
 //! other than the system.
 //!
+//! Reviving a recycled entry is a modify of that entry, so this also refuses reviving a
+//! deleted approval policy (or request, or decision record) from the recycle bin. That is
+//! on purpose, failing closed: a revived policy would bring back who approves under it
+//! without going through `approval_policy_create`. Create a new policy instead.
+//!
 //! Replication does not run these hooks, so replicated records and requests are applied.
 
 use std::sync::Arc;
