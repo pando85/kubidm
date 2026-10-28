@@ -36,8 +36,16 @@
 //!
 //! The receivers excluded from every delegated target are derived from the delegated
 //! profiles each time the access controls are reloaded, which they are whenever a profile
-//! is created, changed, deleted or revived. Nothing else maintains them, so they can not
-//! drift from the profiles (say, under concurrent grants on different replicas).
+//! is created, changed or deleted. Nothing else maintains them, so they can not drift from
+//! the profiles (say, under concurrent grants on different replicas). A revoked
+//! delegation can not be revived from the recycle bin (`DG0011`): it is granted again,
+//! which checks it again.
+//!
+//! The entry managers (`entry_managed_by`) and approval policy approvers (`approver`,
+//! `backup_approver`) of any entry, and their members, are excluded the same way: taking
+//! one of them over would reach what it manages or approves (say, a high privilege service
+//! account whose entry managers may mint its api tokens). Any change of an entry that has
+//! (or had) one of these attributes reloads the access controls.
 //!
 //! # Entry managers and dynamic groups
 //!
@@ -1733,7 +1741,7 @@ mod tests {
     /// The receivers of a delegation are never its targets, even when their group is
     /// nested into the scope after the grant, and the receivers of one delegation are
     /// never the targets of another, in either direction. The exclusion follows the
-    /// profiles as they are granted, revoked and revived.
+    /// profiles as they are granted and revoked, and a revoked profile is not revived.
     #[idm_test]
     async fn test_delegation_receivers_never_targets(
         idms: &IdmServer,
@@ -1805,12 +1813,17 @@ mod tests {
         assert!(!can_reset(&mut idms_prox_write, HELPER_B, OUTSIDER, ct));
         drop(idms_prox_write);
 
-        // Reviving the profile of B excludes its receivers again.
+        // The profile of B can not be revived from the recycle bin, it is granted again,
+        // which excludes its receivers again.
         let mut idms_prox_write = idms.proxy_write(ct).await.unwrap();
+        assert_eq!(
+            idms_prox_write.qs_write.internal_revive_uuid(grant_b.uuid),
+            Err(OperationError::DG0011DelegationNotRevivable)
+        );
         idms_prox_write
             .qs_write
-            .internal_revive_uuid(grant_b.uuid)
-            .expect("revive b");
+            .delegation_grant(&admin, "helpdesk", "dlg_receivers_b", "dlg_scope_b", None)
+            .expect("grant b again");
         idms_prox_write.commit().expect("commit");
         let mut idms_prox_write = idms.proxy_write(ct).await.unwrap();
         assert!(!can_reset(&mut idms_prox_write, HELPER, HELPER_B, ct));
@@ -2021,6 +2034,112 @@ mod tests {
                 .filter,
             grant.filter
         );
+    }
+
+    /// The (members of) entry managers and approvers of any entry are never targets:
+    /// taking one over would reach what it manages or approves, such as a high privilege
+    /// service account whose entry manager may mint its api tokens.
+    #[idm_test]
+    async fn test_delegation_managers_and_approvers_never_targets(
+        idms: &IdmServer,
+        _idms_delayed: &mut IdmServerDelayed,
+    ) {
+        let ct = duration_from_epoch_now();
+        let manager_group = Uuid::new_v4();
+        let service_account = Uuid::new_v4();
+        let approver = Uuid::new_v4();
+        let mut idms_prox_write = idms.proxy_write(ct).await.unwrap();
+        setup(&mut idms_prox_write.qs_write);
+        idms_prox_write
+            .qs_write
+            .internal_create(vec![
+                person("dlg_approver", approver),
+                group("dlg_manager_group", manager_group, &[TARGET]),
+                entry_init!(
+                    (Attribute::Class, EntryClass::Object.to_value()),
+                    (Attribute::Class, EntryClass::Account.to_value()),
+                    (Attribute::Class, EntryClass::ServiceAccount.to_value()),
+                    (Attribute::Name, Value::new_iname("dlg_hp_service")),
+                    (Attribute::DisplayName, Value::new_utf8s("dlg_hp_service")),
+                    (Attribute::Uuid, Value::Uuid(service_account))
+                ),
+            ])
+            .expect("create");
+        add_member(&mut idms_prox_write.qs_write, SCOPE, approver);
+        add_member(
+            &mut idms_prox_write.qs_write,
+            UUID_IDM_HIGH_PRIVILEGE,
+            service_account,
+        );
+        let admin = ident(&mut idms_prox_write.qs_write, ACP_ADMIN);
+        idms_prox_write
+            .qs_write
+            .delegation_grant(&admin, "helpdesk", "dlg_receivers", "dlg_scope", None)
+            .expect("grant");
+        idms_prox_write.commit().expect("commit");
+
+        // Positive control: both persons are targets.
+        let mut idms_prox_write = idms.proxy_write(ct).await.unwrap();
+        assert!(can_reset(&mut idms_prox_write, HELPER, TARGET, ct));
+        assert!(can_reset(&mut idms_prox_write, HELPER, approver, ct));
+        drop(idms_prox_write);
+
+        // The high privilege service account is managed by a group TARGET is in.
+        let mut idms_prox_write = idms.proxy_write(ct).await.unwrap();
+        idms_prox_write
+            .qs_write
+            .internal_modify_uuid(
+                service_account,
+                &ModifyList::new_purge_and_set(
+                    Attribute::EntryManagedBy,
+                    Value::Refer(manager_group),
+                ),
+            )
+            .expect("set entry manager");
+        idms_prox_write.commit().expect("commit");
+
+        let mut idms_prox_write = idms.proxy_write(ct).await.unwrap();
+        assert!(!can_reset(&mut idms_prox_write, HELPER, TARGET, ct));
+        assert!(can_reset(&mut idms_prox_write, HELPER, approver, ct));
+        drop(idms_prox_write);
+
+        // The person becomes an approver of an approval policy.
+        let mut idms_prox_write = idms.proxy_write(ct).await.unwrap();
+        idms_prox_write
+            .qs_write
+            .approval_policy_create(
+                &Identity::from_internal(),
+                &kubidm_proto::v1::ApprovalPolicyCreateRequest {
+                    name: "dlg_policy".to_string(),
+                    description: None,
+                    operation_types: vec![kubidm_proto::v1::ApprovalOperationType::PrivilegeGrant],
+                    approvers: vec![approver, OUTSIDER],
+                    backup_approvers: vec![],
+                    pattern: kubidm_proto::v1::ApprovalPattern::All,
+                    timeout_seconds: 7200,
+                    escalation_timeout_seconds: None,
+                },
+            )
+            .expect("create approval policy");
+        idms_prox_write.commit().expect("commit");
+
+        let mut idms_prox_write = idms.proxy_write(ct).await.unwrap();
+        assert!(!can_reset(&mut idms_prox_write, HELPER, approver, ct));
+        drop(idms_prox_write);
+
+        // Removing the entry manager makes the person a target again.
+        let mut idms_prox_write = idms.proxy_write(ct).await.unwrap();
+        idms_prox_write
+            .qs_write
+            .internal_modify_uuid(
+                service_account,
+                &ModifyList::new_purge(Attribute::EntryManagedBy),
+            )
+            .expect("clear entry manager");
+        idms_prox_write.commit().expect("commit");
+        let mut idms_prox_write = idms.proxy_write(ct).await.unwrap();
+        assert!(can_reset(&mut idms_prox_write, HELPER, TARGET, ct));
+        drop(idms_prox_write);
     }
 
     /// A delegated profile grants what its template grants, even when the stored profile

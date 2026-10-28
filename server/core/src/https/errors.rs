@@ -130,7 +130,8 @@ impl IntoResponse for WebError {
                     | OperationError::DG0007DelegationScopeIsReceiver
                     | OperationError::DG0008DelegationInvalidFilter
                     | OperationError::DG0009DelegationEntryManaged
-                    | OperationError::DG0010DelegationDynamicGroup => {
+                    | OperationError::DG0010DelegationDynamicGroup
+                    | OperationError::DG0011DelegationNotRevivable => {
                         (StatusCode::BAD_REQUEST, None)
                     }
                     OperationError::DG0006DelegationAlreadyExists => (StatusCode::CONFLICT, None),
@@ -176,6 +177,7 @@ mod tests {
             OperationError::DG0008DelegationInvalidFilter,
             OperationError::DG0009DelegationEntryManaged,
             OperationError::DG0010DelegationDynamicGroup,
+            OperationError::DG0011DelegationNotRevivable,
         ] {
             let response = WebError::OperationError(err).into_response();
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);

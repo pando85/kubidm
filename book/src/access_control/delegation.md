@@ -99,13 +99,26 @@ OAuth2 scope map groups they are a member of: only grant `helpdesk` over persons
 `user_admin` can set and clear `account_expire` and `account_valid_from`, so it can re-enable an expired account in its
 scope.
 
+`user_admin` can set `displayname`, `legalname`, `account_expire` and `account_valid_from` on the persons in its scope,
+so its receivers can steer any dynamic group whose filter uses those attributes: they decide which of those persons it
+holds. Do not nest such dynamic groups into privileged groups, nor use them where membership grants access.
+
 ### Receivers Are Never Targets
 
 The receivers of a delegation are never its targets, even if their group is nested into the scope group after the
 delegation was granted. The receivers of a delegation are not the targets of any other delegation either: whenever the
 access controls are loaded, the server collects the receiver groups of all delegations, and excludes them and their
 members from every delegated scope. This set is derived from the delegations themselves, so it follows every grant and
-revoke (including on other replicas) without anything to maintain.
+revoke (including on other replicas) without anything to maintain. A revoked delegation can not be revived from the
+recycle bin: grant it again, which checks it again.
+
+### Entry Managers and Approvers Are Never Targets
+
+The entry managers (`entry_managed_by`) of any entry, and the approvers and backup approvers of any approval policy, are
+never targets of a delegation, nor are their members. Taking over such a person would reach whatever they manage or
+approve, outside of the scope: for example, the entry managers of a high privilege service account can create API tokens
+for it. The server collects these whenever the access controls are reloaded, which happens whenever an entry with an
+entry manager or approvers changes.
 
 ## Granting, Listing and Revoking
 
@@ -165,7 +178,8 @@ terms and the filter (`delegated_scope_filter`), the template (`delegated_role_t
 ```text
 memberof=<scope> AND <template classes> AND <filter> AND NOT (
   memberof=idm_high_privilege OR recycled OR tombstone
-  OR uuid=<R> OR memberof=<R>  (for every receiver group R of any delegation)
+  OR uuid=<R> OR memberof=<R>  (for every receiver group R of any delegation,
+                                and every entry manager or approver R of any entry)
   OR uuid=<B> OR memberof=<B>  (for every excluded privileged built-in group B)
 )
 ```

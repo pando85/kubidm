@@ -629,6 +629,21 @@ impl AccessControlProfile {
                 EntryClass::AccessControlReceiverEntryManager
             )));
         }
+        // A delegated target is administered by the receiver group its delegation
+        // names, never by entry managers, which a delegation does not control.
+        if target_delegated && !receiver_group {
+            admin_error!(
+                ?name,
+                "{} requires {}",
+                EntryClass::AccessControlTargetDelegatedScope,
+                EntryClass::AccessControlReceiverGroup
+            );
+            return Err(OperationError::InvalidAcpState(format!(
+                "{} requires {}",
+                EntryClass::AccessControlTargetDelegatedScope,
+                EntryClass::AccessControlReceiverGroup
+            )));
+        }
         if target_scope && target_delegated {
             admin_error!(
                 ?name,
@@ -740,7 +755,15 @@ impl AccessControlProfile {
                 // created, changed, deleted or revived. So the exclusion can never drift from
                 // the profiles, as a separately maintained group could (say, under concurrent
                 // replicated grants). This profile's own receivers are always included.
-                let mut receivers = delegated_receivers(qs)?;
+                // A change of an entry manager or approver anywhere also reloads them.
+                // Nor are they (members of) an entry manager or an approver of any entry:
+                // taking over such a person would reach what it manages or approves (say, a
+                // high privilege service account it manages), outside of the scope. Both
+                // sets are computed once per reload, see `delegation_excluded_principals`.
+                let mut receivers = match &qs.delegation_excluded {
+                    Some(excluded) => excluded.clone(),
+                    None => delegation_excluded_principals(qs)?,
+                };
                 if let AccessControlReceiver::Group(own) = &receiver {
                     receivers.extend(own.iter().copied());
                 }
@@ -886,4 +909,52 @@ fn delegated_template_grant(
                 Attribute::DelegatedRoleTemplate
             ))
         })
+}
+
+/// Kubidm: does `entry` name entry managers or approvers? A change of such an entry
+/// reloads the access controls, so that [`delegation_lateral_principals`] (and so every
+/// delegated target) follows it.
+pub(crate) fn delegation_lateral_reach<VALID, STATE>(entry: &Entry<VALID, STATE>) -> bool {
+    entry.attribute_pres(Attribute::EntryManagedBy)
+        || entry.attribute_pres(Attribute::Approver)
+        || entry.attribute_pres(Attribute::BackupApprover)
+}
+
+/// Kubidm: every entry manager (`entry_managed_by`) and approval policy approver
+/// (`approver`, `backup_approver`) of any entry, as stored now. They, and their members, are excluded from
+/// every delegated target: a delegation that could take over one of them would reach
+/// whatever it manages or approves.
+pub(crate) fn delegation_lateral_principals(
+    qs: &mut QueryServerWriteTransaction,
+) -> Result<BTreeSet<Uuid>, OperationError> {
+    let entries = qs.internal_search(filter!(f_or(vec![
+        f_pres(Attribute::EntryManagedBy),
+        f_pres(Attribute::Approver),
+        f_pres(Attribute::BackupApprover),
+    ])))?;
+    let mut principals = BTreeSet::new();
+    for entry in entries.iter() {
+        for attr in [
+            Attribute::EntryManagedBy,
+            Attribute::Approver,
+            Attribute::BackupApprover,
+        ] {
+            if let Some(refs) = entry.get_ava_refer(&attr) {
+                principals.extend(refs.iter().copied());
+            }
+            principals.extend(entry.get_ava_single_refer(&attr));
+        }
+    }
+    Ok(principals)
+}
+
+/// Kubidm: the receivers of every delegated profile, and every entry manager and
+/// approver: the entries that, with their members, are excluded from every delegated
+/// target.
+pub(crate) fn delegation_excluded_principals(
+    qs: &mut QueryServerWriteTransaction,
+) -> Result<BTreeSet<Uuid>, OperationError> {
+    let mut excluded = delegated_receivers(qs)?;
+    excluded.extend(delegation_lateral_principals(qs)?);
+    Ok(excluded)
 }

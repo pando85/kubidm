@@ -3500,7 +3500,7 @@ pub(crate) fn route_setup(state: ServerState) -> Router<ServerState> {
     get,
     path = "/v1/delegation",
     responses(
-        (status = 200, body=Vec<DelegationGrant>, content_type=APPLICATION_JSON),
+        (status = 200, description = "Ok", body=Vec<DelegationGrant>, content_type=APPLICATION_JSON),
         ApiResponseWithout200,
     ),
     security(("token_jwt" = [])),
@@ -3525,7 +3525,7 @@ pub async fn delegation_list(
     post,
     path = "/v1/delegation",
     responses(
-        (status = 200, body=DelegationGrant, content_type=APPLICATION_JSON),
+        (status = 200, description = "Ok", body=DelegationGrant, content_type=APPLICATION_JSON),
         (status = 400, description = "Unknown template, or a receiver, scope or filter that is refused"),
         (status = 409, description = "The delegation already exists"),
         ApiResponseWithout200,
@@ -3554,7 +3554,7 @@ pub async fn delegation_grant(
     get,
     path = "/v1/delegation/{id}",
     responses(
-        (status = 200, body=DelegationGrant, content_type=APPLICATION_JSON),
+        (status = 200, description = "Ok", body=DelegationGrant, content_type=APPLICATION_JSON),
         ApiResponseWithout200,
     ),
     security(("token_jwt" = [])),

@@ -192,6 +192,7 @@ pub enum OperationError {
     DG0008DelegationInvalidFilter,
     DG0009DelegationEntryManaged,
     DG0010DelegationDynamicGroup,
+    DG0011DelegationNotRevivable,
 
     // Credential Update Errors
     CU0001WebauthnAttestationNotTrusted,
@@ -637,6 +638,7 @@ impl OperationError {
             Self::DG0007DelegationScopeIsReceiver => Some("The scope group of a delegation can not be the receiver group of a delegation, nor nested in one".into()),
             Self::DG0008DelegationInvalidFilter => Some("The delegation scope filter is invalid: it may not use self, and every entry it refers to must exist".into()),
             Self::DG0009DelegationEntryManaged => Some("The receiver group, the scope group or a group nested in the scope has an entry manager that is not high privilege: entry managers of these groups bypass the delegation scope, remove them first".into()),
+            Self::DG0011DelegationNotRevivable => Some("A revoked delegation can not be revived from the recycle bin, grant it again".into()),
             Self::DG0010DelegationDynamicGroup => Some("A delegation receiver or scope can not be a dynamic group, nor have one nested in it".into()),
             Self::LD0001AnonymousNotAllowed => Some("Anonymous is not allowed to access LDAP with this method.".into()),
             Self::MG0001InvalidReMigrationLevel => None,

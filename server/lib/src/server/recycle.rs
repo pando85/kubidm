@@ -189,6 +189,19 @@ impl QueryServerWriteTransaction<'_> {
 
         pre_candidates.append(&mut pre_cascade_revive_candidates);
 
+        // Kubidm: a revoked delegation is never revived. Its grant was checked against
+        // the groups as they were then (entry managers, dynamic groups, nesting), which a
+        // revive would skip: grant it again instead.
+        if pre_candidates.iter().any(|entry| {
+            entry.attribute_equality(
+                Attribute::Class,
+                &EntryClass::AccessControlTargetDelegatedScope.into(),
+            )
+        }) {
+            security_access!("denied - a revoked delegation can not be revived");
+            return Err(OperationError::DG0011DelegationNotRevivable);
+        }
+
         // clone the writeable entries.
         let mut candidates: Vec<Entry<EntryInvalid, EntryCommitted>> = pre_candidates
             .iter()

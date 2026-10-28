@@ -4700,9 +4700,9 @@ mod tests {
             assert!(matches!(acp.target, AccessControlTarget::Scope(_)));
         }
 
-        // An entry manager receiver with a delegated target parses: the delegated scope
-        // only narrows the entries the manager already manages.
-        let acp = acp_from_entry_ok!(
+        // An entry manager receiver with a delegated target is refused: a delegated
+        // target is only administered by the receiver group of its delegation.
+        acp_from_entry_err!(
             &mut qs_write,
             delegated_acp_entry(
                 "acp_delegated_entry_manager",
@@ -4712,8 +4712,6 @@ mod tests {
             ),
             AccessControlProfile
         );
-        assert!(matches!(&acp.receiver, AccessControlReceiver::EntryManager));
-        assert!(matches!(acp.target, AccessControlTarget::Scope(_)));
     }
 
     /// Kubidm: a delegated profile is enforced as its upstream rewrite. The receivers
@@ -4837,32 +4835,17 @@ mod tests {
         qs_write.commit().expect("commit");
     }
 
-    /// Kubidm: an entry manager receiver with a delegated target only administers the
-    /// managed entries that are in the delegated scope.
+    /// Kubidm: an entry manager receiver with a delegated target is refused when the
+    /// profile is created, so it never grants anything.
     #[qs_test]
     async fn test_access_delegated_acp_entry_manager(qs: &QueryServer) {
         let ct = duration_from_epoch_now();
-
-        let manager_uuid = Uuid::new_v4();
-        let managers_uuid = Uuid::new_v4();
-        let in_scope_uuid = Uuid::new_v4();
-        let out_of_scope_uuid = Uuid::new_v4();
         let scope_uuid = Uuid::new_v4();
-
-        let managed = |name: &str, uuid: Uuid| {
-            let mut entry = dg_person(name, uuid);
-            entry.add_ava(Attribute::EntryManagedBy, Value::Refer(managers_uuid));
-            entry
-        };
 
         let mut qs_write = qs.write(ct).await.unwrap();
         qs_write
             .internal_create(vec![
-                dg_person("dgm_manager", manager_uuid),
-                dg_group("dgm_managers", managers_uuid, &[manager_uuid]),
-                managed("dgm_in_scope", in_scope_uuid),
-                managed("dgm_out_of_scope", out_of_scope_uuid),
-                dg_group("dgm_scope", scope_uuid, &[in_scope_uuid]),
+                dg_group("dgm_scope", scope_uuid, &[]),
                 delegated_acp_entry(
                     "acp_delegated_entry_manager",
                     EntryClass::AccessControlReceiverEntryManager,
@@ -4874,13 +4857,10 @@ mod tests {
                 ),
             ])
             .expect("failed to create entries");
-        qs_write.commit().expect("commit");
-        let mut qs_write = qs.write(ct).await.unwrap();
-
-        let manager = dg_ident(&mut qs_write, manager_uuid);
-        assert!(!dg_can_modify(&mut qs_write, &manager, out_of_scope_uuid));
-        assert!(!dg_can_delete(&mut qs_write, &manager, out_of_scope_uuid));
-        assert!(dg_can_modify(&mut qs_write, &manager, in_scope_uuid));
+        assert!(matches!(
+            qs_write.commit(),
+            Err(OperationError::InvalidAcpState(_))
+        ));
     }
 
     /// Kubidm: deleting the delegated scope group must never widen the target to the

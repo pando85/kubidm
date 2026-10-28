@@ -221,6 +221,7 @@ impl QueryServerWriteTransaction<'_> {
         if !self.changed_flags.contains(ChangeFlag::ACP)
             && del_cand.iter().any(|e| {
                 e.attribute_equality(Attribute::Class, &EntryClass::AccessControlProfile.into())
+                    || crate::server::access::profiles::delegation_lateral_reach(e)
             })
         {
             self.changed_flags.insert(ChangeFlag::ACP)
