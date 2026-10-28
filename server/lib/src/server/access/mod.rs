@@ -39,6 +39,7 @@ use self::profiles::{
     AccessControlDeleteResolved, AccessControlModify, AccessControlModifyResolved,
     AccessControlReceiver, AccessControlReceiverCondition, AccessControlSearch,
     AccessControlSearchResolved, AccessControlTarget, AccessControlTargetCondition,
+    AcpPipCondition,
 };
 
 use kubidm_proto::scim_v1::server::ScimAttributeEffectiveAccess;
@@ -52,6 +53,8 @@ mod create;
 mod delete;
 mod migration;
 mod modify;
+#[cfg(test)]
+mod pip_tests;
 pub mod profiles;
 mod protected;
 mod search;
@@ -172,8 +175,28 @@ struct AccessControlsInner {
     /// Kubidm: the enabled profiles that the last reload skipped because they are invalid,
     /// per kind. They grant nothing (as that kind) until they are fixed or disabled.
     skipped: SkippedAcps,
+    /// Kubidm: the `pip:<source>:<attribute>` names the loaded profiles' PIP conditions
+    /// reference, recomputed whenever the profiles change. Requests only prefetch PIP
+    /// attributes when this is not empty.
+    pip_referenced: BTreeSet<String>,
     // Oauth2
     // Sync prov
+}
+
+impl AccessControlsInner {
+    fn refresh_pip_referenced(&mut self) {
+        self.pip_referenced = self
+            .acps_search
+            .iter()
+            .map(|a| &a.acp)
+            .chain(self.acps_create.iter().map(|a| &a.acp))
+            .chain(self.acps_modify.iter().map(|a| &a.acp))
+            .chain(self.acps_delete.iter().map(|a| &a.acp))
+            .filter_map(|acp| acp.pip_condition.as_ref())
+            .flat_map(|condition| condition.attribute_names())
+            .cloned()
+            .collect();
+    }
 }
 
 pub struct AccessControls {
@@ -186,6 +209,7 @@ fn resolve_access_conditions(
     ident: &Identity,
     ident_memberof: Option<&BTreeSet<Uuid>>,
     receiver: &AccessControlReceiver,
+    pip_condition: Option<&AcpPipCondition>,
     target: &AccessControlTarget,
     acp_resolve_filter_cache: &mut ResolveFilterCacheReadTxn<'_>,
 ) -> Option<(AccessControlReceiverCondition, AccessControlTargetCondition)> {
@@ -210,6 +234,15 @@ fn resolve_access_conditions(
         AccessControlReceiver::None => return None,
         // AccessControlReceiverCondition::None,
     };
+
+    // Kubidm: the receiver must also satisfy the profile's PIP condition, from the
+    // attributes prefetched for this request. This fails closed.
+    if let Some(pip_condition) = pip_condition {
+        if !pip_condition.is_satisfied_by(ident) {
+            trace!(?pip_condition, "PIP condition not satisfied");
+            return None;
+        }
+    }
 
     let target_condition = match &target {
         AccessControlTarget::Scope(filter) => filter
@@ -244,6 +277,10 @@ pub trait AccessControlsTransaction<'a> {
             .map(|((uuid, _), name)| (*uuid, name.as_str()))
             .collect()
     }
+
+    /// Kubidm: the `pip:<source>:<attribute>` names that the loaded profiles' PIP
+    /// conditions reference.
+    fn get_pip_referenced_attributes(&self) -> &BTreeSet<String>;
 
     #[allow(clippy::mut_from_ref)]
     fn get_acp_resolve_filter_cache(&self) -> &mut ResolveFilterCacheReadTxn<'a>;
@@ -311,6 +348,7 @@ pub trait AccessControlsTransaction<'a> {
                     ident,
                     ident_memberof,
                     &acs.acp.receiver,
+                    acs.acp.pip_condition.as_ref(),
                     &acs.acp.target,
                     acp_resolve_filter_cache,
                 )?;
@@ -533,6 +571,7 @@ pub trait AccessControlsTransaction<'a> {
                     ident,
                     ident_memberof,
                     &acs.acp.receiver,
+                    acs.acp.pip_condition.as_ref(),
                     &acs.acp.target,
                     acp_resolve_filter_cache,
                 )?;
@@ -924,6 +963,7 @@ pub trait AccessControlsTransaction<'a> {
                     &ce.ident,
                     ident_memberof,
                     &acs.acp.receiver,
+                    acs.acp.pip_condition.as_ref(),
                     &acs.acp.target,
                     acp_resolve_filter_cache,
                 )?;
@@ -1010,6 +1050,7 @@ pub trait AccessControlsTransaction<'a> {
                     ident,
                     ident_memberof,
                     &acs.acp.receiver,
+                    acs.acp.pip_condition.as_ref(),
                     &acs.acp.target,
                     acp_resolve_filter_cache,
                 )?;
@@ -1189,6 +1230,7 @@ impl AccessControlsWriteTransaction<'_> {
         mut acps: Vec<AccessControlSearch>,
     ) -> Result<(), OperationError> {
         std::mem::swap(&mut acps, &mut self.inner.deref_mut().acps_search);
+        self.inner.deref_mut().refresh_pip_referenced();
         Ok(())
     }
 
@@ -1197,6 +1239,7 @@ impl AccessControlsWriteTransaction<'_> {
         mut acps: Vec<AccessControlCreate>,
     ) -> Result<(), OperationError> {
         std::mem::swap(&mut acps, &mut self.inner.deref_mut().acps_create);
+        self.inner.deref_mut().refresh_pip_referenced();
         Ok(())
     }
 
@@ -1205,6 +1248,7 @@ impl AccessControlsWriteTransaction<'_> {
         mut acps: Vec<AccessControlModify>,
     ) -> Result<(), OperationError> {
         std::mem::swap(&mut acps, &mut self.inner.deref_mut().acps_modify);
+        self.inner.deref_mut().refresh_pip_referenced();
         Ok(())
     }
 
@@ -1213,6 +1257,7 @@ impl AccessControlsWriteTransaction<'_> {
         mut acps: Vec<AccessControlDelete>,
     ) -> Result<(), OperationError> {
         std::mem::swap(&mut acps, &mut self.inner.deref_mut().acps_delete);
+        self.inner.deref_mut().refresh_pip_referenced();
         Ok(())
     }
 
@@ -1261,6 +1306,10 @@ impl<'a> AccessControlsTransaction<'a> for AccessControlsWriteTransaction<'a> {
 
     fn get_skipped(&self) -> &SkippedAcps {
         &self.inner.skipped
+    }
+
+    fn get_pip_referenced_attributes(&self) -> &BTreeSet<String> {
+        &self.inner.pip_referenced
     }
 
     fn get_acp_resolve_filter_cache(&self) -> &mut ResolveFilterCacheReadTxn<'a> {
@@ -1315,6 +1364,10 @@ impl<'a> AccessControlsTransaction<'a> for AccessControlsReadTransaction<'a> {
         &self.inner.skipped
     }
 
+    fn get_pip_referenced_attributes(&self) -> &BTreeSet<String> {
+        &self.inner.pip_referenced
+    }
+
     fn get_acp_resolve_filter_cache(&self) -> &mut ResolveFilterCacheReadTxn<'a> {
         unsafe {
             let mptr = self.acp_resolve_filter_cache.as_ptr();
@@ -1342,6 +1395,7 @@ impl Default for AccessControls {
                 acps_delete: Vec::with_capacity(0),
                 sync_agreements: HashMap::default(),
                 skipped: BTreeMap::new(),
+                pip_referenced: BTreeSet::new(),
             }),
             // Allow the expect, if this fails it represents a programming/development
             // failure.

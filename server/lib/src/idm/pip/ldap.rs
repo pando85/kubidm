@@ -184,11 +184,11 @@ impl LdapPip {
     /// Turn search results into attributes: exactly one entry must match.
     fn entries_to_attributes(&self, entries: &[LdapEntry]) -> Result<PipAttributeSet, PipFailure> {
         match entries {
-            [] => Err(PipFailure::Error(
+            [] => Err(PipFailure::Subject(
                 "No LDAP entries found for subject".to_string(),
             )),
             [entry] => Ok(self.parse_ldap_entry(entry)),
-            _ => Err(PipFailure::Error(format!(
+            _ => Err(PipFailure::Subject(format!(
                 "LDAP search matched {} entries for subject, expected exactly one",
                 entries.len()
             ))),
@@ -253,7 +253,7 @@ impl PolicyInformationPoint for LdapPip {
 
         let filter = match self.build_search_filter(subject) {
             Ok(filter) => filter,
-            Err(e) => return self.on_failure(PipFailure::Error(e)),
+            Err(e) => return self.on_failure(PipFailure::Subject(e)),
         };
 
         if !self.health.try_begin_attempt(&self.config.health_check) {
@@ -357,6 +357,10 @@ impl PolicyInformationPoint for LdapPip {
     async fn clear_all_cache(&self) {
         let mut cache = self.cache.write().await;
         cache.clear();
+    }
+
+    fn record_source_failure(&self, error: String) {
+        self.health.record_failure(&self.config.health_check, error);
     }
 }
 
@@ -690,7 +694,7 @@ mod tests {
         let pip = LdapPip::new(create_test_config()).unwrap();
 
         let none = pip.entries_to_attributes(&[]);
-        assert!(matches!(none, Err(PipFailure::Error(_))));
+        assert!(matches!(none, Err(PipFailure::Subject(_))));
 
         let one = pip
             .entries_to_attributes(&[entry(
@@ -708,7 +712,7 @@ mod tests {
             entry("uid=b,dc=example,dc=com", &[("department", &["Sales"])]),
         ]);
         match many {
-            Err(PipFailure::Error(e)) => assert!(e.contains("matched 2 entries")),
+            Err(PipFailure::Subject(e)) => assert!(e.contains("matched 2 entries")),
             other => panic!("multiple matches must be an error, got {other:?}"),
         }
     }
@@ -1016,7 +1020,7 @@ mod tests {
             fallback_behavior: PipFallbackBehavior::Deny,
             ..create_test_config()
         };
-        let mut manager = PipManager::new(Duration::from_secs(60));
+        let mut manager = PipManager::new();
         manager.register(Arc::new(LdapPip::new(config).unwrap()));
 
         let subject = PipSubject::from_uuid(uuid::Uuid::new_v4()).with_username("alice");

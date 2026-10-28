@@ -35,6 +35,7 @@ concread = { workspace = true }
 crypto-glue = { workspace = true }
 dhat = { workspace = true, optional = true }
 dyn-clone = { workspace = true }
+futures = { workspace = true }
 hashbrown = { workspace = true }
 idlset = { workspace = true }
 itertools = { workspace = true }
@@ -95,7 +96,6 @@ whoami = { workspace = true }
 
 [dev-dependencies]
 compact_jwt = { workspace = true, features = ["unsafe_release_without_verify"] }
-futures = { workspace = true }
 kubidmd_lib_macros = { workspace = true }
 kubidm_proto = { workspace = true, features = ["test"] }
 tempfile = { workspace = true }

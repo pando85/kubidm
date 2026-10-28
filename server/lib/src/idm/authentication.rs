@@ -1,4 +1,5 @@
 use crate::{
+    idm::pip::prefetch::PipPrefetchedAttributes,
     prelude::{OperationError, Url, Uuid},
     server::identity::Source,
 };
@@ -16,6 +17,7 @@ use kubidm_proto::{
     },
 };
 use std::fmt;
+use std::sync::Arc;
 use webauthn_rs::prelude::PublicKeyCredential;
 
 #[derive(Debug)]
@@ -207,6 +209,9 @@ pub struct ClientAuthInfo {
     pub(crate) bearer_token: Option<JwsCompact>,
     pub(crate) basic_authz: Option<String>,
     pub(crate) pre_validated_token: PreValidatedTokenStatus,
+    /// Kubidm: the PIP attributes prefetched for this request's subject, attached to
+    /// the identity when it is validated (only if it is the same subject).
+    pub(crate) pip_attributes: Option<Arc<PipPrefetchedAttributes>>,
 }
 
 impl ClientAuthInfo {
@@ -222,6 +227,7 @@ impl ClientAuthInfo {
             bearer_token,
             basic_authz,
             pre_validated_token: Default::default(),
+            pip_attributes: None,
         }
     }
 
@@ -241,6 +247,12 @@ impl ClientAuthInfo {
     pub(crate) fn set_pre_validated_uat(&mut self, status: PreValidatedTokenStatus) {
         self.pre_validated_token = status
     }
+
+    /// Kubidm: attach the PIP attributes prefetched for this request, see
+    /// [crate::idm::pip::prefetch].
+    pub fn set_pip_attributes(&mut self, pip_attributes: PipPrefetchedAttributes) {
+        self.pip_attributes = Some(Arc::new(pip_attributes));
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -258,6 +270,7 @@ impl ClientAuthInfo {
             bearer_token: None,
             basic_authz: None,
             pre_validated_token: Default::default(),
+            pip_attributes: None,
         }
     }
 }
@@ -271,6 +284,7 @@ impl From<Source> for ClientAuthInfo {
             bearer_token: None,
             basic_authz: None,
             pre_validated_token: Default::default(),
+            pip_attributes: None,
         }
     }
 }
@@ -284,6 +298,7 @@ impl From<JwsCompact> for ClientAuthInfo {
             bearer_token: Some(value),
             basic_authz: None,
             pre_validated_token: Default::default(),
+            pip_attributes: None,
         }
     }
 }
@@ -297,6 +312,7 @@ impl From<ClientCertInfo> for ClientAuthInfo {
             bearer_token: None,
             basic_authz: None,
             pre_validated_token: Default::default(),
+            pip_attributes: None,
         }
     }
 }
@@ -310,6 +326,7 @@ impl From<&str> for ClientAuthInfo {
             bearer_token: None,
             basic_authz: Some(value.to_string()),
             pre_validated_token: Default::default(),
+            pip_attributes: None,
         }
     }
 }
@@ -326,6 +343,7 @@ impl ClientAuthInfo {
             bearer_token: None,
             basic_authz: Some(value),
             pre_validated_token: Default::default(),
+            pip_attributes: None,
         }
     }
 }

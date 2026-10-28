@@ -395,15 +395,29 @@ pub(crate) fn kubidm_builtin_access_control_profiles() -> Vec<EntryInitNew> {
 }
 
 /// Kubidm: the fork's changes to upstream built-in access control profiles, applied to the
-/// shipped definition before it is migrated (`kubidm_migrate_builtin_acp_batch`), at every
-/// level that migrates through it.
+/// shipped definition before it is migrated (see
+/// `QueryServerWriteTransaction::kubidm_migrate_builtin_acp_batch`), at every level that
+/// migrates through it, including 1.11 -> 1.12.
 ///
+/// - `idm_acp_acp_manage` also grants search, modify and create of
+///   `acp_receiver_pip_condition`, so that access control admins can manage PIP
+///   conditions in band.
 /// - `idm_acp_acp_manage` does not target delegations (profiles with the
 ///   `access_control_target_delegated_scope` class): they are only granted and revoked
 ///   through `server::delegation`, which builds them from a template. Editing one through
 ///   the generic operations would change what it grants behind the template's back.
-pub(crate) fn kubidm_patch_builtin_acp(mut entry: EntryInitNew) -> EntryInitNew {
+pub(crate) fn kubidm_patch_builtin_acp(entry: &mut EntryInitNew) {
     if entry.get_uuid() == Some(UUID_IDM_ACP_ACP_MANAGE_V1) {
+        let attr = Attribute::AcpReceiverPipCondition.as_str();
+        for grant in [
+            Attribute::AcpSearchAttr,
+            Attribute::AcpModifyRemovedAttr,
+            Attribute::AcpModifyPresentAttr,
+            Attribute::AcpCreateAttr,
+        ] {
+            entry.add_ava(grant, Value::new_iutf8n(attr));
+        }
+
         if let Some(target) = entry
             .get_ava_single_protofilter(Attribute::AcpTargetScope)
             .cloned()
@@ -419,7 +433,6 @@ pub(crate) fn kubidm_patch_builtin_acp(mut entry: EntryInitNew) -> EntryInitNew 
             entry.add_ava(Attribute::AcpTargetScope, Value::JsonFilt(target));
         }
     }
-    entry
 }
 
 pub fn phase_8_delete_uuids() -> Vec<Uuid> {

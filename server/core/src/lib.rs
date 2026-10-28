@@ -1243,9 +1243,23 @@ pub async fn create_server_core(
         if config_test { "TEST " } else { "" },
         config
     );
-    if let Some(warning) = config.pip_config_ignored_warning() {
-        warn!("{}", warning);
-    }
+    // Policy Information Point: an invalid source configuration refuses to start, rather
+    // than silently dropping the attributes access decisions depend on.
+    let pip_prefetcher = match config.pip_prefetcher() {
+        Ok(Some(prefetcher)) => {
+            info!(
+                sources = prefetcher.manager().iter().count(),
+                timeout_ms = prefetcher.timeout().as_millis() as u64,
+                "Policy Information Point enabled"
+            );
+            Some(Arc::new(prefetcher))
+        }
+        Ok(None) => None,
+        Err(err) => {
+            error!(%err, "Invalid pip_config");
+            return Err(());
+        }
+    };
     // Setup umask, so that every we touch or create is secure.
     #[cfg(not(target_family = "windows"))]
     unsafe {
@@ -1409,7 +1423,8 @@ pub async fn create_server_core(
 
     // Pass it to the actor for threading.
     // Start the read query server with the given be path: future config
-    let server_read_ref = QueryServerReadV1::start_static(idms_arc.clone(), ldap_arc.clone());
+    let server_read_ref =
+        QueryServerReadV1::start_static(idms_arc.clone(), ldap_arc.clone(), pip_prefetcher);
 
     // Create the server async write entry point.
     let server_write_ref = QueryServerWriteV1::start_static(idms_arc.clone());
