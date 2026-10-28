@@ -116,10 +116,15 @@ impl ReferentialIntegrity {
     /// remove dangling references from entries that are still alive. Importantly, we need to perform
     /// these actions in *order* so that reference entries that relate to something retain their
     /// references to their related entry, so that revival of those entries works as we expect.
+    ///
+    /// Kubidm: `keep_required` are targets that replication found missing. When removing them
+    /// would take the last value of a required (must) reference attribute of a live entry,
+    /// the dangling values are kept instead (see [`ReferentialIntegrity::post_repl_refresh`]).
     #[instrument(level = "trace", skip_all)]
     fn remove_references(
         qs: &mut QueryServerWriteTransaction,
         uuids: Vec<Uuid>,
+        keep_required: &BTreeSet<Uuid>,
     ) -> Result<(), OperationError> {
         trace!(?uuids);
 
@@ -127,7 +132,7 @@ impl ReferentialIntegrity {
         let schema = qs.get_schema();
         let ref_types = schema.get_reference_types();
 
-        let removed_ids: BTreeSet<_> = uuids.iter().map(|u| PartialValue::Refer(*u)).collect();
+        let removed: BTreeSet<Uuid> = uuids.iter().copied().collect();
 
         // Generate a filter which is the set of all schema reference types
         // as EQ to all uuid of all entries in delete. - this INCLUDES recycled
@@ -145,13 +150,176 @@ impl ReferentialIntegrity {
 
         let mut work_set = qs.internal_search_writeable(&filt)?;
 
-        for (_, post) in work_set.iter_mut() {
+        // Only the attributes that hold a removed value change, so that an entry that keeps
+        // all of them is not rewritten.
+        work_set.retain_mut(|(pre, post)| {
+            let pre = pre.as_ref();
+            let mut changed = false;
             for schema_attribute in ref_types.values() {
-                post.remove_avas(&schema_attribute.name, &removed_ids);
+                let attr = &schema_attribute.name;
+                let Some(values) = pre.get_ava_set(attr).and_then(|vs| vs.as_ref_uuid_iter())
+                else {
+                    continue;
+                };
+                let (mut lost, kept): (BTreeSet<Uuid>, BTreeSet<Uuid>) =
+                    values.partition(|vu| removed.contains(vu));
+                if lost.is_empty() {
+                    continue;
+                }
+
+                // Kubidm: removing the last value of a required reference would make a live
+                // entry schema invalid, failing the whole replication, every time. Keep the
+                // dangling value: it resolves to nothing, so it grants nothing, and every
+                // node keeps the same value.
+                if kept.is_empty()
+                    && !keep_required.is_empty()
+                    && pre.mask_recycled_ts().is_some()
+                    && !is_derived_reference_for_entry(attr, pre)
+                    && is_attribute_must_for_entry(schema, pre, attr)
+                {
+                    for target in lost.iter().filter(|vu| keep_required.contains(vu)) {
+                        error!(
+                            source_entry_uuid = %pre.get_uuid(),
+                            source_entry = %pre.get_display_id(),
+                            attribute = %attr,
+                            missing_target_uuid = %target,
+                            "Keeping a dangling reference in a required attribute: its target is missing. \
+                             It grants nothing. Modify the entry to reference an existing entry, or delete it."
+                        );
+                    }
+                    lost.retain(|vu| !keep_required.contains(vu));
+                    if lost.is_empty() {
+                        continue;
+                    }
+                }
+
+                let lost: BTreeSet<PartialValue> =
+                    lost.into_iter().map(PartialValue::Refer).collect();
+                post.remove_avas(attr, &lost);
+                changed = true;
+            }
+            changed
+        });
+
+        qs.internal_apply_writable(work_set)
+    }
+
+    /// Kubidm: the required reference attributes of each class, as (class, attribute) pairs.
+    fn required_reference_pairs(schema: &dyn SchemaTransaction) -> Vec<(AttrString, Attribute)> {
+        let ref_types = schema.get_reference_types();
+        schema
+            .get_classes()
+            .values()
+            .flat_map(|cls| {
+                cls.systemmust
+                    .iter()
+                    .chain(cls.must.iter())
+                    .filter(|attr| ref_types.contains_key(*attr))
+                    .map(|attr| (cls.name.clone(), attr.clone()))
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    /// Kubidm: the filter of the entries that hold one of `targets` in a required reference
+    /// attribute. Each term is bound by the indexed `class` of the holder, so that an
+    /// unindexed reference attribute (such as `oauth2_account_provider`) does not make the
+    /// search a scan of the whole database. Tombstones keep no class but `object` and
+    /// `tombstone`, so they never match; recycled holders do, as a revive restores them.
+    fn required_reference_holders_filter(
+        schema: &dyn SchemaTransaction,
+        targets: &BTreeSet<Uuid>,
+    ) -> Option<Filter<FilterInvalid>> {
+        let pairs = Self::required_reference_pairs(schema);
+        if pairs.is_empty() || targets.is_empty() {
+            return None;
+        }
+        Some(filter_all!(f_or(
+            pairs
+                .into_iter()
+                .map(|(class, attr)| {
+                    f_and(vec![
+                        f_eq(Attribute::Class, PartialValue::new_iutf8(class.as_str())),
+                        f_or(
+                            targets
+                                .iter()
+                                .map(|u| f_eq(attr.clone(), PartialValue::Refer(*u)))
+                                .collect(),
+                        ),
+                    ])
+                })
+                .collect(),
+        )))
+    }
+
+    /// Kubidm: refuse to create an entry whose uuid is the target of a dangling required
+    /// reference. Replication keeps such a reference (see `post_repl_refresh`), and it grants
+    /// nothing while its target does not exist. Creating an entry with that uuid (a client,
+    /// or a sync connector, may choose the uuid once the tombstone of the old target has been
+    /// purged) would silently give the new entry what the reference grants, for example the
+    /// receivers of an access control profile. The dangling reference must be fixed first.
+    ///
+    /// Only uuids of the dynamic range are checked: built-in entries have system uuids.
+    fn reject_dangling_required_target_reuse(
+        qs: &mut QueryServerWriteTransaction,
+        cand: &[EntrySealedCommitted],
+    ) -> Result<(), OperationError> {
+        let cand_uuids: BTreeSet<Uuid> = cand
+            .iter()
+            .map(|e| e.get_uuid())
+            .filter(|u| *u >= DYNAMIC_RANGE_MINIMUM_UUID)
+            .collect();
+
+        let schema = qs.get_schema();
+        let Some(filt) = Self::required_reference_holders_filter(schema, &cand_uuids) else {
+            return Ok(());
+        };
+
+        let holders = qs.internal_search(filt).inspect_err(|err| {
+            error!(
+                ?err,
+                "internal search failure during refint uuid reuse check"
+            );
+        })?;
+
+        let schema = qs.get_schema();
+        let ref_types = schema.get_reference_types();
+        for holder in holders
+            .iter()
+            .filter(|h| !cand_uuids.contains(&h.get_uuid()))
+        {
+            for attr in ref_types
+                .keys()
+                .filter(|attr| is_attribute_must_for_entry(schema, holder, attr))
+            {
+                let Some(uuid_iter) = holder
+                    .get_ava_set(attr)
+                    .and_then(|vs| vs.as_ref_uuid_iter())
+                else {
+                    continue;
+                };
+                if let Some(target) = uuid_iter.into_iter().find(|vu| cand_uuids.contains(vu)) {
+                    error!(
+                        source_entry_uuid = %holder.get_uuid(),
+                        source_entry = %holder.get_display_id(),
+                        attribute = %attr,
+                        target_uuid = %target,
+                        "Create rejected: the uuid is the target of a dangling required reference. Fix that reference first."
+                    );
+                    return Err(OperationError::Plugin(PluginError::ReferentialIntegrity(
+                        format!(
+                            "uuid {} is the target of the dangling required reference {} of entry {}",
+                            target,
+                            attr,
+                            holder.get_uuid()
+                        ),
+                    )));
+                }
             }
         }
 
-        qs.internal_apply_writable(work_set)
+        Ok(())
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -245,13 +413,16 @@ impl Plugin for ReferentialIntegrity {
     // so we can assert stronger trust in it's correct operation and interaction
     // in complex scenarios - It actually simplifies the check from "could
     // be in cand AND db" to simply "is it in the DB?".
-    #[instrument(level = "debug", name = "refint_post_create", skip(qs, cand, _ce))]
+    #[instrument(level = "debug", name = "refint_post_create", skip_all)]
     fn post_create(
         qs: &mut QueryServerWriteTransaction,
         cand: &[Entry<EntrySealed, EntryCommitted>],
         _ce: &CreateEvent,
     ) -> Result<(), OperationError> {
-        Self::post_modify_inner(qs, None, cand)
+        Self::post_modify_inner(qs, None, cand)?;
+        // Kubidm: whatever the identity, as a sync connector creates its entries internally.
+        // Replication never creates through here, it applies entries directly.
+        Self::reject_dangling_required_target_reuse(qs, cand)
     }
 
     #[instrument(level = "debug", name = "refint_post_modify", skip_all)]
@@ -274,6 +445,12 @@ impl Plugin for ReferentialIntegrity {
         Self::post_modify_inner(qs, Some(pre_cand), cand)
     }
 
+    /// Kubidm: a refresh removes the dangling references of the supplier's content, except
+    /// the last value of a required reference attribute of a live entry. Removing that would
+    /// make the entry schema invalid and fail the refresh every time, leaving the node
+    /// unable to ever be refreshed. The dangling value is kept (and logged, and reported
+    /// by verify) instead: it resolves to nothing, so it grants nothing, and the entry
+    /// stays identical on every node, where an administrator can fix it.
     #[instrument(level = "debug", name = "refint_post_repl_refresh", skip_all)]
     fn post_repl_refresh(
         qs: &mut QueryServerWriteTransaction,
@@ -284,7 +461,7 @@ impl Plugin for ReferentialIntegrity {
         let all_exist_fast = Self::check_uuids_exist_fast(qs, uuids.as_slice())?;
 
         let missing_uuids = if !all_exist_fast {
-            debug!("Refresh contains missing references; checking schema validity.");
+            debug!("Not all uuids referenced by these candidates exist. Slow path to remove them.");
             Self::check_uuids_exist_slow(qs, uuids.as_slice())?
         } else {
             debug!("All references are valid!");
@@ -295,80 +472,15 @@ impl Plugin for ReferentialIntegrity {
             return Ok(());
         }
 
-        let schema = qs.get_schema();
-        let ref_types = schema.get_reference_types();
-        let missing_set: BTreeSet<Uuid> = missing_uuids.iter().copied().collect();
-
-        let filt = filter_all!(f_or(
-            missing_uuids
-                .iter()
-                .flat_map(|u| {
-                    ref_types
-                        .values()
-                        .map(move |r| f_eq(r.name.clone(), PartialValue::Refer(*u)))
-                })
-                .collect(),
-        ));
-
-        let affected_entries = qs.internal_search(filt).inspect_err(|err| {
-            error!(?err, "internal search failure during refresh refint check");
-        })?;
-
-        for entry in &affected_entries {
-            let entry_uuid = entry.get_uuid();
-            let entry_name = entry
-                .get_ava_single_iname(Attribute::Name)
-                .map(|s| s.to_string());
-
-            for rtype in ref_types.values() {
-                if is_derived_reference_for_entry(&rtype.name, entry) {
-                    continue;
-                }
-                if let Some(vs) = entry.get_ava_set(&rtype.name) {
-                    if let Some(uuid_iter) = vs.as_ref_uuid_iter() {
-                        for vu in uuid_iter {
-                            if missing_set.contains(&vu) {
-                                if is_attribute_must_for_entry(schema, entry, &rtype.name) {
-                                    error!(
-                                        source_entry_uuid = %entry_uuid,
-                                        source_entry_name = ?entry_name,
-                                        attribute = %rtype.name,
-                                        missing_target_uuid = %vu,
-                                        "Refresh rejected: required reference target missing"
-                                    );
-                                    return Err(OperationError::Plugin(
-                                        PluginError::ReferentialIntegrity(format!(
-                                            "Refresh rejected: entry {} ({}) attribute {} references missing target {}",
-                                            entry_uuid,
-                                            entry_name.as_deref().unwrap_or("<unknown>"),
-                                            rtype.name,
-                                            vu
-                                        )),
-                                    ));
-                                } else {
-                                    warn!(
-                                        source_entry_uuid = %entry_uuid,
-                                        source_entry_name = ?entry_name,
-                                        attribute = %rtype.name,
-                                        missing_target_uuid = %vu,
-                                        "Self-healing: removing optional reference to missing target during refresh"
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+        for missing in &missing_uuids {
+            warn!(
+                missing_target_uuid = %missing,
+                "Self-healing: removing references to a missing target during refresh"
+            );
         }
 
-        if event_enabled!(tracing::Level::DEBUG) {
-            debug!("Removing the following missing reference uuids from refresh");
-            for missing in &missing_uuids {
-                debug!(?missing);
-            }
-        }
-
-        Self::remove_references(qs, missing_uuids)
+        let keep_required: BTreeSet<Uuid> = missing_uuids.iter().copied().collect();
+        Self::remove_references(qs, missing_uuids, &keep_required)
     }
 
     #[instrument(level = "debug", name = "attrunique_post_repl_incremental", skip_all)]
@@ -494,6 +606,15 @@ impl Plugin for ReferentialIntegrity {
 
         // Now, we need to find for each of the missing uuids, which values had them.
         // We could use a clever query to internal_search_writeable?
+        // Kubidm: targets that are missing (or were just deleted) may stay as the last value
+        // of a required reference, as in a refresh. Conflicts are removed as before, so that
+        // a reference never resolves to the entry that won the uuid.
+        let keep_required: BTreeSet<Uuid> = missing_uuids
+            .iter()
+            .chain(inactive_entries.iter())
+            .copied()
+            .collect();
+
         missing_uuids.extend(conflict_uuids.iter().copied());
         missing_uuids.extend_from_slice(&inactive_entries);
 
@@ -511,7 +632,7 @@ impl Plugin for ReferentialIntegrity {
 
         // Now we have to look them up and clean it up. Turns out this is the
         // same code path as "post delete" so we can share that!
-        Self::remove_references(qs, missing_uuids)
+        Self::remove_references(qs, missing_uuids, &keep_required)
 
         // Complete!
     }
@@ -529,7 +650,7 @@ impl Plugin for ReferentialIntegrity {
         // Get the UUID of all entries we are deleting
         let uuids: Vec<Uuid> = cand.iter().map(|e| e.get_uuid()).collect();
 
-        Self::remove_references(qs, uuids)
+        Self::remove_references(qs, uuids, &BTreeSet::new())
     }
 
     #[instrument(level = "debug", name = "refint::verify", skip_all)]
@@ -545,6 +666,14 @@ impl Plugin for ReferentialIntegrity {
         };
 
         let acu_map: HashSet<Uuid> = all_cand.iter().map(|e| e.get_uuid()).collect();
+        // Kubidm: replication keeps the last value of a required reference when its target
+        // is missing, recycled or deleted (see `post_repl_refresh`). Such a value is reported
+        // too, so that operators find it.
+        let live_map: HashSet<Uuid> = all_cand
+            .iter()
+            .filter(|e| e.mask_recycled_ts().is_some())
+            .map(|e| e.get_uuid())
+            .collect();
 
         let schema = qs.get_schema();
         let ref_types = schema.get_reference_types();
@@ -556,16 +685,22 @@ impl Plugin for ReferentialIntegrity {
                 .get_ava_single_iname(Attribute::Name)
                 .map(|s| s.to_string());
 
+            let live_source = c.mask_recycled_ts().is_some();
+
             for rtype in ref_types.values() {
                 if is_derived_reference_for_entry(&rtype.name, c) {
                     continue;
                 }
 
+                let required = live_source && is_attribute_must_for_entry(schema, c, &rtype.name);
+
                 if let Some(vs) = c.get_ava_set(&rtype.name) {
                     match vs.as_ref_uuid_iter() {
                         Some(uuid_iter) => {
                             for vu in uuid_iter {
-                                if acu_map.get(&vu).is_none() {
+                                if acu_map.get(&vu).is_none()
+                                    || (required && live_map.get(&vu).is_none())
+                                {
                                     res.push(Err(ConsistencyError::RefintNotUpheld {
                                         entry_id: c.get_id(),
                                         entry_uuid: Some(entry_uuid),
@@ -747,7 +882,9 @@ impl ReferentialIntegrity {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_always_derived_reference, is_derived_reference_for_entry};
+    use super::{
+        is_always_derived_reference, is_derived_reference_for_entry, ReferentialIntegrity,
+    };
     use crate::{
         credential::Credential,
         event::CreateEvent,
@@ -757,6 +894,7 @@ mod tests {
     use crypto_glue::{traits::DecodePem, x509::Certificate};
     use kubidm_lib_crypto::CryptoPolicy;
     use kubidm_proto::internal::Filter as ProtoFilter;
+    use std::collections::BTreeSet;
     use time::OffsetDateTime;
 
     const TEST_TESTGROUP_A_UUID: Uuid = uuid::uuid!("aaa496bd-8493-47b7-8142-f568b5cf47ee");
@@ -2137,5 +2275,58 @@ mod tests {
         }
         assert!(server_txn.internal_apply_writable(work_set).is_ok());
         assert!(server_txn.commit().is_ok());
+    }
+
+    /// Kubidm: the uuid reuse guard runs on every create, so its search must be bound by
+    /// indexes. `oauth2_account_provider` is a required reference without an index: on its
+    /// own, a term on it makes the whole search a scan of all entries.
+    #[qs_test]
+    async fn test_refint_reuse_guard_filter_is_indexed(server: &QueryServer) {
+        use crate::be::{BackendTransaction, IdList};
+
+        let mut server_txn = server.write(duration_from_epoch_now()).await.unwrap();
+        let targets = BTreeSet::from([Uuid::new_v4(), Uuid::new_v4()]);
+
+        let pairs = ReferentialIntegrity::required_reference_pairs(server_txn.get_schema());
+        assert!(pairs.iter().any(|(class, attr)| class.as_str()
+            == EntryClass::OAuth2Account.as_ref()
+            && *attr == Attribute::OAuth2AccountProvider));
+
+        let holders_filt = ReferentialIntegrity::required_reference_holders_filter(
+            server_txn.get_schema(),
+            &targets,
+        )
+        .expect("there are required references");
+
+        let mut plan_of = |filt: Filter<FilterInvalid>| {
+            let filt = filt
+                .validate(server_txn.get_schema())
+                .expect("invalid filter");
+            let filt = {
+                let idxmeta = server_txn.get_be_txn().get_idxmeta_ref();
+                filt.resolve(&Identity::from_internal(), Some(idxmeta), None)
+                    .expect("unable to resolve the filter")
+            };
+            server_txn
+                .get_be_txn()
+                .filter2idl(filt.to_inner(), 0)
+                .expect("unable to plan the filter")
+        };
+
+        // Control: an unbound term on the unindexed attribute is a full scan.
+        let (idl, plan) = plan_of(filter_all!(f_or(
+            pairs
+                .iter()
+                .flat_map(|(_, attr)| {
+                    targets
+                        .iter()
+                        .map(move |u| f_eq(attr.clone(), PartialValue::Refer(*u)))
+                })
+                .collect()
+        )));
+        assert!(matches!(idl, IdList::AllIds), "{plan}");
+
+        let (idl, plan) = plan_of(holders_filt);
+        assert!(!matches!(idl, IdList::AllIds), "{plan}");
     }
 }
