@@ -600,11 +600,9 @@ pub struct ServerConfig {
     repl_config: Option<ReplicationConfiguration>,
     /// An optional OpenTelemetry collector (GRPC) url to send trace and log data to, eg `localhost:4317`. If not set, disables the feature.
     otel_grpc_endpoint: Option<String>,
-    /// Policy Information Point (PIP) configuration for external attribute retrieval.
+    /// Policy Information Point (PIP) configuration for external attribute retrieval,
+    /// used by the `acp_receiver_pip_condition` of access control profiles.
     /// See [kubidmd_lib::idm::pip::config::PipConfig] for details.
-    ///
-    /// NOTE: PIP is not yet integrated into access decisions; this is parsed but
-    /// ignored (a warning is logged at startup).
     #[serde(default)]
     pip_config: Option<kubidmd_lib::idm::pip::config::PipConfig>,
 }
@@ -695,10 +693,8 @@ pub struct ServerConfigV2 {
     #[serde(rename = "replication")]
     repl_config: Option<ReplicationConfiguration>,
     otel_grpc_endpoint: Option<String>,
-    /// Policy Information Point (PIP) configuration for external attribute retrieval.
-    ///
-    /// NOTE: PIP is not yet integrated into access decisions; this is parsed but
-    /// ignored (a warning is logged at startup).
+    /// Policy Information Point (PIP) configuration for external attribute retrieval,
+    /// used by the `acp_receiver_pip_condition` of access control profiles.
     #[serde(default)]
     pip_config: Option<kubidmd_lib::idm::pip::config::PipConfig>,
 }
@@ -751,20 +747,24 @@ pub struct Configuration {
     /// This allows internally setting some unsafe options for replication.
     pub integration_repl_config: Option<Box<IntegrationReplConfig>>,
     pub otel_grpc_endpoint: Option<String>,
-    /// Policy Information Point (PIP) configuration for external attribute retrieval.
-    /// Not yet used: see [`Configuration::pip_config_ignored_warning`].
+    /// Policy Information Point (PIP) configuration for external attribute retrieval,
+    /// used by the `acp_receiver_pip_condition` of access control profiles.
     pub pip_config: Option<kubidmd_lib::idm::pip::config::PipConfig>,
 }
 
 impl Configuration {
-    /// Warning to log at startup when `pip_config` is set: the Policy Information
-    /// Point framework is not yet wired into access decisions, so the
-    /// configuration has no effect.
-    pub fn pip_config_ignored_warning(&self) -> Option<&'static str> {
-        self.pip_config.as_ref().map(|_| {
-            "pip_config is set, but the Policy Information Point (PIP) framework is not yet \
-             integrated into access decisions: this configuration is ignored"
-        })
+    /// Build the PIP prefetcher from `pip_config`. `Ok(None)` when it is not set,
+    /// disabled or has no sources: no request is then prefetched, and access control
+    /// profiles with a PIP condition never match. An invalid source is an error.
+    pub fn pip_prefetcher(
+        &self,
+    ) -> Result<Option<kubidmd_lib::idm::pip::prefetch::PipPrefetcher>, String> {
+        match &self.pip_config {
+            Some(pip_config) => {
+                kubidmd_lib::idm::pip::prefetch::PipPrefetcher::from_config(pip_config)
+            }
+            None => Ok(None),
+        }
     }
 
     pub fn build() -> ConfigurationBuilder {
@@ -1456,16 +1456,50 @@ schedule = "@daily"
 "#;
 
     #[test]
-    fn pip_config_is_parsed_but_flagged_as_ignored() {
+    fn pip_config_builds_prefetcher() {
+        // No pip_config: nothing is prefetched.
         let without = build_from_toml(BASE_V2_CONFIG).expect("config must build");
-        assert!(without.pip_config_ignored_warning().is_none());
+        assert!(matches!(without.pip_prefetcher(), Ok(None)));
 
-        let with = build_from_toml(&format!("{BASE_V2_CONFIG}\n[pip_config]\nenabled = true\n"))
-            .expect("pip_config must not fail startup");
-        assert!(with.pip_config.is_some());
-        assert!(with
-            .pip_config_ignored_warning()
-            .is_some_and(|w| w.contains("ignored")));
+        // No sources: nothing is prefetched either.
+        let empty = build_from_toml(&format!("{BASE_V2_CONFIG}\n[pip_config]\nenabled = true\n"))
+            .expect("pip_config must parse");
+        assert!(empty.pip_config.is_some());
+        assert!(matches!(empty.pip_prefetcher(), Ok(None)));
+
+        let source = r#"
+[pip_config]
+prefetch_timeout_ms = 1500
+
+[[pip_config.sources]]
+type = "http"
+id = "hr"
+base_url = "https://hr.example.com/api"
+endpoint_path = "/employees/{username}"
+"#;
+        let with =
+            build_from_toml(&format!("{BASE_V2_CONFIG}\n{source}")).expect("pip_config must parse");
+        let prefetcher = with
+            .pip_prefetcher()
+            .expect("valid pip_config")
+            .expect("enabled");
+        assert_eq!(prefetcher.timeout(), std::time::Duration::from_millis(1500));
+
+        // A source timeout (default 1 s) above the prefetch budget is refused.
+        let too_short = build_from_toml(&format!(
+            "{BASE_V2_CONFIG}\n{}",
+            source.replace("prefetch_timeout_ms = 1500", "prefetch_timeout_ms = 500")
+        ))
+        .expect("pip_config must parse");
+        assert!(too_short.pip_prefetcher().is_err());
+
+        // An invalid source fails rather than being dropped.
+        let invalid = build_from_toml(&format!(
+            "{BASE_V2_CONFIG}\n{}",
+            source.replace("https://", "http://")
+        ))
+        .expect("pip_config must parse");
+        assert!(invalid.pip_prefetcher().is_err());
     }
 
     fn build_from_toml(contents: &str) -> Option<Configuration> {

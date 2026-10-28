@@ -42,6 +42,7 @@
 
 - [Access Control](access_control/intro.md)
   - [Approval Workflows](access_control/approvals.md)
+  - [External Attributes (PIP)](access_control/pip.md)
 
 - [Service Integrations](integrations/readme.md)
   - [LDAP](integrations/ldap.md)

@@ -39,8 +39,8 @@ use kubidmd_lib::{
     prelude::*,
 };
 use ldap3_proto::simple::*;
-use std::{convert::TryFrom, net::IpAddr, str::FromStr};
-use tracing::{error, instrument, trace};
+use std::{convert::TryFrom, net::IpAddr, str::FromStr, sync::Arc};
+use tracing::{error, instrument, trace, warn};
 use uuid::Uuid;
 
 use super::QueryServerReadV1;
@@ -260,18 +260,37 @@ impl QueryServerReadV1 {
         }
     }
 
+    /// Pre-validate the credentials of a request, see
+    /// `IdmServerTransaction::pre_validate_client_auth_info`.
+    ///
+    /// Kubidm: when a PIP is configured and an access control profile has a PIP
+    /// condition, this also prefetches the referenced PIP attributes for the request's
+    /// subject. The fetch happens after the read transaction is released and is bounded
+    /// by the PIP's per-request timeout; the attributes are attached to the identity when
+    /// the request validates it.
     pub async fn pre_validate_client_auth_info(
         &self,
         client_auth_info: &mut ClientAuthInfo,
     ) -> Result<(), OperationError> {
         let ct = duration_from_epoch_now();
-        let mut idms_prox_read = self.idms.proxy_read().await?;
-        idms_prox_read
-            .pre_validate_client_auth_info(client_auth_info, ct)
-            .map_err(|e| {
-                error!(?e, "Invalid identity");
-                e
-            })
+        let pip_request = {
+            let mut idms_prox_read = self.idms.proxy_read().await?;
+            idms_prox_read
+                .pre_validate_client_auth_info(client_auth_info, ct)
+                .map_err(|e| {
+                    error!(?e, "Invalid identity");
+                    e
+                })?;
+            match self.pip {
+                Some(_) => idms_prox_read.pip_prefetch_request(client_auth_info, ct),
+                None => None,
+            }
+        };
+
+        if let (Some(pip), Some(pip_request)) = (&self.pip, pip_request) {
+            client_auth_info.set_pip_attributes(pip.prefetch(&pip_request).await);
+        }
+        Ok(())
     }
 
     #[instrument(
@@ -1448,23 +1467,66 @@ impl QueryServerReadV1 {
         ip_addr: IpAddr,
     ) -> Option<LdapResponseState> {
         let res = match ServerOps::try_from(protomsg) {
-            Ok(server_op) => self
-                .ldap
-                .do_op(&self.idms, server_op, uat, ip_addr, eventid)
-                .await
-                .unwrap_or_else(|e| {
-                    error!("do_op failed -> {:?}", e);
-                    LdapResponseState::Disconnect(DisconnectionNotice::gen_response(
-                        LdapResultCode::Other,
-                        format!("Internal Server Error {:?}", eventid).as_str(),
-                    ))
-                }),
+            Ok(server_op) => {
+                let uat = self.ldap_prefetch_pip(&server_op, uat, ip_addr).await;
+                self.ldap
+                    .do_op(&self.idms, server_op, uat, ip_addr, eventid)
+                    .await
+                    .unwrap_or_else(|e| {
+                        error!("do_op failed -> {:?}", e);
+                        LdapResponseState::Disconnect(DisconnectionNotice::gen_response(
+                            LdapResultCode::Other,
+                            format!("Internal Server Error {:?}", eventid).as_str(),
+                        ))
+                    })
+            }
             Err(_) => LdapResponseState::Disconnect(DisconnectionNotice::gen_response(
                 LdapResultCode::ProtocolError,
                 format!("Invalid Request {:?}", eventid).as_str(),
             )),
         };
         Some(res)
+    }
+
+    /// Kubidm: prefetch the PIP attributes for an LDAP search or compare by a bound
+    /// session, as `pre_validate_client_auth_info` does for HTTP, outside of the
+    /// operation's transaction. Other operations, and operations without a bind (which
+    /// run as anonymous), are not prefetched, so PIP conditions never match them.
+    async fn ldap_prefetch_pip(
+        &self,
+        server_op: &ServerOps,
+        uat: Option<LdapBoundToken>,
+        ip_addr: IpAddr,
+    ) -> Option<LdapBoundToken> {
+        let mut uat = uat?;
+        // Attributes are only ever valid for the operation they were fetched for.
+        uat.pip_attributes = None;
+
+        let Some(pip) = &self.pip else {
+            return Some(uat);
+        };
+        if !matches!(server_op, ServerOps::Search(_) | ServerOps::Compare(_)) {
+            return Some(uat);
+        }
+
+        let ct = duration_from_epoch_now();
+        let pip_request = match self.idms.proxy_read().await {
+            Ok(mut idms_prox_read) => {
+                idms_prox_read.pip_prefetch_request_ldap(&uat, Source::Ldaps(ip_addr), ct)
+            }
+            Err(err) => {
+                warn!(
+                    ?err,
+                    "Unable to prepare the PIP prefetch for an LDAP operation"
+                );
+                None
+            }
+        };
+
+        if let Some(pip_request) = pip_request {
+            uat.pip_attributes = Some(Arc::new(pip.prefetch(&pip_request).await));
+        }
+        Some(uat)
     }
 
     pub fn domain_info_read(&self) -> DomainInfoRead {

@@ -417,7 +417,11 @@ impl HttpPip {
 
         let status = response.status();
         if status.is_client_error() {
-            return Err(FetchError::client(PipFailure::Error(format!(
+            // A 4xx is about this request, not an outage: it does not mark the source
+            // unhealthy, and it never uses fallback values. That includes 408 and 429: a
+            // user can cause them (for example by flooding requests until the source
+            // rate limits), and must not be given the fallback values for it.
+            return Err(FetchError::client(PipFailure::Subject(format!(
                 "HTTP error: {status}"
             ))));
         }
@@ -457,7 +461,7 @@ impl PolicyInformationPoint for HttpPip {
 
         let url = match self.build_url(subject) {
             Ok(url) => url,
-            Err(e) => return self.on_failure(PipFailure::Error(e)),
+            Err(e) => return self.on_failure(PipFailure::Subject(e)),
         };
 
         if !self.health.try_begin_attempt(&self.config.health_check) {
@@ -562,6 +566,10 @@ impl PolicyInformationPoint for HttpPip {
     async fn clear_all_cache(&self) {
         let mut cache = self.cache.write().await;
         cache.clear();
+    }
+
+    fn record_source_failure(&self, error: String) {
+        self.health.record_failure(&self.config.health_check, error);
     }
 }
 
@@ -1236,7 +1244,7 @@ mod tests {
             fallback_behavior: PipFallbackBehavior::Deny,
             ..config_with(refused_url().as_str(), "/users/{username}")
         };
-        let mut manager = PipManager::new(Duration::from_secs(60));
+        let mut manager = PipManager::new();
         manager.register(Arc::new(HttpPip::new(config).unwrap()));
 
         let subject = PipSubject::from_uuid(uuid::Uuid::new_v4()).with_username("alice");
@@ -1404,9 +1412,46 @@ mod tests {
         let subject = PipSubject::from_uuid(uuid::Uuid::new_v4()).with_username("ghost");
 
         let result = pip.retrieve_attributes(&subject).await;
-        assert!(matches!(result, PipResult::Ignored(PipFailure::Error(_))));
+        assert!(matches!(result, PipResult::Ignored(PipFailure::Subject(_))));
         assert_eq!(pip.cached_health_status(), PipHealthStatus::Unknown);
         server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_usefallback_not_used_for_unknown_subject() {
+        // A 404 (unknown account) is not an outage: usefallback must not grant the
+        // fallback values, the source just contributes nothing.
+        let (base, server) = serve(vec![
+            http_response("404 Not Found", "{}"),
+            http_response("429 Too Many Requests", "{}"),
+            http_response("408 Request Timeout", "{}"),
+        ]);
+        let config = HttpPipConfig {
+            fallback_behavior: PipFallbackBehavior::UseFallback,
+            fallback_values: fallback_department(),
+            ..config_with(base.as_str(), "/users/{username}")
+        };
+        let pip = HttpPip::new(config).unwrap();
+        let subject = PipSubject::from_uuid(uuid::Uuid::new_v4()).with_username("ghost");
+
+        let result = pip.retrieve_attributes(&subject).await;
+        assert!(!result.fallback_used());
+        assert!(result.attributes().is_none());
+        assert!(matches!(result, PipResult::Ignored(PipFailure::Subject(_))));
+
+        // Nor when the source rate limits or times out the request: a user can cause
+        // that, e.g. by flooding requests.
+        for _ in 0..2 {
+            let result = pip.retrieve_attributes(&subject).await;
+            assert!(!result.fallback_used());
+            assert!(matches!(result, PipResult::Ignored(PipFailure::Subject(_))));
+        }
+        server.join().unwrap();
+
+        // Nor when the query can not be built for the subject (no username).
+        let subject = PipSubject::from_uuid(uuid::Uuid::new_v4());
+        let result = pip.retrieve_attributes(&subject).await;
+        assert!(matches!(result, PipResult::Ignored(PipFailure::Subject(_))));
     }
 
     #[tokio::test]

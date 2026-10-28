@@ -3,7 +3,7 @@
 //! and this provides the set of `Limits` to confine how many resources that the
 //! identity may consume during operations to prevent denial-of-service.
 
-use crate::{be::Limits, prelude::*, value::Session};
+use crate::{be::Limits, idm::pip::prefetch::PipPrefetchedAttributes, prelude::*, value::Session};
 use kubidm_proto::internal::{ApiTokenPurpose, UatPurpose};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, hash::Hash, net::IpAddr, sync::Arc};
@@ -146,6 +146,10 @@ pub struct Identity {
     pub(crate) scope: AccessScope,
     limits: Limits,
     last_verified_at: Option<OffsetDateTime>,
+    /// Kubidm: the PIP attributes prefetched for this request's subject, read by
+    /// `acp_receiver_pip_condition`. `None` when nothing was prefetched, in which case
+    /// no PIP condition matches.
+    pip_attributes: Option<Arc<PipPrefetchedAttributes>>,
 }
 
 impl std::fmt::Display for Identity {
@@ -184,6 +188,7 @@ impl Identity {
             scope,
             limits,
             last_verified_at,
+            pip_attributes: None,
         }
     }
 
@@ -215,6 +220,7 @@ impl Identity {
             scope: AccessScope::ReadWrite,
             limits: Limits::unlimited(),
             last_verified_at: None,
+            pip_attributes: None,
         }
     }
 
@@ -226,6 +232,7 @@ impl Identity {
             scope: AccessScope::ReadOnly,
             limits: Limits::unlimited(),
             last_verified_at: None,
+            pip_attributes: None,
         }
     }
 
@@ -237,6 +244,7 @@ impl Identity {
             scope: AccessScope::ReadWrite,
             limits: Limits::unlimited(),
             last_verified_at: None,
+            pip_attributes: None,
         }
     }
 
@@ -248,6 +256,7 @@ impl Identity {
             scope: AccessScope::ReadWrite,
             limits: Limits::unlimited(),
             last_verified_at: None,
+            pip_attributes: None,
         }
     }
 
@@ -262,6 +271,7 @@ impl Identity {
             scope: AccessScope::ReadOnly,
             limits: Limits::unlimited(),
             last_verified_at: None,
+            pip_attributes: None,
         }
     }
 
@@ -275,7 +285,39 @@ impl Identity {
             scope: AccessScope::ReadWrite,
             limits: Limits::unlimited(),
             last_verified_at: None,
+            pip_attributes: None,
         }
+    }
+
+    /// Kubidm: attach the PIP attributes prefetched for this request. They are only
+    /// kept when they were fetched for this identity's own entry, so attributes of a
+    /// different subject (or attached to an internal identity) can never satisfy a PIP
+    /// condition.
+    pub(crate) fn with_pip_attributes(
+        mut self,
+        pip_attributes: Option<Arc<PipPrefetchedAttributes>>,
+    ) -> Self {
+        self.pip_attributes = match (&self.origin, pip_attributes) {
+            (IdentType::User(u), Some(attrs)) if attrs.subject() == u.entry.get_uuid() => {
+                Some(attrs)
+            }
+            (_, Some(attrs)) => {
+                security_info!(
+                    subject = %attrs.subject(),
+                    ident = %self.get_uuid(),
+                    "Discarding PIP attributes prefetched for a different subject"
+                );
+                None
+            }
+            (_, None) => None,
+        };
+        self
+    }
+
+    /// Kubidm: the PIP attributes prefetched for this request, see
+    /// `with_pip_attributes`.
+    pub fn pip_attributes(&self) -> Option<&PipPrefetchedAttributes> {
+        self.pip_attributes.as_deref()
     }
 
     pub fn access_scope(&self) -> AccessScope {

@@ -881,6 +881,7 @@ impl Account {
                     return Ok(Some(LdapBoundToken {
                         spn: self.spn.clone(),
                         session_id,
+                        pip_attributes: None,
                         effective_session: LdapSession::ApplicationPasswordBind(
                             application.uuid,
                             self.uuid,

@@ -25,6 +25,7 @@ use crate::{
             Oauth2ResourceServersWriteTransaction,
         },
         oauth2_client::OAuth2ClientProvider,
+        pip::prefetch::PipPrefetchRequest,
         radius::RadiusAccount,
         scim::SyncAccount,
         serviceaccount::ServiceAccount,
@@ -439,42 +440,46 @@ pub trait IdmServerTransaction<'a> {
             bearer_token,
             basic_authz: _,
             pre_validated_token,
+            pip_attributes,
         } = client_auth_info;
 
         // If there is a pre-validated UAT, use that. This pre-validation is an "optimisation"
         // for the web-ui where operations will make a number of api calls, and we don't
         // want to do redundant work.
-        match pre_validated_token {
-            PreValidatedTokenStatus::Valid(uat) => {
-                return self.process_uat_to_identity(&uat, ct, source)
-            }
-            PreValidatedTokenStatus::SessionExpired => return Err(OperationError::SessionExpired),
+        let ident = match pre_validated_token {
+            PreValidatedTokenStatus::Valid(uat) => self.process_uat_to_identity(&uat, ct, source),
+            PreValidatedTokenStatus::SessionExpired => Err(OperationError::SessionExpired),
             PreValidatedTokenStatus::NotAuthenticated | PreValidatedTokenStatus::None => {
-                // Fall through and verify the credential details.
+                // Verify the credential details.
                 //
                 // TODO: Currently pre-validation only applies to UAT, not certificate
                 // or api token flows. These will incorrectly set the pre-validation
                 // to NotAuthenticated. It's a larger refactor to correct that.
-            }
-        }
-
-        match (client_cert, bearer_token) {
-            (Some(client_cert_info), _) => {
-                self.client_certificate_to_identity(&client_cert_info, ct, source)
-            }
-            (None, Some(token)) => {
-                match self.validate_and_parse_token_to_identity_token(&token, ct)? {
-                    Token::UserAuthToken(uat) => self.process_uat_to_identity(&uat, ct, source),
-                    Token::ApiToken(apit, entry) => {
-                        self.process_apit_to_identity(&apit, source, entry, ct)
+                match (client_cert, bearer_token) {
+                    (Some(client_cert_info), _) => {
+                        self.client_certificate_to_identity(&client_cert_info, ct, source)
+                    }
+                    (None, Some(token)) => {
+                        match self.validate_and_parse_token_to_identity_token(&token, ct)? {
+                            Token::UserAuthToken(uat) => {
+                                self.process_uat_to_identity(&uat, ct, source)
+                            }
+                            Token::ApiToken(apit, entry) => {
+                                self.process_apit_to_identity(&apit, source, entry, ct)
+                            }
+                        }
+                    }
+                    (None, None) => {
+                        debug!("No client certificate or bearer tokens were supplied");
+                        Err(OperationError::NotAuthenticated)
                     }
                 }
             }
-            (None, None) => {
-                debug!("No client certificate or bearer tokens were supplied");
-                Err(OperationError::NotAuthenticated)
-            }
-        }
+        }?;
+
+        // Kubidm: the PIP attributes prefetched for this request (if any), only kept when
+        // they were fetched for this identity.
+        Ok(ident.with_pip_attributes(pip_attributes))
     }
 
     /// This function will pre-validate the credentials provided and update the
@@ -1613,6 +1618,7 @@ impl IdmServerAuthTransaction<'_> {
             Ok(Some(LdapBoundToken {
                 session_id,
                 spn: account.spn().into(),
+                pip_attributes: None,
                 effective_session: LdapSession::UnixBind(UUID_ANONYMOUS),
             }))
         } else {
@@ -1638,6 +1644,7 @@ impl IdmServerAuthTransaction<'_> {
                     Ok(Some(LdapBoundToken {
                         spn: account.spn().into(),
                         session_id,
+                        pip_attributes: None,
                         effective_session: LdapSession::UnixBind(account.uuid),
                     }))
                 }
@@ -1657,6 +1664,7 @@ impl IdmServerAuthTransaction<'_> {
                 Ok(Some(LdapBoundToken {
                     session_id: uat.session_id,
                     spn,
+                    pip_attributes: None,
                     effective_session: LdapSession::UserAuthToken(uat),
                 }))
             }
@@ -1668,6 +1676,7 @@ impl IdmServerAuthTransaction<'_> {
                 Ok(Some(LdapBoundToken {
                     session_id: apit.token_id,
                     spn,
+                    pip_attributes: None,
                     effective_session: LdapSession::ApiToken(apit),
                 }))
             }
@@ -1795,6 +1804,62 @@ impl IdmServerProxyReadTransaction<'_> {
             })?;
 
         account.to_credentialstatus()
+    }
+
+    /// Kubidm: what to prefetch from the PIP for the subject of `client_auth_info`, see
+    /// [crate::idm::pip::prefetch].
+    ///
+    /// `None` when no loaded access control profile references a PIP attribute (checked
+    /// first, so this is cheap when PIP conditions are not used), when the credentials
+    /// do not validate (the request fails later anyway), or when the identity can not
+    /// have PIP attributes.
+    pub fn pip_prefetch_request(
+        &mut self,
+        client_auth_info: &ClientAuthInfo,
+        ct: Duration,
+    ) -> Option<PipPrefetchRequest> {
+        if self
+            .qs_read
+            .get_accesscontrols()
+            .get_pip_referenced_attributes()
+            .is_empty()
+        {
+            return None;
+        }
+        let ident = self
+            .validate_client_auth_info_to_ident(client_auth_info.clone(), ct)
+            .ok()?;
+        self.pip_prefetch_request_for(&ident)
+    }
+
+    /// Kubidm: as [Self::pip_prefetch_request], for an LDAP bound session.
+    pub fn pip_prefetch_request_ldap(
+        &mut self,
+        uat: &LdapBoundToken,
+        source: Source,
+        ct: Duration,
+    ) -> Option<PipPrefetchRequest> {
+        if self
+            .qs_read
+            .get_accesscontrols()
+            .get_pip_referenced_attributes()
+            .is_empty()
+        {
+            return None;
+        }
+        let ident = self
+            .validate_ldap_session(&uat.effective_session, source, ct)
+            .ok()?;
+        self.pip_prefetch_request_for(&ident)
+    }
+
+    fn pip_prefetch_request_for(&self, ident: &Identity) -> Option<PipPrefetchRequest> {
+        PipPrefetchRequest::for_identity(
+            ident,
+            self.qs_read
+                .get_accesscontrols()
+                .get_pip_referenced_attributes(),
+        )
     }
 }
 

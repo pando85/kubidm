@@ -1,5 +1,6 @@
+use crate::idm::pip::PipAttributeName;
 use crate::prelude::*;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::filter::{Filter, FilterValid, FilterValidResolved};
 
@@ -80,6 +81,7 @@ impl AccessControlSearch {
                 require_reauth: false,
                 time_restriction_start: None,
                 time_restriction_end: None,
+                pip_condition: None,
             },
             attrs,
         }
@@ -113,6 +115,7 @@ impl AccessControlSearch {
                 require_reauth: false,
                 time_restriction_start,
                 time_restriction_end,
+                pip_condition: None,
             },
             attrs,
         }
@@ -152,6 +155,7 @@ impl AccessControlSearch {
                 require_reauth: false,
                 time_restriction_start: None,
                 time_restriction_end: None,
+                pip_condition: None,
             },
             attrs: attrs.split_whitespace().map(Attribute::from).collect(),
         }
@@ -205,6 +209,7 @@ impl AccessControlDelete {
                 require_reauth: false,
                 time_restriction_start: None,
                 time_restriction_end: None,
+                pip_condition: None,
             },
         }
     }
@@ -222,6 +227,7 @@ impl AccessControlDelete {
                 require_reauth: false,
                 time_restriction_start: None,
                 time_restriction_end: None,
+                pip_condition: None,
             },
         }
     }
@@ -309,6 +315,7 @@ impl AccessControlCreate {
                 require_reauth: false,
                 time_restriction_start: None,
                 time_restriction_end: None,
+                pip_condition: None,
             },
             classes: classes.split_whitespace().map(AttrString::from).collect(),
             attrs: attrs.split_whitespace().map(Attribute::from).collect(),
@@ -334,6 +341,7 @@ impl AccessControlCreate {
                 require_reauth: false,
                 time_restriction_start: None,
                 time_restriction_end: None,
+                pip_condition: None,
             },
             classes: classes.split_whitespace().map(AttrString::from).collect(),
             attrs: attrs.split_whitespace().map(Attribute::from).collect(),
@@ -425,6 +433,7 @@ impl AccessControlModify {
                 require_reauth: false,
                 time_restriction_start: None,
                 time_restriction_end: None,
+                pip_condition: None,
             },
             pres_classes: pres_classes
                 .split_whitespace()
@@ -460,6 +469,7 @@ impl AccessControlModify {
                 require_reauth: false,
                 time_restriction_start: None,
                 time_restriction_end: None,
+                pip_condition: None,
             },
             pres_classes: pres_classes
                 .split_whitespace()
@@ -526,6 +536,8 @@ pub struct AccessControlProfile {
     pub require_reauth: bool,
     pub time_restriction_start: Option<time::OffsetDateTime>,
     pub time_restriction_end: Option<time::OffsetDateTime>,
+    /// Kubidm: the receiver must also satisfy this PIP condition, see [AcpPipCondition].
+    pub pip_condition: Option<AcpPipCondition>,
 }
 
 impl AccessControlProfile {
@@ -754,6 +766,28 @@ impl AccessControlProfile {
         let time_restriction_start = restriction_utc(Attribute::AcpTimeRestrictionStart)?;
         let time_restriction_end = restriction_utc(Attribute::AcpTimeRestrictionEnd)?;
 
+        // Kubidm: a malformed condition is an error rather than ignored, which would
+        // widen the access to every receiver.
+        let pip_condition = match value.get_ava_set(Attribute::AcpReceiverPipCondition) {
+            Some(vs) => {
+                let terms = vs.as_iutf8_iter().ok_or_else(|| {
+                    admin_error!(?name, "{} is not iutf8", Attribute::AcpReceiverPipCondition);
+                    OperationError::InvalidAcpState(format!(
+                        "{} is not iutf8",
+                        Attribute::AcpReceiverPipCondition
+                    ))
+                })?;
+                Some(AcpPipCondition::parse(terms).map_err(|err| {
+                    admin_error!(?name, %err, "Invalid {}", Attribute::AcpReceiverPipCondition);
+                    OperationError::InvalidAcpState(format!(
+                        "Invalid {}: {err}",
+                        Attribute::AcpReceiverPipCondition
+                    ))
+                })?)
+            }
+            None => None,
+        };
+
         Ok(AccessControlProfile {
             name,
             uuid,
@@ -762,6 +796,95 @@ impl AccessControlProfile {
             require_reauth,
             time_restriction_start,
             time_restriction_end,
+            pip_condition,
+        })
+    }
+}
+
+/// Kubidm: a Policy Information Point condition on the receiver of an access control
+/// profile, from `acp_receiver_pip_condition`.
+///
+/// Each value is `pip:<source>:<attribute>=<value>`, and every value must hold: the
+/// receiver's prefetched PIP attribute `pip:<source>:<attribute>` must contain `<value>`.
+/// Values are compared as strings, and (like the source and attribute names)
+/// case-insensitively: the attribute's syntax stores them lowercased, see
+/// [crate::idm::pip::prefetch::PipPrefetchedAttributes].
+///
+/// It fails closed: an identity without prefetched attributes (PIP not configured,
+/// prefetch failed or timed out, an internal or anonymous identity) or without the
+/// attribute or value never satisfies it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcpPipCondition {
+    /// `pip:<source>:<attribute>` to the values it must all contain, all lowercase.
+    required: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl AcpPipCondition {
+    /// Parse the condition terms. At least one term is required, and every term must
+    /// be well formed. Terms are lowercased.
+    pub fn parse<'a>(terms: impl IntoIterator<Item = &'a str>) -> Result<Self, String> {
+        let mut required: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for term in terms {
+            let (name, value) = Self::parse_term(term)?;
+            required.entry(name).or_default().insert(value);
+        }
+        if required.is_empty() {
+            return Err("at least one condition is required".to_string());
+        }
+        Ok(AcpPipCondition { required })
+    }
+
+    fn parse_term(term: &str) -> Result<(String, String), String> {
+        let term = term.to_lowercase();
+        let term = term.as_str();
+        let malformed = || format!("'{term}' is not of the form pip:<source>:<attribute>=<value>");
+
+        let (name, value) = term.split_once('=').ok_or_else(malformed)?;
+        let (source, attribute) = PipAttributeName::parse(name).ok_or_else(malformed)?;
+
+        let valid_name = |part: &str| {
+            !part.is_empty()
+                && part
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        };
+        if !valid_name(source.as_str()) {
+            return Err(format!(
+                "'{term}': the source must be non-empty and only use ASCII letters, digits, '_', '-' and '.'"
+            ));
+        }
+        if !valid_name(&attribute) {
+            return Err(format!(
+                "'{term}': the attribute must be non-empty and only use ASCII letters, digits, '_', '-' and '.'"
+            ));
+        }
+        if value.is_empty() || value.chars().any(char::is_control) {
+            return Err(format!(
+                "'{term}': the value must be non-empty and must not contain control characters"
+            ));
+        }
+
+        Ok((name.to_string(), value.to_string()))
+    }
+
+    /// The `pip:<source>:<attribute>` names this condition reads.
+    pub fn attribute_names(&self) -> impl Iterator<Item = &String> {
+        self.required.keys()
+    }
+
+    /// Does `ident` satisfy this condition, from its prefetched PIP attributes?
+    pub fn is_satisfied_by(&self, ident: &Identity) -> bool {
+        let Some(attributes) = ident.pip_attributes() else {
+            return false;
+        };
+        // Defence in depth: attributes are only attached to their own subject.
+        if attributes.subject() != ident.get_uuid() {
+            return false;
+        }
+        self.required.iter().all(|(name, values)| {
+            attributes
+                .values(name)
+                .is_some_and(|have| values.is_subset(have))
         })
     }
 }

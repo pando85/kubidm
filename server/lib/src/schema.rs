@@ -744,7 +744,8 @@ pub trait SchemaTransaction {
 }
 
 /// Kubidm fork-only schema attributes: delegation, step-up reauth, ACP time
-/// restrictions, time-bounded grants, OAuth2 federation and approval workflows.
+/// restrictions, ACP PIP conditions, time-bounded grants, OAuth2 federation and
+/// approval workflows.
 ///
 /// From DL 1.11 the schema lives only in memory and `update_attributes` clears the
 /// attribute map before loading, so anything the fork needs must be returned here.
@@ -888,6 +889,22 @@ pub(crate) fn kubidm_schema_attributes() -> Vec<SchemaAttribute> {
             syntax: SyntaxType::DateTime,
         },
         SchemaAttribute {
+            name: Attribute::AcpReceiverPipCondition,
+            uuid: UUID_SCHEMA_ATTR_ACP_RECEIVER_PIP_CONDITION,
+            description: String::from(
+                "Policy Information Point conditions (pip:<source>:<attribute>=<value>) that the receiver's external attributes must all satisfy.",
+            ),
+            multivalue: true,
+            unique: false,
+            phantom: false,
+            sync_allowed: false,
+            replicated: Replicated::True,
+            indexed: false,
+            // A syntax is either single or multi valued, and the only multi valued string
+            // syntaxes are case insensitive: conditions are matched case-insensitively.
+            syntax: SyntaxType::Utf8StringInsensitiveN,
+        },
+        SchemaAttribute {
             name: Attribute::AcpScopeFilter,
             uuid: UUID_SCHEMA_ATTR_ACP_SCOPE_FILTER,
             description: String::from(
@@ -984,6 +1001,9 @@ fn kubidm_bootstrap_schema_classes() -> Vec<SchemaClass> {
                 // operation through `check_time_restriction`.
                 Attribute::AcpTimeRestrictionStart,
                 Attribute::AcpTimeRestrictionEnd,
+                // Read by `AccessControlProfile::try_from`, enforced per receiver from
+                // the identity's prefetched PIP attributes.
+                Attribute::AcpReceiverPipCondition,
             ],
             systemmust: vec![Attribute::Name],
             systemsupplements: vec![
@@ -1736,6 +1756,11 @@ mod tests {
         assert!(acp.systemmay.contains(&Attribute::AcpRequireReauth));
         assert!(acp.systemmay.contains(&Attribute::AcpTimeRestrictionStart));
         assert!(acp.systemmay.contains(&Attribute::AcpTimeRestrictionEnd));
+        assert!(acp.systemmay.contains(&Attribute::AcpReceiverPipCondition));
+        assert!(schema_ro
+            .get_attributes()
+            .get(&Attribute::AcpReceiverPipCondition)
+            .is_some_and(|a| a.multivalue && a.syntax == SyntaxType::Utf8StringInsensitiveN));
         assert!(schema_ro
             .get_classes()
             .contains_key(EntryClass::ApprovalPolicy.as_ref()));
