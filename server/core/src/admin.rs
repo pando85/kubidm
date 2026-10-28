@@ -39,8 +39,9 @@ use uuid::Uuid;
 /// start: see [`start_consumer_refresh`].
 const REPL_CTRL_TIMEOUT: Duration = Duration::from_secs(15);
 /// How long the requester of a refresh waits for it once a supplier task has started it.
-/// The refresh is applied locally and finishes regardless, so this only bounds how long the
-/// requester waits to learn the outcome.
+/// A task that has not yet reached its pre-apply check refuses to apply the refresh once the
+/// requester has gone away; past that check the apply finishes regardless, so this only
+/// bounds how long the requester waits to learn the outcome.
 const REFRESH_COMPLETION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// The most bytes of one request the server buffers while it waits for the rest of it.
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
@@ -1103,17 +1104,33 @@ async fn start_consumer_refresh(
             error!("{message}");
             Err(message.to_string())
         }
-        Err(_) => {
-            // Refuse any task that would start it from now on.
-            progress.close();
-            let message = format!(
-                "No replication supplier could start the refresh within {}s, nothing was changed. Please inspect the logs.",
-                start_timeout.as_secs()
-            );
-            error!("{message}");
-            Err(message)
-        }
+        Err(_) => Err(refresh_start_timed_out(progress, start_timeout)),
     }
+}
+
+/// The message for the operator when no task reported the start of the refresh by its start
+/// deadline. Closes `progress`, which refuses any task that would start the refresh from
+/// now on.
+fn refresh_start_timed_out(
+    mut progress: mpsc::Receiver<RefreshProgress>,
+    start_timeout: Duration,
+) -> String {
+    progress.close();
+    // A task may have claimed the refresh and reported its start at the deadline itself,
+    // after the wait ended but before the close. The refresh may then be applied.
+    if let Ok(RefreshProgress::Started { supplier }) = progress.try_recv() {
+        let message = format!(
+            "Refresh from {supplier} started at its deadline, its outcome is unknown. Check the server logs or `kubidmd domain show`."
+        );
+        warn!("{message}");
+        return message;
+    }
+    let message = format!(
+        "No replication supplier could start the refresh within {}s, nothing was changed. Please inspect the logs.",
+        start_timeout.as_secs()
+    );
+    error!("{message}");
+    message
 }
 
 /// Wait for the outcome of a refresh that a supplier task has started. The refresh is
@@ -1960,6 +1977,32 @@ mod maintenance_protocol_tests {
             .await
             .is_none());
         assert!(claim_refresh(&coord, None, "repl://b:8444").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn refresh_started_at_its_deadline_has_an_unknown_outcome() {
+        // A task reported its start after the requester's wait ended, before it closed.
+        let (tx, rx) = mpsc::channel(1);
+        let started = RefreshProgress::Started {
+            supplier: "repl://b:8444".to_string(),
+        };
+        assert!(tx.send(started).await.is_ok());
+        let message = refresh_start_timed_out(rx, Duration::from_secs(15));
+        assert!(
+            message.contains("repl://b:8444")
+                && message.contains("outcome is unknown")
+                && message.contains("domain show")
+                && !message.contains("nothing was changed"),
+            "{message}"
+        );
+        // The channel is closed: no other task starts it now.
+        assert!(tx.is_closed());
+
+        // No start reported: nothing was changed.
+        let (tx, rx) = mpsc::channel::<RefreshProgress>(1);
+        let message = refresh_start_timed_out(rx, Duration::from_secs(15));
+        assert!(message.contains("nothing was changed"), "{message}");
+        assert!(tx.is_closed());
     }
 
     #[tokio::test]

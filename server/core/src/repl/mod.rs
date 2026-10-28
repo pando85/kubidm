@@ -555,14 +555,17 @@ async fn repl_run_consumer_refresh_inner(
         }
     };
 
-    // The requester may have given up between the claim and reading the report that the
-    // refresh started (it reached its start deadline first). It then closed its receiver
-    // and told the operator that the refresh did not start, so do not replace the content
-    // of this node behind its back. A requester that read the report keeps its receiver
-    // until the refresh is done, as does the requester of an automatic refresh.
+    // A task that has not yet reached this check refuses to apply the refresh if its
+    // requester has gone away: the requester may have given up between the claim and reading
+    // the report that the refresh started (it reached its start deadline first). It then
+    // closed its receiver and told the operator that the refresh did not start, so do not
+    // replace the content of this node behind its back. Once past this check the apply
+    // finishes, whatever the requester does afterwards. A requester that read the report
+    // keeps its receiver until the refresh is done, as does the requester of an automatic
+    // refresh. The refresh did not run, which is not a failure of this supplier.
     if refresh_coord_guard.1.is_closed() {
         warn!("Refresh was abandoned by its requester before it could be applied, not refreshing.");
-        return Err(());
+        return Ok(None);
     }
 
     // Now apply the refresh if possible

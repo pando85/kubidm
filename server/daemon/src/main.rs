@@ -115,8 +115,27 @@ const REFRESH_FROM_ANSWER_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// What the operator is told when the server did not answer within
 /// [`REFRESH_FROM_ANSWER_TIMEOUT`].
-const REFRESH_FROM_NO_ANSWER: &str = "The server did not answer: it may be older than this \
-     kubidmd and not support --from. Check the server version and its logs.";
+const REFRESH_FROM_NO_ANSWER: &str = "No answer within 45s: the server may be older than this \
+     kubidmd (no --from support) or overloaded. Check its logs before retrying.";
+
+/// What the operator is told when a refresh request got a generic error: the refresh may have
+/// been applied all the same.
+const REFRESH_NOT_CONFIRMED: &str = "The refresh did not confirm success; it may still have \
+     been applied. Check the server logs or `kubidmd domain show`.";
+
+/// What the operator is told when the server closed the connection after it acknowledged the
+/// start of a refresh.
+const REFRESH_CONNECTION_CLOSED: &str = "the refresh started but its outcome is unknown \
+     (connection closed); check the server logs or `kubidmd domain show`";
+
+/// Whether `req` asks the server to refresh this node from a supplier.
+fn is_refresh_request(req: &AdminTaskRequest) -> bool {
+    matches!(
+        req,
+        AdminTaskRequest::RefreshReplicationConsumer
+            | AdminTaskRequest::RefreshReplicationConsumerFrom { .. }
+    )
+}
 
 /// How long to wait for the first answer to `req`, when it is bounded at all.
 fn first_answer_timeout(req: &AdminTaskRequest) -> Option<Duration> {
@@ -137,7 +156,12 @@ async fn read_admin_response(
     match timeout(first_answer_timeout, reqs.next()).await? {
         Some(Ok(AdminTaskResponse::RefreshStarted { supplier })) => {
             info!("Refresh started from {supplier}, waiting for it to complete ...");
-            Ok(reqs.next().await)
+            // The server closing the connection now leaves the outcome unknown.
+            Ok(reqs.next().await.or_else(|| {
+                Some(Ok(AdminTaskResponse::ErrorMessage {
+                    message: REFRESH_CONNECTION_CLOSED.to_string(),
+                }))
+            }))
         }
         response => Ok(response),
     }
@@ -156,6 +180,7 @@ async fn submit_admin_req_json(path: &str, req: AdminTaskRequest) -> ExitCode {
 
     let mut reqs = Framed::new(stream, ClientCodec);
     let answer_timeout = first_answer_timeout(&req);
+    let is_refresh = is_refresh_request(&req);
 
     if let Err(err) = reqs.send(req).await {
         display_json_error(err, "Unable to connect to send request.");
@@ -182,9 +207,19 @@ async fn submit_admin_req_json(path: &str, req: AdminTaskRequest) -> ExitCode {
             display_json_success();
         }
         Some(Ok(AdminTaskResponse::Error)) => {
+            let message = if is_refresh {
+                REFRESH_NOT_CONFIRMED
+            } else {
+                "Error processing request - you should inspect the server logs."
+            };
+            display_json_error("ResponseError", message);
+            return ExitCode::FAILURE;
+        }
+        // Only ever the first answer to a refresh, which `read_admin_response` reads.
+        Some(Ok(AdminTaskResponse::RefreshStarted { supplier })) => {
             display_json_error(
-                "ResponseError",
-                "Error processing request - you should inspect the server logs.",
+                "UnexpectedResponse",
+                format!("Unexpected refresh started response from {supplier}: the outcome of the refresh is unknown. Check the server logs or `kubidmd domain show`."),
             );
             return ExitCode::FAILURE;
         }
@@ -221,6 +256,7 @@ async fn submit_admin_req_human(path: &str, req: AdminTaskRequest) -> ExitCode {
 
     let mut reqs = Framed::new(stream, ClientCodec);
     let answer_timeout = first_answer_timeout(&req);
+    let is_refresh = is_refresh_request(&req);
 
     if let Err(e) = reqs.send(req).await {
         error!(err = ?e, "Unable to send request");
@@ -368,12 +404,16 @@ async fn submit_admin_req_human(path: &str, req: AdminTaskRequest) -> ExitCode {
         }
         // Only ever the first answer to a refresh, which `read_admin_response` reads.
         Some(Ok(AdminTaskResponse::RefreshStarted { .. })) => {
-            error!("Unexpected refresh started response");
+            error!("Unexpected refresh started response: the outcome of the refresh is unknown. Check the server logs or `kubidmd domain show`.");
             return ExitCode::FAILURE;
         }
         Some(Ok(AdminTaskResponse::Success)) => info!("success"),
         Some(Ok(AdminTaskResponse::Error)) => {
-            info!("Error - you should inspect the logs.");
+            if is_refresh {
+                error!("{REFRESH_NOT_CONFIRMED}");
+            } else {
+                info!("Error - you should inspect the logs.");
+            }
             return ExitCode::FAILURE;
         }
         Some(Ok(AdminTaskResponse::ErrorMessage { message })) => {
@@ -1851,6 +1891,20 @@ mod tests {
             Ok(Some(Ok(AdminTaskResponse::Success)))
         ));
         assert!(server.await.is_ok());
+
+        // A server that closes the connection after it acknowledged the start: the outcome
+        // is unknown, not a socket error.
+        let (client_sock, mut server_sock) = UnixStream::pair().expect("socket pair");
+        let mut client = Framed::new(client_sock, ClientCodec);
+        server_sock
+            .write_all(br#"{"RefreshStarted":{"supplier":"repl://pod-1.example.com:8444"}}"#)
+            .await
+            .expect("write");
+        drop(server_sock);
+        assert!(matches!(
+            read_admin_response(&mut client, Some(Duration::from_millis(50))).await,
+            Ok(Some(Ok(AdminTaskResponse::ErrorMessage { ref message }))) if message.contains("outcome is unknown")
+        ));
 
         // Or refuses it at once.
         let (client_sock, mut server_sock) = UnixStream::pair().expect("socket pair");
