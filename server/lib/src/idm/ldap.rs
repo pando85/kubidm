@@ -9,6 +9,7 @@ use kubidm_proto::{
     constants::*,
     internal::{ApiToken, UserAuthToken},
 };
+use ldap3_proto::proto::{LdapOp, LdapResult};
 use ldap3_proto::simple::*;
 use regex::{Regex, RegexBuilder};
 use std::net::IpAddr;
@@ -728,6 +729,21 @@ impl LdapServer {
                     wr.gen_operror(format!("Unbound Connection {eventid}").as_str()),
                 )),
             },
+            ServerOps::Abandon { .. } => {
+                // Abandon operations don't require a response per RFC 4511.
+                // The server should stop processing the referenced operation.
+                // For now, we just acknowledge and continue.
+                Ok(LdapResponseState::Respond(LdapMsg {
+                    msgid: 0,
+                    op: LdapOp::SearchResultDone(LdapResult {
+                        code: LdapResultCode::Success,
+                        matcheddn: "".to_string(),
+                        message: "".to_string(),
+                        referral: vec![],
+                    }),
+                    ctrl: vec![],
+                }))
+            }
         } // end match server op
     }
 

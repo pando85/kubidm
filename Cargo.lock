@@ -4474,7 +4474,7 @@ dependencies = [
  "kubidm_utils_users",
  "kubidmd_lib",
  "ldap3_client",
- "ldap3_proto 0.8.1",
+ "ldap3_proto",
  "rustls",
  "serde",
  "serde_json",
@@ -4686,7 +4686,7 @@ dependencies = [
  "kubidm_proto",
  "kubidm_utils_users",
  "kubidmd_lib",
- "ldap3_proto 0.8.1",
+ "ldap3_proto",
  "libc",
  "opentelemetry",
  "qrcode",
@@ -4747,7 +4747,7 @@ dependencies = [
  "kubidm_proto",
  "kubidmd_lib_macros",
  "ldap3_client",
- "ldap3_proto 0.8.1",
+ "ldap3_proto",
  "lodepng",
  "nonempty",
  "num_enum",
@@ -4856,7 +4856,7 @@ checksum = "7a04fdb6f2b263c0fb6613a2f3ce20ad354ff8b1c5c451a6491848d44054d1e5"
 dependencies = [
  "base64 0.22.1",
  "futures-util",
- "ldap3_proto 0.9.0",
+ "ldap3_proto",
  "rustls-platform-verifier 0.6.2",
  "serde",
  "serde_with",
@@ -4866,16 +4866,6 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
-]
-
-[[package]]
-name = "ldap3_lber"
-version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf85b08fb467260c0f8f305b30e819cf3e9584f0f50f2879fbec9bc58f639504"
-dependencies = [
- "bytes",
- "nom 7.1.3",
 ]
 
 [[package]]
@@ -4890,31 +4880,13 @@ dependencies = [
 
 [[package]]
 name = "ldap3_proto"
-version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "105256b138a7ed84ac1ae375870eae23be5f8fed16ca172ae5f1c1aa37bd4242"
-dependencies = [
- "base64 0.22.1",
- "bytes",
- "ldap3_lber 0.8.1",
- "nom 7.1.3",
- "peg",
- "serde",
- "thiserror 2.0.20",
- "tokio-util",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "ldap3_proto"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c6ad762d9cf62b815ed8022a088c78733f7b25059ee76fe8cd0de8df609ebd6"
 dependencies = [
  "base64 0.22.1",
  "bytes",
- "ldap3_lber 0.9.0",
+ "ldap3_lber",
  "nom 7.1.3",
  "peg",
  "serde",
