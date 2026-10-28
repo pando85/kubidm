@@ -24,6 +24,6 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Validate brand references and assets
         run: python3 scripts/check-brand-assets.py
