@@ -140,7 +140,7 @@ pub(crate) async fn oauth2_federation_id_patch(
     path = "/v1/federation/oauth2/{name}",
     responses(
         DefaultApiResponse,
-        (status = 404, description = "No such identity provider"),
+        (status = 404, description = "The OAuth2 federation identity provider does not exist"),
     ),
     security(("token_jwt" = [])),
     tag = "oauth2_federation",
