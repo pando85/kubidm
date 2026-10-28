@@ -2569,9 +2569,81 @@ impl<'a> QueryServerWriteTransaction<'a> {
             .update_sync_agreements(sync_agreement_map);
 
         // Update search
+        let search_acps = self.reload_acp_kind(
+            EntryClass::AccessControlSearch,
+            AccessControlSearch::try_from,
+        )?;
+        self.accesscontrols
+            .update_search(search_acps)
+            .map_err(|e| {
+                admin_error!(err = ?e, "Failed to update search accesscontrols");
+                e
+            })?;
+
+        // Update create
+        let create_acps = self.reload_acp_kind(
+            EntryClass::AccessControlCreate,
+            AccessControlCreate::try_from,
+        )?;
+        self.accesscontrols
+            .update_create(create_acps)
+            .map_err(|e| {
+                admin_error!(err = ?e, "Failed to update create accesscontrols");
+                e
+            })?;
+
+        // Update modify
+        let modify_acps = self.reload_acp_kind(
+            EntryClass::AccessControlModify,
+            AccessControlModify::try_from,
+        )?;
+        self.accesscontrols
+            .update_modify(modify_acps)
+            .map_err(|e| {
+                admin_error!("Failed to update modify accesscontrols {:?}", e);
+                e
+            })?;
+
+        // Update delete
+        let delete_acps = self.reload_acp_kind(
+            EntryClass::AccessControlDelete,
+            AccessControlDelete::try_from,
+        )?;
+        self.accesscontrols.update_delete(delete_acps).map_err(|e| {
+            admin_error!("Failed to update delete accesscontrols {:?}", e);
+            e
+        })
+    }
+
+    /// Kubidm: is an access control profile that was changed in this transaction and
+    /// fails to parse an error (rejecting the change), rather than skipped?
+    ///
+    /// Only while running and applying local changes. During start up (the server phase
+    /// is not yet `Running`) and while applying replicated changes, every invalid profile
+    /// is skipped: the content was already accepted (by an older version, or by the
+    /// supplier), and failing here would stop the server from starting or block
+    /// replication. A refresh also marks every entry as changed.
+    fn acp_reload_is_strict(&self) -> bool {
+        !self.replication_apply && *self.phase >= ServerPhase::Running
+    }
+
+    /// Kubidm: search and parse the enabled access control profiles of one kind.
+    ///
+    /// Parsing fails closed per profile: access control profiles only ever grant, so a
+    /// profile that is skipped grants nothing. A profile changed in this transaction that
+    /// is invalid fails the reload when [Self::acp_reload_is_strict], so the offending
+    /// change is rejected with a clear error (this includes changes made by referential
+    /// integrity, such as deleting a delegated scope group). Any other invalid profile is
+    /// logged and skipped, so a stored profile that the current parser rejects never
+    /// blocks unrelated writes, start up or replication.
+    fn reload_acp_kind<T>(
+        &mut self,
+        kind: EntryClass,
+        parse: impl Fn(&mut Self, &EntrySealedCommitted) -> Result<T, OperationError>,
+    ) -> Result<Vec<T>, OperationError> {
         let filt = filter!(f_and!([
             f_eq(Attribute::Class, EntryClass::AccessControlProfile.into()),
-            f_eq(Attribute::Class, EntryClass::AccessControlSearch.into()),
+            f_eq(Attribute::Class, kind.into()),
             f_andnot(f_eq(Attribute::AcpEnable, PV_FALSE.clone())),
         ]));
 
@@ -2582,104 +2654,36 @@ impl<'a> QueryServerWriteTransaction<'a> {
             );
             e
         })?;
-        let search_acps: Result<Vec<_>, _> = res
-            .iter()
-            .map(|e| AccessControlSearch::try_from(self, e))
-            .collect();
 
-        let search_acps = search_acps.map_err(|e| {
-            admin_error!(err = ?e, "Unable to parse search accesscontrols");
-            e
-        })?;
+        let strict = self.acp_reload_is_strict();
+        let mut acps = Vec::with_capacity(res.len());
+        for entry in res.iter() {
+            let uuid = entry.get_uuid();
+            match parse(self, entry.as_ref()) {
+                Ok(acp) => acps.push(acp),
+                Err(err) if strict && self.is_changed_uuid(&uuid) => {
+                    error!(
+                        ?err,
+                        ?uuid,
+                        name = ?entry.get_display_id(),
+                        %kind,
+                        "Rejecting a change that leaves this access control profile invalid"
+                    );
+                    return Err(err);
+                }
+                Err(err) => {
+                    error!(
+                        ?err,
+                        ?uuid,
+                        name = ?entry.get_display_id(),
+                        %kind,
+                        "Skipping invalid access control profile, it grants nothing until it is fixed or disabled"
+                    );
+                }
+            }
+        }
 
-        self.accesscontrols
-            .update_search(search_acps)
-            .map_err(|e| {
-                admin_error!(err = ?e, "Failed to update search accesscontrols");
-                e
-            })?;
-        // Update create
-        let filt = filter!(f_and!([
-            f_eq(Attribute::Class, EntryClass::AccessControlProfile.into()),
-            f_eq(Attribute::Class, EntryClass::AccessControlCreate.into()),
-            f_andnot(f_eq(Attribute::AcpEnable, PV_FALSE.clone())),
-        ]));
-
-        let res = self.internal_search(filt).map_err(|e| {
-            admin_error!(
-                err = ?e,
-                "reload accesscontrols internal search failed"
-            );
-            e
-        })?;
-        let create_acps: Result<Vec<_>, _> = res
-            .iter()
-            .map(|e| AccessControlCreate::try_from(self, e))
-            .collect();
-
-        let create_acps = create_acps.map_err(|e| {
-            admin_error!(err = ?e, "Unable to parse create accesscontrols");
-            e
-        })?;
-
-        self.accesscontrols
-            .update_create(create_acps)
-            .map_err(|e| {
-                admin_error!(err = ?e, "Failed to update create accesscontrols");
-                e
-            })?;
-        // Update modify
-        let filt = filter!(f_and!([
-            f_eq(Attribute::Class, EntryClass::AccessControlProfile.into()),
-            f_eq(Attribute::Class, EntryClass::AccessControlModify.into()),
-            f_andnot(f_eq(Attribute::AcpEnable, PV_FALSE.clone())),
-        ]));
-
-        let res = self.internal_search(filt).map_err(|e| {
-            admin_error!("reload accesscontrols internal search failed {:?}", e);
-            e
-        })?;
-        let modify_acps: Result<Vec<_>, _> = res
-            .iter()
-            .map(|e| AccessControlModify::try_from(self, e))
-            .collect();
-
-        let modify_acps = modify_acps.map_err(|e| {
-            admin_error!("Unable to parse modify accesscontrols {:?}", e);
-            e
-        })?;
-
-        self.accesscontrols
-            .update_modify(modify_acps)
-            .map_err(|e| {
-                admin_error!("Failed to update modify accesscontrols {:?}", e);
-                e
-            })?;
-        // Update delete
-        let filt = filter!(f_and!([
-            f_eq(Attribute::Class, EntryClass::AccessControlProfile.into()),
-            f_eq(Attribute::Class, EntryClass::AccessControlDelete.into()),
-            f_andnot(f_eq(Attribute::AcpEnable, PV_FALSE.clone())),
-        ]));
-
-        let res = self.internal_search(filt).map_err(|e| {
-            admin_error!("reload accesscontrols internal search failed {:?}", e);
-            e
-        })?;
-        let delete_acps: Result<Vec<_>, _> = res
-            .iter()
-            .map(|e| AccessControlDelete::try_from(self, e))
-            .collect();
-
-        let delete_acps = delete_acps.map_err(|e| {
-            admin_error!("Unable to parse delete accesscontrols {:?}", e);
-            e
-        })?;
-
-        self.accesscontrols.update_delete(delete_acps).map_err(|e| {
-            admin_error!("Failed to update delete accesscontrols {:?}", e);
-            e
-        })
+        Ok(acps)
     }
 
     #[instrument(level = "debug", skip_all)]

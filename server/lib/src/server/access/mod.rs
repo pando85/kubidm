@@ -4300,71 +4300,191 @@ mod tests {
         entry
     }
 
-    /// Kubidm: delegated profiles are rewritten into the upstream receiver and target
-    /// types at parse time, and rejected when they can not be expressed safely.
+    /// Kubidm: a person entry for the delegated administration tests.
+    fn dg_person(name: &str, uuid: Uuid) -> EntryInitNew {
+        entry_init!(
+            (Attribute::Class, EntryClass::Object.to_value()),
+            (Attribute::Class, EntryClass::Account.to_value()),
+            (Attribute::Class, EntryClass::Person.to_value()),
+            (Attribute::Name, Value::new_iname(name)),
+            (Attribute::DisplayName, Value::new_utf8s(name)),
+            (Attribute::Uuid, Value::Uuid(uuid))
+        )
+    }
+
+    /// Kubidm: a group entry for the delegated administration tests.
+    fn dg_group(name: &str, uuid: Uuid, members: &[Uuid]) -> EntryInitNew {
+        let mut entry = entry_init!(
+            (Attribute::Class, EntryClass::Object.to_value()),
+            (Attribute::Class, EntryClass::Group.to_value()),
+            (Attribute::Name, Value::new_iname(name)),
+            (Attribute::Uuid, Value::Uuid(uuid))
+        );
+        for member in members {
+            entry.add_ava(Attribute::Member, Value::ReferN(*member));
+        }
+        entry
+    }
+
+    /// Kubidm: a read-write identity for the entry `uuid`.
+    fn dg_ident(qs_write: &mut QueryServerWriteTransaction<'_>, uuid: Uuid) -> Identity {
+        let entry = qs_write.internal_search_uuid(uuid).expect("entry");
+        Identity::from_impersonate_entry_readwrite(entry)
+    }
+
+    /// Kubidm: can `ident` replace the displayname of `target`?
+    fn dg_can_modify(
+        qs_write: &mut QueryServerWriteTransaction<'_>,
+        ident: &Identity,
+        target: Uuid,
+    ) -> bool {
+        let filter = filter!(f_eq(Attribute::Uuid, PartialValue::Uuid(target)));
+        let modlist = ModifyList::new_list(vec![
+            Modify::Purged(Attribute::DisplayName),
+            Modify::Present(Attribute::DisplayName, Value::new_utf8s("delegated")),
+        ]);
+        qs_write
+            .impersonate_modify(&filter, &filter, &modlist, ident)
+            .is_ok()
+    }
+
+    /// Kubidm: can `ident` delete `target`?
+    fn dg_can_delete(
+        qs_write: &mut QueryServerWriteTransaction<'_>,
+        ident: &Identity,
+        target: Uuid,
+    ) -> bool {
+        let filter = filter!(f_eq(Attribute::Uuid, PartialValue::Uuid(target)));
+        let de = DeleteEvent::new_impersonate_identity(ident.clone(), filter);
+        qs_write.delete(&de).is_ok()
+    }
+
+    /// Kubidm: the names of the loaded modify profiles.
+    fn dg_loaded_modify(qs_write: &QueryServerWriteTransaction<'_>) -> BTreeSet<String> {
+        qs_write
+            .get_accesscontrols()
+            .get_modify()
+            .iter()
+            .map(|acm| acm.acp.name.clone())
+            .collect()
+    }
+
+    /// Kubidm: the scope filter used by most delegated tests.
+    fn dg_person_filter() -> Value {
+        Value::new_json_filter_s("{\"eq\":[\"class\",\"person\"]}").expect("filter")
+    }
+
+    /// Kubidm: delegated targets are rewritten into upstream scope targets at parse time,
+    /// and every profile that can not be expressed safely is rejected.
     #[qs_test]
     async fn test_access_delegated_acp_parser(qs: &QueryServer) {
         let mut qs_write = qs.write(duration_from_epoch_now()).await.unwrap();
+        let receivers = Uuid::new_v4();
         let group = Uuid::new_v4();
         let filter = || Value::new_json_filter_s("{\"pres\":\"name\"}").expect("filter");
+        let receiver_group = || (Attribute::AcpReceiverGroup, Value::ReferN(receivers));
+        let scope_group = || (Attribute::DelegatedScopeGroup, Value::Refer(group));
 
-        // A delegated receiver needs the scope group, a filter alone is not enough.
-        acp_from_entry_err!(
-            &mut qs_write,
-            delegated_acp_entry(
-                "acp_delegated_no_group",
-                EntryClass::AccessControlReceiverDelegated,
-                EntryClass::AccessControlTargetScope,
-                vec![
-                    (Attribute::DelegatedScopeFilter, filter()),
-                    (
-                        Attribute::AcpTargetScope,
-                        Value::new_json_filter_s("{\"pres\":\"name\"}").expect("filter")
-                    ),
-                ]
-            ),
-            AccessControlProfile
-        );
+        // Receiving through the delegated scope is unsupported in every form, so the
+        // scope group is never both the administrators and the administered.
+        for extra in [
+            vec![scope_group()],
+            vec![scope_group(), (Attribute::DelegatedScopeFilter, filter())],
+            vec![(Attribute::DelegatedScopeFilter, filter())],
+            vec![
+                scope_group(),
+                (
+                    Attribute::AcpReceiverDelegated,
+                    Value::Refer(Uuid::new_v4()),
+                ),
+            ],
+        ] {
+            acp_from_entry_err!(
+                &mut qs_write,
+                delegated_acp_entry(
+                    "acp_delegated_receiver",
+                    EntryClass::AccessControlReceiverDelegated,
+                    EntryClass::AccessControlTargetDelegatedScope,
+                    extra
+                ),
+                AccessControlProfile
+            );
+        }
 
-        // A delegated target needs a scope group or filter.
-        acp_from_entry_err!(
-            &mut qs_write,
-            delegated_acp_entry(
-                "acp_delegated_no_scope",
-                EntryClass::AccessControlReceiverGroup,
-                EntryClass::AccessControlTargetDelegatedScope,
-                vec![(Attribute::AcpReceiverGroup, Value::ReferN(group))]
-            ),
-            AccessControlProfile
+        // A delegated receiver class next to a group receiver is rejected, not ignored.
+        let mut entry = delegated_acp_entry(
+            "acp_delegated_receiver_and_group",
+            EntryClass::AccessControlReceiverGroup,
+            EntryClass::AccessControlTargetDelegatedScope,
+            vec![receiver_group(), scope_group()],
         );
+        entry.add_ava(
+            Attribute::Class,
+            EntryClass::AccessControlReceiverDelegated.to_value(),
+        );
+        acp_from_entry_err!(&mut qs_write, entry, AccessControlProfile);
 
-        // Receiving through a delegated role is unsupported.
-        acp_from_entry_err!(
-            &mut qs_write,
-            delegated_acp_entry(
-                "acp_delegated_role",
-                EntryClass::AccessControlReceiverDelegated,
-                EntryClass::AccessControlTargetDelegatedScope,
-                vec![
-                    (Attribute::DelegatedScopeGroup, Value::Refer(group)),
-                    (
-                        Attribute::AcpReceiverDelegated,
-                        Value::Refer(Uuid::new_v4())
-                    ),
-                ]
-            ),
-            AccessControlProfile
+        // Conflicting receiver kinds.
+        let mut entry = delegated_acp_entry(
+            "acp_group_and_entry_manager",
+            EntryClass::AccessControlReceiverGroup,
+            EntryClass::AccessControlTargetScope,
+            vec![receiver_group(), (Attribute::AcpTargetScope, filter())],
         );
+        entry.add_ava(
+            Attribute::Class,
+            EntryClass::AccessControlReceiverEntryManager.to_value(),
+        );
+        acp_from_entry_err!(&mut qs_write, entry, AccessControlProfile);
+
+        // Conflicting target kinds.
+        let mut entry = delegated_acp_entry(
+            "acp_scope_and_delegated_scope",
+            EntryClass::AccessControlReceiverGroup,
+            EntryClass::AccessControlTargetDelegatedScope,
+            vec![
+                receiver_group(),
+                scope_group(),
+                (Attribute::AcpTargetScope, filter()),
+            ],
+        );
+        entry.add_ava(
+            Attribute::Class,
+            EntryClass::AccessControlTargetScope.to_value(),
+        );
+        acp_from_entry_err!(&mut qs_write, entry, AccessControlProfile);
+
+        // A delegated target requires the scope group: a filter alone (for example after
+        // the scope group was deleted) or nothing at all is rejected.
+        for extra in [
+            vec![
+                receiver_group(),
+                (Attribute::DelegatedScopeFilter, filter()),
+            ],
+            vec![receiver_group()],
+        ] {
+            acp_from_entry_err!(
+                &mut qs_write,
+                delegated_acp_entry(
+                    "acp_delegated_no_group",
+                    EntryClass::AccessControlReceiverGroup,
+                    EntryClass::AccessControlTargetDelegatedScope,
+                    extra
+                ),
+                AccessControlProfile
+            );
+        }
 
         // A scope filter that is not valid for the schema is rejected.
         acp_from_entry_err!(
             &mut qs_write,
             delegated_acp_entry(
                 "acp_delegated_bad_filter",
-                EntryClass::AccessControlReceiverDelegated,
+                EntryClass::AccessControlReceiverGroup,
                 EntryClass::AccessControlTargetDelegatedScope,
                 vec![
-                    (Attribute::DelegatedScopeGroup, Value::Refer(group)),
+                    receiver_group(),
+                    scope_group(),
                     (
                         Attribute::DelegatedScopeFilter,
                         Value::new_json_filter_s("{\"eq\":[\"not_an_attribute\",\"x\"]}")
@@ -4383,7 +4503,7 @@ mod tests {
                 EntryClass::AccessControlReceiverGroup,
                 EntryClass::AccessControlTargetScope,
                 vec![
-                    (Attribute::AcpReceiverGroup, Value::ReferN(group)),
+                    receiver_group(),
                     (Attribute::AcpTargetScope, filter()),
                     (Attribute::AcpReauthMaxAge, Value::Uint32(300)),
                 ]
@@ -4391,225 +4511,513 @@ mod tests {
             AccessControlProfile
         );
 
-        // A valid delegated profile becomes a group receiver and a scope target.
+        // memberof is server maintained and may never be granted on create.
+        for attr in [Attribute::MemberOf, Attribute::DirectMemberOf] {
+            acp_from_entry_err!(
+                &mut qs_write,
+                delegated_acp_entry(
+                    "acp_create_memberof",
+                    EntryClass::AccessControlReceiverGroup,
+                    EntryClass::AccessControlTargetScope,
+                    vec![
+                        receiver_group(),
+                        (Attribute::AcpTargetScope, filter()),
+                        (Attribute::AcpCreateAttr, Value::new_iutf8n(attr.as_str())),
+                    ]
+                ),
+                AccessControlCreate
+            );
+        }
+        acp_from_entry_ok!(
+            &mut qs_write,
+            delegated_acp_entry(
+                "acp_create_valid",
+                EntryClass::AccessControlReceiverGroup,
+                EntryClass::AccessControlTargetScope,
+                vec![receiver_group(), (Attribute::AcpTargetScope, filter())]
+            ),
+            AccessControlCreate
+        );
+
+        // A group receiver with a delegated target, with or without the scope filter,
+        // becomes a group receiver and a scope target.
+        for extra in [
+            vec![
+                receiver_group(),
+                scope_group(),
+                (Attribute::DelegatedScopeFilter, filter()),
+            ],
+            vec![receiver_group(), scope_group()],
+        ] {
+            let acp = acp_from_entry_ok!(
+                &mut qs_write,
+                delegated_acp_entry(
+                    "acp_delegated_valid",
+                    EntryClass::AccessControlReceiverGroup,
+                    EntryClass::AccessControlTargetDelegatedScope,
+                    extra
+                ),
+                AccessControlProfile
+            );
+            assert!(matches!(
+                &acp.receiver,
+                AccessControlReceiver::Group(groups) if groups == &btreeset![receivers]
+            ));
+            assert!(matches!(acp.target, AccessControlTarget::Scope(_)));
+        }
+
+        // An entry manager receiver with a delegated target parses: the delegated scope
+        // only narrows the entries the manager already manages.
         let acp = acp_from_entry_ok!(
             &mut qs_write,
             delegated_acp_entry(
-                "acp_delegated_valid",
-                EntryClass::AccessControlReceiverDelegated,
+                "acp_delegated_entry_manager",
+                EntryClass::AccessControlReceiverEntryManager,
                 EntryClass::AccessControlTargetDelegatedScope,
-                vec![
-                    (Attribute::DelegatedScopeGroup, Value::Refer(group)),
-                    (Attribute::DelegatedScopeFilter, filter()),
-                ]
+                vec![scope_group()]
             ),
             AccessControlProfile
         );
-        assert!(matches!(
-            &acp.receiver,
-            AccessControlReceiver::Group(groups) if groups == &btreeset![group]
-        ));
+        assert!(matches!(&acp.receiver, AccessControlReceiver::EntryManager));
         assert!(matches!(acp.target, AccessControlTarget::Scope(_)));
     }
 
-    /// Kubidm: delegated profiles are enforced as their upstream rewrite, and the
-    /// effective permission check agrees with the real operations.
+    /// Kubidm: a delegated profile is enforced as its upstream rewrite. The receivers
+    /// administer exactly the members of the scope group that match the scope filter
+    /// and are not high privilege, and the effective permission check agrees with the
+    /// real operations.
     #[qs_test]
     async fn test_access_delegated_acp_enforced(qs: &QueryServer) {
         let ct = duration_from_epoch_now();
 
-        let member_uuid = Uuid::new_v4();
-        let outsider_uuid = Uuid::new_v4();
+        let admin_uuid = Uuid::new_v4();
         let target_uuid = Uuid::new_v4();
-        let group_uuid = Uuid::new_v4();
-
-        let person = |name: &str, uuid: Uuid| {
-            entry_init!(
-                (Attribute::Class, EntryClass::Object.to_value()),
-                (Attribute::Class, EntryClass::Account.to_value()),
-                (Attribute::Class, EntryClass::Person.to_value()),
-                (Attribute::Name, Value::new_iname(name)),
-                (Attribute::DisplayName, Value::new_utf8s(name)),
-                (Attribute::Uuid, Value::Uuid(uuid))
-            )
-        };
+        let outsider_uuid = Uuid::new_v4();
+        let svc_uuid = Uuid::new_v4();
+        let hp_uuid = Uuid::new_v4();
+        let peer_uuid = Uuid::new_v4();
+        let receivers_uuid = Uuid::new_v4();
+        let scope_uuid = Uuid::new_v4();
 
         let mut qs_write = qs.write(ct).await.unwrap();
         qs_write
             .internal_create(vec![
-                person("dg_member", member_uuid),
-                person("dg_outsider", outsider_uuid),
-                person("dg_target", target_uuid),
+                dg_person("dg_admin", admin_uuid),
+                dg_person("dg_target", target_uuid),
+                dg_person("dg_peer", peer_uuid),
+                dg_person("dg_outsider", outsider_uuid),
+                dg_person("dg_hp", hp_uuid),
                 entry_init!(
                     (Attribute::Class, EntryClass::Object.to_value()),
-                    (Attribute::Class, EntryClass::Group.to_value()),
-                    (Attribute::Name, Value::new_iname("dg_group")),
-                    (Attribute::Uuid, Value::Uuid(group_uuid)),
-                    (Attribute::Member, Value::ReferN(member_uuid)),
-                    (Attribute::Member, Value::ReferN(target_uuid))
+                    (Attribute::Class, EntryClass::Account.to_value()),
+                    (Attribute::Class, EntryClass::ServiceAccount.to_value()),
+                    (Attribute::Name, Value::new_iname("dg_svc")),
+                    (Attribute::DisplayName, Value::new_utf8s("dg_svc")),
+                    (Attribute::Uuid, Value::Uuid(svc_uuid))
                 ),
-                // Members of dg_group administer the members of dg_group.
+                dg_group("dg_receivers", receivers_uuid, &[admin_uuid]),
+                dg_group(
+                    "dg_scope",
+                    scope_uuid,
+                    &[target_uuid, peer_uuid, svc_uuid, hp_uuid],
+                ),
+                // Members of dg_receivers administer the persons in dg_scope.
                 delegated_acp_entry(
                     "acp_delegated_enforced",
-                    EntryClass::AccessControlReceiverDelegated,
+                    EntryClass::AccessControlReceiverGroup,
                     EntryClass::AccessControlTargetDelegatedScope,
-                    vec![(Attribute::DelegatedScopeGroup, Value::Refer(group_uuid))],
+                    vec![
+                        (Attribute::AcpReceiverGroup, Value::ReferN(receivers_uuid)),
+                        (Attribute::DelegatedScopeGroup, Value::Refer(scope_uuid)),
+                        (Attribute::DelegatedScopeFilter, dg_person_filter()),
+                    ],
                 ),
             ])
             .expect("failed to create entries");
+        // dg_hp is in the scope, but also high privilege.
+        qs_write
+            .internal_modify_uuid(
+                UUID_IDM_HIGH_PRIVILEGE,
+                &ModifyList::new_append(Attribute::Member, Value::ReferN(hp_uuid)),
+            )
+            .expect("add to high privilege");
         // Access controls are reloaded on commit.
         qs_write.commit().expect("commit");
         let mut qs_write = qs.write(ct).await.unwrap();
 
-        let ident = |qs_write: &mut QueryServerWriteTransaction<'_>, uuid: Uuid| {
-            let entry = qs_write.internal_search_uuid(uuid).expect("entry");
-            Identity::from_impersonate_entry_readwrite(entry)
-        };
-        let member = ident(&mut qs_write, member_uuid);
-        let outsider = ident(&mut qs_write, outsider_uuid);
-        let anonymous = ident(&mut qs_write, UUID_ANONYMOUS);
-
-        let target_filter = filter!(f_eq(Attribute::Uuid, PartialValue::Uuid(target_uuid)));
-        let modlist = ModifyList::new_list(vec![
-            Modify::Purged(Attribute::DisplayName),
-            Modify::Present(Attribute::DisplayName, Value::new_utf8s("delegated")),
-        ]);
+        let admin = dg_ident(&mut qs_write, admin_uuid);
+        let outsider = dg_ident(&mut qs_write, outsider_uuid);
+        let target = dg_ident(&mut qs_write, target_uuid);
+        let anonymous = dg_ident(&mut qs_write, UUID_ANONYMOUS);
 
         // The effective permissions agree with the operations below.
-        let target_entry = qs_write.internal_search_uuid(target_uuid).expect("target");
-        let effective = |qs_write: &QueryServerWriteTransaction<'_>, ident: &Identity| {
-            qs_write
-                .get_accesscontrols()
-                .effective_permission_check(ident, None, std::slice::from_ref(&target_entry))
-                .expect("effective permission check")
-                .remove(0)
-        };
-
+        let effective =
+            |qs_write: &mut QueryServerWriteTransaction<'_>, ident: &Identity, uuid: Uuid| {
+                let entry = qs_write.internal_search_uuid(uuid).expect("entry");
+                qs_write
+                    .get_accesscontrols()
+                    .effective_permission_check(ident, None, std::slice::from_ref(&entry))
+                    .expect("effective permission check")
+                    .remove(0)
+            };
         let can_modify = |ep: &AccessEffectivePermission| {
             matches!(&ep.modify_pres, Access::Allow(attrs) if attrs.contains(&Attribute::DisplayName))
                 && matches!(&ep.modify_rem, Access::Allow(attrs) if attrs.contains(&Attribute::DisplayName))
         };
         let can_read_legalname = |ep: &AccessEffectivePermission| matches!(&ep.search, Access::Allow(attrs) if attrs.contains(&Attribute::LegalName));
 
-        for denied in [&anonymous, &outsider] {
-            let ep = effective(&qs_write, denied);
+        // Neither non receivers, nor the members of the scope group themselves, receive
+        // the profile.
+        for denied in [&anonymous, &outsider, &target] {
+            let ep = effective(&mut qs_write, denied, peer_uuid);
             assert!(!can_modify(&ep));
             assert!(!can_read_legalname(&ep));
             assert!(!ep.delete);
-
-            assert!(qs_write
-                .impersonate_modify(&target_filter, &target_filter, &modlist, denied)
-                .is_err());
-            let de = DeleteEvent::new_impersonate_identity(denied.clone(), target_filter.clone());
-            assert!(qs_write.delete(&de).is_err());
+            assert!(!dg_can_modify(&mut qs_write, denied, peer_uuid));
+            assert!(!dg_can_delete(&mut qs_write, denied, peer_uuid));
         }
 
-        let ep = effective(&qs_write, &member);
-        assert!(can_modify(&ep));
-        assert!(can_read_legalname(&ep));
-        assert!(ep.delete);
+        // The receiver can not administer anything outside of the scope: a person that
+        // is not in the scope group, a scope group member that does not match the scope
+        // filter, or a high privilege scope group member.
+        for out_of_scope in [outsider_uuid, svc_uuid, hp_uuid] {
+            let ep = effective(&mut qs_write, &admin, out_of_scope);
+            assert!(!can_modify(&ep), "{out_of_scope}");
+            assert!(!ep.delete, "{out_of_scope}");
+            assert!(!dg_can_modify(&mut qs_write, &admin, out_of_scope));
+            assert!(!dg_can_delete(&mut qs_write, &admin, out_of_scope));
+        }
 
         // A new entry has no memberof, so it is never in a delegated scope.
         assert!(qs_write
-            .impersonate_create(&member, vec![person("dg_created", Uuid::new_v4())])
+            .impersonate_create(&admin, vec![dg_person("dg_created", Uuid::new_v4())])
             .is_err());
 
-        qs_write
-            .impersonate_modify(&target_filter, &target_filter, &modlist, &member)
-            .expect("member can modify");
-        let de = DeleteEvent::new_impersonate_identity(member.clone(), target_filter.clone());
-        qs_write.delete(&de).expect("member can delete");
+        let ep = effective(&mut qs_write, &admin, target_uuid);
+        assert!(can_modify(&ep));
+        assert!(can_read_legalname(&ep));
+        assert!(ep.delete);
+        assert!(dg_can_modify(&mut qs_write, &admin, target_uuid));
+        assert!(dg_can_delete(&mut qs_write, &admin, target_uuid));
 
         qs_write.commit().expect("commit");
     }
 
-    /// Kubidm: a delegated scope filter that can not match grants nothing, even to a
-    /// member of the scope group.
+    /// Kubidm: an entry manager receiver with a delegated target only administers the
+    /// managed entries that are in the delegated scope.
     #[qs_test]
-    async fn test_access_delegated_acp_unresolvable_filter(qs: &QueryServer) {
+    async fn test_access_delegated_acp_entry_manager(qs: &QueryServer) {
         let ct = duration_from_epoch_now();
 
-        let member_uuid = Uuid::new_v4();
-        let target_uuid = Uuid::new_v4();
-        let group_uuid = Uuid::new_v4();
+        let manager_uuid = Uuid::new_v4();
+        let managers_uuid = Uuid::new_v4();
+        let in_scope_uuid = Uuid::new_v4();
+        let out_of_scope_uuid = Uuid::new_v4();
+        let scope_uuid = Uuid::new_v4();
 
-        let person = |name: &str, uuid: Uuid| {
-            entry_init!(
-                (Attribute::Class, EntryClass::Object.to_value()),
-                (Attribute::Class, EntryClass::Account.to_value()),
-                (Attribute::Class, EntryClass::Person.to_value()),
-                (Attribute::Name, Value::new_iname(name)),
-                (Attribute::DisplayName, Value::new_utf8s(name)),
-                (Attribute::Uuid, Value::Uuid(uuid))
-            )
+        let managed = |name: &str, uuid: Uuid| {
+            let mut entry = dg_person(name, uuid);
+            entry.add_ava(Attribute::EntryManagedBy, Value::Refer(managers_uuid));
+            entry
         };
 
         let mut qs_write = qs.write(ct).await.unwrap();
         qs_write
             .internal_create(vec![
-                person("dgu_member", member_uuid),
-                person("dgu_target", target_uuid),
-                entry_init!(
-                    (Attribute::Class, EntryClass::Object.to_value()),
-                    (Attribute::Class, EntryClass::Group.to_value()),
-                    (Attribute::Name, Value::new_iname("dgu_group")),
-                    (Attribute::Uuid, Value::Uuid(group_uuid)),
-                    (Attribute::Member, Value::ReferN(member_uuid)),
-                    (Attribute::Member, Value::ReferN(target_uuid))
-                ),
-                // The scope filter names a group that does not exist.
+                dg_person("dgm_manager", manager_uuid),
+                dg_group("dgm_managers", managers_uuid, &[manager_uuid]),
+                managed("dgm_in_scope", in_scope_uuid),
+                managed("dgm_out_of_scope", out_of_scope_uuid),
+                dg_group("dgm_scope", scope_uuid, &[in_scope_uuid]),
                 delegated_acp_entry(
-                    "acp_delegated_unresolvable",
-                    EntryClass::AccessControlReceiverDelegated,
+                    "acp_delegated_entry_manager",
+                    EntryClass::AccessControlReceiverEntryManager,
                     EntryClass::AccessControlTargetDelegatedScope,
                     vec![
-                        (Attribute::DelegatedScopeGroup, Value::Refer(group_uuid)),
-                        (
-                            Attribute::DelegatedScopeFilter,
-                            Value::new_json_filter_s(
-                                "{\"eq\":[\"memberof\",\"dgu_no_such_group\"]}",
-                            )
-                            .expect("filter"),
-                        ),
+                        (Attribute::DelegatedScopeGroup, Value::Refer(scope_uuid)),
+                        (Attribute::DelegatedScopeFilter, dg_person_filter()),
                     ],
                 ),
             ])
             .expect("failed to create entries");
-        // Access controls are reloaded on commit.
         qs_write.commit().expect("commit");
         let mut qs_write = qs.write(ct).await.unwrap();
 
-        // The profile is loaded, it just never matches.
-        assert!(qs_write
-            .get_accesscontrols()
-            .get_modify()
-            .iter()
-            .any(|acm| acm.acp.name == "acp_delegated_unresolvable"));
+        let manager = dg_ident(&mut qs_write, manager_uuid);
+        assert!(!dg_can_modify(&mut qs_write, &manager, out_of_scope_uuid));
+        assert!(!dg_can_delete(&mut qs_write, &manager, out_of_scope_uuid));
+        assert!(dg_can_modify(&mut qs_write, &manager, in_scope_uuid));
+    }
 
-        let member_entry = qs_write.internal_search_uuid(member_uuid).expect("member");
-        let member = Identity::from_impersonate_entry_readwrite(member_entry);
-        let target_entry = qs_write.internal_search_uuid(target_uuid).expect("target");
+    /// Kubidm: deleting the delegated scope group must never widen the target to the
+    /// scope filter alone. A local delete is refused, since it leaves the profile
+    /// invalid. When the delete arrives through replication, the profile is skipped and
+    /// grants nothing until it is fixed.
+    #[qs_test]
+    async fn test_access_delegated_scope_group_deleted(qs: &QueryServer) {
+        let ct = duration_from_epoch_now();
 
-        let ep = qs_write
-            .get_accesscontrols()
-            .effective_permission_check(&member, None, std::slice::from_ref(&target_entry))
-            .expect("effective permission check")
-            .remove(0);
-        assert!(
-            !matches!(&ep.modify_pres, Access::Allow(attrs) if attrs.contains(&Attribute::DisplayName))
+        let admin_uuid = Uuid::new_v4();
+        let target_uuid = Uuid::new_v4();
+        let outsider_uuid = Uuid::new_v4();
+        let receivers_uuid = Uuid::new_v4();
+        let scope_uuid = Uuid::new_v4();
+        let new_scope_uuid = Uuid::new_v4();
+        let acp_uuid = Uuid::new_v4();
+
+        let mut acp = delegated_acp_entry(
+            "acp_delegated_deleted_scope",
+            EntryClass::AccessControlReceiverGroup,
+            EntryClass::AccessControlTargetDelegatedScope,
+            vec![
+                (Attribute::AcpReceiverGroup, Value::ReferN(receivers_uuid)),
+                (Attribute::DelegatedScopeGroup, Value::Refer(scope_uuid)),
+                (Attribute::DelegatedScopeFilter, dg_person_filter()),
+            ],
         );
-        assert!(!ep.delete);
+        acp.remove_ava(Attribute::Uuid);
+        acp.add_ava(Attribute::Uuid, Value::Uuid(acp_uuid));
 
-        let target_filter = filter!(f_eq(Attribute::Uuid, PartialValue::Uuid(target_uuid)));
-        let modlist = ModifyList::new_list(vec![
-            Modify::Purged(Attribute::DisplayName),
-            Modify::Present(Attribute::DisplayName, Value::new_utf8s("delegated")),
-        ]);
-        assert!(qs_write
-            .impersonate_modify(&target_filter, &target_filter, &modlist, &member)
-            .is_err());
-        let de = DeleteEvent::new_impersonate_identity(member, target_filter);
-        assert!(qs_write.delete(&de).is_err());
+        let mut qs_write = qs.write(ct).await.unwrap();
+        qs_write
+            .internal_create(vec![
+                dg_person("dgd_admin", admin_uuid),
+                dg_person("dgd_target", target_uuid),
+                dg_person("dgd_outsider", outsider_uuid),
+                dg_group("dgd_receivers", receivers_uuid, &[admin_uuid]),
+                dg_group("dgd_scope", scope_uuid, &[target_uuid]),
+                dg_group("dgd_new_scope", new_scope_uuid, &[outsider_uuid]),
+                acp,
+            ])
+            .expect("failed to create entries");
+        qs_write.commit().expect("commit");
+
+        // A local delete of the scope group is refused: referential integrity removes the
+        // scope group from the profile in the same transaction, which leaves it invalid.
+        let mut qs_write = qs.write(ct).await.unwrap();
+        qs_write
+            .internal_delete_uuid(scope_uuid)
+            .expect("delete scope group");
+        assert!(matches!(
+            qs_write.commit(),
+            Err(OperationError::InvalidAcpState(_))
+        ));
+
+        // Nothing changed: the receiver still only administers the scope.
+        let mut qs_write = qs.write(ct).await.unwrap();
+        assert!(qs_write.internal_search_uuid(scope_uuid).is_ok());
+        let admin = dg_ident(&mut qs_write, admin_uuid);
+        assert!(!dg_can_modify(&mut qs_write, &admin, outsider_uuid));
+        assert!(!dg_can_delete(&mut qs_write, &admin, outsider_uuid));
+        assert!(dg_can_modify(&mut qs_write, &admin, target_uuid));
+        drop(qs_write);
+
+        // The same delete applied by replication is accepted, and the profile is skipped
+        // rather than widened to every person.
+        let mut qs_write = qs.write(ct).await.unwrap();
+        qs_write.replication_apply = true;
+        qs_write
+            .internal_delete_uuid(scope_uuid)
+            .expect("delete scope group");
+        qs_write.commit().expect("commit");
+
+        let mut qs_write = qs.write(ct).await.unwrap();
+        let acp_entry = qs_write.internal_search_uuid(acp_uuid).expect("acp");
+        assert!(!acp_entry.attribute_pres(Attribute::DelegatedScopeGroup));
+        assert!(!dg_loaded_modify(&qs_write).contains("acp_delegated_deleted_scope"));
+        let admin = dg_ident(&mut qs_write, admin_uuid);
+        for uuid in [outsider_uuid, target_uuid] {
+            assert!(!dg_can_modify(&mut qs_write, &admin, uuid));
+            assert!(!dg_can_delete(&mut qs_write, &admin, uuid));
+        }
+        drop(qs_write);
+
+        // Unrelated writes are not blocked by the skipped profile.
+        let mut qs_write = qs.write(ct).await.unwrap();
+        qs_write
+            .internal_create(vec![delegated_acp_entry(
+                "acp_unrelated",
+                EntryClass::AccessControlReceiverGroup,
+                EntryClass::AccessControlTargetScope,
+                vec![
+                    (Attribute::AcpReceiverGroup, Value::ReferN(receivers_uuid)),
+                    (
+                        Attribute::AcpTargetScope,
+                        Value::new_json_filter_s("{\"eq\":[\"name\",\"no_such_entry\"]}")
+                            .expect("filter"),
+                    ),
+                ],
+            )])
+            .expect("create");
+        qs_write.commit().expect("commit");
+
+        // Setting a new scope group fixes the profile.
+        let mut qs_write = qs.write(ct).await.unwrap();
+        qs_write
+            .internal_modify_uuid(
+                acp_uuid,
+                &ModifyList::new_purge_and_set(
+                    Attribute::DelegatedScopeGroup,
+                    Value::Refer(new_scope_uuid),
+                ),
+            )
+            .expect("modify");
+        qs_write.commit().expect("commit");
+
+        let mut qs_write = qs.write(ct).await.unwrap();
+        assert!(dg_loaded_modify(&qs_write).contains("acp_delegated_deleted_scope"));
+        let admin = dg_ident(&mut qs_write, admin_uuid);
+        assert!(!dg_can_modify(&mut qs_write, &admin, target_uuid));
+        assert!(dg_can_modify(&mut qs_write, &admin, outsider_uuid));
+    }
+
+    /// Kubidm: a stored profile that the current parser rejects (for example written by
+    /// an older version or received through replication) is skipped at reload and on
+    /// start up, while every other profile keeps working. Changing it locally requires
+    /// making it valid, or disabling it.
+    #[qs_test]
+    async fn test_access_reload_skips_stored_invalid_acp(qs: &QueryServer) {
+        let ct = duration_from_epoch_now();
+
+        let admin_uuid = Uuid::new_v4();
+        let valid_target_uuid = Uuid::new_v4();
+        let other_target_uuid = Uuid::new_v4();
+        let receivers_uuid = Uuid::new_v4();
+        let scope_uuid = Uuid::new_v4();
+        let reauth_max_age_uuid = Uuid::new_v4();
+
+        let name_filter = |name: &str| {
+            Value::new_json_filter_s(&format!("{{\"eq\":[\"name\",\"{name}\"]}}")).expect("filter")
+        };
+        let receiver_group = || (Attribute::AcpReceiverGroup, Value::ReferN(receivers_uuid));
+
+        let mut reauth_max_age = delegated_acp_entry(
+            "acp_stored_reauth_max_age",
+            EntryClass::AccessControlReceiverGroup,
+            EntryClass::AccessControlTargetScope,
+            vec![
+                receiver_group(),
+                (Attribute::AcpTargetScope, name_filter("dgs_other")),
+                (Attribute::AcpReauthMaxAge, Value::Uint32(300)),
+            ],
+        );
+        reauth_max_age.remove_ava(Attribute::Uuid);
+        reauth_max_age.add_ava(Attribute::Uuid, Value::Uuid(reauth_max_age_uuid));
+
+        // Written as replicated content, so the current parser does not validate it.
+        let mut qs_write = qs.write(ct).await.unwrap();
+        qs_write.replication_apply = true;
+        qs_write
+            .internal_create(vec![
+                dg_person("dgs_admin", admin_uuid),
+                dg_person("dgs_valid", valid_target_uuid),
+                dg_person("dgs_other", other_target_uuid),
+                dg_group("dgs_receivers", receivers_uuid, &[admin_uuid]),
+                dg_group("dgs_scope", scope_uuid, &[admin_uuid, other_target_uuid]),
+                delegated_acp_entry(
+                    "acp_stored_valid",
+                    EntryClass::AccessControlReceiverGroup,
+                    EntryClass::AccessControlTargetScope,
+                    vec![
+                        receiver_group(),
+                        (Attribute::AcpTargetScope, name_filter("dgs_valid")),
+                    ],
+                ),
+                reauth_max_age,
+                delegated_acp_entry(
+                    "acp_stored_delegated_receiver",
+                    EntryClass::AccessControlReceiverDelegated,
+                    EntryClass::AccessControlTargetDelegatedScope,
+                    vec![(Attribute::DelegatedScopeGroup, Value::Refer(scope_uuid))],
+                ),
+                delegated_acp_entry(
+                    "acp_stored_filter_only",
+                    EntryClass::AccessControlReceiverGroup,
+                    EntryClass::AccessControlTargetDelegatedScope,
+                    vec![
+                        receiver_group(),
+                        (Attribute::DelegatedScopeFilter, name_filter("dgs_other")),
+                    ],
+                ),
+            ])
+            .expect("failed to create entries");
+        qs_write.commit().expect("commit");
+
+        let check = |qs_write: &mut QueryServerWriteTransaction<'_>| {
+            let loaded = dg_loaded_modify(qs_write);
+            assert!(loaded.contains("acp_stored_valid"));
+            for name in [
+                "acp_stored_reauth_max_age",
+                "acp_stored_delegated_receiver",
+                "acp_stored_filter_only",
+            ] {
+                assert!(!loaded.contains(name), "{name}");
+            }
+            let admin = dg_ident(qs_write, admin_uuid);
+            assert!(!dg_can_modify(qs_write, &admin, other_target_uuid));
+            assert!(dg_can_modify(qs_write, &admin, valid_target_uuid));
+        };
+
+        let mut qs_write = qs.write(ct).await.unwrap();
+        check(&mut qs_write);
+        drop(qs_write);
+
+        // A local change to another profile reloads every profile, and is not blocked.
+        let mut qs_write = qs.write(ct).await.unwrap();
+        qs_write
+            .internal_create(vec![delegated_acp_entry(
+                "acp_stored_unrelated",
+                EntryClass::AccessControlReceiverGroup,
+                EntryClass::AccessControlTargetScope,
+                vec![
+                    receiver_group(),
+                    (Attribute::AcpTargetScope, name_filter("no_such_entry")),
+                ],
+            )])
+            .expect("create");
+        qs_write.commit().expect("commit");
+
+        // Start up is not blocked either. Return to the bootstrap phase first, as a
+        // freshly started server would be.
+        let mut qs_write = qs.write(ct).await.unwrap();
+        qs_write.set_phase_bootstrap();
+        qs_write.commit().expect("commit");
+        qs.initialise_helper(duration_from_epoch_now(), DOMAIN_TGT_LEVEL)
+            .await
+            .expect("restart");
+
+        let mut qs_write = qs.write(ct).await.unwrap();
+        check(&mut qs_write);
+        drop(qs_write);
+
+        // Changing a stored invalid profile locally without fixing it is refused.
+        let mut qs_write = qs.write(ct).await.unwrap();
+        qs_write
+            .internal_modify_uuid(
+                reauth_max_age_uuid,
+                &ModifyList::new_purge_and_set(
+                    Attribute::Description,
+                    Value::new_utf8s("still invalid"),
+                ),
+            )
+            .expect("modify");
+        assert!(matches!(
+            qs_write.commit(),
+            Err(OperationError::InvalidAcpState(_))
+        ));
+
+        // Disabling it is accepted.
+        let mut qs_write = qs.write(ct).await.unwrap();
+        qs_write
+            .internal_modify_uuid(
+                reauth_max_age_uuid,
+                &ModifyList::new_purge_and_set(Attribute::AcpEnable, Value::new_bool(false)),
+            )
+            .expect("modify");
+        qs_write.commit().expect("commit");
+
+        let mut qs_write = qs.write(ct).await.unwrap();
+        check(&mut qs_write);
     }
 
     // =========================================================================

@@ -70,6 +70,10 @@ impl Evaluation {
 /// Fails with `NoMatchingEntries` if the resource does not exist or is not visible to
 /// the caller (even after re-authentication), and with `InvalidRequestState` if the
 /// request names a subject other than the caller.
+///
+/// A privilege capable read-only session gets `ReauthRequired` when re-authentication
+/// would allow the request. This can reveal the existence of an entry that is visible to
+/// the caller only after elevation, to that same principal only.
 pub fn make_authorization_decision(
     qs: &mut QueryServerReadTransaction<'_>,
     ident: &Identity,
@@ -93,6 +97,13 @@ pub fn make_authorization_decision(
     // once it re-authenticates. The elevated identity is only used for this check and
     // never leaves this function; nothing from its evaluation except the fact that it
     // would be allowed is disclosed.
+    //
+    // Note that `ReauthRequired` does disclose that the resource exists when it is only
+    // visible after elevation (the read-only evaluation fails with `NoMatchingEntries`,
+    // where a plain `NotFound` would otherwise be returned). This is disclosed only to the
+    // same principal, which would see the entry anyway after re-authenticating, and only
+    // for sessions that can elevate (see `can_elevate`); read-only API tokens and other
+    // sessions that can never be privileged still get `NotFound`.
     let needs_stepup = match &evaluation {
         Ok(eval) => eval.decision == AuthorizationDecision::Deny,
         Err(OperationError::NoMatchingEntries) => true,
@@ -134,14 +145,7 @@ pub fn make_batch_authorization_decision(
     ident: &Identity,
     reqs: &[AuthorizationRequest],
 ) -> Result<Vec<AuthorizationResponse>, OperationError> {
-    if reqs.len() > AUTHORIZATION_BATCH_MAX {
-        request_error!(
-            len = reqs.len(),
-            max = AUTHORIZATION_BATCH_MAX,
-            "batch authorization request is too large"
-        );
-        return Err(OperationError::InvalidRequestState);
-    }
+    check_authorization_batch_len(reqs.len())?;
 
     reqs.iter()
         .map(|req| match make_authorization_decision(qs, ident, req) {
@@ -151,6 +155,21 @@ pub fn make_batch_authorization_decision(
             res => res,
         })
         .collect()
+}
+
+/// Reject a batch of `len` authorization requests that is larger than
+/// [`AUTHORIZATION_BATCH_MAX`]. Callers should check this before doing any other work
+/// for the batch, such as opening a transaction or validating the identity.
+pub fn check_authorization_batch_len(len: usize) -> Result<(), OperationError> {
+    if len > AUTHORIZATION_BATCH_MAX {
+        request_error!(
+            len,
+            max = AUTHORIZATION_BATCH_MAX,
+            "batch authorization request is too large"
+        );
+        return Err(OperationError::InvalidRequestState);
+    }
+    Ok(())
 }
 
 /// A read-only identity can be elevated by re-authentication when its session is
@@ -630,7 +649,9 @@ mod pdp_tests {
     use crate::be::Limits;
     use crate::prelude::*;
     use crate::server::identity::{IdentUser, IdentityId, Source};
-    use crate::value::{AuthType, Session, SessionExtMetadata, SessionScope, SessionState};
+    use crate::value::{
+        ApiToken, ApiTokenScope, AuthType, Session, SessionExtMetadata, SessionScope, SessionState,
+    };
     use kubidm_proto::internal::{
         AuthorizationAction, AuthorizationDecision, AuthorizationRequest, AUTHORIZATION_BATCH_MAX,
     };
@@ -985,6 +1006,145 @@ mod pdp_tests {
                 assert_eq!(res.decision, AuthorizationDecision::Deny);
             }
         }
+    }
+
+    /// A read-only API token can never be privileged, so a request that needs a
+    /// read-write session is denied rather than answered with `ReauthRequired`.
+    #[qs_test]
+    async fn test_pdp_readonly_api_token_denied(qs: &QueryServer) {
+        let fx = setup(qs).await;
+        let mut qs_read = qs.read().await.unwrap();
+
+        // The identity of a read-only API token: the token is an api token session (not
+        // a user auth session) and the access scope is read-only.
+        let token_id = Uuid::new_v4();
+        let mut entry = entry_init!(
+            (Attribute::Class, EntryClass::Object.to_value()),
+            (Attribute::Class, EntryClass::Account.to_value()),
+            (Attribute::Class, EntryClass::ServiceAccount.to_value()),
+            (Attribute::Name, Value::new_iname("pdp_user")),
+            (Attribute::Uuid, Value::Uuid(fx.user)),
+            (Attribute::MemberOf, Value::ReferN(fx.group)),
+            (
+                Attribute::ApiTokenSession,
+                Value::ApiToken(
+                    token_id,
+                    ApiToken {
+                        label: "test".to_string(),
+                        expiry: None,
+                        issued_at: time::OffsetDateTime::UNIX_EPOCH,
+                        issued_by: IdentityId::User(fx.user),
+                        scope: ApiTokenScope::ReadOnly,
+                    },
+                )
+            )
+        );
+        entry.add_ava(
+            Attribute::UserAuthTokenSession,
+            Value::Session(
+                Uuid::new_v4(),
+                Session {
+                    label: "other".to_string(),
+                    state: SessionState::NeverExpires,
+                    issued_at: time::OffsetDateTime::UNIX_EPOCH,
+                    issued_by: IdentityId::User(fx.user),
+                    cred_id: Uuid::new_v4(),
+                    scope: SessionScope::PrivilegeCapable,
+                    type_: AuthType::Passkey,
+                    ext_metadata: SessionExtMetadata::None,
+                },
+            ),
+        );
+        let token = Identity::new(
+            IdentType::User(IdentUser {
+                entry: Arc::new(entry.into_sealed_committed()),
+            }),
+            Source::Internal,
+            token_id,
+            AccessScope::ReadOnly,
+            Limits::unlimited(),
+            None,
+        );
+
+        for req in [
+            request(
+                fx.target,
+                AuthorizationAction::Modify,
+                Some(&["displayname"]),
+            ),
+            request(fx.target, AuthorizationAction::Delete, None),
+        ] {
+            let res = make_authorization_decision(&mut qs_read, &token, &req).expect("decision");
+            assert_eq!(res.decision, AuthorizationDecision::Deny);
+            assert!(res.allowed_attributes.is_none());
+        }
+
+        // Reading is still allowed for the read-only token.
+        let res = make_authorization_decision(
+            &mut qs_read,
+            &token,
+            &request(fx.target, AuthorizationAction::Search, Some(&["name"])),
+        )
+        .expect("decision");
+        assert_eq!(res.decision, AuthorizationDecision::Allow);
+    }
+
+    /// An access control admin is told which profiles matched, for every action and also
+    /// when the decision is `ReauthRequired`.
+    #[qs_test]
+    async fn test_pdp_matched_rules_for_acp_admin(qs: &QueryServer) {
+        let fx = setup(qs).await;
+        let mut qs_read = qs.read().await.unwrap();
+        let memberof = [fx.group, UUID_IDM_ACCESS_CONTROL_ADMINS];
+
+        let admin = identity(&fx, &memberof, None, AccessScope::ReadWrite);
+        for req in [
+            request(fx.target, AuthorizationAction::Search, None),
+            request(
+                fx.target,
+                AuthorizationAction::Modify,
+                Some(&["displayname"]),
+            ),
+            request(fx.target, AuthorizationAction::Delete, None),
+        ] {
+            let req = req.with_explanation(true);
+            let res = make_authorization_decision(&mut qs_read, &admin, &req).expect("decision");
+            assert_eq!(
+                res.decision,
+                AuthorizationDecision::Allow,
+                "{:?}",
+                req.action
+            );
+            let explanation = res.explanation.expect("explanation");
+            assert!(
+                explanation.matched_rules.contains(&"pdp_acp".to_string()),
+                "{:?}",
+                req.action
+            );
+        }
+
+        let privilege_capable = identity(
+            &fx,
+            &memberof,
+            Some(SessionScope::PrivilegeCapable),
+            AccessScope::ReadOnly,
+        );
+        let req = request(fx.target, AuthorizationAction::Delete, None).with_explanation(true);
+        let res =
+            make_authorization_decision(&mut qs_read, &privilege_capable, &req).expect("decision");
+        assert_eq!(res.decision, AuthorizationDecision::ReauthRequired);
+        let explanation = res.explanation.expect("explanation");
+        assert!(explanation.matched_rules.contains(&"pdp_acp".to_string()));
+    }
+
+    #[test]
+    fn test_pdp_batch_len_check() {
+        assert!(super::check_authorization_batch_len(0).is_ok());
+        assert!(super::check_authorization_batch_len(AUTHORIZATION_BATCH_MAX).is_ok());
+        assert_eq!(
+            super::check_authorization_batch_len(AUTHORIZATION_BATCH_MAX + 1),
+            Err(OperationError::InvalidRequestState)
+        );
     }
 
     #[qs_test]

@@ -247,6 +247,12 @@ impl QueryServer {
             )?;
         }
 
+        // Kubidm: apply any pending reloads while still in the start up phase, where an
+        // invalid stored access control profile is skipped rather than failing start up.
+        // From `Running` on, profiles changed in a transaction are validated strictly,
+        // and every profile was "changed" by the migrations above.
+        write_txn.reload()?;
+
         // We are ready to run
         write_txn.set_phase(ServerPhase::Running);
 

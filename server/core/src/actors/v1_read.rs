@@ -1511,8 +1511,11 @@ impl QueryServerReadV1 {
         req: kubidm_proto::internal::BatchAuthorizationRequest,
         eventid: Uuid,
     ) -> Result<kubidm_proto::internal::BatchAuthorizationResponse, OperationError> {
+        // Oversized batches are rejected before any other work, including opening the
+        // read transaction and validating the identity.
+        kubidmd_lib::server::authorization::check_authorization_batch_len(req.requests.len())?;
+
         // Validate the identity once, and decide every request in one read transaction.
-        // Oversized batches are rejected before any request is decided.
         let ct = duration_from_epoch_now();
         let mut idms_prox_read = self.idms.proxy_read().await?;
         let ident = idms_prox_read

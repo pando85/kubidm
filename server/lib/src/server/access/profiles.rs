@@ -254,10 +254,28 @@ impl AccessControlCreate {
             )));
         }
 
-        let attrs = value
+        let attrs: Vec<Attribute> = value
             .get_ava_iter_iutf8(Attribute::AcpCreateAttr)
             .map(|i| i.map(Attribute::from).collect())
             .unwrap_or_default();
+
+        // Kubidm: create access is evaluated before the memberof plugin purges client
+        // supplied values, so granting memberof on create would let a client claim
+        // memberships for the access check. memberof is always server maintained.
+        for attr in [Attribute::MemberOf, Attribute::DirectMemberOf] {
+            if attrs.contains(&attr) {
+                admin_error!(
+                    "{} may not grant the server maintained {}",
+                    Attribute::AcpCreateAttr,
+                    attr
+                );
+                return Err(OperationError::InvalidAcpState(format!(
+                    "{} may not contain {}",
+                    Attribute::AcpCreateAttr,
+                    attr
+                )));
+            }
+        }
 
         let classes = value
             .get_ava_iter_iutf8(Attribute::AcpCreateClass)
@@ -537,27 +555,65 @@ impl AccessControlProfile {
         // copy uuid
         let uuid = value.get_uuid();
 
-        // Kubidm delegated administration. Delegated profiles are rewritten at parse time
-        // into the upstream receiver and target types, so that the enforcement paths only
-        // ever see `Group` receivers and `Scope` targets, and inherit their fail-closed
-        // behaviour. Both delegated classes share the same scope attributes.
-        let delegated_receiver = value.attribute_equality(
-            Attribute::Class,
-            &EntryClass::AccessControlReceiverDelegated.into(),
-        );
-        let delegated_target = value.attribute_equality(
-            Attribute::Class,
-            &EntryClass::AccessControlTargetDelegatedScope.into(),
-        );
-        let delegated_scope_group = value.get_ava_single_refer(Attribute::DelegatedScopeGroup);
-        let delegated_scope_filter = value
-            .get_ava_single_protofilter(Attribute::DelegatedScopeFilter)
-            .cloned();
+        // Kubidm delegated administration. A delegated target is rewritten at parse time
+        // into an upstream `Scope` target, so that the enforcement paths only ever see
+        // `Group`/`EntryManager` receivers and `Scope` targets, and inherit their
+        // fail-closed behaviour.
+        let has_class =
+            |class: EntryClass| value.attribute_equality(Attribute::Class, &class.into());
+        let receiver_group = has_class(EntryClass::AccessControlReceiverGroup);
+        let receiver_entry_manager = has_class(EntryClass::AccessControlReceiverEntryManager);
+        let receiver_delegated = has_class(EntryClass::AccessControlReceiverDelegated);
+        let target_scope = has_class(EntryClass::AccessControlTargetScope);
+        let target_delegated = has_class(EntryClass::AccessControlTargetDelegatedScope);
 
-        let receiver = if value.attribute_equality(
-            Attribute::Class,
-            &EntryClass::AccessControlReceiverGroup.into(),
-        ) {
+        // Receiving a profile through the delegated scope is unsupported: it would make
+        // the scope group both the administrators and the administered. Only a `Group`
+        // (or `EntryManager`) receiver with a delegated target is supported.
+        if receiver_delegated {
+            admin_error!(
+                ?name,
+                "{} is unsupported, use {} with {}",
+                EntryClass::AccessControlReceiverDelegated,
+                EntryClass::AccessControlReceiverGroup,
+                EntryClass::AccessControlTargetDelegatedScope
+            );
+            return Err(OperationError::InvalidAcpState(format!(
+                "{} is unsupported",
+                EntryClass::AccessControlReceiverDelegated
+            )));
+        }
+
+        // Conflicting receiver or target kinds are ambiguous, reject them rather than
+        // silently picking one.
+        if receiver_group && receiver_entry_manager {
+            admin_error!(
+                ?name,
+                "{} and {} are mutually exclusive",
+                EntryClass::AccessControlReceiverGroup,
+                EntryClass::AccessControlReceiverEntryManager
+            );
+            return Err(OperationError::InvalidAcpState(format!(
+                "{} and {} are mutually exclusive",
+                EntryClass::AccessControlReceiverGroup,
+                EntryClass::AccessControlReceiverEntryManager
+            )));
+        }
+        if target_scope && target_delegated {
+            admin_error!(
+                ?name,
+                "{} and {} are mutually exclusive",
+                EntryClass::AccessControlTargetScope,
+                EntryClass::AccessControlTargetDelegatedScope
+            );
+            return Err(OperationError::InvalidAcpState(format!(
+                "{} and {} are mutually exclusive",
+                EntryClass::AccessControlTargetScope,
+                EntryClass::AccessControlTargetDelegatedScope
+            )));
+        }
+
+        let receiver = if receiver_group {
             value
                 .get_ava_refer(Attribute::AcpReceiverGroup)
                 .cloned()
@@ -569,31 +625,8 @@ impl AccessControlProfile {
                         Attribute::AcpReceiverGroup
                     ))
                 })?
-        } else if value.attribute_equality(
-            Attribute::Class,
-            &EntryClass::AccessControlReceiverEntryManager.into(),
-        ) {
+        } else if receiver_entry_manager {
             AccessControlReceiver::EntryManager
-        } else if delegated_receiver {
-            // Receiving a profile through a delegated role is not implemented.
-            if value.attribute_pres(Attribute::AcpReceiverDelegated) {
-                admin_error!(?name, "{} is unsupported", Attribute::AcpReceiverDelegated);
-                return Err(OperationError::InvalidAcpState(format!(
-                    "{} is unsupported",
-                    Attribute::AcpReceiverDelegated
-                )));
-            }
-
-            // The members of the delegated scope group receive this profile.
-            delegated_scope_group
-                .map(|group| AccessControlReceiver::Group(btreeset!(group)))
-                .ok_or_else(|| {
-                    admin_error!(?name, "Missing {}", Attribute::DelegatedScopeGroup);
-                    OperationError::InvalidAcpState(format!(
-                        "Missing {}",
-                        Attribute::DelegatedScopeGroup
-                    ))
-                })?
         } else {
             warn!(
                 ?name,
@@ -602,12 +635,7 @@ impl AccessControlProfile {
             AccessControlReceiver::None
         };
 
-        // Collect the target scope terms, which are all required to match.
-        let mut target_terms: Vec<ProtoFilter> = Vec::with_capacity(3);
-        let has_target = if value.attribute_equality(
-            Attribute::Class,
-            &EntryClass::AccessControlTargetScope.into(),
-        ) {
+        let targetscope_f: Option<ProtoFilter> = if target_scope {
             // targetscope, and turn to real filter
             let targetscope_f: ProtoFilter = value
                 .get_ava_single_protofilter(Attribute::AcpTargetScope)
@@ -619,55 +647,57 @@ impl AccessControlProfile {
                         Attribute::AcpTargetScope
                     ))
                 })?;
-            target_terms.push(targetscope_f);
-            true
-        } else if delegated_target {
-            if delegated_scope_group.is_none() && delegated_scope_filter.is_none() {
+            Some(targetscope_f)
+        } else if target_delegated {
+            // The scope group is required. It is a reference, so referential integrity
+            // removes it when the group is deleted: the filter alone must then never
+            // become the scope, or the receivers would administer everything matching it.
+            let Some(group) = value.get_ava_single_refer(Attribute::DelegatedScopeGroup) else {
                 admin_error!(
                     ?name,
-                    "Missing {} or {}",
-                    Attribute::DelegatedScopeGroup,
-                    Attribute::DelegatedScopeFilter
+                    "A delegated target requires {}",
+                    Attribute::DelegatedScopeGroup
                 );
                 return Err(OperationError::InvalidAcpState(format!(
-                    "Missing {} or {}",
-                    Attribute::DelegatedScopeGroup,
-                    Attribute::DelegatedScopeFilter
+                    "{name}: a delegated target requires {}",
+                    Attribute::DelegatedScopeGroup
                 )));
-            }
-
-            // The targets are the members of the delegated scope group ...
-            if let Some(group) = delegated_scope_group {
-                target_terms.push(ProtoFilter::Eq(
-                    Attribute::MemberOf.to_string(),
-                    group.to_string(),
-                ));
-            }
-            // ... that also match the delegated scope filter.
-            if let Some(scope_filter) = delegated_scope_filter.clone() {
-                target_terms.push(scope_filter);
-            }
-            true
-        } else {
-            false
-        };
-
-        // A delegated receiver's scope filter further narrows the targets. When the target
-        // is also delegated, the shared filter was already added above.
-        if has_target && delegated_receiver && !delegated_target {
-            if let Some(scope_filter) = delegated_scope_filter {
-                target_terms.push(scope_filter);
-            }
-        }
-
-        let target = if has_target {
-            // Keep a lone term as is, so upstream profiles parse exactly as before.
-            let targetscope_f = if target_terms.len() == 1 {
-                target_terms.swap_remove(0)
-            } else {
-                ProtoFilter::And(target_terms)
             };
 
+            // The targets are the members of the delegated scope group ...
+            let mut target_terms = vec![ProtoFilter::Eq(
+                Attribute::MemberOf.to_string(),
+                group.to_string(),
+            )];
+            // ... that also match the delegated scope filter, if any ...
+            if let Some(scope_filter) = value
+                .get_ava_single_protofilter(Attribute::DelegatedScopeFilter)
+                .cloned()
+            {
+                target_terms.push(scope_filter);
+            }
+            // ... and are never high privilege, recycled or tombstoned, the same exclusion
+            // the upstream user management profiles apply.
+            target_terms.push(ProtoFilter::AndNot(Box::new(ProtoFilter::Or(vec![
+                ProtoFilter::Eq(
+                    Attribute::MemberOf.to_string(),
+                    UUID_IDM_HIGH_PRIVILEGE.to_string(),
+                ),
+                ProtoFilter::Eq(
+                    Attribute::Class.to_string(),
+                    EntryClass::Recycled.to_string(),
+                ),
+                ProtoFilter::Eq(
+                    Attribute::Class.to_string(),
+                    EntryClass::Tombstone.to_string(),
+                ),
+            ]))));
+            Some(ProtoFilter::And(target_terms))
+        } else {
+            None
+        };
+
+        let target = if let Some(targetscope_f) = targetscope_f {
             let ident = Identity::from_internal();
 
             let targetscope_i = Filter::from_rw(&ident, &targetscope_f, qs).map_err(|e| {
