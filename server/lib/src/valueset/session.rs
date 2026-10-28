@@ -11,7 +11,7 @@ use crate::{
         ApiToken, ApiTokenScope, AuthType, Oauth2Session, Session, SessionExtMetadata,
         SessionScope, SessionState,
     },
-    valueset::{uuid_to_proto_string, DbValueSetV2, ScimResolveStatus, ValueSet},
+    valueset::{parse_utc, uuid_to_proto_string, DbValueSetV2, ScimResolveStatus, ValueSet},
 };
 use kubidm_proto::scim_v1::server::{ScimApiToken, ScimAuthSession, ScimOAuth2Session};
 use std::collections::{btree_map::Entry as BTreeEntry, BTreeMap};
@@ -124,8 +124,9 @@ impl ValueSetSession {
                         ext_metadata,
                     } => {
                         // Convert things.
-                        let issued_at = OffsetDateTime::parse(issued_at, &Rfc3339)
-                            .map(|odt| odt.to_offset(time::UtcOffset::UTC))
+                        let issued_at = parse_utc(issued_at)
+                            // Kubidm: checked, a time out of range in UTC is invalid.
+                            .ok_or(OperationError::InvalidValueState)
                             .map_err(|e| {
                                 admin_error!(
                                     ?e,
@@ -137,8 +138,9 @@ impl ValueSetSession {
 
                         let state = match state {
                             DbValueSessionStateV1::ExpiresAt(e_inner) => {
-                                OffsetDateTime::parse(e_inner, &Rfc3339)
-                                    .map(|odt| odt.to_offset(time::UtcOffset::UTC))
+                                parse_utc(e_inner)
+                                    // Kubidm: checked, a time out of range in UTC is invalid.
+                                    .ok_or(OperationError::InvalidValueState)
                                     .map(SessionState::ExpiresAt)
                                     .map_err(|e| {
                                         admin_error!(
@@ -519,8 +521,9 @@ impl ValueSetOauth2Session {
                         rs_uuid,
                     } => {
                         // Convert things.
-                        let issued_at = OffsetDateTime::parse(&issued_at, &Rfc3339)
-                            .map(|odt| odt.to_offset(time::UtcOffset::UTC))
+                        let issued_at = parse_utc(&issued_at)
+                            // Kubidm: checked, a time out of range in UTC is invalid.
+                            .ok_or(OperationError::InvalidValueState)
                             .map_err(|e| {
                                 admin_error!(
                                     ?e,
@@ -536,8 +539,9 @@ impl ValueSetOauth2Session {
                         // here.
                         let expiry = expiry
                             .map(|e_inner| {
-                                OffsetDateTime::parse(&e_inner, &Rfc3339)
-                                    .map(|odt| odt.to_offset(time::UtcOffset::UTC))
+                                parse_utc(&e_inner)
+                                    // Kubidm: checked, a time out of range in UTC is invalid.
+                                    .ok_or(OperationError::InvalidValueState)
                                 // We now have an
                                 // Option<Result<ODT, _>>
                             })
@@ -579,8 +583,9 @@ impl ValueSetOauth2Session {
                         rs_uuid,
                     } => {
                         // Convert things.
-                        let issued_at = OffsetDateTime::parse(&issued_at, &Rfc3339)
-                            .map(|odt| odt.to_offset(time::UtcOffset::UTC))
+                        let issued_at = parse_utc(&issued_at)
+                            // Kubidm: checked, a time out of range in UTC is invalid.
+                            .ok_or(OperationError::InvalidValueState)
                             .map_err(|e| {
                                 admin_error!(
                                     ?e,
@@ -592,8 +597,9 @@ impl ValueSetOauth2Session {
 
                         let state = match state {
                             DbValueSessionStateV1::ExpiresAt(e_inner) => {
-                                OffsetDateTime::parse(&e_inner, &Rfc3339)
-                                    .map(|odt| odt.to_offset(time::UtcOffset::UTC))
+                                parse_utc(&e_inner)
+                                    // Kubidm: checked, a time out of range in UTC is invalid.
+                                    .ok_or(OperationError::InvalidValueState)
                                     .map(SessionState::ExpiresAt)
                                     .map_err(|e| {
                                         admin_error!(
@@ -633,8 +639,9 @@ impl ValueSetOauth2Session {
                         rs_uuid,
                     } => {
                         // Convert things.
-                        let issued_at = OffsetDateTime::parse(&issued_at, &Rfc3339)
-                            .map(|odt| odt.to_offset(time::UtcOffset::UTC))
+                        let issued_at = parse_utc(&issued_at)
+                            // Kubidm: checked, a time out of range in UTC is invalid.
+                            .ok_or(OperationError::InvalidValueState)
                             .map_err(|e| {
                                 admin_error!(
                                     ?e,
@@ -646,8 +653,9 @@ impl ValueSetOauth2Session {
 
                         let state = match state {
                             DbValueSessionStateV1::ExpiresAt(e_inner) => {
-                                OffsetDateTime::parse(&e_inner, &Rfc3339)
-                                    .map(|odt| odt.to_offset(time::UtcOffset::UTC))
+                                parse_utc(&e_inner)
+                                    // Kubidm: checked, a time out of range in UTC is invalid.
+                                    .ok_or(OperationError::InvalidValueState)
                                     .map(SessionState::ExpiresAt)
                                     .map_err(|e| {
                                         admin_error!(
@@ -1032,8 +1040,9 @@ impl ValueSetApiTokenSet {
                         scope,
                     } => {
                         // Convert things.
-                        let issued_at = OffsetDateTime::parse(&issued_at, &Rfc3339)
-                            .map(|odt| odt.to_offset(time::UtcOffset::UTC))
+                        let issued_at = parse_utc(&issued_at)
+                            // Kubidm: checked, a time out of range in UTC is invalid.
+                            .ok_or(OperationError::InvalidValueState)
                             .map_err(|e| {
                                 admin_error!(
                                     ?e,
@@ -1049,8 +1058,9 @@ impl ValueSetApiTokenSet {
                         // here.
                         let expiry = expiry
                             .map(|e_inner| {
-                                OffsetDateTime::parse(&e_inner, &Rfc3339)
-                                    .map(|odt| odt.to_offset(time::UtcOffset::UTC))
+                                parse_utc(&e_inner)
+                                    // Kubidm: checked, a time out of range in UTC is invalid.
+                                    .ok_or(OperationError::InvalidValueState)
                                 // We now have an
                                 // Option<Result<ODT, _>>
                             })

@@ -233,7 +233,7 @@ pub trait AccessControlsTransaction<'a> {
     fn get_delete(&self) -> &Vec<AccessControlDelete>;
     fn get_sync_agreements(&self) -> &HashMap<Uuid, BTreeSet<Attribute>>;
     /// Kubidm: the enabled profiles that the last reload skipped because they are
-    /// invalid, per kind, see [SkippedAcps].
+    /// invalid, per kind, see `SkippedAcps`.
     fn get_skipped(&self) -> &SkippedAcps;
 
     /// Kubidm: the enabled profiles (uuid to name) that the last reload skipped as any

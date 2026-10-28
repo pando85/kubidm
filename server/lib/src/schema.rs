@@ -436,10 +436,10 @@ impl SchemaAttribute {
         };
             */
 
-        let valid = self.syntax == ava.syntax()
-            // Kubidm: a maximum grant duration of 0 would make every time-bounded grant on
-            // the group fail, so it is rejected rather than treated as "disabled".
-            && (*a != Attribute::MaxGrantDuration || ava.to_uint32_single() != Some(0));
+        // Kubidm: a `max_grant_duration` of 0 is rejected when it is written by a create or
+        // modify (`plugins::max_grant_duration`), not here: released versions accepted it,
+        // and schema validation also runs for replicated and refreshed entries.
+        let valid = self.syntax == ava.syntax();
 
         if valid && ava.validate(self) {
             Ok(())

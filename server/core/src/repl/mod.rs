@@ -562,15 +562,23 @@ async fn repl_run_consumer_inner(
         }
     };
 
-    // A supplier in another domain while this node is in sync with other suppliers is the
-    // one that must be refreshed (for example a new replica): never refresh from it.
+    // A supplier in another domain while this node holds replicated content (or is in sync
+    // with other suppliers) is the one that must be refreshed, for example a new replica or
+    // an empty re-created one: never refresh from it, that would wipe this node. The manual
+    // `kubidmd refresh-replication-consumer` does not go through this check.
     if matches!(changes, ReplIncrementalContext::DomainMismatch)
         && !tracker.notify_replication_domain_mismatch(peer_url, now_secs())
     {
         error!(
-            "Supplier {peer_url} is in a different domain while this node is in sync with \
-             other suppliers. That supplier must be refreshed; this node will not be refreshed \
-             from it."
+            "Supplier {peer_url} is in a different domain from this node, which holds \
+             replicated content. This node will not be refreshed from it automatically, as \
+             that would replace its content with the supplier's: the supplier is reported \
+             stale and this node degraded. If the supplier is the one out of the domain (for \
+             example an empty or re-created node), refresh the supplier from this node. If \
+             the supplier's domain is the intended one (the cluster was intentionally \
+             rebuilt in a new domain), an operator must run \
+             `kubidmd refresh-replication-consumer --i-want-to-refresh-this-servers-database` \
+             on this node."
         );
         return None;
     }

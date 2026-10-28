@@ -36,8 +36,13 @@
 //! The window of a new grant, from the later of now and `valid_from` to `valid_until`, may
 //! not exceed the group's `max_grant_duration` (in seconds), or
 //! [`DEFAULT_MAX_GRANT_DURATION_SECS`] when the group does not set one. The start of a
-//! grant may also be at most that far in the future. A `max_grant_duration` of 0 is
-//! rejected by schema validation.
+//! grant may also be at most that far in the future.
+//!
+//! Writing a `max_grant_duration` of 0 is rejected (`plugins::max_grant_duration`), but
+//! released versions accepted it, so a group may still hold it (stored, or replicated from
+//! such a version). A stored 0 is read as "no grants allowed": the safer reading, and what
+//! such a cap always did, since no window fits in 0 seconds. Grants that already exist on
+//! the group are left as they are, and can be revoked.
 
 use crate::prelude::*;
 use crate::server::access::{Access, AccessControlsTransaction};
@@ -271,6 +276,15 @@ impl QueryServerWriteTransaction<'_> {
         let max_secs = entry
             .get_ava_single_uint32(Attribute::MaxGrantDuration)
             .unwrap_or(DEFAULT_MAX_GRANT_DURATION_SECS);
+        // A stored cap of 0 (accepted by released versions) allows no grant, see the module
+        // documentation.
+        if max_secs == 0 {
+            return Err(OperationError::InvalidAttribute(
+                "the maximum grant duration of this group is 0, which allows no grant: set it \
+                 to a positive number of seconds, or remove it to use the default"
+                    .to_string(),
+            ));
+        }
         let max = time::Duration::seconds(i64::from(max_secs));
         if grant.valid_until - start > max {
             return Err(OperationError::InvalidAttribute(format!(
@@ -980,6 +994,95 @@ mod tests {
                 &ModifyList::new_purge_and_set(Attribute::MaxGrantDuration, Value::Uint32(1)),
             )
             .expect("a positive cap");
+
+        // Nor can a group be created with it.
+        let mut zero = group("tb_zero", Uuid::new_v4(), true);
+        zero.add_ava(Attribute::MaxGrantDuration, Value::Uint32(0));
+        assert!(matches!(
+            server_txn.internal_create(vec![zero]),
+            Err(OperationError::SchemaViolation(_))
+        ));
+        server_txn.commit().expect("commit");
+    }
+
+    #[qs_test]
+    async fn test_time_bounded_stored_zero_cap_allows_no_grant(server: &QueryServer) {
+        let ct = duration_from_epoch_now();
+        setup(server, ct).await;
+
+        // Plant a grant, then a cap of 0 as a released version could store it (or
+        // replicate it), bypassing the write checks.
+        let mut server_txn = server.write(ct).await.expect("txn");
+        server_txn
+            .grant_time_bounded_member(
+                &Identity::from_internal(),
+                UUID_TB_GROUP,
+                UUID_TB_TARGET,
+                None,
+                odt(ct + secs(3600)),
+            )
+            .expect("grant");
+        let filt = filter!(f_eq(Attribute::Uuid, PartialValue::Uuid(UUID_TB_GROUP)));
+        let mut work_set = server_txn.internal_search_writeable(&filt).expect("search");
+        for (_, entry) in work_set.iter_mut() {
+            entry.set_ava(&Attribute::MaxGrantDuration, [Value::Uint32(0)]);
+        }
+        server_txn
+            .internal_apply_writable(work_set)
+            .expect("plant 0");
+        server_txn.commit().expect("commit");
+
+        let mut server_txn = server.write(ct).await.expect("txn");
+        assert_eq!(
+            server_txn
+                .internal_search_uuid(UUID_TB_GROUP)
+                .expect("group")
+                .get_ava_single_uint32(Attribute::MaxGrantDuration),
+            Some(0)
+        );
+        // The group can still be modified, as long as the cap is left as it is.
+        server_txn
+            .internal_modify_uuid(
+                UUID_TB_GROUP,
+                &ModifyList::new_append(Attribute::Member, Value::ReferN(UUID_TB_OUTSIDER)),
+            )
+            .expect("add a member to a group with a stored cap of 0");
+        assert!(is_memberof(
+            &mut server_txn,
+            UUID_TB_OUTSIDER,
+            UUID_TB_GROUP
+        ));
+        // The existing grant stays active.
+        assert!(is_memberof(&mut server_txn, UUID_TB_TARGET, UUID_TB_GROUP));
+
+        // A stored 0 allows no new grant.
+        assert!(invalid_attribute(server_txn.grant_time_bounded_member(
+            &Identity::from_internal(),
+            UUID_TB_GROUP,
+            UUID_TB_MANAGER,
+            None,
+            odt(ct + secs(1)),
+        )));
+        // The existing grant can be revoked.
+        server_txn
+            .revoke_time_bounded_member(&Identity::from_internal(), UUID_TB_GROUP, UUID_TB_TARGET)
+            .expect("revoke");
+        assert!(!is_memberof(&mut server_txn, UUID_TB_TARGET, UUID_TB_GROUP));
+
+        // The cap can be fixed, but not set to 0 again.
+        server_txn
+            .internal_modify_uuid(
+                UUID_TB_GROUP,
+                &ModifyList::new_purge_and_set(Attribute::MaxGrantDuration, Value::Uint32(60)),
+            )
+            .expect("a positive cap");
+        assert!(matches!(
+            server_txn.internal_modify_uuid(
+                UUID_TB_GROUP,
+                &ModifyList::new_purge_and_set(Attribute::MaxGrantDuration, Value::Uint32(0)),
+            ),
+            Err(OperationError::SchemaViolation(_))
+        ));
         server_txn.commit().expect("commit");
     }
 
@@ -1052,6 +1155,104 @@ mod tests {
         server_txn
             .revoke_time_bounded_member(&manager, UUID_TB_GROUP, UUID_TB_TARGET)
             .expect("revoke");
+        assert!(!is_memberof(&mut server_txn, UUID_TB_TARGET, UUID_TB_GROUP));
+        server_txn.commit().expect("commit");
+    }
+
+    #[qs_test]
+    async fn test_time_bounded_grants_inactive_on_group_that_became_high_privilege(
+        server: &QueryServer,
+    ) {
+        let ct = duration_from_epoch_now();
+        setup(server, ct).await;
+
+        // A grant that starts later, and one that is active now.
+        let mut server_txn = server.write(ct).await.expect("txn");
+        let manager = ident_of(&mut server_txn, UUID_TB_MANAGER);
+        server_txn
+            .grant_time_bounded_member(
+                &manager,
+                UUID_TB_GROUP,
+                UUID_TB_TARGET,
+                Some(odt(ct + secs(60))),
+                odt(ct + secs(3600)),
+            )
+            .expect("future grant");
+        server_txn
+            .grant_time_bounded_member(
+                &manager,
+                UUID_TB_GROUP,
+                UUID_TB_OUTSIDER,
+                None,
+                odt(ct + secs(3600)),
+            )
+            .expect("active grant");
+        assert!(is_memberof(
+            &mut server_txn,
+            UUID_TB_OUTSIDER,
+            UUID_TB_GROUP
+        ));
+
+        // The group becomes high privilege, by nesting.
+        server_txn
+            .internal_create(vec![entry_init!(
+                (Attribute::Class, EntryClass::Object.to_value()),
+                (Attribute::Class, EntryClass::Group.to_value()),
+                (Attribute::Name, Value::new_iname("tb_hp_parent")),
+                (Attribute::Uuid, Value::Uuid(UUID_TB_HP_PARENT)),
+                (Attribute::Member, Value::ReferN(UUID_TB_GROUP))
+            )])
+            .expect("create parent");
+        add_member(&mut server_txn, UUID_IDM_HIGH_PRIVILEGE, UUID_TB_HP_PARENT);
+        // The active grant no longer grants anything.
+        assert!(!is_memberof(
+            &mut server_txn,
+            UUID_TB_OUTSIDER,
+            UUID_TB_GROUP
+        ));
+        assert!(!is_memberof(
+            &mut server_txn,
+            UUID_TB_OUTSIDER,
+            UUID_IDM_HIGH_PRIVILEGE
+        ));
+        server_txn.commit().expect("commit");
+
+        // Once the future grant starts, the refresh does not activate it.
+        let later = ct + secs(120);
+        let mut server_txn = server.write(later).await.expect("txn");
+        assert_eq!(server_txn.refresh_time_bounded_memberships(), Ok(0));
+        assert!(!is_memberof(&mut server_txn, UUID_TB_TARGET, UUID_TB_GROUP));
+        assert!(!is_memberof(
+            &mut server_txn,
+            UUID_TB_TARGET,
+            UUID_IDM_HIGH_PRIVILEGE
+        ));
+        // Nor does a write that recomputes the member's memberof.
+        server_txn
+            .internal_modify_uuid(
+                UUID_TB_TARGET,
+                &ModifyList::new_purge_and_set(Attribute::DisplayName, Value::new_utf8s("t")),
+            )
+            .expect("modify target");
+        assert!(!is_memberof(&mut server_txn, UUID_TB_TARGET, UUID_TB_GROUP));
+
+        // The grants can still be revoked.
+        server_txn
+            .revoke_time_bounded_member(&Identity::from_internal(), UUID_TB_GROUP, UUID_TB_TARGET)
+            .expect("revoke");
+
+        // Once the group is no longer high privilege, the remaining grant applies again.
+        server_txn
+            .internal_modify_uuid(
+                UUID_IDM_HIGH_PRIVILEGE,
+                &ModifyList::new_remove(Attribute::Member, PartialValue::Refer(UUID_TB_HP_PARENT)),
+            )
+            .expect("remove parent from high privilege");
+        assert!(is_memberof(
+            &mut server_txn,
+            UUID_TB_OUTSIDER,
+            UUID_TB_GROUP
+        ));
         assert!(!is_memberof(&mut server_txn, UUID_TB_TARGET, UUID_TB_GROUP));
         server_txn.commit().expect("commit");
     }

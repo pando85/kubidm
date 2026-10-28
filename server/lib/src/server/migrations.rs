@@ -275,6 +275,14 @@ impl QueryServer {
                 profiles = ?skipped_acps,
                 "Some access control profiles, including built-in ones, are invalid and were skipped, they grant nothing until they are fixed or disabled"
             );
+            // Kubidm: the re-migration of the current level repairs built-ins (see
+            // `kubidm_migrate_builtin_acp_batch`). Pre-release builds run it on every start
+            // up; release builds only when the domain level changes.
+            if !current_devel_flag {
+                error!(
+                    "To repair the built-in access control profiles, run `kubidmd domain remigrate` on this server"
+                );
+            }
         } else if !skipped_acps.is_empty() {
             warn!(
                 count = skipped_acps.len(),
@@ -353,10 +361,15 @@ impl QueryServerWriteTransaction<'_> {
     ///
     /// - `acp_reauth_max_age`, which is unsupported;
     /// - the `access_control_receiver_delegated` class, which is unsupported, with
-    ///   `acp_receiver_delegated` and, unless the profile has a delegated target, the
-    ///   delegated scope attributes, which only that class allows. The class also
-    ///   excludes the group receiver of the shipped definition, so the rewrite would
-    ///   otherwise fail;
+    ///   `acp_receiver_delegated`. The class also excludes the group receiver of the
+    ///   shipped definition, so the rewrite would otherwise fail;
+    /// - on a built-in that receives through a group, the
+    ///   `access_control_receiver_entry_manager` class, which excludes the group receiver
+    ///   that the rewrite restores;
+    /// - on a built-in that targets a scope, the `access_control_target_delegated_scope`
+    ///   class, which excludes the target scope that the rewrite restores;
+    /// - with either delegated class removed, the delegated scope attributes, unless a
+    ///   delegated class remains (only those classes allow them);
     /// - `memberof` and `directmemberof` in `acp_create_attr`, which are server maintained
     ///   (the rewrite also replaces `acp_create_attr` outright when the shipped definition
     ///   has it).
@@ -396,21 +409,47 @@ impl QueryServerWriteTransaction<'_> {
                 || builtin.attribute_equality(Attribute::Class, &class)
         };
 
+        let builtin_has_class = |class: EntryClass| {
+            builtin.attribute_equality(Attribute::Class, &PartialValue::from(class))
+        };
+
         let mut mods = Vec::new();
         if stored_only_attr(&Attribute::AcpReauthMaxAge) {
             mods.push(Modify::Purged(Attribute::AcpReauthMaxAge));
         }
         let receiver_delegated = PartialValue::from(EntryClass::AccessControlReceiverDelegated);
-        if stored_only(&Attribute::Class, &receiver_delegated) {
+        let remove_receiver_delegated = stored_only(&Attribute::Class, &receiver_delegated);
+        if remove_receiver_delegated {
             mods.push(Modify::Removed(Attribute::Class, receiver_delegated));
-            if !has_class(EntryClass::AccessControlTargetDelegatedScope) {
-                for attr in [
-                    Attribute::DelegatedScopeGroup,
-                    Attribute::DelegatedScopeFilter,
-                ] {
-                    if stored_only_attr(&attr) {
-                        mods.push(Modify::Purged(attr));
-                    }
+        }
+        // An entry manager receiver excludes the group receiver the rewrite restores.
+        let receiver_entry_manager =
+            PartialValue::from(EntryClass::AccessControlReceiverEntryManager);
+        if builtin_has_class(EntryClass::AccessControlReceiverGroup)
+            && stored_only(&Attribute::Class, &receiver_entry_manager)
+        {
+            mods.push(Modify::Removed(Attribute::Class, receiver_entry_manager));
+        }
+        // A delegated target excludes the target scope the rewrite restores.
+        let target_delegated = PartialValue::from(EntryClass::AccessControlTargetDelegatedScope);
+        let remove_target_delegated = builtin_has_class(EntryClass::AccessControlTargetScope)
+            && stored_only(&Attribute::Class, &target_delegated);
+        if remove_target_delegated {
+            mods.push(Modify::Removed(Attribute::Class, target_delegated));
+        }
+        // The delegated scope attributes are only allowed by the two delegated classes:
+        // once neither remains, remove them as well.
+        let delegated_class_remains = (has_class(EntryClass::AccessControlReceiverDelegated)
+            && !remove_receiver_delegated)
+            || (has_class(EntryClass::AccessControlTargetDelegatedScope)
+                && !remove_target_delegated);
+        if (remove_receiver_delegated || remove_target_delegated) && !delegated_class_remains {
+            for attr in [
+                Attribute::DelegatedScopeGroup,
+                Attribute::DelegatedScopeFilter,
+            ] {
+                if stored_only_attr(&attr) {
+                    mods.push(Modify::Purged(attr));
                 }
             }
         }
@@ -1513,6 +1552,52 @@ mod tests {
                 ]),
             )
             .expect("modify");
+        // An entry manager receiver instead of the group receiver, and a delegated target
+        // instead of the target scope. Both parse, but exclude the receiver and target
+        // that the rewrite restores, so the rewrite would fail.
+        write_txn
+            .internal_modify_uuid(
+                UUID_IDM_ACP_GROUP_MANAGE_V1,
+                &ModifyList::new_list(vec![
+                    Modify::Removed(
+                        Attribute::Class,
+                        EntryClass::AccessControlReceiverGroup.into(),
+                    ),
+                    Modify::Purged(Attribute::AcpReceiverGroup),
+                    Modify::Present(
+                        Attribute::Class,
+                        EntryClass::AccessControlReceiverEntryManager.to_value(),
+                    ),
+                ]),
+            )
+            .expect("modify");
+        write_txn
+            .internal_modify_uuid(
+                UUID_IDM_ACP_PEOPLE_DELETE_V1,
+                &ModifyList::new_list(vec![
+                    Modify::Removed(
+                        Attribute::Class,
+                        EntryClass::AccessControlTargetScope.into(),
+                    ),
+                    Modify::Purged(Attribute::AcpTargetScope),
+                    Modify::Present(
+                        Attribute::Class,
+                        EntryClass::AccessControlTargetDelegatedScope.to_value(),
+                    ),
+                    Modify::Present(
+                        Attribute::DelegatedScopeGroup,
+                        Value::Refer(UUID_IDM_PEOPLE_ADMINS),
+                    ),
+                    Modify::Present(
+                        Attribute::DelegatedScopeFilter,
+                        Value::JsonFilt(ProtoFilter::Eq(
+                            Attribute::Class.to_string(),
+                            EntryClass::Person.to_string(),
+                        )),
+                    ),
+                ]),
+            )
+            .expect("modify");
         write_txn.commit().expect("commit");
 
         // They are skipped.
@@ -1569,6 +1654,37 @@ mod tests {
             Attribute::AcpReceiverGroup,
             &PartialValue::Refer(UUID_IDM_PEOPLE_ADMINS)
         ));
+
+        let group_manage = write_txn
+            .internal_search_uuid(UUID_IDM_ACP_GROUP_MANAGE_V1)
+            .expect("acp");
+        assert!(!group_manage.attribute_equality(
+            Attribute::Class,
+            &EntryClass::AccessControlReceiverEntryManager.into()
+        ));
+        assert!(group_manage.attribute_equality(
+            Attribute::Class,
+            &EntryClass::AccessControlReceiverGroup.into()
+        ));
+        assert!(group_manage.attribute_equality(
+            Attribute::AcpReceiverGroup,
+            &PartialValue::Refer(UUID_IDM_GROUP_ADMINS)
+        ));
+
+        let people_delete = write_txn
+            .internal_search_uuid(UUID_IDM_ACP_PEOPLE_DELETE_V1)
+            .expect("acp");
+        assert!(!people_delete.attribute_equality(
+            Attribute::Class,
+            &EntryClass::AccessControlTargetDelegatedScope.into()
+        ));
+        assert!(!people_delete.attribute_pres(Attribute::DelegatedScopeGroup));
+        assert!(!people_delete.attribute_pres(Attribute::DelegatedScopeFilter));
+        assert!(people_delete.attribute_equality(
+            Attribute::Class,
+            &EntryClass::AccessControlTargetScope.into()
+        ));
+        assert!(people_delete.attribute_pres(Attribute::AcpTargetScope));
     }
 
     #[qs_test]

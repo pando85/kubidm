@@ -736,13 +736,23 @@ impl AccessControlProfile {
             )));
         }
 
-        let time_restriction_start = value
-            .get_ava_single_datetime(Attribute::AcpTimeRestrictionStart)
-            .map(|dt| dt.to_offset(time::UtcOffset::UTC));
-
-        let time_restriction_end = value
-            .get_ava_single_datetime(Attribute::AcpTimeRestrictionEnd)
-            .map(|dt| dt.to_offset(time::UtcOffset::UTC));
+        // Kubidm: checked, as to_offset panics for a time that is out of range in UTC. Such
+        // a restriction is an error rather than dropped, which would widen the access.
+        let restriction_utc = |attr: Attribute| {
+            value
+                .get_ava_single_datetime(attr.clone())
+                .map(|dt| {
+                    dt.checked_to_offset(time::UtcOffset::UTC).ok_or_else(|| {
+                        admin_error!(?name, "{} can not be expressed in UTC", attr);
+                        OperationError::InvalidAcpState(format!(
+                            "{attr} can not be expressed in UTC"
+                        ))
+                    })
+                })
+                .transpose()
+        };
+        let time_restriction_start = restriction_utc(Attribute::AcpTimeRestrictionStart)?;
+        let time_restriction_end = restriction_utc(Attribute::AcpTimeRestrictionEnd)?;
 
         Ok(AccessControlProfile {
             name,

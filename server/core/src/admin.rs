@@ -1304,7 +1304,8 @@ async fn replication_sync_until(
 }
 
 /// Resume serving after a maintenance operation. The operator decided the node is fit to
-/// serve, so a failed verification of the operation no longer keeps it not ready.
+/// serve, so a failed verification no longer keeps it not ready: this clears any failed
+/// verification, not only one of this operation (the health tracker keeps a single flag).
 async fn maintenance_resume(
     controller: Arc<Mutex<MaintenanceController>>,
     operation_id: Uuid,

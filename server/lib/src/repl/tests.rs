@@ -4604,6 +4604,95 @@ async fn test_repl_oauth2_federation_invalid_does_not_block(
     }
 }
 
+/// Kubidm: released versions accepted a `max_grant_duration` of 0. A group that holds it
+/// must replicate (incrementally and through a refresh) like any other, and stay modifiable
+/// on the consumer: only writing 0 anew is rejected.
+#[qs_pair_test]
+async fn test_repl_max_grant_duration_zero_replicates(
+    server_a: &QueryServer,
+    server_b: &QueryServer,
+) {
+    let ct = duration_from_epoch_now();
+    let mut server_a_txn = server_a.write(ct).await.unwrap();
+    let mut server_b_txn = server_b.read().await.unwrap();
+    assert!(repl_initialise(&mut server_b_txn, &mut server_a_txn)
+        .and_then(|_| server_a_txn.commit())
+        .is_ok());
+    drop(server_b_txn);
+
+    // On B, a group with a cap of 0 as a released version stored it.
+    let g_uuid = Uuid::new_v4();
+    let m_uuid = Uuid::new_v4();
+    let mut server_b_txn = server_b.write(ct).await.unwrap();
+    server_b_txn
+        .internal_create(vec![
+            entry_init!(
+                (Attribute::Class, EntryClass::Object.to_value()),
+                (Attribute::Class, EntryClass::Group.to_value()),
+                (Attribute::Class, EntryClass::TimeBoundedGrant.to_value()),
+                (Attribute::Name, Value::new_iname("testgroup_zero_cap")),
+                (Attribute::Uuid, Value::Uuid(g_uuid))
+            ),
+            entry_init!(
+                (Attribute::Class, EntryClass::Object.to_value()),
+                (Attribute::Class, EntryClass::Group.to_value()),
+                (
+                    Attribute::Name,
+                    Value::new_iname("testgroup_zero_cap_member")
+                ),
+                (Attribute::Uuid, Value::Uuid(m_uuid))
+            ),
+        ])
+        .expect("create");
+    let filt = filter!(f_eq(Attribute::Uuid, PartialValue::Uuid(g_uuid)));
+    let mut work_set = server_b_txn.internal_search_writeable(&filt).unwrap();
+    for (_, entry) in work_set.iter_mut() {
+        entry.set_ava(&Attribute::MaxGrantDuration, [Value::Uint32(0)]);
+    }
+    server_b_txn
+        .internal_apply_writable(work_set)
+        .expect("plant 0");
+    server_b_txn.commit().expect("commit");
+
+    // Incremental B -> A: the group arrives as is, not as a conflict.
+    let ct = duration_from_epoch_now();
+    let mut server_a_txn = server_a.write(ct).await.unwrap();
+    let mut server_b_txn = server_b.read().await.unwrap();
+    repl_incremental(&mut server_b_txn, &mut server_a_txn);
+    let group = server_a_txn
+        .internal_search_uuid(g_uuid)
+        .expect("group on A");
+    assert!(!group.attribute_equality(Attribute::Class, &EntryClass::Conflict.into()));
+    assert_eq!(
+        group.get_ava_single_uint32(Attribute::MaxGrantDuration),
+        Some(0)
+    );
+
+    // It can be modified on A.
+    server_a_txn
+        .internal_modify_uuid(
+            g_uuid,
+            &ModifyList::new_append(Attribute::Member, Value::ReferN(m_uuid)),
+        )
+        .expect("add a member on A");
+    server_a_txn.commit().expect("commit");
+    drop(server_b_txn);
+
+    // A refresh of A from B carries it too.
+    let ct = duration_from_epoch_now();
+    let mut server_a_txn = server_a.write(ct).await.unwrap();
+    let mut server_b_txn = server_b.read().await.unwrap();
+    assert!(repl_initialise(&mut server_b_txn, &mut server_a_txn).is_ok());
+    assert_eq!(
+        server_a_txn
+            .internal_search_uuid(g_uuid)
+            .expect("group on A")
+            .get_ava_single_uint32(Attribute::MaxGrantDuration),
+        Some(0)
+    );
+    server_a_txn.commit().expect("commit");
+}
+
 /// Kubidm: two approvers decide on the same approval request on different replicas within
 /// one replication interval. Both decisions reach both replicas (whichever direction
 /// replicates first), and the state recomputed from them is the same on both replicas,

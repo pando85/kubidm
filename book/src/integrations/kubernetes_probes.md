@@ -171,11 +171,9 @@ run of failures ends when no new failure happens for the stale window, and a lat
   cleared, the node counts as synced, and any run of apply failures ends.
 - **Supplier reports that this node is behind its changelog:** the node is `refresh_required` until that supplier
   answers an incremental normally again or a refresh succeeds. With `automatic_refresh` the refresh starts immediately.
-- **Supplier answers from another domain:** if this node is synced and another supplier synced within the stale window,
-  the peer is the one out of the domain (a new replica not refreshed yet, or a rebuilt one). It is reported stale, the
-  node is `degraded` and keeps serving, an error is logged, and this node is never refreshed from that peer even with
-  `automatic_refresh`. Otherwise (this node has never synced, or no other supplier is in sync) the mismatch is treated
-  as `refresh_required`, as upstream does.
+- **Supplier answers from another domain:** a refresh would replace all of this node's content with the peer's, so it is
+  only done automatically when this node has nothing to lose. See
+  [The Domain Mismatch Guard](#the-domain-mismatch-guard).
 - **Refresh:** `refreshing` while it runs. On success every `refresh_required` flag is cleared, the node is synced, and
   a failed verification is cleared because the content was replaced. A refresh is applied in a single transaction, so a
   failed refresh leaves the content unchanged and the state returns to what it was before (`refresh_required`,
@@ -204,6 +202,12 @@ When the server starts with replication configured, it decides whether it must w
   successful refresh or incremental. A fresh replica's first incremental is answered with a domain mismatch, so it moves
   to `refresh_required` and is refreshed automatically.
 
+A node without an `automatic_refresh` supplier is ready as soon as it starts, before it has talked to any peer. If such
+a node was replaced by an empty one (for example pod-0 re-created with a new volume), it creates a new domain and is
+ready for up to one `task_poll_interval`, until its first incremental with a peer is answered with a domain mismatch. It
+then reports `refresh_required` (not ready). The replicas that pull from it never refresh from it automatically, see
+[The Domain Mismatch Guard](#the-domain-mismatch-guard).
+
 The database shows that a node has synced before when either:
 
 - its domain info entry was created by another server. A fresh server creates its own domain; a refresh replaces the
@@ -220,25 +224,67 @@ stays not ready until its first successful sync; an error is logged.
 Supplier peers must be configured by DNS name: replication refuses addresses because the TLS check needs a name. A peer
 configured by address is logged at startup, tracked under its address, and reported stale.
 
+### The Domain Mismatch Guard
+
+A supplier answers with a domain mismatch when it and this node are not in the same domain. Either side may be the one
+out of the domain, and an automatic refresh would replace all of this node's content with the supplier's. The node
+decides as follows:
+
+- **This node has evidence that it holds replicated content, and a supplier configured with `automatic_refresh`:** it is
+  never refreshed automatically from a mismatched peer, whatever the other peers do. The evidence is the one used at
+  startup (its database shows that it synced before), or any successful refresh or incremental since it started. The
+  peer is reported stale, the node is `degraded` and keeps serving, and an error is logged on every replication
+  interval. This protects a synced replica from an empty, re-created supplier: such a node has no `automatic_refresh`
+  supplier, so it is ready at once and would otherwise wipe every replica that refreshes from it (in a two replica
+  StatefulSet, or after a full restart of a larger one, where no other peer is in sync yet).
+- **This node has no such evidence (a fresh replica):** it is the one out of the domain. It reports `refresh_required`
+  and, with `automatic_refresh`, is refreshed from the peer.
+- **This node has no supplier configured with `automatic_refresh` (the origin, pod-0):** it is never refreshed
+  automatically. If another supplier synced within the stale window, the mismatched peer is reported stale (`degraded`,
+  still ready); otherwise the node can not tell which side is out of the domain and reports `refresh_required` (not
+  ready).
+
+A supplier that reports that this node fell behind its changelog, in the same domain, is not a domain mismatch: with
+`automatic_refresh` the node is refreshed as before.
+
 When a new replica joins an existing topology, the existing nodes that pull from it are answered with a domain mismatch
-until the new replica has been refreshed. As long as they are in sync with another supplier they only report it as a
-stale peer (`degraded`, still ready). An existing node whose only supplier is the new replica can not tell which side is
-out of the domain and reports `refresh_required`: refresh the new replica before adding it as the only supplier of an
-existing node.
+until it has been refreshed. They report it as a stale peer (`degraded`, still ready) and are never refreshed from it.
+An existing node without `automatic_refresh` whose only supplier is the new replica reports `refresh_required` until the
+new replica has been refreshed: refresh the new replica before adding it as the only supplier of an existing node.
+
+#### Recovering From a Mismatch
+
+The guard never decides which domain is the right one, an operator does. Check the error logged on the degraded node,
+which names the supplier, and compare the domain of both sides (`kubidmd domain show`).
+
+- **The supplier is the one out of the domain** (an empty or re-created node, for example pod-0 after its volume was
+  lost): refresh the supplier from a node that holds the content. On the supplier, run:
+
+  ```bash
+  kubidmd refresh-replication-consumer --i-want-to-refresh-this-servers-database
+  ```
+
+  A node without `automatic_refresh` refreshes from one of its suppliers, so it needs a supplier that holds the content
+  (in a Kaniop StatefulSet every pod pulls from every other pod).
+- **The cluster was intentionally rebuilt in a new domain** (for example restored from a backup of another cluster, or
+  re-initialised on purpose): the nodes that still hold the old domain refuse the automatic refresh. Run the same
+  command on each of them to replace their content with the new domain's. The manual refresh does not go through the
+  guard, and on success the node is synced and healthy again.
 
 ## Database Health
 
 The `database_health` field is `unhealthy` (not ready) when either of these checks last failed:
 
-| Check  | Fails when                                                                                       | Recovers when                                                                                                         |
-| ------ | ------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------- |
-| Commit | The backend commit of a write transaction fails (database or IO error, for example a full disk)  | The next write transaction commits                                                                                    |
-| Verify | The online consistency verification that ends every admin socket `MaintenanceRun` reports errors | The next verification reports none, the operator resumes the maintenance operation, or a replication refresh succeeds |
+| Check  | Fails when                                                                                       | Recovers when                                                                                                       |
+| ------ | ------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------- |
+| Commit | The backend commit of a write transaction fails (database or IO error, for example a full disk)  | The next write transaction commits                                                                                  |
+| Verify | The online consistency verification that ends every admin socket `MaintenanceRun` reports errors | The next verification reports none, the operator resumes a maintenance operation, or a replication refresh succeeds |
 
 Changes rejected by schema, access control or plugin validation never reach the backend commit and do not affect the
 database health. Search errors do not affect it either. The two checks recover independently: a successful write does
-not clear a corruption found by a verification. Both results are kept in memory only, so a restart of the server also
-clears them.
+not clear a corruption found by a verification. A `resume` clears any failed verification, not only one found by the
+operation it ends: resuming is the operator's decision that the node is fit to serve. Both results are kept in memory
+only, so a restart of the server also clears them.
 
 ## Readiness Decision Matrix
 
@@ -462,22 +508,28 @@ Check the `/readyz` endpoint response to determine the cause:
    `kubidmd refresh-replication-consumer`).
 
 4. **`replication_state` is `refresh_required`:** A supplier reported that this node's content must be refreshed: it is
-   a new replica, it has fallen further behind than the changelog, or its only in-sync supplier is itself a new, not yet
-   refreshed replica. With `automatic_refresh` this happens automatically; if it persists, check:
+   a new replica, it has fallen further behind than the changelog, or (on a node without `automatic_refresh`) a supplier
+   is in another domain and no other supplier is in sync, for example an empty, re-created pod-0. See
+   [Recovering From a Mismatch](#recovering-from-a-mismatch). With `automatic_refresh` a refresh of a new or lagging
+   replica happens automatically; if it persists, check:
    - Network connectivity to peers
    - Peer availability
    - Replication configuration
 
-5. **`replication_state` is `failed`:** This node has been unable to apply the changes its suppliers send. Check the
+5. **`replication_state` stays `degraded` with a domain mismatch error in the logs:** a supplier is in another domain,
+   and this node holds replicated content, so it refuses to be refreshed from it automatically. See
+   [Recovering From a Mismatch](#recovering-from-a-mismatch).
+
+6. **`replication_state` is `failed`:** This node has been unable to apply the changes its suppliers send. Check the
    logs for `Consumer was not able to apply changes`; a refresh from a healthy peer usually resolves it.
 
-6. **`replication_state` is `refreshing`:** Replica is currently performing a full refresh. This is normal and will
+7. **`replication_state` is `refreshing`:** Replica is currently performing a full refresh. This is normal and will
    complete automatically. If it takes too long, check:
    - Network bandwidth
    - Database size
    - Peer load
 
-7. **`message` reports maintenance:** The node is drained for a maintenance operation. Check `/maintenance` for the
+8. **`message` reports maintenance:** The node is drained for a maintenance operation. Check `/maintenance` for the
    state. A `failed` state needs the operator to retry or resume the operation; run `kubidmd maintenance status` on the
    node for the operation ID and the last error (see
    [Draining a Node for Maintenance](#draining-a-node-for-maintenance)).

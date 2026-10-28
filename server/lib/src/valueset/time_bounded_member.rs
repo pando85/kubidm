@@ -2,18 +2,10 @@ use crate::be::dbvalue::DbValueTimeBoundedMemberV1;
 use crate::prelude::*;
 use crate::schema::SchemaAttribute;
 use crate::value::TimeBoundedMember;
-use crate::valueset::{DbValueSetV2, ScimResolveStatus, ValueSet};
+use crate::valueset::{parse_utc, DbValueSetV2, ScimResolveStatus, ValueSet};
 use std::collections::{BTreeMap, BTreeSet};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
-
-/// Parse an RFC 3339 time and normalise it to UTC. `None` when the time does not parse, or
-/// can not be expressed in UTC (`to_offset` would panic).
-fn parse_utc(s: &str) -> Option<OffsetDateTime> {
-    OffsetDateTime::parse(s, &Rfc3339)
-        .ok()
-        .and_then(|odt| odt.checked_to_offset(time::UtcOffset::UTC))
-}
 
 #[derive(Debug, Clone)]
 pub struct ValueSetTimeBoundedMember {

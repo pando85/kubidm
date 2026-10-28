@@ -255,9 +255,18 @@ struct ReplicationTracking {
     timings: ReplicationTimings,
     /// When tracking started: the reference for peers that never synced.
     started_at: u64,
+    /// A supplier peer is configured with `automatic_refresh`.
+    automatic_refresh: bool,
     /// The node holds the domain's content: it has synced from a supplier, or it does not
-    /// expect to receive its content from one.
+    /// expect to receive its content from one. The second case is an assumption that
+    /// makes the node ready, not evidence of anything, see `sync_evidence`.
     synced: bool,
+    /// Durable evidence that this node holds replicated content: the database showed at
+    /// startup that it synced from a supplier before (`ReplicationStartup::has_synced`),
+    /// or a sync succeeded since. A node with this evidence is never refreshed
+    /// automatically from a peer in another domain, see
+    /// `ReplicationStateTracker::notify_replication_domain_mismatch`.
+    sync_evidence: bool,
     refreshing: bool,
     /// When the current run of failures to apply replicated changes started.
     apply_failing_since: Option<u64>,
@@ -324,6 +333,7 @@ impl ReplicationTracking {
 
     fn record_sync_success(&mut self, peer_url: &str, now: u64) {
         self.synced = true;
+        self.sync_evidence = true;
         self.apply_failing_since = None;
         self.last_apply_failure = None;
         self.last_success = Some(now);
@@ -405,7 +415,9 @@ impl ReplicationStateTracker {
             ReplicationTracking {
                 timings: ReplicationTimings::from_poll_interval(startup.poll_interval),
                 started_at: now,
+                automatic_refresh: startup.automatic_refresh,
                 synced,
+                sync_evidence: startup.has_synced,
                 refreshing: false,
                 apply_failing_since: None,
                 last_apply_failure: None,
@@ -516,14 +528,27 @@ impl ReplicationStateTracker {
     /// A supplier peer answered that its domain differs from this node's. Returns whether
     /// this node must be refreshed.
     ///
-    /// When this node holds the domain's content and another supplier synced within the
-    /// stale window, the peer is the one out of the domain (a new replica not yet
-    /// refreshed, or a rebuilt one): it is marked stale, which degrades this node, and the
-    /// node must not be refreshed from it. Otherwise this node can not tell, and treats
-    /// the mismatch as a refresh requirement.
+    /// A refresh replaces the whole content of this node with the peer's, so it is only
+    /// allowed when this node has nothing to lose. The peer is treated as the one out of
+    /// the domain (a new replica not yet refreshed, or an empty re-created one) when:
+    ///
+    /// * this node expects its content from a supplier (`automatic_refresh`) and has
+    ///   evidence that it holds replicated content (`sync_evidence`), whatever the other
+    ///   peers do. Otherwise an empty re-created origin (which is ready at once, as it has
+    ///   no `automatic_refresh` supplier) would wipe every replica that refreshes from it;
+    /// * or this node holds the domain's content and another supplier synced within the
+    ///   stale window.
+    ///
+    /// The peer is then marked stale, which degrades this node, and the node is never
+    /// refreshed from it automatically: an operator runs
+    /// `kubidmd refresh-replication-consumer`, which does not go through this check, when
+    /// the peer's domain is the intended one. Otherwise (a fresh replica with no evidence,
+    /// or a node without `automatic_refresh` that can not tell) the mismatch is a refresh
+    /// requirement: a fresh replica refreshes, any other node reports not ready.
     pub fn notify_replication_domain_mismatch(&self, peer_url: &str, now: u64) -> bool {
         self.with_replication(|tracking| {
-            let peer_is_foreign = tracking.synced_with_other_peer(peer_url, now);
+            let peer_is_foreign = (tracking.automatic_refresh && tracking.sync_evidence)
+                || tracking.synced_with_other_peer(peer_url, now);
             if let Some(peer) = tracking.peers.get_mut(peer_url) {
                 peer.connected = true;
                 peer.foreign_domain = peer_is_foreign;
@@ -1327,19 +1352,134 @@ mod tests {
         assert!(tracker.notify_replication_domain_mismatch(PEER_2, T0 + 1));
         assert!(tracker.notify_replication_domain_mismatch(PEER_1, T0 + 1));
 
-        // Synced, but no other supplier synced within the stale window: can not tell.
-        let tracker = replicated(&[PEER_1, PEER_2], true);
+        // Without automatic_refresh (the origin, pod-0): synced, but no other supplier
+        // synced within the stale window, it can not tell. The node is never refreshed
+        // automatically, the mismatch makes it not ready.
+        let tracker = replicated_with(&[PEER_1, PEER_2], false, false);
         tracker.notify_replication_incremental_success(PEER_1, T0);
         assert!(tracker.notify_replication_domain_mismatch(PEER_2, T0 + STALE));
+        tracker.notify_replication_refresh_required(PEER_2);
+        assert_state(
+            &tracker,
+            T0 + STALE,
+            ReplicationState::RefreshRequired,
+            ServingReadiness::NotReady,
+        );
 
-        // A single supplier: nobody to compare with.
-        let tracker = replicated(&[PEER_1], true);
+        // A single supplier without automatic_refresh: nobody to compare with.
+        let tracker = replicated_with(&[PEER_1], false, false);
         tracker.notify_replication_incremental_success(PEER_1, T0);
         assert!(tracker.notify_replication_domain_mismatch(PEER_1, T0 + 1));
 
         // Without replication tracking the upstream behaviour is kept.
         let tracker = ReplicationStateTracker::new();
         assert!(tracker.notify_replication_domain_mismatch(PEER_1, T0));
+    }
+
+    #[test]
+    fn test_domain_mismatch_never_refreshes_replica_with_sync_evidence() {
+        // Two replicas: pod-1 synced from pod-0 before (the evidence is in its database),
+        // then pod-0 was re-created empty. pod-0 has no automatic_refresh supplier, so it
+        // is ready at once, and answers pod-1 with a domain mismatch. No other peer can
+        // vouch for pod-1's content, but refreshing would wipe it: never refresh.
+        let tracker = replicated(&[PEER_1], true);
+        let mut now = T0 + 10;
+        while now < T0 + 10 * FAILED {
+            assert!(!tracker.notify_replication_domain_mismatch(PEER_1, now));
+            assert_state(
+                &tracker,
+                now,
+                ReplicationState::Degraded,
+                ServingReadiness::Ready,
+            );
+            now += 10;
+        }
+        assert_eq!(
+            tracker.build_readiness_status(now).peers,
+            Some(PeerSummary {
+                total: 1,
+                healthy: 0,
+                stale: 1,
+            })
+        );
+
+        // A full restart with three replicas: pod-1 starts first after the empty pod-0,
+        // pod-2 is not up yet. The same holds.
+        let tracker = replicated(&[PEER_1, PEER_2], true);
+        assert!(!tracker.notify_replication_domain_mismatch(PEER_1, T0 + 1));
+        assert_state(
+            &tracker,
+            T0 + 1,
+            ReplicationState::Degraded,
+            ServingReadiness::Ready,
+        );
+
+        // Evidence from a sync in this process counts as well, long after it.
+        let tracker = replicated(&[PEER_1], false);
+        tracker.notify_replication_refresh_started();
+        tracker.notify_replication_refresh_success(PEER_1, T0 + 1);
+        assert!(!tracker.notify_replication_domain_mismatch(PEER_1, T0 + 10 * FAILED));
+        assert_state(
+            &tracker,
+            T0 + 10 * FAILED,
+            ReplicationState::Degraded,
+            ServingReadiness::Ready,
+        );
+    }
+
+    #[test]
+    fn test_domain_mismatch_refreshes_fresh_replica() {
+        // A fresh replica with no evidence of a sync is the one out of the domain: it is
+        // refreshed automatically.
+        let tracker = replicated(&[PEER_1], false);
+        assert!(tracker.notify_replication_domain_mismatch(PEER_1, T0 + 1));
+        tracker.notify_replication_refresh_required(PEER_1);
+        assert_state(
+            &tracker,
+            T0 + 1,
+            ReplicationState::RefreshRequired,
+            ServingReadiness::NotReady,
+        );
+        tracker.notify_replication_refresh_started();
+        tracker.notify_replication_refresh_success(PEER_1, T0 + 2);
+        assert_state(
+            &tracker,
+            T0 + 2,
+            ReplicationState::Healthy,
+            ServingReadiness::Ready,
+        );
+    }
+
+    #[test]
+    fn test_manual_refresh_from_foreign_peer_recovers() {
+        // The cluster was intentionally rebuilt in a new domain: the synced replica refuses
+        // the automatic refresh, and the operator runs `refresh-replication-consumer`,
+        // which refreshes without the domain check.
+        let tracker = replicated(&[PEER_1], true);
+        assert!(!tracker.notify_replication_domain_mismatch(PEER_1, T0 + 1));
+        tracker.notify_replication_refresh_started();
+        assert_state(
+            &tracker,
+            T0 + 2,
+            ReplicationState::Refreshing,
+            ServingReadiness::NotReady,
+        );
+        tracker.notify_replication_refresh_success(PEER_1, T0 + 3);
+        assert_state(
+            &tracker,
+            T0 + 3,
+            ReplicationState::Healthy,
+            ServingReadiness::Ready,
+        );
+        let peers = tracker.get_peers(T0 + 3).unwrap_or_default();
+        assert!(!peers[0].stale);
+        tracker.notify_replication_incremental_success(PEER_1, T0 + 13);
+        assert_state(
+            &tracker,
+            T0 + 13,
+            ReplicationState::Healthy,
+            ServingReadiness::Ready,
+        );
     }
 
     #[test]

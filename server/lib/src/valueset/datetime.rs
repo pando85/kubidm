@@ -1,7 +1,10 @@
 use crate::{
     prelude::*,
     schema::SchemaAttribute,
-    valueset::{DbValueSetV2, ScimResolveStatus, ValueSet, ValueSetResolveStatus, ValueSetScimPut},
+    valueset::{
+        parse_utc, DbValueSetV2, ScimResolveStatus, ValueSet, ValueSetResolveStatus,
+        ValueSetScimPut,
+    },
 };
 use kubidm_proto::scim_v1::{client::ScimDateTime, JsonValue};
 use smolset::SmolSet;
@@ -27,9 +30,8 @@ impl ValueSetDateTime {
         let set = data
             .into_iter()
             .map(|s| {
-                OffsetDateTime::parse(&s, &Rfc3339)
-                    .map(|odt| odt.to_offset(time::UtcOffset::UTC))
-                    .map_err(|_| OperationError::InvalidValueState)
+                // Kubidm: checked, a time out of range in UTC is invalid.
+                parse_utc(&s).ok_or(OperationError::InvalidValueState)
             })
             .collect::<Result<_, _>>()?;
         Ok(Box::new(ValueSetDateTime { set }))
@@ -53,6 +55,15 @@ impl ValueSetScimPut for ValueSetDateTime {
             error!(?err, "SCIM DateTime syntax invalid");
             OperationError::SC0010DateTimeSyntaxInvalid
         })?;
+
+        // Kubidm: normalise to UTC like every other path, checked: a time out of range in
+        // UTC would make `to_offset` panic, here or when the value is loaded.
+        let date_time = date_time
+            .checked_to_offset(time::UtcOffset::UTC)
+            .ok_or_else(|| {
+                error!("SCIM DateTime can not be expressed in UTC");
+                OperationError::SC0010DateTimeSyntaxInvalid
+            })?;
 
         let mut set = SmolSet::new();
         set.insert(date_time);
@@ -217,5 +228,31 @@ mod tests {
 
         // Test that we can parse json values into a valueset.
         crate::valueset::scim_json_put_reflexive::<ValueSetDateTime>(&vs, &[])
+    }
+
+    /// Kubidm: a time that can not be expressed in UTC is an error, not a panic, both when
+    /// it is put through SCIM and when it is loaded.
+    #[test]
+    fn test_datetime_out_of_range_in_utc() {
+        use crate::prelude::OperationError;
+        use crate::valueset::ValueSetScimPut;
+
+        let out_of_range = "9999-12-31T23:59:59-23:59";
+        assert!(matches!(
+            ValueSetDateTime::from_dbvs2(vec![out_of_range.to_string()]),
+            Err(OperationError::InvalidValueState)
+        ));
+        assert!(matches!(
+            ValueSetDateTime::from_scim_json_put(serde_json::json!(out_of_range)),
+            Err(OperationError::SC0010DateTimeSyntaxInvalid)
+        ));
+
+        // A time with an offset is normalised to UTC.
+        let vs = ValueSetDateTime::from_dbvs2(vec!["2024-01-01T10:00:00+02:00".to_string()])
+            .expect("valid");
+        assert_eq!(
+            vs.to_datetime_single().map(|odt| odt.offset()),
+            Some(time::UtcOffset::UTC)
+        );
     }
 }

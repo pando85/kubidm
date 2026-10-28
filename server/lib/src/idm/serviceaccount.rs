@@ -185,8 +185,18 @@ impl IdmServerProxyWriteTransaction<'_> {
         let session_id = Uuid::new_v4();
         let issued_at = time::OffsetDateTime::UNIX_EPOCH + ct;
 
-        // Normalise to UTC in case it was provided as something else.
-        let expiry = gte.expiry.map(|odt| odt.to_offset(time::UtcOffset::UTC));
+        // Normalise to UTC in case it was provided as something else. Kubidm: checked, as
+        // to_offset panics for a time that is out of range in UTC.
+        let expiry = gte
+            .expiry
+            .map(|odt| {
+                odt.checked_to_offset(time::UtcOffset::UTC).ok_or_else(|| {
+                    OperationError::InvalidAttribute(
+                        "expiry must be a time that can be expressed in UTC".to_string(),
+                    )
+                })
+            })
+            .transpose()?;
 
         let scope = if gte.read_write {
             ApiTokenScope::ReadWrite
@@ -496,6 +506,44 @@ mod tests {
                 == OperationError::SessionExpired
         );
 
+        assert!(idms_prox_write.commit().is_ok());
+    }
+
+    /// Kubidm: an expiry that can not be expressed in UTC is refused, rather than making the
+    /// conversion to UTC panic.
+    #[idm_test]
+    async fn test_idm_service_account_api_token_expiry_out_of_range(
+        idms: &IdmServer,
+        _idms_delayed: &mut IdmServerDelayed,
+    ) {
+        let ct = Duration::from_secs(TEST_CURRENT_TIME);
+        let mut idms_prox_write = idms.proxy_write(ct).await.unwrap();
+
+        let testaccount_uuid = Uuid::new_v4();
+        idms_prox_write
+            .qs_write
+            .internal_create(vec![entry_init!(
+                (Attribute::Class, EntryClass::Object.to_value()),
+                (Attribute::Class, EntryClass::Account.to_value()),
+                (Attribute::Class, EntryClass::ServiceAccount.to_value()),
+                (Attribute::Name, Value::new_iname("test_account_expiry")),
+                (Attribute::Uuid, Value::Uuid(testaccount_uuid)),
+                (Attribute::DisplayName, Value::new_utf8s("testaccount"))
+            )])
+            .expect("Failed to create service account");
+
+        let expiry = time::OffsetDateTime::parse(
+            "9999-12-31T23:59:59-23:59",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .expect("parse");
+        let mut gte = GenerateApiTokenEvent::new_internal(testaccount_uuid, "TestToken", None);
+        gte.expiry = Some(expiry);
+
+        assert!(matches!(
+            idms_prox_write.service_account_generate_api_token(&gte, ct),
+            Err(OperationError::InvalidAttribute(_))
+        ));
         assert!(idms_prox_write.commit().is_ok());
     }
 

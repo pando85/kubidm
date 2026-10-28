@@ -835,7 +835,10 @@ kubidmd database recover -c /data/server.toml --region eu-west-1 --latest
 ```
 
 Base backups and segments can only be used by the server version that wrote them, like backups. In a replicated
-topology, treat a recovered node like a restored one: the other nodes must be refreshed from it.
+topology, treat a recovered node like a restored one: the other nodes must be refreshed from it. A node that holds
+replicated content is never refreshed automatically from a supplier in another domain (for example a cluster restored
+from a backup of another domain), run `kubidmd refresh-replication-consumer` on it, see
+[The Domain Mismatch Guard](integrations/kubernetes_probes.md#the-domain-mismatch-guard).
 
 ### How the Features Combine
 

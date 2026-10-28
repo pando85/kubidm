@@ -37,10 +37,28 @@ fn has_time_bounded_member_attr(qs: &QueryServerWriteTransaction) -> bool {
         .contains_key(&Attribute::TimeBoundedMemberAttr)
 }
 
+/// Kubidm: whether the time-bounded grants of `group` grant nothing because the group is
+/// high privilege: `idm_high_privilege` itself, or a group nested in it. Grants on such
+/// groups are refused when written (see `server::time_bounded`), but a group can become
+/// high privilege after grants on it were written, including grants that start later.
+/// Those are treated as inactive for as long as the group is high privilege, so that they
+/// can not bypass the approvals that high privilege membership is meant to require. They
+/// can still be revoked.
+fn time_bounded_grants_suppressed(group: &EntrySealedCommitted) -> bool {
+    group.get_uuid() == UUID_IDM_HIGH_PRIVILEGE
+        || group.attribute_equality(
+            Attribute::MemberOf,
+            &PartialValue::Refer(UUID_IDM_HIGH_PRIVILEGE),
+        )
+}
+
 fn get_valid_time_bounded_members(
     entry: &Arc<Entry<EntrySealed, EntryCommitted>>,
     now: OffsetDateTime,
 ) -> BTreeSet<Uuid> {
+    if time_bounded_grants_suppressed(entry) {
+        return BTreeSet::new();
+    }
     entry
         .get_ava_set(Attribute::TimeBoundedMemberAttr)
         .and_then(|vs| vs.as_time_bounded_member_set())
@@ -110,6 +128,7 @@ fn do_group_memberof(
 
     let groups_with_valid_time_bounded: BTreeSet<Uuid> = groups
         .iter()
+        .filter(|g| !time_bounded_grants_suppressed(g))
         .filter_map(|g| {
             let time_bounded = g
                 .get_ava_set(Attribute::TimeBoundedMemberAttr)
@@ -645,10 +664,11 @@ pub(crate) fn refresh_time_bounded_memberships(
 
         let member_ref = group.get_ava_refer(Attribute::Member);
         let dynmember_ref = group.get_ava_refer(Attribute::DynMember);
+        let suppressed = time_bounded_grants_suppressed(group);
 
         for grant in grants.values() {
             // A permanent membership in the same group always takes precedence.
-            let is_member = grant.is_valid_at(now)
+            let is_member = (grant.is_valid_at(now) && !suppressed)
                 || member_ref.is_some_and(|set| set.contains(&grant.uuid))
                 || dynmember_ref.is_some_and(|set| set.contains(&grant.uuid));
 
@@ -946,9 +966,18 @@ impl Plugin for MemberOf {
                 .and_then(|vs| vs.as_time_bounded_member_set())
                 .into_iter()
                 .flat_map(|map| map.values());
+            // Kubidm: the grants of a high privilege group are inactive. A database written
+            // before they were may still reflect them, so they may be in either state.
+            let suppressed = time_bounded_grants_suppressed(entry);
 
             for grant in grants {
                 match grant.valid_from {
+                    _ if suppressed => {
+                        time_bounded_membership_map
+                            .entry(grant.uuid)
+                            .or_default()
+                            .insert(group_uuid);
+                    }
                     None if grant.valid_until > required_after => {
                         // Must be present.
                         direct_membership_map
