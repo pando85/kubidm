@@ -23,6 +23,7 @@ pub mod constants;
 pub mod internal;
 pub mod messages;
 pub mod oauth2;
+pub mod oauth2_federation;
 pub mod scim_v1;
 pub mod v1;
 

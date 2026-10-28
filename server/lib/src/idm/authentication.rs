@@ -7,9 +7,9 @@ use crypto_glue::{s256::Sha256Output, x509::Certificate};
 use kubidm_proto::{
     internal::UserAuthToken,
     oauth2::{
-        AccessTokenIntrospectRequest, AccessTokenIntrospectResponse, AccessTokenRequest,
-        AccessTokenResponse, AuthorisationRequest,
+        AccessTokenIntrospectRequest, AccessTokenRequest, AccessTokenResponse, AuthorisationRequest,
     },
+    oauth2_federation::OAuth2ClientIntrospectResponse,
     v1::{
         AuthAllowed, AuthCredential as ProtoAuthCredential, AuthIssueSession, AuthMech,
         AuthStep as ProtoAuthStep,
@@ -127,7 +127,7 @@ pub enum AuthCredential {
         response: AccessTokenResponse,
     },
     OAuth2AccessTokenIntrospectResponse {
-        response: AccessTokenIntrospectResponse,
+        response: OAuth2ClientIntrospectResponse,
     },
 }
 

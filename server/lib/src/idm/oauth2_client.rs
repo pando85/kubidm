@@ -313,14 +313,23 @@ impl IdmServerProxyWriteTransaction<'_> {
 }
 
 /// Kubidm: the server itself sends the client secret and the access token to the token
-/// and introspection endpoints, so they must use https. Plain http is only accepted when
-/// the host is a loopback address (`localhost`, `127.0.0.0/8` or `::1`), for local
-/// development and tests.
-fn require_secure_backchannel_url(
+/// and introspection endpoints, and a federation's users type their IdP password at its
+/// authorisation endpoint, so they must use https. Plain http is only accepted when the
+/// host is a loopback address (`localhost`, `127.0.0.0/8` or `::1`), for local
+/// development and tests. Credentials in the URL (`user:password@`) are never accepted.
+fn require_secure_endpoint_url(
     uuid: Uuid,
     endpoint_name: &str,
     url: &Url,
 ) -> Result<(), OperationError> {
+    if !url.username().is_empty() || url.password().is_some() {
+        error!(
+            ?uuid,
+            "OAuth2 provider {endpoint_name} endpoint must not contain credentials (user:password@)"
+        );
+        return Err(OperationError::InvalidValueState);
+    }
+
     if url.scheme() == "https" {
         return Ok(());
     }
@@ -483,9 +492,27 @@ fn oauth2_client_provider_from_entry(
 
     // Kubidm: the client secret and the access token are sent to these endpoints by the
     // server, so they must use https. Plain http is only accepted on loopback addresses.
-    require_secure_backchannel_url(uuid, "token", &token_endpoint)?;
+    require_secure_endpoint_url(uuid, "token", &token_endpoint)?;
     if let Some(endpoint) = maybe_rfc7662_endpoint.as_ref() {
-        require_secure_backchannel_url(uuid, "token introspection", endpoint)?;
+        require_secure_endpoint_url(uuid, "token introspection", endpoint)?;
+    }
+
+    if is_federation {
+        // Kubidm: users of a federation type their IdP password at the authorisation
+        // endpoint, so it must not be plain http either. Upstream `OAuth2Client`
+        // providers keep their behaviour.
+        require_secure_endpoint_url(uuid, "authorisation", &authorisation_endpoint)?;
+
+        // Kubidm: a login is only accepted once the access token is introspected, so a
+        // federation without an introspection endpoint would deny every user after they
+        // signed in at the IdP.
+        if maybe_rfc7662_endpoint.is_none() {
+            error!(
+                ?uuid,
+                "OAuth2 federation is missing the token introspection endpoint, which is required to verify logins"
+            );
+            return Err(OperationError::InvalidValueState);
+        }
     }
 
     let user_sub_verifier = match maybe_rfc7662_endpoint {
@@ -519,7 +546,7 @@ fn oauth2_client_provider_from_entry(
 
 #[cfg(test)]
 mod tests {
-    use super::{require_secure_backchannel_url, AccountLinkPolicy, OAuth2SubjectVerifier};
+    use super::{require_secure_endpoint_url, AccountLinkPolicy, OAuth2SubjectVerifier};
     use crate::prelude::*;
 
     /// Kubidm: OAuth2 federation entries are valid at the target domain level, and every
@@ -1013,36 +1040,40 @@ mod tests {
         }
     }
 
-    /// Kubidm: the token and introspection endpoints must use https, except on loopback.
+    /// Kubidm: the authorisation, token and introspection endpoints of a federation must
+    /// use https, except on loopback, and must not carry credentials.
     #[idm_test]
     async fn test_idm_oauth2_federation_backchannel_https(
         idms: &IdmServer,
         _idms_delayed: &mut IdmServerDelayed,
     ) {
         for attr in [
+            Attribute::OAuth2AuthorisationEndpoint,
             Attribute::OAuth2TokenEndpoint,
             Attribute::OAuth2TokenIntrospectEndpoint,
         ] {
-            let entry = federation_entry_with(
-                Uuid::new_v4(),
-                &attr,
-                vec![url_value("http://idp.example.com/endpoint")],
-            );
-            assert_eq!(
-                commit_provider(idms, entry).await,
-                Err(OperationError::InvalidValueState),
-                "a non loopback http {attr} must be rejected"
-            );
+            for url in [
+                "http://idp.example.com/endpoint",
+                "https://user:password@idp.example.com/endpoint",
+                "https://user@idp.example.com/endpoint",
+                "http://user:password@127.0.0.1/endpoint",
+            ] {
+                let entry = federation_entry_with(Uuid::new_v4(), &attr, vec![url_value(url)]);
+                assert_eq!(
+                    commit_provider(idms, entry).await,
+                    Err(OperationError::InvalidValueState),
+                    "{attr} {url} must be rejected"
+                );
+            }
         }
 
-        // Loopback http is accepted, for the testkit and local development. The
-        // authorisation endpoint is a browser redirect and is not restricted here.
+        // Loopback http is accepted, for the testkit and local development.
         let uuid = Uuid::new_v4();
         let mut entry = federation_entry(uuid, "loopback_federation");
         replace_ava(
             &mut entry,
             Attribute::OAuth2AuthorisationEndpoint,
-            url_value("http://idp.example.com/authorise"),
+            url_value("http://[::1]:8443/authorise"),
         );
         replace_ava(
             &mut entry,
@@ -1059,11 +1090,134 @@ mod tests {
             .expect("loopback http endpoints must be accepted");
     }
 
+    /// Kubidm: a federation without an introspection endpoint is rejected when it is
+    /// created or modified, since every login through it would be denied. One already
+    /// stored is skipped at startup.
+    #[idm_test]
+    async fn test_idm_oauth2_federation_requires_introspection(
+        idms: &IdmServer,
+        _idms_delayed: &mut IdmServerDelayed,
+    ) {
+        let entry = federation_entry_with(
+            Uuid::new_v4(),
+            &Attribute::OAuth2TokenIntrospectEndpoint,
+            vec![],
+        );
+        assert_eq!(
+            commit_provider(idms, entry).await,
+            Err(OperationError::InvalidValueState),
+        );
+
+        // Removing it from a valid federation is rejected too, and nothing changes.
+        let ct = duration_from_epoch_now();
+        let uuid = Uuid::new_v4();
+        commit_provider(idms, federation_entry(uuid, "introspected_federation"))
+            .await
+            .expect("a federation with an introspection endpoint must be accepted");
+        let mut idms_prox_write = idms.proxy_write(ct).await.unwrap();
+        idms_prox_write
+            .qs_write
+            .internal_modify_uuid(
+                uuid,
+                &ModifyList::new_purge(Attribute::OAuth2TokenIntrospectEndpoint),
+            )
+            .expect("the entry itself is schema valid");
+        assert_eq!(
+            idms_prox_write.commit(),
+            Err(OperationError::InvalidValueState)
+        );
+        let idms_prox_write = idms.proxy_write(ct).await.unwrap();
+        assert!(matches!(
+            idms_prox_write
+                .oauth2_client_providers
+                .get(&uuid)
+                .map(|p| &p.user_sub_verifier),
+            Some(OAuth2SubjectVerifier::Rfc7662TokenIntrospection { .. })
+        ));
+    }
+
+    #[qs_test]
+    async fn test_idm_oauth2_federation_without_introspection_skipped_at_startup(
+        server: &QueryServer,
+    ) {
+        let ct = duration_from_epoch_now();
+        let good_uuid = Uuid::new_v4();
+        let bad_uuid = Uuid::new_v4();
+
+        let mut bad = federation_entry(bad_uuid, "unverified_federation");
+        bad.remove_ava(&Attribute::OAuth2TokenIntrospectEndpoint);
+        let mut qs_write = server.write(ct).await.unwrap();
+        qs_write
+            .internal_create(vec![federation_entry(good_uuid, "good_federation"), bad])
+            .expect("the entries are schema valid");
+        qs_write.commit().expect("failed to commit");
+
+        let (idms, _idms_delayed, _idms_audit) = IdmServer::new(
+            server.clone(),
+            &Url::parse("https://idm.example.com").unwrap(),
+            true,
+            ct,
+        )
+        .await
+        .expect("a federation without introspection must not prevent startup");
+
+        let idms_prox_write = idms.proxy_write(ct).await.unwrap();
+        assert!(idms_prox_write
+            .oauth2_client_providers
+            .get(&good_uuid)
+            .is_some());
+        assert!(idms_prox_write
+            .oauth2_client_providers
+            .get(&bad_uuid)
+            .is_none());
+    }
+
+    /// The federation only rules (introspection required, https authorisation endpoint)
+    /// do not apply to an upstream `OAuth2Client` provider.
+    #[idm_test]
+    async fn test_idm_oauth2_client_upstream_rules_unchanged(
+        idms: &IdmServer,
+        _idms_delayed: &mut IdmServerDelayed,
+    ) {
+        let uuid = Uuid::new_v4();
+        let entry: EntryInitNew = entry_init!(
+            (Attribute::Class, EntryClass::Object.to_value()),
+            (Attribute::Class, EntryClass::OAuth2Client.to_value()),
+            (Attribute::Uuid, Value::Uuid(uuid)),
+            (Attribute::Name, Value::new_iname("upstream_client")),
+            (Attribute::OAuth2ClientId, Value::new_utf8s("client_id")),
+            (Attribute::OAuth2ClientSecret, Value::new_utf8s("secret")),
+            (
+                Attribute::OAuth2AuthorisationEndpoint,
+                url_value("http://idp.example.com/authorise")
+            ),
+            (
+                Attribute::OAuth2TokenEndpoint,
+                url_value("https://idp.example.com/token")
+            ),
+            (
+                Attribute::OAuth2RequestScopes,
+                Value::new_oauthscope("openid").unwrap()
+            )
+        );
+        commit_provider(idms, entry)
+            .await
+            .expect("an upstream OAuth2Client provider must be accepted");
+
+        let idms_prox_write = idms.proxy_write(duration_from_epoch_now()).await.unwrap();
+        assert!(matches!(
+            idms_prox_write
+                .oauth2_client_providers
+                .get(&uuid)
+                .map(|p| &p.user_sub_verifier),
+            Some(OAuth2SubjectVerifier::None)
+        ));
+    }
+
     #[test]
-    fn test_require_secure_backchannel_url() {
-        let check = |url: &str| {
-            require_secure_backchannel_url(Uuid::nil(), "test", &Url::parse(url).unwrap())
-        };
+    fn test_require_secure_endpoint_url() {
+        let check =
+            |url: &str| require_secure_endpoint_url(Uuid::nil(), "test", &Url::parse(url).unwrap());
 
         for good in [
             "https://idp.example.com/token",
@@ -1084,6 +1238,10 @@ mod tests {
             "http://localhost.example.com/token",
             "http://0.0.0.0/token",
             "ftp://localhost/token",
+            "https://user:password@idp.example.com/token",
+            "https://user@idp.example.com/token",
+            "https://:password@idp.example.com/token",
+            "http://user:password@localhost/token",
         ] {
             assert_eq!(
                 check(bad),

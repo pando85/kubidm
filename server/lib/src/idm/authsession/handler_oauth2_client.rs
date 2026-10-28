@@ -13,10 +13,12 @@ use crate::{
     utils,
     value::{AuthType, SessionExtMetadata},
 };
-use kubidm_proto::oauth2::{
-    AccessTokenIntrospectRequest, AccessTokenIntrospectResponse, AccessTokenRequest,
-    AccessTokenResponse, AuthorisationRequest, AuthorisationRequestOidc, GrantTypeReq,
-    ResponseType,
+use kubidm_proto::{
+    oauth2::{
+        AccessTokenIntrospectRequest, AccessTokenRequest, AccessTokenResponse,
+        AuthorisationRequest, AuthorisationRequestOidc, GrantTypeReq, ResponseType,
+    },
+    oauth2_federation::OAuth2ClientIntrospectResponse,
 };
 use std::{collections::BTreeSet, fmt};
 
@@ -51,6 +53,7 @@ pub struct CredHandlerOAuth2Client {
     client_redirect_url: Url,
     authorisation_endpoint: Url,
     token_endpoint: Url,
+    issuer: Option<Url>,
     pkce_secret: PkceS256Secret,
     csrf_state: String,
 
@@ -90,6 +93,7 @@ impl CredHandlerOAuth2Client {
             client_redirect_url: client_provider.client_redirect_uri.clone(),
             authorisation_endpoint: client_provider.authorisation_endpoint.clone(),
             token_endpoint: client_provider.token_endpoint.clone(),
+            issuer: client_provider.issuer.clone(),
             pkce_secret,
             csrf_state,
             user_sub_verifier: client_provider.user_sub_verifier.clone(),
@@ -146,6 +150,7 @@ impl CredHandlerOAuth2Client {
                 access_token,
                 refresh_token,
                 access_expires_at,
+                current_time,
             ),
             _ => (SessionState::Finished, CredState::Denied(BAD_AUTH_TYPE_MSG)),
         };
@@ -228,10 +233,11 @@ impl CredHandlerOAuth2Client {
 
     fn validate_access_token_introspection_response(
         &self,
-        response: &AccessTokenIntrospectResponse,
+        response: &OAuth2ClientIntrospectResponse,
         access_token: String,
         refresh_token: Option<String>,
         access_expires_at: Duration,
+        current_time: Duration,
     ) -> (SessionState, CredState) {
         // Process the response!!!
 
@@ -240,6 +246,19 @@ impl CredHandlerOAuth2Client {
         if !response.active {
             error!(
                 "access token introspection indicates the token is not active, refusing to proceed"
+            );
+            return (
+                SessionState::Finished,
+                CredState::Denied(BAD_OAUTH2_SESSION_MSG),
+            );
+        }
+
+        // Kubidm: defence in depth. The optional claims, when present, must agree with
+        // this provider and the token must not have expired.
+        if let Err(reason) = self.check_introspection_claims(response, current_time) {
+            error!(
+                provider = %self.provider_name,
+                "access token introspection {reason}, refusing to proceed"
             );
             return (
                 SessionState::Finished,
@@ -285,5 +304,251 @@ impl CredHandlerOAuth2Client {
                 ext_session_metadata,
             },
         )
+    }
+
+    /// Kubidm: check the optional claims of an introspection response. Each is only
+    /// checked when the provider sent it: `client_id` must be ours, `iss` must be the
+    /// configured issuer (ignoring a trailing `/`) and `exp` must be in the future.
+    fn check_introspection_claims(
+        &self,
+        response: &OAuth2ClientIntrospectResponse,
+        current_time: Duration,
+    ) -> Result<(), &'static str> {
+        if response
+            .client_id
+            .as_deref()
+            .is_some_and(|client_id| client_id != self.client_id)
+        {
+            return Err("returned a different client_id");
+        }
+
+        if let (Some(response_iss), Some(issuer)) = (response.iss.as_deref(), &self.issuer) {
+            if response_iss.trim_end_matches('/') != issuer.as_str().trim_end_matches('/') {
+                return Err("returned a different issuer");
+            }
+        }
+
+        if let Some(exp) = response.exp {
+            let now = i64::try_from(current_time.as_secs()).unwrap_or(i64::MAX);
+            if exp <= now {
+                return Err("indicates the token has expired");
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CLIENT_ID: &str = "test_client_id";
+    const USER_SUB: &str = "test_user_sub";
+    const ISSUER: &str = "https://idp.example.com/realms/main";
+    /// The time the introspection response is validated at, in seconds since the epoch.
+    const NOW: u64 = 1_800_000_000;
+
+    fn handler(issuer: Option<&str>) -> CredHandlerOAuth2Client {
+        let mut provider = OAuth2ClientProvider::new_test(
+            CLIENT_ID,
+            "https://idp.example.com",
+            ["openid"],
+            "https://idp.example.com/introspect",
+        );
+        provider.issuer = issuer.map(|iss| Url::parse(iss).expect("invalid test issuer"));
+        let cred = OAuth2AccountCredential {
+            provider: provider.uuid,
+            cred_id: Uuid::new_v4(),
+            user_id: "user".to_string(),
+            user_sub: USER_SUB.to_string(),
+        };
+        CredHandlerOAuth2Client::new(&provider, &cred)
+    }
+
+    /// An active response for our client and subject, with every optional claim valid.
+    fn valid_response() -> OAuth2ClientIntrospectResponse {
+        OAuth2ClientIntrospectResponse {
+            active: true,
+            sub: Some(USER_SUB.to_string()),
+            client_id: Some(CLIENT_ID.to_string()),
+            iss: Some(ISSUER.to_string()),
+            aud: vec![CLIENT_ID.to_string(), "account".to_string()],
+            scope: BTreeSet::from(["openid".to_string()]),
+            jti: Some("not-a-uuid".to_string()),
+            exp: Some(NOW as i64 + 300),
+        }
+    }
+
+    fn introspect(
+        handler: &CredHandlerOAuth2Client,
+        response: &OAuth2ClientIntrospectResponse,
+    ) -> CredState {
+        let (state, cred_state) = handler.validate_access_token_introspection_response(
+            response,
+            "access_token".to_string(),
+            None,
+            Duration::from_secs(NOW + 300),
+            Duration::from_secs(NOW),
+        );
+        assert!(matches!(state, SessionState::Finished));
+        cred_state
+    }
+
+    fn assert_success(
+        handler: &CredHandlerOAuth2Client,
+        response: &OAuth2ClientIntrospectResponse,
+    ) {
+        assert!(
+            matches!(introspect(handler, response), CredState::Success { .. }),
+            "{response:?} must be accepted"
+        );
+    }
+
+    fn assert_denied(
+        handler: &CredHandlerOAuth2Client,
+        response: &OAuth2ClientIntrospectResponse,
+        msg: &str,
+    ) {
+        assert!(
+            matches!(introspect(handler, response), CredState::Denied(m) if m == msg),
+            "{response:?} must be denied with {msg:?}"
+        );
+    }
+
+    #[test]
+    fn test_oauth2_client_introspection_valid() {
+        let handler = handler(Some(ISSUER));
+        assert_success(&handler, &valid_response());
+
+        // Only `active` and `sub` are required, every other claim is optional.
+        let minimal = OAuth2ClientIntrospectResponse {
+            active: true,
+            sub: Some(USER_SUB.to_string()),
+            ..Default::default()
+        };
+        assert_success(&handler, &minimal);
+    }
+
+    #[test]
+    fn test_oauth2_client_introspection_inactive_denied() {
+        let handler = handler(Some(ISSUER));
+        let response = OAuth2ClientIntrospectResponse {
+            active: false,
+            ..valid_response()
+        };
+        assert_denied(&handler, &response, BAD_OAUTH2_SESSION_MSG);
+        assert_denied(
+            &handler,
+            &OAuth2ClientIntrospectResponse::default(),
+            BAD_OAUTH2_SESSION_MSG,
+        );
+    }
+
+    #[test]
+    fn test_oauth2_client_introspection_subject() {
+        let handler = handler(Some(ISSUER));
+        let response = OAuth2ClientIntrospectResponse {
+            sub: Some("another_subject".to_string()),
+            ..valid_response()
+        };
+        assert_denied(&handler, &response, BAD_OAUTH2_SUBJECT_MSG);
+
+        let response = OAuth2ClientIntrospectResponse {
+            sub: None,
+            ..valid_response()
+        };
+        assert_denied(&handler, &response, BAD_OAUTH2_SUBJECT_MSG);
+    }
+
+    #[test]
+    fn test_oauth2_client_introspection_client_id() {
+        let handler = handler(Some(ISSUER));
+        for client_id in ["another_client", "", "TEST_CLIENT_ID"] {
+            let response = OAuth2ClientIntrospectResponse {
+                client_id: Some(client_id.to_string()),
+                ..valid_response()
+            };
+            assert_denied(&handler, &response, BAD_OAUTH2_SESSION_MSG);
+        }
+    }
+
+    #[test]
+    fn test_oauth2_client_introspection_issuer() {
+        // The configured issuer is a Url, so "https://idp.example.com" is stored with a
+        // trailing "/". A trailing "/" on either side is ignored.
+        for (configured, sent) in [
+            (ISSUER, ISSUER),
+            (ISSUER, "https://idp.example.com/realms/main/"),
+            ("https://idp.example.com/realms/main/", ISSUER),
+            ("https://idp.example.com", "https://idp.example.com"),
+            ("https://idp.example.com", "https://idp.example.com/"),
+        ] {
+            let response = OAuth2ClientIntrospectResponse {
+                iss: Some(sent.to_string()),
+                ..valid_response()
+            };
+            assert_success(&handler(Some(configured)), &response);
+        }
+
+        let handler_with_issuer = handler(Some(ISSUER));
+        for sent in [
+            "https://idp.example.com/realms/other",
+            "https://idp.example.com/realms/main/extra",
+            "https://evil.example.com/realms/main",
+            "http://idp.example.com/realms/main",
+            "",
+        ] {
+            let response = OAuth2ClientIntrospectResponse {
+                iss: Some(sent.to_string()),
+                ..valid_response()
+            };
+            assert_denied(&handler_with_issuer, &response, BAD_OAUTH2_SESSION_MSG);
+        }
+
+        // Without a configured issuer (an upstream OAuth2Client may have none), `iss`
+        // can not be checked.
+        let response = OAuth2ClientIntrospectResponse {
+            iss: Some("https://anything.example.com".to_string()),
+            ..valid_response()
+        };
+        assert_success(&handler(None), &response);
+    }
+
+    #[test]
+    fn test_oauth2_client_introspection_expiry() {
+        let handler = handler(Some(ISSUER));
+        for exp in [NOW as i64 - 300, NOW as i64, 0, i64::MIN] {
+            let response = OAuth2ClientIntrospectResponse {
+                exp: Some(exp),
+                ..valid_response()
+            };
+            assert_denied(&handler, &response, BAD_OAUTH2_SESSION_MSG);
+        }
+
+        let response = OAuth2ClientIntrospectResponse {
+            exp: Some(NOW as i64 + 1),
+            ..valid_response()
+        };
+        assert_success(&handler, &response);
+    }
+
+    /// The session's current time is used, not the wall clock: a token that is valid at
+    /// the session time is accepted even if it expired long ago in real time.
+    #[test]
+    fn test_oauth2_client_introspection_expiry_uses_session_time() {
+        let handler = handler(Some(ISSUER));
+        let response = OAuth2ClientIntrospectResponse {
+            exp: Some(1_000),
+            ..valid_response()
+        };
+        let (_, cred_state) = handler.validate_access_token_introspection_response(
+            &response,
+            "access_token".to_string(),
+            None,
+            Duration::from_secs(1_300),
+            Duration::from_secs(999),
+        );
+        assert!(matches!(cred_state, CredState::Success { .. }));
     }
 }

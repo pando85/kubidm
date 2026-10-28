@@ -89,7 +89,7 @@ pub struct ServerState {
     /// So that we can work out which ID to use for spans
     pub(crate) logging_pipeline: LoggerType,
     /// Kubidm: shared HTTP client for OAuth2 client provider (federation) requests.
-    pub(crate) oauth2_client_http: reqwest::Client,
+    pub(crate) oauth2_client_http: oauth2_client_http::OAuth2ClientHttp,
 }
 
 impl ServerState {

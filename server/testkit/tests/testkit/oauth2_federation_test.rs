@@ -480,6 +480,11 @@ async fn test_oauth2_federation_missing_required_fields(rsclient: &KubidmClient)
             "Missing authorisation endpoint",
         ),
         ("oauth2_token_endpoint", "Missing token endpoint"),
+        // Kubidm: without introspection every login would be denied.
+        (
+            "oauth2_token_introspect_endpoint",
+            "Missing introspection endpoint",
+        ),
     ] {
         let entry = without_attr(default_federation_entry(&format!("missing_{attr}")), attr);
         assert_create_rejected(rsclient, entry, reason).await;
@@ -527,21 +532,38 @@ async fn test_oauth2_federation_invalid_issuer_url(rsclient: &KubidmClient) {
     assert_create_rejected(rsclient, entry, "Invalid issuer URL").await;
 }
 
-/// Kubidm: the token and introspection endpoints must use https, except on loopback.
+/// Kubidm: the authorisation, token and introspection endpoints must use https, except
+/// on loopback, and must not carry credentials.
 #[kubidmd_testkit::test]
 async fn test_oauth2_federation_backchannel_requires_https(rsclient: &KubidmClient) {
     login_admin(rsclient).await;
 
-    for attr in ["oauth2_token_endpoint", "oauth2_token_introspect_endpoint"] {
+    for attr in [
+        "oauth2_authorisation_endpoint",
+        "oauth2_token_endpoint",
+        "oauth2_token_introspect_endpoint",
+    ] {
         let entry = with_attr(
             default_federation_entry(&format!("http_{attr}")),
             attr,
             &["http://idp.example.com/endpoint"],
         );
         assert_create_rejected(rsclient, entry, &format!("Non loopback http {attr}")).await;
+
+        let entry = with_attr(
+            default_federation_entry(&format!("userinfo_{attr}")),
+            attr,
+            &["https://user:password@idp.example.com/endpoint"],
+        );
+        assert_create_rejected(rsclient, entry, &format!("Credentials in {attr}")).await;
     }
 
     let entry = default_federation_entry("loopback_http");
+    let entry = with_attr(
+        entry,
+        "oauth2_authorisation_endpoint",
+        &["http://[::1]:8443/oauth2/authorise"],
+    );
     let entry = with_attr(
         entry,
         "oauth2_token_endpoint",
