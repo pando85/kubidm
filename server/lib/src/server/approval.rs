@@ -6281,4 +6281,101 @@ mod tests {
         assert_eq!(txn.approval_policy_disable_break_glass(None), Ok(vec![]));
         txn.commit().expect("failed to commit");
     }
+
+    /// Kubidm: a policy disabled without going through `approval_policy_enable` (so its
+    /// requests are not cancelled) still refuses decisions, executes and consumes.
+    #[qs_test]
+    async fn test_approval_gate_disabled_policy_refuses_uncancelled(server: &QueryServer) {
+        let ct = duration_from_epoch_now();
+        let mut txn = server.write(ct).await.unwrap();
+        let fx = gate_setup(&mut txn);
+        create_gate_policy(&mut txn, GATE_POLICY, fx.approver);
+        let approved = approved_gate_request(&mut txn, &fx, GATE_POLICY, fx.nested, fx.target, ct);
+        let pending = create_gate_request(
+            &mut txn,
+            fx.manager,
+            GATE_POLICY,
+            fx.direct,
+            &member_details(&fx.target.to_string()),
+            ct,
+        )
+        .expect("failed to create request");
+
+        let policy_uuid = find_policy_uuid(&mut txn, GATE_POLICY);
+        txn.internal_modify_uuid(
+            policy_uuid,
+            &ModifyList::new_purge_and_set(Attribute::ApprovalPolicyEnabled, Value::Bool(false)),
+        )
+        .expect("failed to disable the policy directly");
+        assert_eq!(
+            read_request(&mut txn, approved).state,
+            ApprovalRequestState::Approved
+        );
+        assert_eq!(
+            read_request(&mut txn, pending).state,
+            ApprovalRequestState::Pending
+        );
+
+        assert_eq!(
+            decide_as(&mut txn, fx.approver, pending, approve(), ct),
+            Err(OperationError::AP0003ApprovalNotUsable)
+        );
+        assert_eq!(
+            execute_as(&mut txn, fx.manager, approved),
+            Err(OperationError::AP0003ApprovalNotUsable)
+        );
+        let details = read_request(&mut txn, approved).operation_details;
+        let manager = identity(&mut txn, fx.manager);
+        assert_eq!(
+            txn.approval_request_check_and_consume(
+                &manager,
+                approved,
+                GATE_POLICY,
+                &ApprovalOperationType::GroupMembershipHighPrivilege,
+                fx.nested,
+                &details,
+            ),
+            Err(OperationError::AP0003ApprovalNotUsable)
+        );
+        assert!(!is_member(&mut txn, fx.nested, fx.target));
+        assert_eq!(
+            read_request(&mut txn, approved).state,
+            ApprovalRequestState::Approved
+        );
+        assert_eq!(
+            read_request(&mut txn, pending).state,
+            ApprovalRequestState::Pending
+        );
+        txn.commit().expect("failed to commit");
+    }
+
+    /// Kubidm: `member_contents` is recorded by the server; a request that supplies it is
+    /// refused, whatever its value.
+    #[qs_test]
+    async fn test_approval_gate_client_member_contents_refused(server: &QueryServer) {
+        let ct = duration_from_epoch_now();
+        let mut txn = server.write(ct).await.unwrap();
+        let fx = gate_setup(&mut txn);
+        create_gate_policy(&mut txn, GATE_POLICY, fx.approver);
+        let team = create_group(&mut txn, "gate_team", &[fx.target]);
+
+        for (member, contents) in [
+            (fx.target, String::new()),
+            (team, String::new()),
+            (team, fx.target.to_string()),
+        ] {
+            let details = BTreeMap::from([
+                ("member".to_string(), member.to_string()),
+                ("member_contents".to_string(), contents),
+            ]);
+            assert!(
+                matches!(
+                    create_gate_request(&mut txn, fx.manager, GATE_POLICY, fx.direct, &details, ct),
+                    Err(OperationError::InvalidAttribute(_))
+                ),
+                "{details:?} must be refused"
+            );
+        }
+        txn.commit().expect("failed to commit");
+    }
 }
