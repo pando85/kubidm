@@ -279,6 +279,26 @@ impl QueryServerWriteV1 {
         idms_prox_write.commit()
     }
 
+    /// Kubidm: break-glass, see `approval_policy_disable_break_glass`.
+    #[instrument(
+        level = "info",
+        skip(self, eventid),
+        fields(uuid = ?eventid)
+    )]
+    pub(crate) async fn handle_admin_approval_policy_disable(
+        &self,
+        name: Option<String>,
+        eventid: Uuid,
+    ) -> Result<Vec<String>, OperationError> {
+        let ct = duration_from_epoch_now();
+        let mut idms_prox_write = self.idms.proxy_write(ct).await?;
+        let names = idms_prox_write
+            .qs_write
+            .approval_policy_disable_break_glass(name.as_deref())?;
+
+        idms_prox_write.commit().map(|()| names)
+    }
+
     #[instrument(
         level = "info",
         skip_all,

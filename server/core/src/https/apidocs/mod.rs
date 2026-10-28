@@ -225,6 +225,7 @@ impl Modify for SecurityAddon {
         super::v1::approval_request_create,
         super::v1::approval_request_decision,
         super::v1::approval_request_cancel,
+        super::v1::approval_request_execute,
         super::v1::auth,
         super::v1::auth_valid,
         super::v1::logout,

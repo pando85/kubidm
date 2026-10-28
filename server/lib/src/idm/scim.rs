@@ -1,6 +1,7 @@
 use crate::{
     credential::totp::{Totp, TotpAlgo, TotpDigits},
     idm::server::{IdmServerProxyReadTransaction, IdmServerProxyWriteTransaction},
+    plugins::approval_gate::{adds_member, approval_gate_enabled, is_high_privilege_group},
     prelude::*,
     schema::{SchemaClass, SchemaTransaction},
     value::ApiToken,
@@ -1395,6 +1396,27 @@ impl IdmServerProxyWriteTransaction<'_> {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
+        // Kubidm: the sync connector must not add members to high privilege groups while
+        // the approval gate is on (see `plugins::approval_gate`). These writes are internal,
+        // so record the members of the high privilege groups being changed, and refuse the
+        // sync if any of them gains one.
+        let gated: BTreeMap<Uuid, Option<BTreeSet<Uuid>>> =
+            if approval_gate_enabled(&mut self.qs_write)? {
+                let mut gated = BTreeMap::new();
+                for uuid in change_entries.keys() {
+                    match self.qs_write.internal_search_uuid(*uuid) {
+                        Ok(entry) if is_high_privilege_group(entry.as_ref()) => {
+                            gated.insert(*uuid, entry.get_ava_refer(Attribute::Member).cloned());
+                        }
+                        Ok(_) | Err(OperationError::NoMatchingEntries) => {}
+                        Err(err) => return Err(err),
+                    }
+                }
+                gated
+            } else {
+                BTreeMap::new()
+            };
+
         // We can't just pass the above iter in here since it's fallible due to the
         // external resolve phase.
 
@@ -1402,7 +1424,20 @@ impl IdmServerProxyWriteTransaction<'_> {
             .internal_batch_modify(asserts.into_iter())
             .inspect_err(|err| {
                 error!(?err, "Unable to apply modifications to sync entries.");
-            })
+            })?;
+
+        for (uuid, before) in gated {
+            let after = self.qs_write.internal_search_uuid(uuid)?;
+            if adds_member(before.as_ref(), after.get_ava_refer(Attribute::Member)) {
+                error!(
+                    %sync_uuid,
+                    group = %uuid,
+                    "Refusing sync: it adds a member to a high privilege group, which requires an approved approval request while an approval policy covers group_membership_high_privilege. Remove the group from the sync, or have an approval admin disable the policy."
+                );
+                return Err(OperationError::AP0002ApprovalRequired);
+            }
+        }
+        Ok(())
     }
 
     #[instrument(level = "info", skip_all)]
@@ -2176,6 +2211,133 @@ mod tests {
     // Phase 4
 
     // Good delete - requires phase 5 due to need to do two syncs
+    /// Kubidm: while the approval gate on high privilege membership is on, a sync that
+    /// adds a member to a synced group nested in a high privilege group is refused.
+    #[idm_test]
+    async fn test_idm_scim_sync_phase_3_high_privilege_member_gated(
+        idms: &IdmServer,
+        _idms_delayed: &mut IdmServerDelayed,
+    ) {
+        use kubidm_proto::v1::{
+            ApprovalOperationType, ApprovalPattern, ApprovalPolicyCreateRequest,
+        };
+
+        let ct = Duration::from_secs(TEST_CURRENT_TIME);
+        let person_uuid = Uuid::new_v4();
+        let group_uuid = Uuid::new_v4();
+        let entries = |members: Vec<String>| -> Vec<ScimEntry> {
+            let person = ScimSyncPerson::builder(
+                person_uuid,
+                "cn=gate_person".to_string(),
+                "gate_person".to_string(),
+                "Gate Person".to_string(),
+            )
+            .build()
+            .try_into()
+            .expect("person");
+            let group = ScimSyncGroup::builder(
+                group_uuid,
+                "cn=gate_group".to_string(),
+                "gate_group".to_string(),
+            )
+            .set_members(members.into_iter())
+            .build()
+            .try_into()
+            .expect("group");
+            vec![person, group]
+        };
+        let update = |entries: Vec<ScimEntry>| ScimSyncRequest {
+            from_state: ScimSyncState::Active {
+                cookie: vec![1, 2, 3, 4],
+            },
+            to_state: ScimSyncState::Active {
+                cookie: vec![1, 2, 3, 4],
+            },
+            entries,
+            retain: ScimSyncRetentionMode::Ignore,
+        };
+
+        // The synced group, without members, nested into idm_admins; then the gate is
+        // enabled.
+        let mut idms_prox_write = idms.proxy_write(ct).await.unwrap();
+        let (_sync_uuid, ident) = test_scim_sync_apply_setup_ident(&mut idms_prox_write, ct);
+        let sse = ScimSyncUpdateEvent { ident };
+        let changes = ScimSyncRequest {
+            from_state: ScimSyncState::Refresh,
+            to_state: ScimSyncState::Active {
+                cookie: vec![1, 2, 3, 4],
+            },
+            entries: entries(vec![]),
+            retain: ScimSyncRetentionMode::Ignore,
+        };
+        idms_prox_write
+            .scim_sync_apply(&sse, &changes, ct)
+            .expect("initial sync");
+        idms_prox_write
+            .qs_write
+            .internal_modify_uuid(
+                UUID_IDM_ADMINS,
+                &ModifyList::new_append(Attribute::Member, Value::ReferN(group_uuid)),
+            )
+            .expect("nest the synced group");
+        idms_prox_write
+            .qs_write
+            .approval_policy_create(
+                &Identity::from_internal(),
+                &ApprovalPolicyCreateRequest {
+                    name: "hp_members".to_string(),
+                    description: None,
+                    operation_types: vec![ApprovalOperationType::GroupMembershipHighPrivilege],
+                    approvers: vec![UUID_IDM_ADMIN],
+                    backup_approvers: vec![],
+                    pattern: ApprovalPattern::AnyOne,
+                    timeout_seconds: 3600,
+                    escalation_timeout_seconds: None,
+                },
+            )
+            .expect("create the policy");
+        assert!(idms_prox_write.commit().is_ok());
+
+        // A sync that changes nothing about membership still works.
+        let mut idms_prox_write = idms.proxy_write(ct).await.unwrap();
+        idms_prox_write
+            .scim_sync_apply(&sse, &update(entries(vec![])), ct)
+            .expect("a sync without new members is not gated");
+        assert!(idms_prox_write.commit().is_ok());
+
+        // Adding a member is refused.
+        let mut idms_prox_write = idms.proxy_write(ct).await.unwrap();
+        assert_eq!(
+            idms_prox_write.scim_sync_apply(
+                &sse,
+                &update(entries(vec!["cn=gate_person".to_string()])),
+                ct
+            ),
+            Err(OperationError::AP0002ApprovalRequired)
+        );
+        drop(idms_prox_write);
+
+        // With the gate off it applies.
+        let mut idms_prox_write = idms.proxy_write(ct).await.unwrap();
+        idms_prox_write
+            .qs_write
+            .approval_policy_disable_break_glass(None)
+            .expect("break-glass");
+        idms_prox_write
+            .scim_sync_apply(
+                &sse,
+                &update(entries(vec!["cn=gate_person".to_string()])),
+                ct,
+            )
+            .expect("the gate is off");
+        let group = idms_prox_write
+            .qs_write
+            .internal_search_uuid(group_uuid)
+            .expect("group");
+        assert!(group.attribute_equality(Attribute::Member, &PartialValue::Refer(person_uuid)));
+        assert!(idms_prox_write.commit().is_ok());
+    }
+
     #[idm_test]
     async fn test_idm_scim_sync_phase_4_correct_delete(
         idms: &IdmServer,
