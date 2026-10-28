@@ -4292,12 +4292,768 @@ async fn test_repl_refresh_self_heals_derived_references(
     drop(server_a_txn);
 }
 
-// Note: Testing the MUST attribute rejection case (where refresh fails because pruning
-// a required reference would invalidate the entry) requires complex setup with schema
-// classes like ClientCertificate that have required reference attributes (Refers).
-// The code path is implemented in post_repl_refresh (refint.rs lines 331-347) and
-// returns an error when is_attribute_must_for_entry returns true. This behavior is
-// covered by the implementation and can be tested with integration tests if needed.
+// Kubidm: a dangling reference that is the last value of a required (must) attribute must
+// not block replication. It is kept, on every node alike: it resolves to nothing, so it
+// grants nothing, and verify reports it until an administrator fixes the entry.
+
+fn repl_approval_policy(uuid: Uuid, name: &str, approver: Uuid) -> EntryInitNew {
+    entry_init!(
+        (Attribute::Class, EntryClass::Object.to_value()),
+        (Attribute::Class, EntryClass::ApprovalPolicy.to_value()),
+        (Attribute::Uuid, Value::Uuid(uuid)),
+        (Attribute::ApprovalPolicyName, Value::new_iname(name)),
+        (
+            Attribute::ApprovalOperationType,
+            Value::new_iutf8n("delete")
+        ),
+        (Attribute::ApprovalPatternAttr, Value::new_iutf8("any_one")),
+        (Attribute::ApprovalTimeout, Value::Uint32(3600)),
+        (Attribute::Approver, Value::ReferN(approver))
+    )
+}
+
+fn repl_group(uuid: Uuid, name: &str) -> EntryInitNew {
+    entry_init!(
+        (Attribute::Class, EntryClass::Object.to_value()),
+        (Attribute::Class, EntryClass::Group.to_value()),
+        (Attribute::Name, Value::new_iname(name)),
+        (Attribute::Uuid, Value::Uuid(uuid))
+    )
+}
+
+/// Set `attr` of `uuid` to `target`, bypassing referential integrity, as a bug or an older
+/// version could have stored it.
+fn repl_inject_reference(
+    txn: &mut QueryServerWriteTransaction<'_>,
+    uuid: Uuid,
+    attr: &Attribute,
+    target: Uuid,
+) {
+    let filt = filter!(f_eq(Attribute::Uuid, PartialValue::Uuid(uuid)));
+    let mut work_set = txn
+        .internal_search_writeable(&filt)
+        .expect("Failed to search the entry");
+    for (_, entry) in work_set.iter_mut() {
+        entry.set_ava(attr, [Value::ReferN(target)]);
+    }
+    txn.internal_apply_writable(work_set)
+        .expect("Failed to inject the reference");
+}
+
+fn repl_set_approver(txn: &mut QueryServerWriteTransaction<'_>, policy: Uuid, approver: Uuid) {
+    txn.internal_modify_uuid(
+        policy,
+        &ModifyList::new_purge_and_set(Attribute::Approver, Value::ReferN(approver)),
+    )
+    .expect("Failed to set the approver");
+}
+
+/// The policy is live, unchanged and still holds the dangling approver.
+fn assert_dangling_approver_kept(
+    txn: &mut QueryServerWriteTransaction<'_>,
+    policy: Uuid,
+    target: Uuid,
+) {
+    let e = txn
+        .internal_search_uuid(policy)
+        .expect("the entry must stay live");
+    assert!(!e.attribute_equality(Attribute::Class, &EntryClass::Conflict.into()));
+    assert!(!e.attribute_equality(Attribute::Class, &EntryClass::Recycled.into()));
+    assert_eq!(
+        e.get_ava_refer(Attribute::Approver).cloned(),
+        Some(std::collections::BTreeSet::from([target]))
+    );
+}
+
+/// Verify reports exactly this dangling required reference, and nothing else.
+async fn assert_verify_reports_dangling(
+    server: &QueryServer,
+    entry: Uuid,
+    attr: &Attribute,
+    target: Uuid,
+) {
+    let results = server.verify().await;
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert!(
+        matches!(
+            &results[0],
+            Err(ConsistencyError::RefintNotUpheld {
+                entry_uuid: Some(e),
+                attribute: Some(a),
+                missing_target: Some(t),
+                ..
+            }) if *e == entry && *a == attr.to_string() && *t == target
+        ),
+        "{results:?}"
+    );
+}
+
+#[qs_pair_test]
+async fn test_repl_refresh_keeps_dangling_required_reference(
+    server_a: &QueryServer,
+    server_b: &QueryServer,
+) {
+    let ct = duration_from_epoch_now();
+    let mut server_a_txn = server_a.write(ct).await.unwrap();
+    let mut server_b_txn = server_b.read().await.unwrap();
+    assert!(repl_initialise(&mut server_b_txn, &mut server_a_txn)
+        .and_then(|_| server_a_txn.commit())
+        .is_ok());
+    drop(server_b_txn);
+
+    let approvers_uuid = Uuid::new_v4();
+    let other_uuid = Uuid::new_v4();
+    let policy_uuid = Uuid::new_v4();
+    let missing_uuid = Uuid::new_v4();
+
+    // On the supplier (A): a policy whose single, required approver dangles.
+    let mut server_a_txn = server_a.write(duration_from_epoch_now()).await.unwrap();
+    server_a_txn
+        .internal_create(vec![
+            repl_group(approvers_uuid, "testgroup_approvers"),
+            repl_group(other_uuid, "testgroup_other"),
+            repl_approval_policy(policy_uuid, "test_policy", approvers_uuid),
+        ])
+        .expect("Failed to create the entries");
+    repl_inject_reference(
+        &mut server_a_txn,
+        policy_uuid,
+        &Attribute::Approver,
+        missing_uuid,
+    );
+    server_a_txn.commit().expect("Failed to commit");
+
+    // Refreshing B from A succeeds without a local change (the RUVs are equal): the
+    // policy is live with its dangling approver, the rest is present.
+    let mut server_a_txn = server_a.read().await.unwrap();
+    let mut server_b_txn = server_b.write(duration_from_epoch_now()).await.unwrap();
+    repl_initialise(&mut server_a_txn, &mut server_b_txn)
+        .expect("a dangling required reference must not block a refresh");
+    assert_dangling_approver_kept(&mut server_b_txn, policy_uuid, missing_uuid);
+    assert!(server_b_txn.internal_search_uuid(approvers_uuid).is_ok());
+    assert!(server_b_txn.internal_search_uuid(other_uuid).is_ok());
+    let policy_a = server_a_txn
+        .internal_search_all_uuid(policy_uuid)
+        .expect("Unable to access the policy on A");
+    let policy_b = server_b_txn
+        .internal_search_all_uuid(policy_uuid)
+        .expect("Unable to access the policy on B");
+    assert_eq!(policy_a, policy_b);
+    server_b_txn.commit().expect("Failed to commit");
+    drop(server_a_txn);
+
+    // Both nodes report it.
+    for server in [server_a, server_b] {
+        assert_verify_reports_dangling(server, policy_uuid, &Attribute::Approver, missing_uuid)
+            .await;
+    }
+
+    // An administrator fixes it on the consumer, and the fix replicates.
+    let mut server_b_txn = server_b.write(duration_from_epoch_now()).await.unwrap();
+    repl_set_approver(&mut server_b_txn, policy_uuid, approvers_uuid);
+    server_b_txn.commit().expect("Failed to commit");
+
+    let mut server_b_txn = server_b.read().await.unwrap();
+    let mut server_a_txn = server_a.write(duration_from_epoch_now()).await.unwrap();
+    repl_incremental(&mut server_b_txn, &mut server_a_txn);
+    assert_dangling_approver_kept(&mut server_a_txn, policy_uuid, approvers_uuid);
+    server_a_txn.commit().expect("Failed to commit");
+    drop(server_b_txn);
+}
+
+#[qs_pair_test]
+async fn test_repl_increment_keeps_dangling_required_reference(
+    server_a: &QueryServer,
+    server_b: &QueryServer,
+) {
+    let ct = duration_from_epoch_now();
+    let mut server_b_txn = server_b.write(ct).await.unwrap();
+    let mut server_a_txn = server_a.read().await.unwrap();
+    assert!(repl_initialise(&mut server_a_txn, &mut server_b_txn)
+        .and_then(|_| server_b_txn.commit())
+        .is_ok());
+    drop(server_a_txn);
+
+    let approvers_uuid = Uuid::new_v4();
+    let other_uuid = Uuid::new_v4();
+    let policy_uuid = Uuid::new_v4();
+    let missing_uuid = Uuid::new_v4();
+
+    let mut server_a_txn = server_a.write(duration_from_epoch_now()).await.unwrap();
+    server_a_txn
+        .internal_create(vec![
+            repl_group(approvers_uuid, "testgroup_approvers"),
+            repl_group(other_uuid, "testgroup_other"),
+            repl_approval_policy(policy_uuid, "test_policy", approvers_uuid),
+        ])
+        .expect("Failed to create the entries");
+    repl_inject_reference(
+        &mut server_a_txn,
+        policy_uuid,
+        &Attribute::Approver,
+        missing_uuid,
+    );
+    server_a_txn.commit().expect("Failed to commit");
+
+    // The incremental applies, and the policy arrives as it is on A.
+    let mut server_a_txn = server_a.read().await.unwrap();
+    let mut server_b_txn = server_b.write(duration_from_epoch_now()).await.unwrap();
+    repl_incremental(&mut server_a_txn, &mut server_b_txn);
+    assert_dangling_approver_kept(&mut server_b_txn, policy_uuid, missing_uuid);
+    assert!(server_b_txn.internal_search_uuid(approvers_uuid).is_ok());
+    assert!(server_b_txn.internal_search_uuid(other_uuid).is_ok());
+    let policy_a = server_a_txn
+        .internal_search_all_uuid(policy_uuid)
+        .expect("Unable to access the policy on A");
+    let policy_b = server_b_txn
+        .internal_search_all_uuid(policy_uuid)
+        .expect("Unable to access the policy on B");
+    assert_eq!(policy_a, policy_b);
+    server_b_txn.commit().expect("Failed to commit");
+    drop(server_a_txn);
+
+    assert_verify_reports_dangling(server_b, policy_uuid, &Attribute::Approver, missing_uuid).await;
+
+    // Fixing it on the supplier replicates.
+    let mut server_a_txn = server_a.write(duration_from_epoch_now()).await.unwrap();
+    repl_set_approver(&mut server_a_txn, policy_uuid, approvers_uuid);
+    server_a_txn.commit().expect("Failed to commit");
+
+    let mut server_a_txn = server_a.read().await.unwrap();
+    let mut server_b_txn = server_b.write(duration_from_epoch_now()).await.unwrap();
+    repl_incremental(&mut server_a_txn, &mut server_b_txn);
+    assert_dangling_approver_kept(&mut server_b_txn, policy_uuid, approvers_uuid);
+    server_b_txn.commit().expect("Failed to commit");
+    drop(server_a_txn);
+}
+
+/// A sets the approver to G2 while B deletes G2. Neither change can be refused, and the
+/// result must be the same on both nodes.
+#[qs_pair_test]
+async fn test_repl_concurrent_delete_of_required_reference_target(
+    server_a: &QueryServer,
+    server_b: &QueryServer,
+) {
+    let ct = duration_from_epoch_now();
+    let mut server_b_txn = server_b.write(ct).await.unwrap();
+    let mut server_a_txn = server_a.read().await.unwrap();
+    assert!(repl_initialise(&mut server_a_txn, &mut server_b_txn)
+        .and_then(|_| server_b_txn.commit())
+        .is_ok());
+    drop(server_a_txn);
+
+    let g1_uuid = Uuid::new_v4();
+    let g2_uuid = Uuid::new_v4();
+    let policy_uuid = Uuid::new_v4();
+
+    let mut server_a_txn = server_a.write(duration_from_epoch_now()).await.unwrap();
+    server_a_txn
+        .internal_create(vec![
+            repl_group(g1_uuid, "testgroup_g1"),
+            repl_group(g2_uuid, "testgroup_g2"),
+            repl_approval_policy(policy_uuid, "test_policy", g1_uuid),
+        ])
+        .expect("Failed to create the entries");
+    server_a_txn.commit().expect("Failed to commit");
+
+    let mut server_a_txn = server_a.read().await.unwrap();
+    let mut server_b_txn = server_b.write(duration_from_epoch_now()).await.unwrap();
+    repl_incremental(&mut server_a_txn, &mut server_b_txn);
+    server_b_txn.commit().expect("Failed to commit");
+    drop(server_a_txn);
+
+    // The concurrent changes.
+    let mut server_a_txn = server_a.write(duration_from_epoch_now()).await.unwrap();
+    repl_set_approver(&mut server_a_txn, policy_uuid, g2_uuid);
+    server_a_txn.commit().expect("Failed to commit");
+
+    let mut server_b_txn = server_b.write(duration_from_epoch_now()).await.unwrap();
+    server_b_txn
+        .internal_delete_uuid(g2_uuid)
+        .expect("Failed to delete G2");
+    server_b_txn.commit().expect("Failed to commit");
+
+    // A -> B, then B -> A.
+    let mut server_a_txn = server_a.read().await.unwrap();
+    let mut server_b_txn = server_b.write(duration_from_epoch_now()).await.unwrap();
+    repl_incremental(&mut server_a_txn, &mut server_b_txn);
+    assert_dangling_approver_kept(&mut server_b_txn, policy_uuid, g2_uuid);
+    server_b_txn.commit().expect("Failed to commit");
+    drop(server_a_txn);
+
+    let mut server_b_txn = server_b.read().await.unwrap();
+    let mut server_a_txn = server_a.write(duration_from_epoch_now()).await.unwrap();
+    repl_incremental(&mut server_b_txn, &mut server_a_txn);
+    assert_dangling_approver_kept(&mut server_a_txn, policy_uuid, g2_uuid);
+    assert!(server_a_txn.internal_search_uuid(g2_uuid).is_err());
+    let policy_a = server_a_txn
+        .internal_search_all_uuid(policy_uuid)
+        .expect("Unable to access the policy on A");
+    let policy_b = server_b_txn
+        .internal_search_all_uuid(policy_uuid)
+        .expect("Unable to access the policy on B");
+    assert_eq!(policy_a, policy_b);
+    server_a_txn.commit().expect("Failed to commit");
+    drop(server_b_txn);
+
+    // The reference to the deleted G2 is reported on both nodes.
+    for server in [server_a, server_b] {
+        assert_verify_reports_dangling(server, policy_uuid, &Attribute::Approver, g2_uuid).await;
+    }
+
+    // An administrator fixes it on B, and the fix replicates to A.
+    let mut server_b_txn = server_b.write(duration_from_epoch_now()).await.unwrap();
+    repl_set_approver(&mut server_b_txn, policy_uuid, g1_uuid);
+    server_b_txn.commit().expect("Failed to commit");
+
+    let mut server_b_txn = server_b.read().await.unwrap();
+    let mut server_a_txn = server_a.write(duration_from_epoch_now()).await.unwrap();
+    repl_incremental(&mut server_b_txn, &mut server_a_txn);
+    assert_dangling_approver_kept(&mut server_a_txn, policy_uuid, g1_uuid);
+    server_a_txn.commit().expect("Failed to commit");
+    drop(server_b_txn);
+}
+
+/// An access control profile whose receiver group no longer exists grants nothing, and
+/// the dangling uuid can not be taken by a new entry to inherit the grant.
+#[qs_pair_test]
+async fn test_repl_dangling_acp_receiver_grants_nothing(
+    server_a: &QueryServer,
+    server_b: &QueryServer,
+) {
+    let ct = duration_from_epoch_now();
+    let mut server_b_txn = server_b.write(ct).await.unwrap();
+    let mut server_a_txn = server_a.read().await.unwrap();
+    assert!(repl_initialise(&mut server_a_txn, &mut server_b_txn)
+        .and_then(|_| server_b_txn.commit())
+        .is_ok());
+    drop(server_a_txn);
+
+    let receivers_uuid = Uuid::new_v4();
+    let person_uuid = Uuid::new_v4();
+    let target_uuid = Uuid::new_v4();
+    let acp_uuid = Uuid::new_v4();
+    let missing_uuid = Uuid::new_v4();
+
+    let mut acp = entry_init!(
+        (Attribute::Class, EntryClass::Object.to_value()),
+        (
+            Attribute::Class,
+            EntryClass::AccessControlProfile.to_value()
+        ),
+        (
+            Attribute::Class,
+            EntryClass::AccessControlReceiverGroup.to_value()
+        ),
+        (
+            Attribute::Class,
+            EntryClass::AccessControlTargetScope.to_value()
+        ),
+        (Attribute::Class, EntryClass::AccessControlSearch.to_value()),
+        (Attribute::Name, Value::new_iname("test_dangling_acp")),
+        (Attribute::Uuid, Value::Uuid(acp_uuid)),
+        (Attribute::AcpReceiverGroup, Value::ReferN(receivers_uuid)),
+        (
+            Attribute::AcpTargetScope,
+            Value::new_json_filter_s(
+                "{\"eq\":[\"uuid\",\"TARGET\"]}"
+                    .replace("TARGET", &target_uuid.to_string())
+                    .as_str()
+            )
+            .expect("filter")
+        )
+    );
+    for attr in [
+        Attribute::Name,
+        Attribute::Uuid,
+        Attribute::Class,
+        Attribute::Description,
+    ] {
+        acp.add_ava(Attribute::AcpSearchAttr, Value::new_iutf8n(attr.as_str()));
+    }
+
+    let mut server_a_txn = server_a.write(duration_from_epoch_now()).await.unwrap();
+    server_a_txn
+        .internal_create(vec![
+            entry_init!(
+                (Attribute::Class, EntryClass::Object.to_value()),
+                (Attribute::Class, EntryClass::Account.to_value()),
+                (Attribute::Class, EntryClass::Person.to_value()),
+                (Attribute::Name, Value::new_iname("testperson_acp")),
+                (Attribute::Uuid, Value::Uuid(person_uuid)),
+                (Attribute::DisplayName, Value::new_utf8s("testperson_acp"))
+            ),
+            entry_init!(
+                (Attribute::Class, EntryClass::Object.to_value()),
+                (Attribute::Class, EntryClass::Group.to_value()),
+                (Attribute::Name, Value::new_iname("testgroup_receivers")),
+                (Attribute::Uuid, Value::Uuid(receivers_uuid)),
+                (Attribute::Member, Value::ReferN(person_uuid))
+            ),
+            entry_init!(
+                (Attribute::Class, EntryClass::Object.to_value()),
+                (Attribute::Class, EntryClass::Group.to_value()),
+                (Attribute::Name, Value::new_iname("testgroup_acp_target")),
+                (Attribute::Uuid, Value::Uuid(target_uuid)),
+                (Attribute::Description, Value::new_utf8s("acp_secret"))
+            ),
+            acp,
+        ])
+        .expect("Failed to create the entries");
+    server_a_txn.commit().expect("Failed to commit");
+
+    // The filter is on an attribute only this profile lets the person search.
+    let target_filter = || {
+        filter!(f_and!([
+            f_eq(Attribute::Uuid, PartialValue::Uuid(target_uuid)),
+            f_eq(
+                Attribute::Description,
+                PartialValue::new_utf8s("acp_secret")
+            )
+        ]))
+    };
+    let person_finds_target = |txn: &mut QueryServerWriteTransaction<'_>| {
+        let person = txn
+            .internal_search_uuid(person_uuid)
+            .expect("Unable to access the person");
+        let se = SearchEvent::new_impersonate_entry(person, target_filter());
+        txn.search(&se).expect("search failed").len()
+    };
+
+    // Control: through the receiver group, the person finds the target.
+    let mut server_a_txn = server_a.write(duration_from_epoch_now()).await.unwrap();
+    assert_eq!(person_finds_target(&mut server_a_txn), 1);
+    // The receiver now dangles.
+    repl_inject_reference(
+        &mut server_a_txn,
+        acp_uuid,
+        &Attribute::AcpReceiverGroup,
+        missing_uuid,
+    );
+    server_a_txn.commit().expect("Failed to commit");
+
+    // B refreshes from A and keeps the profile with its dangling receiver.
+    let mut server_a_txn = server_a.read().await.unwrap();
+    let mut server_b_txn = server_b.write(duration_from_epoch_now()).await.unwrap();
+    repl_initialise(&mut server_a_txn, &mut server_b_txn).expect("Failed to refresh B");
+    server_b_txn.commit().expect("Failed to commit");
+    drop(server_a_txn);
+
+    for server in [server_a, server_b] {
+        let mut txn = server.write(duration_from_epoch_now()).await.unwrap();
+        let acp = txn
+            .internal_search_uuid(acp_uuid)
+            .expect("the profile stays live");
+        assert!(acp.attribute_equality(
+            Attribute::AcpReceiverGroup,
+            &PartialValue::Refer(missing_uuid)
+        ));
+        assert_eq!(
+            person_finds_target(&mut txn),
+            0,
+            "a dangling receiver grants nothing"
+        );
+
+        // An administrator may not create an entry with the dangling uuid, which would
+        // receive the profile.
+        let idm_admin = txn
+            .internal_search_uuid(UUID_IDM_ADMIN)
+            .expect("Unable to access idm_admin");
+        let ce = CreateEvent::new_impersonate_identity(
+            Identity::from_impersonate_entry_readwrite(idm_admin),
+            vec![repl_group(missing_uuid, "testgroup_reused")],
+        );
+        assert!(matches!(
+            txn.create(&ce),
+            Err(OperationError::Plugin(PluginError::ReferentialIntegrity(_)))
+        ));
+        drop(txn);
+
+        // Neither may an internal create, which is how a sync connector creates its entries.
+        // A fresh transaction: the refused create above leaves its candidate in this one.
+        let mut txn = server.write(duration_from_epoch_now()).await.unwrap();
+        let r = txn.internal_create(vec![repl_group(missing_uuid, "testgroup_reused_internal")]);
+        assert!(
+            matches!(
+                r,
+                Err(OperationError::Plugin(PluginError::ReferentialIntegrity(_)))
+            ),
+            "{r:?}"
+        );
+        drop(txn);
+
+        assert_verify_reports_dangling(
+            server,
+            acp_uuid,
+            &Attribute::AcpReceiverGroup,
+            missing_uuid,
+        )
+        .await;
+    }
+
+    // Fix it on A and replicate, so that both nodes verify at the end of the test.
+    let mut server_a_txn = server_a.write(duration_from_epoch_now()).await.unwrap();
+    server_a_txn
+        .internal_modify_uuid(
+            acp_uuid,
+            &ModifyList::new_purge_and_set(
+                Attribute::AcpReceiverGroup,
+                Value::ReferN(receivers_uuid),
+            ),
+        )
+        .expect("Failed to fix the profile");
+    server_a_txn.commit().expect("Failed to commit");
+
+    let mut server_a_txn = server_a.read().await.unwrap();
+    let mut server_b_txn = server_b.write(duration_from_epoch_now()).await.unwrap();
+    repl_incremental(&mut server_a_txn, &mut server_b_txn);
+    server_b_txn.commit().expect("Failed to commit");
+    drop(server_a_txn);
+
+    // Access control profiles reload on commit: the fixed receiver grants again.
+    for server in [server_a, server_b] {
+        let mut txn = server.write(duration_from_epoch_now()).await.unwrap();
+        assert_eq!(person_finds_target(&mut txn), 1);
+    }
+}
+
+/// Set `attr` of `uuid` to all of `targets`, bypassing referential integrity.
+fn repl_inject_references(
+    txn: &mut QueryServerWriteTransaction<'_>,
+    uuid: Uuid,
+    attr: &Attribute,
+    targets: &[Uuid],
+) {
+    let filt = filter!(f_eq(Attribute::Uuid, PartialValue::Uuid(uuid)));
+    let mut work_set = txn
+        .internal_search_writeable(&filt)
+        .expect("Failed to search the entry");
+    for (_, entry) in work_set.iter_mut() {
+        entry.set_ava(attr, targets.iter().map(|u| Value::ReferN(*u)));
+    }
+    txn.internal_apply_writable(work_set)
+        .expect("Failed to inject the references");
+}
+
+/// Refresh B from A, and return the approvers and the backup approvers of the policy on B.
+async fn repl_refresh_b_policy_refs(
+    server_a: &QueryServer,
+    server_b: &QueryServer,
+    policy_uuid: Uuid,
+) -> (
+    Option<std::collections::BTreeSet<Uuid>>,
+    Option<std::collections::BTreeSet<Uuid>>,
+) {
+    let mut server_a_txn = server_a.read().await.unwrap();
+    let mut server_b_txn = server_b.write(duration_from_epoch_now()).await.unwrap();
+    // The refresh rewrites the entries that lose a reference, so the RUVs differ after it.
+    let refresh_context = server_a_txn
+        .supplier_provide_refresh()
+        .expect("Failed to provide the refresh");
+    server_b_txn
+        .consumer_apply_refresh(refresh_context)
+        .expect("Failed to refresh B");
+    let policy = server_b_txn
+        .internal_search_uuid(policy_uuid)
+        .expect("the policy must stay live");
+    let refs = (
+        policy.get_ava_refer(Attribute::Approver).cloned(),
+        policy.get_ava_refer(Attribute::BackupApprover).cloned(),
+    );
+    server_b_txn.commit().expect("Failed to commit");
+    refs
+}
+
+/// Only the last value of a required reference is kept: with a live value next to the
+/// dangling one, the dangling value is removed as before.
+#[qs_pair_test]
+async fn test_repl_refresh_removes_dangling_required_reference_with_live_value(
+    server_a: &QueryServer,
+    server_b: &QueryServer,
+) {
+    let ct = duration_from_epoch_now();
+    let mut server_a_txn = server_a.write(ct).await.unwrap();
+    let mut server_b_txn = server_b.read().await.unwrap();
+    assert!(repl_initialise(&mut server_b_txn, &mut server_a_txn)
+        .and_then(|_| server_a_txn.commit())
+        .is_ok());
+    drop(server_b_txn);
+
+    let approvers_uuid = Uuid::new_v4();
+    let policy_uuid = Uuid::new_v4();
+    let missing_uuid = Uuid::new_v4();
+
+    let mut server_a_txn = server_a.write(duration_from_epoch_now()).await.unwrap();
+    server_a_txn
+        .internal_create(vec![
+            repl_group(approvers_uuid, "testgroup_approvers"),
+            repl_approval_policy(policy_uuid, "test_policy", approvers_uuid),
+        ])
+        .expect("Failed to create the entries");
+    repl_inject_references(
+        &mut server_a_txn,
+        policy_uuid,
+        &Attribute::Approver,
+        &[approvers_uuid, missing_uuid],
+    );
+    server_a_txn.commit().expect("Failed to commit");
+
+    let (approver, _) = repl_refresh_b_policy_refs(server_a, server_b, policy_uuid).await;
+    assert_eq!(
+        approver,
+        Some(std::collections::BTreeSet::from([approvers_uuid])),
+        "the dangling value goes, the live one stays"
+    );
+
+    // A still holds the dangling value, which verify reports. Fix it so that the nodes verify.
+    let mut server_a_txn = server_a.write(duration_from_epoch_now()).await.unwrap();
+    repl_set_approver(&mut server_a_txn, policy_uuid, approvers_uuid);
+    server_a_txn.commit().expect("Failed to commit");
+}
+
+/// A dangling optional reference is removed even when a required one on the same entry
+/// is dangling and kept.
+#[qs_pair_test]
+async fn test_repl_refresh_drops_optional_dangling_keeps_required(
+    server_a: &QueryServer,
+    server_b: &QueryServer,
+) {
+    let ct = duration_from_epoch_now();
+    let mut server_a_txn = server_a.write(ct).await.unwrap();
+    let mut server_b_txn = server_b.read().await.unwrap();
+    assert!(repl_initialise(&mut server_b_txn, &mut server_a_txn)
+        .and_then(|_| server_a_txn.commit())
+        .is_ok());
+    drop(server_b_txn);
+
+    let approvers_uuid = Uuid::new_v4();
+    let policy_uuid = Uuid::new_v4();
+    let missing_uuid = Uuid::new_v4();
+    let missing_backup_uuid = Uuid::new_v4();
+
+    let mut server_a_txn = server_a.write(duration_from_epoch_now()).await.unwrap();
+    server_a_txn
+        .internal_create(vec![
+            repl_group(approvers_uuid, "testgroup_approvers"),
+            repl_approval_policy(policy_uuid, "test_policy", approvers_uuid),
+        ])
+        .expect("Failed to create the entries");
+    repl_inject_reference(
+        &mut server_a_txn,
+        policy_uuid,
+        &Attribute::Approver,
+        missing_uuid,
+    );
+    repl_inject_reference(
+        &mut server_a_txn,
+        policy_uuid,
+        &Attribute::BackupApprover,
+        missing_backup_uuid,
+    );
+    server_a_txn.commit().expect("Failed to commit");
+
+    let (approver, backup) = repl_refresh_b_policy_refs(server_a, server_b, policy_uuid).await;
+    assert_eq!(
+        approver,
+        Some(std::collections::BTreeSet::from([missing_uuid])),
+        "the required reference is kept"
+    );
+    assert_eq!(backup, None, "the optional reference is removed");
+
+    // Fix the policy on A and replicate it, so that the nodes verify.
+    let mut server_a_txn = server_a.write(duration_from_epoch_now()).await.unwrap();
+    repl_set_approver(&mut server_a_txn, policy_uuid, approvers_uuid);
+    server_a_txn
+        .internal_modify_uuid(
+            policy_uuid,
+            &ModifyList::new_purge(Attribute::BackupApprover),
+        )
+        .expect("Failed to purge the backup approvers");
+    server_a_txn.commit().expect("Failed to commit");
+
+    let mut server_a_txn = server_a.read().await.unwrap();
+    let mut server_b_txn = server_b.write(duration_from_epoch_now()).await.unwrap();
+    repl_incremental(&mut server_a_txn, &mut server_b_txn);
+    server_b_txn.commit().expect("Failed to commit");
+}
+
+/// Refreshing the original supplier back from its consumer keeps the entry as it is, and
+/// it stays live: the recycle bin purge has nothing of it to tombstone. This is the case
+/// where a local quarantine leaked and deleted the entry on every node.
+#[qs_pair_test]
+async fn test_repl_reverse_refresh_keeps_dangling_required_reference(
+    server_a: &QueryServer,
+    server_b: &QueryServer,
+) {
+    let ct = duration_from_epoch_now();
+    let mut server_a_txn = server_a.write(ct).await.unwrap();
+    let mut server_b_txn = server_b.read().await.unwrap();
+    assert!(repl_initialise(&mut server_b_txn, &mut server_a_txn)
+        .and_then(|_| server_a_txn.commit())
+        .is_ok());
+    drop(server_b_txn);
+
+    let approvers_uuid = Uuid::new_v4();
+    let policy_uuid = Uuid::new_v4();
+    let missing_uuid = Uuid::new_v4();
+
+    let mut server_a_txn = server_a.write(duration_from_epoch_now()).await.unwrap();
+    server_a_txn
+        .internal_create(vec![
+            repl_group(approvers_uuid, "testgroup_approvers"),
+            repl_approval_policy(policy_uuid, "test_policy", approvers_uuid),
+        ])
+        .expect("Failed to create the entries");
+    repl_inject_reference(
+        &mut server_a_txn,
+        policy_uuid,
+        &Attribute::Approver,
+        missing_uuid,
+    );
+    server_a_txn.commit().expect("Failed to commit");
+
+    // B refreshes from A.
+    let mut server_a_txn = server_a.read().await.unwrap();
+    let mut server_b_txn = server_b.write(duration_from_epoch_now()).await.unwrap();
+    repl_initialise(&mut server_a_txn, &mut server_b_txn).expect("Failed to refresh B");
+    server_b_txn.commit().expect("Failed to commit");
+    drop(server_a_txn);
+
+    // A fixes the holder locally (the target can not be created again: it is the target of
+    // a dangling required reference), then refreshes from B, which replaces its content.
+    let mut server_a_txn = server_a.write(duration_from_epoch_now()).await.unwrap();
+    repl_set_approver(&mut server_a_txn, policy_uuid, approvers_uuid);
+    server_a_txn.commit().expect("Failed to commit");
+
+    let mut server_b_txn = server_b.read().await.unwrap();
+    let mut server_a_txn = server_a.write(duration_from_epoch_now()).await.unwrap();
+    repl_initialise(&mut server_b_txn, &mut server_a_txn).expect("Failed to refresh A");
+    assert_dangling_approver_kept(&mut server_a_txn, policy_uuid, missing_uuid);
+    let policy_a = server_a_txn
+        .internal_search_all_uuid(policy_uuid)
+        .expect("Unable to access the policy on A");
+    let policy_b = server_b_txn
+        .internal_search_all_uuid(policy_uuid)
+        .expect("Unable to access the policy on B");
+    assert_eq!(policy_a, policy_b);
+    server_a_txn.commit().expect("Failed to commit");
+    drop(server_b_txn);
+
+    // The purge of the recycle bin, past its age, leaves the policy live.
+    let ct = duration_from_epoch_now() + Duration::from_secs(RECYCLEBIN_MAX_AGE + 60);
+    let mut server_a_txn = server_a.write(ct).await.unwrap();
+    assert!(server_a_txn.purge_recycled().is_ok());
+    assert_dangling_approver_kept(&mut server_a_txn, policy_uuid, missing_uuid);
+    // Fix it so that both nodes verify at the end of the test.
+    repl_set_approver(&mut server_a_txn, policy_uuid, approvers_uuid);
+    server_a_txn.commit().expect("Failed to commit");
+
+    let mut server_a_txn = server_a.read().await.unwrap();
+    let mut server_b_txn = server_b.write(ct).await.unwrap();
+    repl_incremental(&mut server_a_txn, &mut server_b_txn);
+    assert_dangling_approver_kept(&mut server_b_txn, policy_uuid, approvers_uuid);
+    server_b_txn.commit().expect("Failed to commit");
+}
 
 /// A replication refresh replaces the whole database and its server uuid. With WAL
 /// archiving enabled on the consumer, the archive must follow it: the segment of the old
