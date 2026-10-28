@@ -362,7 +362,7 @@ impl PolicyInformationPoint for LdapPip {
 
 /// Parse LDAP filter string into LdapFilter
 fn parse_ldap_filter(filter_str: &str) -> Result<LdapFilter, String> {
-    ldap3_proto::filter::parse_ldap_filter_str(filter_str)
+    ldap3_client::filter::parse_ldap_filter_str(filter_str)
         .map_err(|e| format!("Failed to parse filter '{}': {:?}", filter_str, e))
 }
 

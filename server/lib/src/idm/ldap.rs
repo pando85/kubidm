@@ -728,6 +728,12 @@ impl LdapServer {
                     wr.gen_operror(format!("Unbound Connection {eventid}").as_str()),
                 )),
             },
+            ServerOps::Abandon { .. } => {
+                // Per RFC 4511 Section 4.11, the server SHOULD NOT send any response
+                // to an Abandon operation. We log it and return an empty response.
+                trace!("Abandon operation received - no action taken");
+                Ok(LdapResponseState::MultiPartResponse(Vec::new()))
+            }
         } // end match server op
     }
 
