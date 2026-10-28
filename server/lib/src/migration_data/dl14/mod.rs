@@ -393,6 +393,28 @@ pub(crate) fn kubidm_builtin_access_control_profiles() -> Vec<EntryInitNew> {
     ]
 }
 
+/// Kubidm: fork changes to upstream builtin access control profiles, applied to each
+/// shipped definition before it is migrated (see
+/// `QueryServerWriteTransaction::kubidm_migrate_builtin_acp_batch`), so they apply at
+/// every domain migration that rewrites builtin profiles, including 1.11 -> 1.12.
+///
+/// - `idm_acp_acp_manage` also grants search, modify and create of
+///   `acp_receiver_pip_condition`, so that access control admins can manage PIP
+///   conditions in band.
+pub(crate) fn kubidm_patch_builtin_acp(entry: &mut EntryInitNew) {
+    if entry.get_uuid() == Some(UUID_IDM_ACP_ACP_MANAGE_V1) {
+        let attr = Attribute::AcpReceiverPipCondition.as_str();
+        for grant in [
+            Attribute::AcpSearchAttr,
+            Attribute::AcpModifyRemovedAttr,
+            Attribute::AcpModifyPresentAttr,
+            Attribute::AcpCreateAttr,
+        ] {
+            entry.add_ava(grant, Value::new_iutf8n(attr));
+        }
+    }
+}
+
 pub fn phase_8_delete_uuids() -> Vec<Uuid> {
     vec![UUID_SCHEMA_ATTR_EC_KEY_PRIVATE]
 }

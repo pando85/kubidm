@@ -81,10 +81,11 @@ A PIP condition is only satisfied by attributes that were fetched for this reque
 - no PIP is configured, or the source in the condition does not exist;
 - the source fails or times out. With `fallback_behavior = "deny"` (the default) or `"ignore"` the source contributes no
   attributes. With `"usefallback"`, see below;
-- the source has no answer for the account: it does not know the account (an HTTP `404`, or no LDAP entry), it rejects
-  the request for the account (any other HTTP `4xx` except `408` and `429`), the LDAP search matches more than one
-  entry, or the request can not be built for the account (for example `{email}` for an account without `mail`). This is
-  not a source failure, so `fallback_values` are never used for it;
+- the source has no answer for the request: it does not know the account (an HTTP `404`, or no LDAP entry), it rejects
+  the request (any other HTTP `4xx`, including `408 Request Timeout` and `429 Too Many Requests`, which a user can
+  provoke, for example by flooding requests until the source rate limits), the LDAP search matches more than one entry,
+  or the request can not be built for the account (for example `{email}` for an account without `mail`). This is not a
+  source failure, so `fallback_values` are never used for it;
 - the account does not have the attribute, or not with that value;
 - the request is not made by an authenticated account (anonymous, internal, synchronisation), or is made to an endpoint
   that does not fetch PIP attributes: the OAuth2 and OpenID Connect endpoints (authorisation, consent, token, userinfo
@@ -95,26 +96,29 @@ A failure only affects the profiles with a PIP condition on that source. Every o
 ### `usefallback` Fails Open
 
 With `fallback_behavior = "usefallback"`, while a source is down (unreachable, timing out, unhealthy, or answering with
-an error), every account is given that source's `fallback_values` as if the source had returned them. **A profile whose
-conditions match the fallback values then grants its access to all of its receivers for as long as the source is down.**
-Only use it when the fallback values are safe to grant on, for example values that no condition grants on, or that only
-narrow access. The fallback values are never used when the source works but has no answer for an account (see above),
-and the server logs a warning at startup for every source that uses `usefallback`.
+a server error `5xx` or an unusable response), every account is given that source's `fallback_values` as if the source
+had returned them. **A profile whose conditions match the fallback values then grants its access to all of its receivers
+for as long as the source is down.** Only use it when the fallback values are safe to grant on, for example values that
+no condition grants on, or that only narrow access. The fallback values are never used when the source works but has no
+answer for an account (see above), and the server logs a warning at startup for every source that uses `usefallback`.
 
 ## Caching and Timeouts
 
 For every request made by an authenticated account, while at least one enabled profile has a PIP condition, Kubidm
-fetches the attributes that the conditions reference, once per source, before the request is processed. The access
-decisions themselves never wait on a source. A request without valid credentials never causes a fetch.
+fetches the attributes that the conditions reference, from all sources at once, before the request is processed. The
+access decisions themselves never wait on a source. A request without valid credentials never causes a fetch.
 
 - Each source caches the attributes of an account for its own `cache_ttl_secs` (default 300 seconds, up to 1000 accounts
   per source). A change in the external system, including a revocation, can therefore take up to that long to be seen:
   lower `cache_ttl_secs` for attributes that revoke access. Failures are not cached.
-- `prefetch_timeout_ms` bounds the time a request spends fetching attributes, across all sources. A source that has not
-  answered in time contributes no attributes to that request. Set each source's own `timeout_secs` below this budget, so
-  that the source's failure handling and health tracking apply.
-- A source that keeps failing is marked unhealthy, and then only tried again every `health_check.interval_secs` (default
-  60 seconds). Until then, requests fail closed without waiting on it.
+- `prefetch_timeout_ms` (default 2000) bounds the time a request spends fetching attributes, across all sources. A
+  source that has not answered in time contributes no attributes to that request, and this counts as a failure of the
+  source.
+- Each source's own `timeout_secs` (default 1) must not exceed `prefetch_timeout_ms`, otherwise the server refuses to
+  start. With sources configured, `prefetch_timeout_ms` is therefore at least 1000.
+- A source that keeps failing (`health_check.failure_threshold` consecutive failures, default 3, including timeouts) is
+  marked unhealthy, and then only tried again every `health_check.interval_secs` (default 60 seconds). Until then,
+  requests fail closed without waiting on it, so a hanging source does not slow every request down.
 
 ## LDAP
 
@@ -122,46 +126,36 @@ PIP conditions apply to LDAP searches and compares of a bound session (an accoun
 fetched for each operation, in the same way as for HTTP requests. Operations without a bind run as anonymous, so PIP
 conditions never match them.
 
+## Downgrading
+
+A Kubidm version without PIP support ignores `acp_receiver_pip_condition`, so a profile with a PIP condition applies to
+all of its receivers, without the condition: **rolling back widens access.** Before downgrading to such a version,
+disable (`acp_enable`) or delete every profile that has a PIP condition.
+
 ## Example
 
-Allow the members of `hr_viewers` that are in the engineering department of the HR system to read the names and email
-addresses of persons. Access control profiles are created by members of `idm_access_control_admins` with a privileged
-session, here through the raw API.
-
-```bash
-cat > acp.json << 'EOF'
-{
-  "entries": [{
-    "attrs": {
-      "class": [
-        "object", "access_control_profile", "access_control_receiver_group",
-        "access_control_target_scope", "access_control_search"
-      ],
-      "name": ["acp_hr_engineering_read"],
-      "acp_receiver_group": ["hr_viewers"],
-      "acp_targetscope": ["{\"eq\":[\"class\",\"person\"]}"],
-      "acp_search_attr": ["class", "name", "mail"],
-      "acp_receiver_pip_condition": ["pip:hr:department=engineering", "pip:hr:active=true"]
-    }
-  }]
-}
-EOF
-
-curl -X POST https://idm.example.com/v1/raw/create \
-  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  --data @acp.json
-```
-
-A condition can also be added to an existing profile:
+Members of `idm_access_control_admins` manage PIP conditions with a privileged session, through the built-in
+`idm_acp_acp_manage`: they can read them, and add them to and remove them from access control profiles. Here, an
+existing profile `acp_hr_engineering_read` lets the members of `hr_viewers` read the names and email addresses of
+persons. Restrict it to the members that are active in the engineering department of the HR system, through the raw API:
 
 ```bash
 curl -X POST https://idm.example.com/v1/raw/modify \
   -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
   --data '{
     "filter": {"eq": ["name", "acp_hr_engineering_read"]},
-    "modlist": {"mods": [{"present": ["acp_receiver_pip_condition", "pip:hr:department=engineering"]}]}
+    "modlist": {"mods": [
+      {"present": ["acp_receiver_pip_condition", "pip:hr:department=engineering"]},
+      {"present": ["acp_receiver_pip_condition", "pip:hr:active=true"]}
+    ]}
   }'
 ```
+
+To remove the conditions again, use the modification `{"purged": "acp_receiver_pip_condition"}`.
+
+`idm_acp_acp_manage` does not grant the `access_control_receiver_group` and `access_control_target_scope` classes when
+creating a profile (an inherited limitation), so a new profile with a receiver group and a target scope can not be
+created in band; conditions can be set on the profiles that exist.
 
 With the `hr` source above, a member of `hr_viewers` named `alice` is granted the access when
 `https://hr.example.com/api/employees/alice` answers, for example, `{"department": "engineering", "active": true}`. If

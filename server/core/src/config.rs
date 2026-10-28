@@ -1469,7 +1469,7 @@ schedule = "@daily"
 
         let source = r#"
 [pip_config]
-prefetch_timeout_ms = 500
+prefetch_timeout_ms = 1500
 
 [[pip_config.sources]]
 type = "http"
@@ -1483,7 +1483,15 @@ endpoint_path = "/employees/{username}"
             .pip_prefetcher()
             .expect("valid pip_config")
             .expect("enabled");
-        assert_eq!(prefetcher.timeout(), std::time::Duration::from_millis(500));
+        assert_eq!(prefetcher.timeout(), std::time::Duration::from_millis(1500));
+
+        // A source timeout (default 1 s) above the prefetch budget is refused.
+        let too_short = build_from_toml(&format!(
+            "{BASE_V2_CONFIG}\n{}",
+            source.replace("prefetch_timeout_ms = 1500", "prefetch_timeout_ms = 500")
+        ))
+        .expect("pip_config must parse");
+        assert!(too_short.pip_prefetcher().is_err());
 
         // An invalid source fails rather than being dropped.
         let invalid = build_from_toml(&format!(

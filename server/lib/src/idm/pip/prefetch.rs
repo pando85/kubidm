@@ -223,6 +223,18 @@ impl PipPrefetcher {
         if config.prefetch_timeout_ms == 0 {
             return Err("pip_config: prefetch_timeout_ms must be greater than 0".to_string());
         }
+        // A source must give up (and record the failure in its health tracking) before
+        // the request stops waiting on it.
+        let budget = config.prefetch_timeout();
+        if let Some(source) = config.sources.iter().find(|s| s.timeout() > budget) {
+            return Err(format!(
+                "pip_config: source '{}' has timeout_secs = {}, which exceeds prefetch_timeout_ms = {}; \
+                 a source's timeout_secs must not exceed the prefetch budget",
+                source.id(),
+                source.timeout().as_secs(),
+                config.prefetch_timeout_ms
+            ));
+        }
         let manager = PipManager::from_config(config)?;
         for source in &config.sources {
             if source.fallback_behavior() == PipFallbackBehavior::UseFallback {
@@ -250,16 +262,18 @@ impl PipPrefetcher {
 
     /// Fetch the attributes of `request`.
     ///
-    /// Each source is queried once, all within the per-request timeout, and the
-    /// requested attributes are kept (matching names case-insensitively). A source that
-    /// fails (including `deny`, `ignore`, an unknown source, and running out of time)
-    /// contributes no attributes; the others still do. This never fails: missing
-    /// attributes make PIP conditions not match.
+    /// The sources are queried concurrently, each once, all within the per-request
+    /// timeout, and the requested attributes are kept (matching names
+    /// case-insensitively). A source that fails (including `deny`, `ignore`, an unknown
+    /// source, and running out of time) contributes no attributes; the others still do.
+    /// A source cancelled by the timeout has the failure recorded in its health
+    /// tracking, so a hanging source becomes unhealthy and is then skipped without
+    /// waiting. This never fails: missing attributes make PIP conditions not match.
     pub async fn prefetch(&self, request: &PipPrefetchRequest) -> PipPrefetchedAttributes {
         let deadline = tokio::time::Instant::now() + self.timeout;
-        let mut prefetched = PipPrefetchedAttributes::new(request.subject.uuid);
+        let subject = &request.subject;
 
-        for (source, names) in &request.attributes {
+        let fetches = request.attributes.iter().filter_map(|(source, names)| {
             // Source ids are unique case-insensitively, see `PipManager::from_config`.
             let Some((pip_id, pip)) = self
                 .manager
@@ -270,26 +284,38 @@ impl PipPrefetcher {
                     %source,
                     "PIP condition names a source that is not configured, it does not match"
                 );
-                continue;
+                return None;
             };
-
-            let retrieve = pip.retrieve_attributes(&request.subject);
-            match tokio::time::timeout_at(deadline, retrieve).await {
-                Ok(result) => {
-                    let mut set = PipAttributeSet::new();
-                    // Logs a failing source; `Err` is a source failing with `deny`.
-                    if PipManager::merge_result(pip_id, result, &mut set).is_ok() {
-                        prefetched.merge(&set, names);
+            Some(async move {
+                match tokio::time::timeout_at(deadline, pip.retrieve_attributes(subject)).await {
+                    Ok(result) => Some((pip_id, result, names)),
+                    Err(_) => {
+                        pip.record_source_failure(format!(
+                            "cancelled by the prefetch timeout of {} ms",
+                            self.timeout.as_millis()
+                        ));
+                        admin_warn!(
+                            %source,
+                            subject = %subject.uuid,
+                            timeout_ms = self.timeout.as_millis() as u64,
+                            "PIP prefetch timed out, access controls conditioned on this source do not match"
+                        );
+                        None
                     }
                 }
-                Err(_) => {
-                    admin_warn!(
-                        %source,
-                        subject = %request.subject.uuid,
-                        timeout_ms = self.timeout.as_millis() as u64,
-                        "PIP prefetch timed out, access controls conditioned on this source do not match"
-                    );
-                }
+            })
+        });
+
+        let mut prefetched = PipPrefetchedAttributes::new(subject.uuid);
+        for (pip_id, result, names) in futures::future::join_all(fetches)
+            .await
+            .into_iter()
+            .flatten()
+        {
+            let mut set = PipAttributeSet::new();
+            // Logs a failing source; `Err` is a source failing with `deny`.
+            if PipManager::merge_result(pip_id, result, &mut set).is_ok() {
+                prefetched.merge(&set, names);
             }
         }
 
@@ -302,7 +328,7 @@ mod tests {
     use super::super::config::{
         HttpMethod, HttpPipConfig, PipHealthCheckConfig, PipSourceConfig, PipTlsConfig,
     };
-    use super::super::PipId;
+    use super::super::{PipHealthStatus, PipId};
     use super::*;
     use std::io::{Read, Write};
 
@@ -317,7 +343,7 @@ mod tests {
                 allow_insecure: true,
                 ..PipTlsConfig::default()
             },
-            timeout_secs: 5,
+            timeout_secs: 1,
             cache_ttl_secs: 60,
             headers: BTreeMap::new(),
             fallback_behavior: fallback,
@@ -485,6 +511,13 @@ mod tests {
         ))]);
         assert!(PipPrefetcher::from_config(&cfg).is_err());
 
+        // A source timeout above the prefetch budget: the request would stop waiting
+        // before the source records a failure.
+        let mut cfg = config(vec![source.clone()]);
+        cfg.prefetch_timeout_ms = 999;
+        let err = PipPrefetcher::from_config(&cfg).err().unwrap_or_default();
+        assert!(err.contains("exceeds prefetch_timeout_ms"), "{err}");
+
         // A zero timeout.
         let mut cfg = config(vec![source]);
         cfg.prefetch_timeout_ms = 0;
@@ -560,26 +593,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_prefetch_timeout() {
-        // A source that accepts but never answers.
+    async fn test_prefetch_timeout_trips_breaker_and_does_not_starve_other_sources() {
+        // A source that accepts but never answers. Its name sorts first, so a serial
+        // prefetch would spend the whole budget on it.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().expect("addr");
-        let url = Url::parse(&format!("http://{addr}")).expect("url");
+        let hung = Url::parse(&format!("http://{addr}")).expect("url");
+        // Answers once; the result is then cached.
+        let up = serve(r#"{"department": "Eng"}"#, 1);
 
-        let mut cfg = config(vec![PipSourceConfig::Http(http_config(
-            "hr",
-            &url,
-            PipFallbackBehavior::Deny,
-        ))]);
-        cfg.prefetch_timeout_ms = 100;
+        let mut hung_cfg = http_config("aslow", &hung, PipFallbackBehavior::Deny);
+        hung_cfg.health_check = PipHealthCheckConfig {
+            interval_secs: 300,
+            failure_threshold: 2,
+            ..PipHealthCheckConfig::default()
+        };
+        let mut cfg = config(vec![
+            PipSourceConfig::Http(hung_cfg),
+            PipSourceConfig::Http(http_config("hr", &up, PipFallbackBehavior::Deny)),
+        ]);
+        cfg.prefetch_timeout_ms = 1000;
         let prefetcher = PipPrefetcher::from_config(&cfg)
             .expect("valid config")
             .expect("enabled");
+        let req = request(&["pip:aslow:department", "pip:hr:department"]);
+        let hung_status = || {
+            prefetcher
+                .manager()
+                .get(&PipId::new("aslow"))
+                .map(|pip| pip.cached_health_status())
+        };
 
+        for _ in 0..2 {
+            let prefetched = prefetcher.prefetch(&req).await;
+            assert!(prefetched.values("pip:aslow:department").is_none());
+            // The other source is queried concurrently and still answers in time.
+            assert_eq!(
+                prefetched.values("pip:hr:department"),
+                Some(&btreeset!["eng".to_string()])
+            );
+        }
+        // Each cancelled call counted as a failure: the breaker is open.
+        assert_eq!(hung_status(), Some(PipHealthStatus::Unhealthy));
+
+        // Later requests do not wait on the hung source.
         let started = std::time::Instant::now();
-        let prefetched = prefetcher.prefetch(&request(&["pip:hr:department"])).await;
-        assert!(prefetched.is_empty());
-        assert!(started.elapsed() < Duration::from_secs(5));
+        let prefetched = prefetcher.prefetch(&req).await;
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(prefetched.values("pip:aslow:department").is_none());
+        assert!(prefetched.values("pip:hr:department").is_some());
         drop(listener);
     }
 }

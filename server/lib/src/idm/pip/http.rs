@@ -418,17 +418,12 @@ impl HttpPip {
         let status = response.status();
         if status.is_client_error() {
             // A 4xx is about this request, not an outage: it does not mark the source
-            // unhealthy. Except for a timeout or rate limit, it is also specific to the
-            // subject (e.g. 404 for an unknown account), so it never uses fallback values.
-            let failure = if matches!(
-                status,
-                reqwest::StatusCode::REQUEST_TIMEOUT | reqwest::StatusCode::TOO_MANY_REQUESTS
-            ) {
-                PipFailure::Error(format!("HTTP error: {status}"))
-            } else {
-                PipFailure::Subject(format!("HTTP error: {status}"))
-            };
-            return Err(FetchError::client(failure));
+            // unhealthy, and it never uses fallback values. That includes 408 and 429: a
+            // user can cause them (for example by flooding requests until the source
+            // rate limits), and must not be given the fallback values for it.
+            return Err(FetchError::client(PipFailure::Subject(format!(
+                "HTTP error: {status}"
+            ))));
         }
         if !status.is_success() {
             return Err(FetchError::source(PipFailure::Error(format!(
@@ -571,6 +566,10 @@ impl PolicyInformationPoint for HttpPip {
     async fn clear_all_cache(&self) {
         let mut cache = self.cache.write().await;
         cache.clear();
+    }
+
+    fn record_source_failure(&self, error: String) {
+        self.health.record_failure(&self.config.health_check, error);
     }
 }
 
@@ -1422,7 +1421,11 @@ mod tests {
     async fn test_usefallback_not_used_for_unknown_subject() {
         // A 404 (unknown account) is not an outage: usefallback must not grant the
         // fallback values, the source just contributes nothing.
-        let (base, server) = serve(vec![http_response("404 Not Found", "{}")]);
+        let (base, server) = serve(vec![
+            http_response("404 Not Found", "{}"),
+            http_response("429 Too Many Requests", "{}"),
+            http_response("408 Request Timeout", "{}"),
+        ]);
         let config = HttpPipConfig {
             fallback_behavior: PipFallbackBehavior::UseFallback,
             fallback_values: fallback_department(),
@@ -1435,6 +1438,14 @@ mod tests {
         assert!(!result.fallback_used());
         assert!(result.attributes().is_none());
         assert!(matches!(result, PipResult::Ignored(PipFailure::Subject(_))));
+
+        // Nor when the source rate limits or times out the request: a user can cause
+        // that, e.g. by flooding requests.
+        for _ in 0..2 {
+            let result = pip.retrieve_attributes(&subject).await;
+            assert!(!result.fallback_used());
+            assert!(matches!(result, PipResult::Ignored(PipFailure::Subject(_))));
+        }
         server.join().unwrap();
 
         // Nor when the query can not be built for the subject (no username).

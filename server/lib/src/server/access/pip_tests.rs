@@ -369,3 +369,89 @@ async fn test_pip_no_conditions_nothing_referenced(qs: &QueryServer) {
         .get_pip_referenced_attributes()
         .is_empty());
 }
+
+/// The builtin `idm_acp_acp_manage` (patched by the fork's builtin ACP migration) lets
+/// access control admins create, read and change PIP conditions in band.
+#[qs_test]
+async fn test_acp_admin_manages_pip_condition(qs: &QueryServer) {
+    let admin = Uuid::new_v4();
+
+    let mut qs_write = qs.write(duration_from_epoch_now()).await.expect("txn");
+    qs_write
+        .internal_create(vec![person("pip_acp_admin", admin)])
+        .expect("create admin");
+    qs_write
+        .internal_modify_uuid(
+            UUID_IDM_ACCESS_CONTROL_ADMINS,
+            &ModifyList::new_append(Attribute::Member, Value::ReferN(admin)),
+        )
+        .expect("add to idm_access_control_admins");
+    let ident = Identity::from_impersonate_entry_readwrite(
+        qs_write.internal_search_uuid(admin).expect("admin"),
+    );
+
+    // `idm_acp_acp_manage` only grants creating the access control classes it lists
+    // (not the receiver group or target scope classes, nor `uuid`), so the profile
+    // is created with those.
+    let entry = entry_init!(
+        (
+            Attribute::Class,
+            EntryClass::AccessControlProfile.to_value()
+        ),
+        (Attribute::Class, EntryClass::AccessControlSearch.to_value()),
+        (Attribute::Name, Value::new_iname("acp_admin_pip")),
+        (
+            Attribute::AcpSearchAttr,
+            Value::new_iutf8n(Attribute::Name.as_str())
+        ),
+        (
+            Attribute::AcpReceiverPipCondition,
+            Value::new_iutf8n("pip:hr:department=eng")
+        )
+    );
+    qs_write
+        .impersonate_create(&ident, vec![entry])
+        .expect("an ACP admin can create a profile with a PIP condition");
+
+    let f = filter!(f_eq(
+        Attribute::Name,
+        PartialValue::new_iname("acp_admin_pip")
+    ));
+    let acp = qs_write
+        .internal_search(f.clone())
+        .ok()
+        .and_then(|entries| entries.first().map(|e| e.get_uuid()))
+        .expect("created");
+    let read_back = qs_write
+        .impersonate_search_ext(f.clone(), f.clone(), &ident)
+        .expect("search");
+    assert!(read_back
+        .first()
+        .and_then(|e| e.get_ava_set(Attribute::AcpReceiverPipCondition))
+        .is_some_and(|vs| vs.contains(&PartialValue::new_iutf8("pip:hr:department=eng"))));
+
+    // Add another condition, then remove all of them.
+    qs_write
+        .impersonate_modify(
+            &f,
+            &f,
+            &ModifyList::new_append(
+                Attribute::AcpReceiverPipCondition,
+                Value::new_iutf8n("pip:hr:level=5"),
+            ),
+            &ident,
+        )
+        .expect("an ACP admin can add a PIP condition");
+    qs_write
+        .impersonate_modify(
+            &f,
+            &f,
+            &ModifyList::new_purge(Attribute::AcpReceiverPipCondition),
+            &ident,
+        )
+        .expect("an ACP admin can remove the PIP conditions");
+    let stored = qs_write.internal_search_uuid(acp).expect("acp");
+    assert!(stored
+        .get_ava_set(Attribute::AcpReceiverPipCondition)
+        .is_none());
+}

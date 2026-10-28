@@ -358,6 +358,10 @@ impl PolicyInformationPoint for LdapPip {
         let mut cache = self.cache.write().await;
         cache.clear();
     }
+
+    fn record_source_failure(&self, error: String) {
+        self.health.record_failure(&self.config.health_check, error);
+    }
 }
 
 /// Parse LDAP filter string into LdapFilter

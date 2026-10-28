@@ -340,7 +340,8 @@ impl QueryServerWriteTransaction<'_> {
         msg: &str,
         entries: Vec<EntryInitNew>,
     ) -> Result<(), OperationError> {
-        let r: Result<(), _> = entries.into_iter().try_for_each(|entry| {
+        let r: Result<(), _> = entries.into_iter().try_for_each(|mut entry| {
+            migration_data::dl14::kubidm_patch_builtin_acp(&mut entry);
             self.kubidm_purge_unsupported_builtin_acp_values(&entry)
                 .and_then(|()| self.internal_migrate_or_create(entry))
         });

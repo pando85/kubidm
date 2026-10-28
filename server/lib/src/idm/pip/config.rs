@@ -382,8 +382,10 @@ pub enum HttpMethod {
     Post,
 }
 
+/// The default source timeout, below the default `prefetch_timeout_ms` (a source's
+/// timeout must not exceed it, see `PipPrefetcher::from_config`).
 fn default_timeout() -> u64 {
-    30
+    1
 }
 
 fn default_cache_ttl() -> u64 {

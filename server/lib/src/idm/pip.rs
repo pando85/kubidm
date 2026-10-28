@@ -382,13 +382,14 @@ pub enum PipFailure {
     /// The source answered but the answer could not be used (for example a server
     /// error or an unparsable response).
     Error(String),
-    /// The source works, but has no usable answer for this subject: it holds no
-    /// single matching entry, it rejected the request for this subject (an HTTP 4xx
-    /// other than 408 and 429), or the query could not be built for the subject.
+    /// The source works, but has no usable answer for this request: it holds no
+    /// single matching entry for the subject, it rejected the request (any HTTP 4xx,
+    /// including 408 and 429, which a user can provoke), or the query could not be
+    /// built for the subject.
     ///
     /// This is not a source failure, so it never resolves to fallback values: an
-    /// unknown account must not be granted what `usefallback` grants during an
-    /// outage.
+    /// unknown account, or one that got the source to rate limit, must not be granted
+    /// what `usefallback` grants during an outage.
     Subject(String),
 }
 
@@ -615,6 +616,12 @@ pub trait PolicyInformationPoint: Send + Sync {
 
     /// Clear all cached attributes.
     async fn clear_all_cache(&self);
+
+    /// Record in the source's health tracking that a request to it failed outside of
+    /// [Self::retrieve_attributes], for example because the caller's deadline cancelled
+    /// it. Without this, a source that hangs longer than the caller waits would never
+    /// be marked unhealthy, and every request would keep waiting on it.
+    fn record_source_failure(&self, _error: String) {}
 }
 
 /// Manager for multiple PIP instances.

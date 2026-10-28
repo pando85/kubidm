@@ -86,7 +86,7 @@ fn prefetcher(base_url: Url) -> Option<Arc<PipPrefetcher>> {
                 allow_insecure: true,
                 ..PipTlsConfig::default()
             },
-            timeout_secs: 5,
+            timeout_secs: 1,
             cache_ttl_secs: 60,
             headers: BTreeMap::new(),
             fallback_behavior: PipFallbackBehavior::Deny,
