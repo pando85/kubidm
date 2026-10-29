@@ -2484,9 +2484,18 @@ pub(crate) fn delegation_snapshot_principals(
     let requests = qs.internal_search(filter!(f_and(vec![
         f_eq(Attribute::Class, EntryClass::ApprovalRequest.into()),
         f_or(vec![
-            f_eq(Attribute::ApprovalState, PartialValue::new_iutf8(ApprovalRequestState::Pending.as_str())),
-            f_eq(Attribute::ApprovalState, PartialValue::new_iutf8(ApprovalRequestState::Escalated.as_str())),
-            f_eq(Attribute::ApprovalState, PartialValue::new_iutf8(ApprovalRequestState::Approved.as_str())),
+            f_eq(
+                Attribute::ApprovalState,
+                PartialValue::new_iutf8(ApprovalRequestState::Pending.as_str())
+            ),
+            f_eq(
+                Attribute::ApprovalState,
+                PartialValue::new_iutf8(ApprovalRequestState::Escalated.as_str())
+            ),
+            f_eq(
+                Attribute::ApprovalState,
+                PartialValue::new_iutf8(ApprovalRequestState::Approved.as_str())
+            ),
         ]),
     ])))?;
 
@@ -4275,9 +4284,7 @@ mod tests {
     /// A quorum snapshot retains its approvers even after refint removes them from the
     /// current policy; both primary and backup slots must remain delegation exclusions.
     #[qs_test]
-    async fn test_delegation_snapshot_principals_survive_approver_removal(
-        server: &QueryServer,
-    ) {
+    async fn test_delegation_snapshot_principals_survive_approver_removal(server: &QueryServer) {
         let ct = duration_from_epoch_now();
         let mut txn = server.write(ct).await.unwrap();
         let primary = create_person(&mut txn, "snapshot_primary");
@@ -4291,11 +4298,12 @@ mod tests {
         policy.backup_approvers = vec![backup];
         policy.escalation_timeout_seconds = Some(60);
         let admin = identity(&mut txn, UUID_IDM_ADMIN);
-        txn.approval_policy_create(&admin, &policy).expect("create policy");
-        let _request = create_request(&mut txn, requester, &policy.name, ct)
-            .expect("create request");
-        let excluded = super::delegation_snapshot_principals(&mut txn)
-            .expect("read snapshot exclusions");
+        txn.approval_policy_create(&admin, &policy)
+            .expect("create policy");
+        let _request =
+            create_request(&mut txn, requester, &policy.name, ct).expect("create request");
+        let excluded =
+            super::delegation_snapshot_principals(&mut txn).expect("read snapshot exclusions");
         assert!(excluded.contains(&primary));
         assert!(excluded.contains(&backup));
         txn.commit().expect("commit");
@@ -4304,16 +4312,19 @@ mod tests {
         txn.internal_delete_uuid(primary).expect("delete primary");
         let policy_uuid = find_policy_uuid(&mut txn, &policy.name);
         let current_policy = txn.internal_search_uuid(policy_uuid).expect("policy");
-        assert!(!current_policy.get_ava_refer(Attribute::Approver)
+        assert!(!current_policy
+            .get_ava_refer(Attribute::Approver)
             .is_some_and(|approvers| approvers.contains(&primary)));
         assert!(super::delegation_snapshot_principals(&mut txn)
-            .expect("snapshot still protects primary").contains(&primary));
+            .expect("snapshot still protects primary")
+            .contains(&primary));
         txn.commit().expect("commit");
 
         let mut txn = server.write(ct).await.unwrap();
         txn.internal_revive_uuid(primary).expect("revive primary");
         assert!(super::delegation_snapshot_principals(&mut txn)
-            .expect("snapshot remains protected after revival").contains(&primary));
+            .expect("snapshot remains protected after revival")
+            .contains(&primary));
         txn.commit().expect("commit");
     }
 

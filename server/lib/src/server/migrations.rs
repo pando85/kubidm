@@ -1417,7 +1417,10 @@ mod tests {
     async fn test_migration_batch_failures_propagate(server: &QueryServer) {
         let mut txn = server.write(duration_from_epoch_now()).await.unwrap();
         assert_eq!(
-            txn.internal_migrate_or_create_batch("invalid generic entry", vec![EntryInitNew::new()]),
+            txn.internal_migrate_or_create_batch(
+                "invalid generic entry",
+                vec![EntryInitNew::new()]
+            ),
             Err(OperationError::FilterGeneration)
         );
         assert_eq!(
