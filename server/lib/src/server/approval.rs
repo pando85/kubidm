@@ -2473,6 +2473,34 @@ fn approval_request_snapshot(
         .transpose()
 }
 
+/// Protect the authority retained by an outstanding approval's frozen quorum snapshot.
+/// Current policy approvers alone are insufficient: removing an approver from the policy
+/// does not remove that approver from requests already created under it. Backup slots
+/// also remain actionable after escalation. Exclude both until the request is final.
+/// Invalid snapshot JSON is an error rather than silently dropping a protection.
+pub(crate) fn delegation_snapshot_principals(
+    qs: &mut QueryServerWriteTransaction<'_>,
+) -> Result<BTreeSet<Uuid>, OperationError> {
+    let requests = qs.internal_search(filter!(f_and(vec![
+        f_eq(Attribute::Class, EntryClass::ApprovalRequest.into()),
+        f_or(vec![
+            f_eq(Attribute::ApprovalState, PartialValue::new_iutf8(ApprovalRequestState::Pending.as_str())),
+            f_eq(Attribute::ApprovalState, PartialValue::new_iutf8(ApprovalRequestState::Escalated.as_str())),
+            f_eq(Attribute::ApprovalState, PartialValue::new_iutf8(ApprovalRequestState::Approved.as_str())),
+        ]),
+    ])))?;
+
+    let mut excluded = BTreeSet::new();
+    for request in requests {
+        // A request without a snapshot cannot be decided or consumed.
+        if let Some(snapshot) = approval_request_snapshot(&request)? {
+            excluded.extend(snapshot.slots.keys().copied());
+            excluded.extend(snapshot.backups.keys().copied());
+        }
+    }
+    Ok(excluded)
+}
+
 /// `ApprovalOperationType` is shared with approval policies, which list every operation
 /// type they cover, so it is multi-value in the schema. A request is about exactly one
 /// operation, which is enforced here.
@@ -4242,6 +4270,51 @@ mod tests {
         assert_eq!(read.state, ApprovalRequestState::Pending);
         let read = read_txn.approval_request_get(&idm_admin, rejected).unwrap();
         assert_eq!(read.state, ApprovalRequestState::Rejected);
+    }
+
+    /// A quorum snapshot retains its approvers even after refint removes them from the
+    /// current policy; both primary and backup slots must remain delegation exclusions.
+    #[qs_test]
+    async fn test_delegation_snapshot_principals_survive_approver_removal(
+        server: &QueryServer,
+    ) {
+        let ct = duration_from_epoch_now();
+        let mut txn = server.write(ct).await.unwrap();
+        let primary = create_person(&mut txn, "snapshot_primary");
+        let backup = create_person(&mut txn, "snapshot_backup");
+        let requester = create_person(&mut txn, "snapshot_requester");
+        let mut policy = policy_request(
+            "delegation_snapshot_exclusion",
+            ApprovalPattern::AnyOne,
+            vec![primary],
+        );
+        policy.backup_approvers = vec![backup];
+        policy.escalation_timeout_seconds = Some(60);
+        let admin = identity(&mut txn, UUID_IDM_ADMIN);
+        txn.approval_policy_create(&admin, &policy).expect("create policy");
+        let _request = create_request(&mut txn, requester, &policy.name, ct)
+            .expect("create request");
+        let excluded = super::delegation_snapshot_principals(&mut txn)
+            .expect("read snapshot exclusions");
+        assert!(excluded.contains(&primary));
+        assert!(excluded.contains(&backup));
+        txn.commit().expect("commit");
+
+        let mut txn = server.write(ct).await.unwrap();
+        txn.internal_delete_uuid(primary).expect("delete primary");
+        let policy_uuid = find_policy_uuid(&mut txn, &policy.name);
+        let current_policy = txn.internal_search_uuid(policy_uuid).expect("policy");
+        assert!(!current_policy.get_ava_refer(Attribute::Approver)
+            .is_some_and(|approvers| approvers.contains(&primary)));
+        assert!(super::delegation_snapshot_principals(&mut txn)
+            .expect("snapshot still protects primary").contains(&primary));
+        txn.commit().expect("commit");
+
+        let mut txn = server.write(ct).await.unwrap();
+        txn.internal_revive_uuid(primary).expect("revive primary");
+        assert!(super::delegation_snapshot_principals(&mut txn)
+            .expect("snapshot remains protected after revival").contains(&primary));
+        txn.commit().expect("commit");
     }
 
     /// S1: the order of decisions, and so which decision of an approver counts, does not

@@ -322,7 +322,7 @@ impl QueryServerWriteTransaction<'_> {
 
         if let Err(err) = r {
             error!(?err, msg);
-            debug_assert!(false);
+            return Err(err);
         }
 
         Ok(())
@@ -348,7 +348,7 @@ impl QueryServerWriteTransaction<'_> {
 
         if let Err(err) = r {
             error!(?err, msg);
-            debug_assert!(false);
+            return Err(err);
         }
 
         Ok(())
@@ -1410,6 +1410,21 @@ mod tests {
     use std::collections::BTreeSet;
 
     use crate::{prelude::*, value::CredentialType, valueset::ValueSetCredentialType};
+
+    /// A migration error must fail startup in release builds as well as debug builds.
+    /// In particular, a failed ACP patch must never be mistaken for a completed upgrade.
+    #[qs_test]
+    async fn test_migration_batch_failures_propagate(server: &QueryServer) {
+        let mut txn = server.write(duration_from_epoch_now()).await.unwrap();
+        assert_eq!(
+            txn.internal_migrate_or_create_batch("invalid generic entry", vec![EntryInitNew::new()]),
+            Err(OperationError::FilterGeneration)
+        );
+        assert_eq!(
+            txn.kubidm_migrate_builtin_acp_batch("invalid ACP entry", vec![EntryInitNew::new()]),
+            Err(OperationError::FilterGeneration)
+        );
+    }
 
     /// Kubidm guard: the fork-only builtin entries (delegated roles, approval admins, the
     /// high privilege membership) are not part of the upstream phase 6 lists, so every
