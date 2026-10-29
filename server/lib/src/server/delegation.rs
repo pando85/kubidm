@@ -1832,6 +1832,92 @@ mod tests {
         drop(idms_prox_write);
     }
 
+    /// A snapshot must continue protecting its approver after refint removes that
+    /// approver from the current policy. Canceling the request releases the protection.
+    #[idm_test]
+    async fn test_delegation_snapshot_approver_cannot_be_reset(
+        idms: &IdmServer,
+        _idms_delayed: &mut IdmServerDelayed,
+    ) {
+        use kubidm_proto::v1::{
+            ApprovalOperationType, ApprovalPattern, ApprovalPolicyCreateRequest,
+        };
+
+        let ct = duration_from_epoch_now();
+        let mut write = idms.proxy_write(ct).await.unwrap();
+        setup(&mut write.qs_write);
+        let acp_admin = ident(&mut write.qs_write, ACP_ADMIN);
+        write
+            .qs_write
+            .delegation_grant(&acp_admin, "helpdesk", "dlg_receivers", "dlg_scope", None)
+            .expect("grant helpdesk");
+        write.commit().expect("commit grant");
+
+        let mut write = idms.proxy_write(ct).await.unwrap();
+        assert!(can_reset(&mut write, HELPER, TARGET, ct));
+        drop(write);
+
+        let mut write = idms.proxy_write(ct).await.unwrap();
+        let idm_admin = ident(&mut write.qs_write, UUID_IDM_ADMIN);
+        let policy_name = "delegation_snapshot_policy";
+        write
+            .qs_write
+            .approval_policy_create(
+                &idm_admin,
+                &ApprovalPolicyCreateRequest {
+                    name: policy_name.to_string(),
+                    description: None,
+                    operation_types: vec![ApprovalOperationType::SchemaModify],
+                    approvers: vec![TARGET, OUTSIDER],
+                    backup_approvers: vec![],
+                    pattern: ApprovalPattern::AnyOne,
+                    timeout_seconds: 3600,
+                    escalation_timeout_seconds: None,
+                },
+            )
+            .expect("create policy");
+        let requester = ident(&mut write.qs_write, ACP_ADMIN);
+        let request = write
+            .qs_write
+            .approval_request_create(
+                &requester,
+                policy_name,
+                &ApprovalOperationType::SchemaModify,
+                UUID_IDM_ADMINS,
+                &std::collections::BTreeMap::new(),
+                ct,
+            )
+            .expect("create request");
+        write.commit().expect("commit policy and request");
+
+        let mut write = idms.proxy_write(ct).await.unwrap();
+        assert!(!can_reset(&mut write, HELPER, TARGET, ct));
+        drop(write);
+
+        // Deletion removes TARGET from the current policy's approver references.
+        // A revived TARGET still controls the outstanding request via its snapshot.
+        let mut write = idms.proxy_write(ct).await.unwrap();
+        write.qs_write.internal_delete_uuid(TARGET).expect("delete approver");
+        write.commit().expect("commit delete");
+        let mut write = idms.proxy_write(ct).await.unwrap();
+        write.qs_write.internal_revive_uuid(TARGET).expect("revive approver");
+        write.commit().expect("commit revive");
+
+        let mut write = idms.proxy_write(ct).await.unwrap();
+        assert!(!can_reset(&mut write, HELPER, TARGET, ct));
+        drop(write);
+
+        let mut write = idms.proxy_write(ct).await.unwrap();
+        let requester = ident(&mut write.qs_write, ACP_ADMIN);
+        write.qs_write
+            .approval_request_cancel(&requester, request)
+            .expect("cancel pending request");
+        write.commit().expect("commit cancellation");
+
+        let mut write = idms.proxy_write(ct).await.unwrap();
+        assert!(can_reset(&mut write, HELPER, TARGET, ct));
+    }
+
     /// A grant is refused while a group it depends on has an entry manager that is not
     /// high privilege, or is (or holds) a dynamic group. An entry manager set after the
     /// grant is reported as drift.
