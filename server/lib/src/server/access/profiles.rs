@@ -1046,6 +1046,46 @@ pub(crate) fn delegation_lateral_reach<VALID, STATE>(entry: &Entry<VALID, STATE>
         || entry.attribute_equality(Attribute::Class, &EntryClass::ApprovalRequest.into())
 }
 
+/// Only changes to the actual principal references or to an actionable approval
+/// snapshot change the derived delegated-target exclusions. A display-name or token
+/// change on a managed service account must not reload all ACPs.
+pub(crate) fn delegation_lateral_reach_changed<PREVALID, PRESTATE, POSTVALID, POSTSTATE>(
+    before: &Entry<PREVALID, PRESTATE>,
+    after: &Entry<POSTVALID, POSTSTATE>,
+) -> bool {
+    for attr in [
+        Attribute::EntryManagedBy,
+        Attribute::Approver,
+        Attribute::BackupApprover,
+    ] {
+        if before.get_ava_refer(&attr) != after.get_ava_refer(&attr)
+            || before.get_ava_single_refer(&attr) != after.get_ava_single_refer(&attr)
+        {
+            return true;
+        }
+    }
+
+    let request_class = EntryClass::ApprovalRequest.into();
+    let is_request_before = before.attribute_equality(Attribute::Class, &request_class);
+    let is_request_after = after.attribute_equality(Attribute::Class, &request_class);
+    let outstanding = |is_request: bool, state: Option<&str>| {
+        is_request && matches!(state, Some("pending" | "escalated" | "approved"))
+    };
+    let was_outstanding = outstanding(
+        is_request_before,
+        before.get_ava_single_iutf8(Attribute::ApprovalState),
+    );
+    let is_outstanding = outstanding(
+        is_request_after,
+        after.get_ava_single_iutf8(Attribute::ApprovalState),
+    );
+
+    was_outstanding != is_outstanding
+        || (was_outstanding
+            && before.get_ava_single_utf8(Attribute::ApprovalQuorumSnapshot)
+                != after.get_ava_single_utf8(Attribute::ApprovalQuorumSnapshot))
+}
+
 /// Kubidm: every entry manager (`entry_managed_by`) and approval policy approver
 /// (`approver`, `backup_approver`) of any entry, as stored now. They, and their members, are excluded from
 /// every delegated target: a delegation that could take over one of them would reach
@@ -1090,4 +1130,51 @@ pub(crate) fn delegation_excluded_principals(
     excluded.extend(delegation_lateral_principals(qs)?);
     excluded.extend(crate::server::approval::delegation_snapshot_principals(qs)?);
     Ok(excluded)
+}
+
+#[cfg(test)]
+mod delegation_reload_tests {
+    use super::*;
+
+    #[test]
+    fn test_relevant_lateral_changes_only() {
+        let manager = Uuid::new_v4();
+        let mut before = EntryInitNew::new();
+        before.set_ava(Attribute::Class, [EntryClass::Object.to_value()]);
+        before.set_ava(Attribute::EntryManagedBy, [Value::Refer(manager)]);
+        let mut after = before.clone();
+        after.set_ava(Attribute::Description, [Value::new_utf8s("unrelated")]);
+        assert!(!delegation_lateral_reach_changed(&before, &after));
+
+        after.set_ava(Attribute::EntryManagedBy, [Value::Refer(Uuid::new_v4())]);
+        assert!(delegation_lateral_reach_changed(&before, &after));
+        after.remove_ava(&Attribute::EntryManagedBy);
+        assert!(delegation_lateral_reach_changed(&before, &after));
+
+        let mut pending = EntryInitNew::new();
+        pending.set_ava(
+            Attribute::Class,
+            [
+                EntryClass::Object.to_value(),
+                EntryClass::ApprovalRequest.to_value(),
+            ],
+        );
+        pending.set_ava(Attribute::ApprovalState, [Value::new_iutf8("pending")]);
+        pending.set_ava(
+            Attribute::ApprovalQuorumSnapshot,
+            [Value::new_utf8s("snapshot")],
+        );
+        let mut changed = pending.clone();
+        changed.set_ava(Attribute::Description, [Value::new_utf8s("unrelated")]);
+        assert!(!delegation_lateral_reach_changed(&pending, &changed));
+        changed.set_ava(Attribute::ApprovalState, [Value::new_iutf8("approved")]);
+        assert!(!delegation_lateral_reach_changed(&pending, &changed));
+        changed.set_ava(
+            Attribute::ApprovalQuorumSnapshot,
+            [Value::new_utf8s("new snapshot")],
+        );
+        assert!(delegation_lateral_reach_changed(&pending, &changed));
+        changed.set_ava(Attribute::ApprovalState, [Value::new_iutf8("consumed")]);
+        assert!(delegation_lateral_reach_changed(&pending, &changed));
+    }
 }
