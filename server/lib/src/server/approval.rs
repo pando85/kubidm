@@ -2501,10 +2501,18 @@ pub(crate) fn delegation_snapshot_principals(
 
     let mut excluded = BTreeSet::new();
     for request in requests {
-        // A request without a snapshot cannot be decided or consumed.
-        if let Some(snapshot) = approval_request_snapshot(&request)? {
-            excluded.extend(snapshot.slots.keys().copied());
-            excluded.extend(snapshot.backups.keys().copied());
+        // Requests without valid snapshots cannot be decided or consumed. Do not
+        // turn malformed *inert* requests into a denial of all ACP reloads:
+        // approval_request_resolve also rejects these requests independently.
+        match approval_request_snapshot(&request) {
+            Ok(Some(snapshot)) => {
+                excluded.extend(snapshot.slots.keys().copied());
+                excluded.extend(snapshot.backups.keys().copied());
+            }
+            Ok(None) => {}
+            Err(err) => {
+                warn!(request = %request.get_uuid(), ?err, "ignoring unusable approval snapshot");
+            }
         }
     }
     Ok(excluded)
@@ -4288,12 +4296,13 @@ mod tests {
         let ct = duration_from_epoch_now();
         let mut txn = server.write(ct).await.unwrap();
         let primary = create_person(&mut txn, "snapshot_primary");
+        let remaining = create_person(&mut txn, "snapshot_remaining");
         let backup = create_person(&mut txn, "snapshot_backup");
         let requester = create_person(&mut txn, "snapshot_requester");
         let mut policy = policy_request(
             "delegation_snapshot_exclusion",
             ApprovalPattern::AnyOne,
-            vec![primary],
+            vec![primary, remaining],
         );
         policy.backup_approvers = vec![backup];
         policy.escalation_timeout_seconds = Some(60);
@@ -4312,9 +4321,11 @@ mod tests {
         txn.internal_delete_uuid(primary).expect("delete primary");
         let policy_uuid = find_policy_uuid(&mut txn, &policy.name);
         let current_policy = txn.internal_search_uuid(policy_uuid).expect("policy");
-        assert!(!current_policy
+        let current_approvers = current_policy
             .get_ava_refer(Attribute::Approver)
-            .is_some_and(|approvers| approvers.contains(&primary)));
+            .expect("policy must retain at least one approver");
+        assert!(!current_approvers.contains(&primary));
+        assert!(current_approvers.contains(&remaining));
         assert!(super::delegation_snapshot_principals(&mut txn)
             .expect("snapshot still protects primary")
             .contains(&primary));
