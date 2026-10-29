@@ -1897,10 +1897,16 @@ mod tests {
         // Deletion removes TARGET from the current policy's approver references.
         // A revived TARGET still controls the outstanding request via its snapshot.
         let mut write = idms.proxy_write(ct).await.unwrap();
-        write.qs_write.internal_delete_uuid(TARGET).expect("delete approver");
+        write
+            .qs_write
+            .internal_delete_uuid(TARGET)
+            .expect("delete approver");
         write.commit().expect("commit delete");
         let mut write = idms.proxy_write(ct).await.unwrap();
-        write.qs_write.internal_revive_uuid(TARGET).expect("revive approver");
+        write
+            .qs_write
+            .internal_revive_uuid(TARGET)
+            .expect("revive approver");
         write.commit().expect("commit revive");
 
         let mut write = idms.proxy_write(ct).await.unwrap();
@@ -1909,7 +1915,8 @@ mod tests {
 
         let mut write = idms.proxy_write(ct).await.unwrap();
         let requester = ident(&mut write.qs_write, ACP_ADMIN);
-        write.qs_write
+        write
+            .qs_write
             .approval_request_cancel(&requester, request)
             .expect("cancel pending request");
         write.commit().expect("commit cancellation");
