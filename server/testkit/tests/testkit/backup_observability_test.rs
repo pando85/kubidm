@@ -513,7 +513,17 @@ fn test_scheduled_full_verification_of_an_encrypted_backup_updates_last_verified
         assert_eq!(metric(&env, VERIFICATION_ERRORS, LOCAL).await, 0.0);
 
         env.core_handle.shutdown().await;
-        assert!(scratch_dirs(&default_scratch(workdir.path())).is_empty());
+
+        // Wait for any in-flight verification to clean up its scratch directories.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        while !scratch_dirs(&default_scratch(workdir.path())).is_empty() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "scratch data left behind: {:?}",
+                scratch_dirs(&default_scratch(workdir.path()))
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     });
 }
 
