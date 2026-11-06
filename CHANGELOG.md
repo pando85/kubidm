@@ -20,3 +20,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Updated PR template with AI disclosure checkbox
 
 ## [unreleased]
+
+### Fixed
+
+- Regenerated Cargo.lock to resolve transient CI artifact update failures
