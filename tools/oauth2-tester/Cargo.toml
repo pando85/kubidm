@@ -22,7 +22,7 @@ axum = { version = "0.8.8", features = [
 clap = { version = "4.6.0", features = ["derive", "env"] }
 chrono = "^0.4.44"
 
-axum-server = { version = "0.8.0", features = ["tls-rustls-no-provider"] }
+axum-server = { version = "0.9.0", features = ["tls-rustls-no-provider"] }
 tower-sessions = { version = "0.15.0", features = ["signed"] }
 tower-http = { version = "0.7.0", default-features = false, features = ["fs"] }
 
