@@ -1041,6 +1041,9 @@ pub(crate) fn delegation_lateral_reach<VALID, STATE>(entry: &Entry<VALID, STATE>
     entry.attribute_pres(Attribute::EntryManagedBy)
         || entry.attribute_pres(Attribute::Approver)
         || entry.attribute_pres(Attribute::BackupApprover)
+        // Outstanding quorum snapshots keep authority even when policy references
+        // disappear; request lifecycle changes must refresh the ACP exclusions.
+        || entry.attribute_equality(Attribute::Class, &EntryClass::ApprovalRequest.into())
 }
 
 /// Kubidm: every entry manager (`entry_managed_by`) and approval policy approver
@@ -1078,6 +1081,13 @@ pub(crate) fn delegation_excluded_principals(
     qs: &mut QueryServerWriteTransaction,
 ) -> Result<BTreeSet<Uuid>, OperationError> {
     let mut excluded = delegated_receivers(qs)?;
+    // No delegated receiver means no delegated profile can grant anything.
+    // Avoid scanning every manager and outstanding approval during unrelated
+    // ACP reloads on installations that do not use delegated administration.
+    if excluded.is_empty() {
+        return Ok(excluded);
+    }
     excluded.extend(delegation_lateral_principals(qs)?);
+    excluded.extend(crate::server::approval::delegation_snapshot_principals(qs)?);
     Ok(excluded)
 }
