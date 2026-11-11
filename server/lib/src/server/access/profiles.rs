@@ -1136,45 +1136,155 @@ pub(crate) fn delegation_excluded_principals(
 mod delegation_reload_tests {
     use super::*;
 
-    #[test]
-    fn test_relevant_lateral_changes_only() {
-        let manager = Uuid::new_v4();
-        let mut before = EntryInitNew::new();
-        before.set_ava(Attribute::Class, [EntryClass::Object.to_value()]);
-        before.set_ava(Attribute::EntryManagedBy, [Value::Refer(manager)]);
-        let mut after = before.clone();
-        after.set_ava(Attribute::Description, [Value::new_utf8s("unrelated")]);
-        assert!(!delegation_lateral_reach_changed(&before, &after));
+    // EntryInitNew::set_ava merges existing value sets. A modification in the
+    // write path instead replaces the value, so test replacements explicitly.
+    fn replace_ava(entry: &mut EntryInitNew, attr: Attribute, value: Value) {
+        entry.remove_ava(&attr);
+        entry.set_ava(attr, [value]);
+    }
 
-        after.set_ava(Attribute::EntryManagedBy, [Value::Refer(Uuid::new_v4())]);
-        assert!(delegation_lateral_reach_changed(&before, &after));
-        after.remove_ava(&Attribute::EntryManagedBy);
-        assert!(delegation_lateral_reach_changed(&before, &after));
+    fn object() -> EntryInitNew {
+        let mut entry = EntryInitNew::new();
+        entry.set_ava(Attribute::Class, [EntryClass::Object.to_value()]);
+        entry
+    }
 
-        let mut pending = EntryInitNew::new();
-        pending.set_ava(
-            Attribute::Class,
-            [
-                EntryClass::Object.to_value(),
-                EntryClass::ApprovalRequest.to_value(),
-            ],
-        );
-        pending.set_ava(Attribute::ApprovalState, [Value::new_iutf8("pending")]);
-        pending.set_ava(
+    fn request(state: &str) -> EntryInitNew {
+        let mut entry = object();
+        entry.set_ava(Attribute::Class, [EntryClass::ApprovalRequest.to_value()]);
+        entry.set_ava(Attribute::ApprovalState, [Value::new_iutf8(state)]);
+        entry.set_ava(
             Attribute::ApprovalQuorumSnapshot,
             [Value::new_utf8s("snapshot")],
         );
-        let mut changed = pending.clone();
-        changed.set_ava(Attribute::Description, [Value::new_utf8s("unrelated")]);
-        assert!(!delegation_lateral_reach_changed(&pending, &changed));
-        changed.set_ava(Attribute::ApprovalState, [Value::new_iutf8("approved")]);
-        assert!(!delegation_lateral_reach_changed(&pending, &changed));
-        changed.set_ava(
-            Attribute::ApprovalQuorumSnapshot,
-            [Value::new_utf8s("new snapshot")],
+        entry
+    }
+
+    #[test]
+    fn test_entry_manager_reload_only_for_reference_changes() {
+        let manager = Uuid::new_v4();
+        let mut before = object();
+        before.set_ava(Attribute::EntryManagedBy, [Value::Refer(manager)]);
+
+        let mut unrelated = before.clone();
+        unrelated.set_ava(Attribute::Description, [Value::new_utf8s("unrelated")]);
+        unrelated.set_ava(Attribute::DisplayName, [Value::new_utf8s("new name")]);
+        assert!(!delegation_lateral_reach_changed(&before, &unrelated));
+
+        let mut unchanged = before.clone();
+        replace_ava(&mut unchanged, Attribute::EntryManagedBy, Value::Refer(manager));
+        assert!(!delegation_lateral_reach_changed(&before, &unchanged));
+
+        let mut replaced = before.clone();
+        replace_ava(
+            &mut replaced,
+            Attribute::EntryManagedBy,
+            Value::Refer(Uuid::new_v4()),
         );
-        assert!(delegation_lateral_reach_changed(&pending, &changed));
-        changed.set_ava(Attribute::ApprovalState, [Value::new_iutf8("consumed")]);
-        assert!(delegation_lateral_reach_changed(&pending, &changed));
+        assert!(delegation_lateral_reach_changed(&before, &replaced));
+
+        let mut removed = before.clone();
+        removed.remove_ava(&Attribute::EntryManagedBy);
+        assert!(delegation_lateral_reach_changed(&before, &removed));
+        assert!(delegation_lateral_reach_changed(&removed, &before));
+    }
+
+    #[test]
+    fn test_approver_references_trigger_reload_on_actual_changes() {
+        for attr in [Attribute::Approver, Attribute::BackupApprover] {
+            let approver = Uuid::new_v4();
+            let mut before = object();
+            before.set_ava(attr.clone(), [Value::ReferN(approver)]);
+
+            let mut unrelated = before.clone();
+            unrelated.set_ava(Attribute::Description, [Value::new_utf8s("unrelated")]);
+            assert!(
+                !delegation_lateral_reach_changed(&before, &unrelated),
+                "{attr:?}"
+            );
+
+            let mut unchanged = before.clone();
+            replace_ava(&mut unchanged, attr.clone(), Value::ReferN(approver));
+            assert!(
+                !delegation_lateral_reach_changed(&before, &unchanged),
+                "{attr:?}"
+            );
+
+            let mut added = before.clone();
+            added.add_ava(attr.clone(), Value::ReferN(Uuid::new_v4()));
+            assert!(delegation_lateral_reach_changed(&before, &added), "{attr:?}");
+
+            let mut replaced = before.clone();
+            replace_ava(&mut replaced, attr.clone(), Value::ReferN(Uuid::new_v4()));
+            assert!(
+                delegation_lateral_reach_changed(&before, &replaced),
+                "{attr:?}"
+            );
+
+            let mut removed = before.clone();
+            removed.remove_ava(&attr);
+            assert!(delegation_lateral_reach_changed(&before, &removed), "{attr:?}");
+            assert!(delegation_lateral_reach_changed(&removed, &before), "{attr:?}");
+        }
+    }
+
+    #[test]
+    fn test_approval_request_snapshot_and_lifecycle_invalidation() {
+        let pending = request("pending");
+        let mut unrelated = pending.clone();
+        unrelated.set_ava(Attribute::Description, [Value::new_utf8s("unrelated")]);
+        assert!(!delegation_lateral_reach_changed(&pending, &unrelated));
+
+        for state in ["escalated", "approved"] {
+            let mut still_actionable = pending.clone();
+            replace_ava(
+                &mut still_actionable,
+                Attribute::ApprovalState,
+                Value::new_iutf8(state),
+            );
+            assert!(
+                !delegation_lateral_reach_changed(&pending, &still_actionable),
+                "{state}"
+            );
+        }
+
+        let mut new_snapshot = pending.clone();
+        replace_ava(
+            &mut new_snapshot,
+            Attribute::ApprovalQuorumSnapshot,
+            Value::new_utf8s("new snapshot"),
+        );
+        assert!(delegation_lateral_reach_changed(&pending, &new_snapshot));
+        let mut missing_snapshot = pending.clone();
+        missing_snapshot.remove_ava(&Attribute::ApprovalQuorumSnapshot);
+        assert!(delegation_lateral_reach_changed(&pending, &missing_snapshot));
+
+        for state in ["consumed", "cancelled", "expired", "rejected", "invalid"] {
+            let mut final_request = pending.clone();
+            replace_ava(
+                &mut final_request,
+                Attribute::ApprovalState,
+                Value::new_iutf8(state),
+            );
+            assert!(delegation_lateral_reach_changed(&pending, &final_request), "{state}");
+            assert!(delegation_lateral_reach_changed(&final_request, &pending), "{state}");
+
+            let mut final_snapshot_changed = final_request.clone();
+            replace_ava(
+                &mut final_snapshot_changed,
+                Attribute::ApprovalQuorumSnapshot,
+                Value::new_utf8s("new snapshot"),
+            );
+            assert!(
+                !delegation_lateral_reach_changed(&final_request, &final_snapshot_changed),
+                "{state}"
+            );
+        }
+
+        let mut no_request_class = pending.clone();
+        no_request_class.remove_ava(&Attribute::Class);
+        no_request_class.set_ava(Attribute::Class, [EntryClass::Object.to_value()]);
+        assert!(delegation_lateral_reach_changed(&pending, &no_request_class));
+        assert!(delegation_lateral_reach_changed(&no_request_class, &pending));
     }
 }
