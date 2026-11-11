@@ -1172,7 +1172,11 @@ mod delegation_reload_tests {
         assert!(!delegation_lateral_reach_changed(&before, &unrelated));
 
         let mut unchanged = before.clone();
-        replace_ava(&mut unchanged, Attribute::EntryManagedBy, Value::Refer(manager));
+        replace_ava(
+            &mut unchanged,
+            Attribute::EntryManagedBy,
+            Value::Refer(manager),
+        );
         assert!(!delegation_lateral_reach_changed(&before, &unchanged));
 
         let mut replaced = before.clone();
@@ -1212,7 +1216,10 @@ mod delegation_reload_tests {
 
             let mut added = before.clone();
             added.add_ava(attr.clone(), Value::ReferN(Uuid::new_v4()));
-            assert!(delegation_lateral_reach_changed(&before, &added), "{attr:?}");
+            assert!(
+                delegation_lateral_reach_changed(&before, &added),
+                "{attr:?}"
+            );
 
             let mut replaced = before.clone();
             replace_ava(&mut replaced, attr.clone(), Value::ReferN(Uuid::new_v4()));
@@ -1223,8 +1230,14 @@ mod delegation_reload_tests {
 
             let mut removed = before.clone();
             removed.remove_ava(&attr);
-            assert!(delegation_lateral_reach_changed(&before, &removed), "{attr:?}");
-            assert!(delegation_lateral_reach_changed(&removed, &before), "{attr:?}");
+            assert!(
+                delegation_lateral_reach_changed(&before, &removed),
+                "{attr:?}"
+            );
+            assert!(
+                delegation_lateral_reach_changed(&removed, &before),
+                "{attr:?}"
+            );
         }
     }
 
@@ -1257,7 +1270,10 @@ mod delegation_reload_tests {
         assert!(delegation_lateral_reach_changed(&pending, &new_snapshot));
         let mut missing_snapshot = pending.clone();
         missing_snapshot.remove_ava(&Attribute::ApprovalQuorumSnapshot);
-        assert!(delegation_lateral_reach_changed(&pending, &missing_snapshot));
+        assert!(delegation_lateral_reach_changed(
+            &pending,
+            &missing_snapshot
+        ));
 
         for state in ["consumed", "cancelled", "expired", "rejected", "invalid"] {
             let mut final_request = pending.clone();
@@ -1266,8 +1282,14 @@ mod delegation_reload_tests {
                 Attribute::ApprovalState,
                 Value::new_iutf8(state),
             );
-            assert!(delegation_lateral_reach_changed(&pending, &final_request), "{state}");
-            assert!(delegation_lateral_reach_changed(&final_request, &pending), "{state}");
+            assert!(
+                delegation_lateral_reach_changed(&pending, &final_request),
+                "{state}"
+            );
+            assert!(
+                delegation_lateral_reach_changed(&final_request, &pending),
+                "{state}"
+            );
 
             let mut final_snapshot_changed = final_request.clone();
             replace_ava(
@@ -1284,7 +1306,13 @@ mod delegation_reload_tests {
         let mut no_request_class = pending.clone();
         no_request_class.remove_ava(&Attribute::Class);
         no_request_class.set_ava(Attribute::Class, [EntryClass::Object.to_value()]);
-        assert!(delegation_lateral_reach_changed(&pending, &no_request_class));
-        assert!(delegation_lateral_reach_changed(&no_request_class, &pending));
+        assert!(delegation_lateral_reach_changed(
+            &pending,
+            &no_request_class
+        ));
+        assert!(delegation_lateral_reach_changed(
+            &no_request_class,
+            &pending
+        ));
     }
 }
