@@ -2235,6 +2235,143 @@ mod tests {
         drop(idms_prox_write);
     }
 
+    /// The ACP cache must be reloaded when manager references change, not on
+    /// unrelated managed-entry updates. Exercise both regular and batch modify,
+    /// and verify the effective delegated helpdesk permission after each commit.
+    #[idm_test]
+    async fn test_delegation_managed_entry_acp_invalidation(
+        idms: &IdmServer,
+        _idms_delayed: &mut IdmServerDelayed,
+    ) {
+        use crate::server::ChangeFlag;
+
+        let ct = duration_from_epoch_now();
+        let mut write = idms.proxy_write(ct).await.unwrap();
+        setup(&mut write.qs_write);
+        let admin = ident(&mut write.qs_write, ACP_ADMIN);
+        write
+            .qs_write
+            .delegation_grant(&admin, "helpdesk", "dlg_receivers", "dlg_scope", None)
+            .expect("grant helpdesk");
+        write.commit().expect("commit grant");
+
+        let mut write = idms.proxy_write(ct).await.unwrap();
+        assert!(can_reset(&mut write, HELPER, TARGET, ct));
+        drop(write);
+
+        // A manager added after the grant must immediately become excluded.
+        let mut write = idms.proxy_write(ct).await.unwrap();
+        write
+            .qs_write
+            .internal_modify_uuid(
+                OUTSIDER,
+                &ModifyList::new_purge_and_set(
+                    Attribute::EntryManagedBy,
+                    Value::Refer(TARGET),
+                ),
+            )
+            .expect("set entry manager");
+        assert!(write.qs_write.changed_flags.contains(ChangeFlag::ACP));
+        write.commit().expect("commit manager");
+        let mut write = idms.proxy_write(ct).await.unwrap();
+        assert!(!can_reset(&mut write, HELPER, TARGET, ct));
+        drop(write);
+
+        // An unrelated ordinary modify must not invalidate every ACP, and must
+        // not accidentally remove the current protection.
+        let mut write = idms.proxy_write(ct).await.unwrap();
+        write
+            .qs_write
+            .internal_modify_uuid(
+                OUTSIDER,
+                &ModifyList::new_purge_and_set(
+                    Attribute::Description,
+                    Value::new_utf8s("description changed"),
+                ),
+            )
+            .expect("modify description");
+        assert!(!write.qs_write.changed_flags.contains(ChangeFlag::ACP));
+        write.commit().expect("commit unrelated modify");
+        let mut write = idms.proxy_write(ct).await.unwrap();
+        assert!(!can_reset(&mut write, HELPER, TARGET, ct));
+        drop(write);
+
+        // The same optimization must apply to the batch modification path.
+        let mut write = idms.proxy_write(ct).await.unwrap();
+        write
+            .qs_write
+            .internal_batch_modify(
+                [(
+                    OUTSIDER,
+                    ModifyList::new_purge_and_set(
+                        Attribute::Description,
+                        Value::new_utf8s("batch description changed"),
+                    ),
+                )]
+                .into_iter(),
+            )
+            .expect("batch modify description");
+        assert!(!write.qs_write.changed_flags.contains(ChangeFlag::ACP));
+        write.commit().expect("commit unrelated batch modify");
+        let mut write = idms.proxy_write(ct).await.unwrap();
+        assert!(!can_reset(&mut write, HELPER, TARGET, ct));
+        drop(write);
+
+        // Reapplying the same reference is not a principal-set change.
+        let mut write = idms.proxy_write(ct).await.unwrap();
+        write
+            .qs_write
+            .internal_modify_uuid(
+                OUTSIDER,
+                &ModifyList::new_purge_and_set(
+                    Attribute::EntryManagedBy,
+                    Value::Refer(TARGET),
+                ),
+            )
+            .expect("reapply manager");
+        assert!(!write.qs_write.changed_flags.contains(ChangeFlag::ACP));
+        write.commit().expect("commit unchanged manager");
+
+        // A batch replacement does change the principal set. TARGET must
+        // become reachable again once another principal is the manager.
+        let mut write = idms.proxy_write(ct).await.unwrap();
+        write
+            .qs_write
+            .internal_batch_modify(
+                [(
+                    OUTSIDER,
+                    ModifyList::new_purge_and_set(
+                        Attribute::EntryManagedBy,
+                        Value::Refer(HP_TARGET),
+                    ),
+                )]
+                .into_iter(),
+            )
+            .expect("batch replace entry manager");
+        assert!(write.qs_write.changed_flags.contains(ChangeFlag::ACP));
+        write.commit().expect("commit replacement manager");
+        let mut write = idms.proxy_write(ct).await.unwrap();
+        assert!(can_reset(&mut write, HELPER, TARGET, ct));
+        drop(write);
+
+        // Removing the reference also reloads ACPs.
+        let mut write = idms.proxy_write(ct).await.unwrap();
+        write
+            .qs_write
+            .internal_batch_modify(
+                [(
+                    OUTSIDER,
+                    ModifyList::new_purge(Attribute::EntryManagedBy),
+                )]
+                .into_iter(),
+            )
+            .expect("batch remove entry manager");
+        assert!(write.qs_write.changed_flags.contains(ChangeFlag::ACP));
+        write.commit().expect("commit removed manager");
+        let mut write = idms.proxy_write(ct).await.unwrap();
+        assert!(can_reset(&mut write, HELPER, TARGET, ct));
+    }
+
     /// A delegated profile grants what its template grants, even when the stored profile
     /// was changed (internally) to grant more.
     #[qs_test]
