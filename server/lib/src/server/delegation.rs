@@ -2265,10 +2265,7 @@ mod tests {
             .qs_write
             .internal_modify_uuid(
                 OUTSIDER,
-                &ModifyList::new_purge_and_set(
-                    Attribute::EntryManagedBy,
-                    Value::Refer(TARGET),
-                ),
+                &ModifyList::new_purge_and_set(Attribute::EntryManagedBy, Value::Refer(TARGET)),
             )
             .expect("set entry manager");
         assert!(write.qs_write.changed_flags.contains(ChangeFlag::ACP));
@@ -2323,10 +2320,7 @@ mod tests {
             .qs_write
             .internal_modify_uuid(
                 OUTSIDER,
-                &ModifyList::new_purge_and_set(
-                    Attribute::EntryManagedBy,
-                    Value::Refer(TARGET),
-                ),
+                &ModifyList::new_purge_and_set(Attribute::EntryManagedBy, Value::Refer(TARGET)),
             )
             .expect("reapply manager");
         assert!(!write.qs_write.changed_flags.contains(ChangeFlag::ACP));
@@ -2359,11 +2353,7 @@ mod tests {
         write
             .qs_write
             .internal_batch_modify(
-                [(
-                    OUTSIDER,
-                    ModifyList::new_purge(Attribute::EntryManagedBy),
-                )]
-                .into_iter(),
+                [(OUTSIDER, ModifyList::new_purge(Attribute::EntryManagedBy))].into_iter(),
             )
             .expect("batch remove entry manager");
         assert!(write.qs_write.changed_flags.contains(ChangeFlag::ACP));
