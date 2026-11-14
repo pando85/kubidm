@@ -930,6 +930,7 @@ async fn scripting_command(cmd: ScriptingCommand, config: Configuration) -> Exit
             if !backup_server_core(&config, path.as_deref(), name.as_deref()).await {
                 return ExitCode::FAILURE;
             }
+            ExitCode::SUCCESS
         }
 
         ScriptingCommand::Reload => {
@@ -1030,10 +1031,9 @@ async fn scripting_command(cmd: ScriptingCommand, config: Configuration) -> Exit
                 }
             };
             display_json_success();
+            ExitCode::SUCCESS
         }
     }
-
-    ExitCode::SUCCESS
 }
 
 // We have to do this because we can't use tracing until we've started the logging pipeline, and we can't start the logging pipeline until the tokio runtime's doing its thing.
@@ -1504,10 +1504,12 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
             sctx.shutdown().await;
 
             info!("Stopped 🛑 ");
+            ExitCode::SUCCESS
         }
         KubidmdOpt::CertGenerate => {
             info!("Running in certificate generate mode ...");
             cert_generate_core(&config);
+            ExitCode::SUCCESS
         }
         KubidmdOpt::Database {
             commands: DbCommands::Backup(bopt),
@@ -1517,6 +1519,7 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
             if !backup_server_core(&config, Some(&bopt.path), None).await {
                 return ExitCode::FAILURE;
             }
+            ExitCode::SUCCESS
         }
         KubidmdOpt::Database {
             commands: DbCommands::Restore(ropt),
@@ -1529,6 +1532,7 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
         } => {
             info!("Running in db verification mode ...");
             verify_server_core(&config).await;
+            ExitCode::SUCCESS
         }
         KubidmdOpt::Database {
             commands: DbCommands::VerifyBackup(vbopt),
@@ -1541,6 +1545,7 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
             if !verify_backup_server_core(&config, &vbopt.path, level).await {
                 return ExitCode::FAILURE;
             }
+            ExitCode::SUCCESS
         }
         KubidmdOpt::Database {
             commands: DbCommands::RestoreS3(ropt),
@@ -1575,6 +1580,7 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
             if !verify_s3_backup_server_core(&config, s3_config, &vopt.key, level).await {
                 return ExitCode::FAILURE;
             }
+            ExitCode::SUCCESS
         }
         KubidmdOpt::Database {
             commands:
@@ -1588,6 +1594,7 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
             if !list_backups_server_core(&config, *local_only, *s3_only, region.as_deref()).await {
                 return ExitCode::FAILURE;
             }
+            ExitCode::SUCCESS
         }
         KubidmdOpt::ShowReplicationCertificate => {
             info!("Running show replication certificate ...");
@@ -1646,6 +1653,7 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
             if code != ExitCode::SUCCESS {
                 return code;
             }
+            ExitCode::SUCCESS
         }
         KubidmdOpt::DisableAccount { name } => {
             info!("Running account disable ...");
@@ -1663,36 +1671,42 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
         } => {
             info!("Running in reindex mode ...");
             reindex_server_core(&config).await;
+            ExitCode::SUCCESS
         }
         KubidmdOpt::DbScan {
             commands: DbScanOpt::ListIndexes,
         } => {
             info!("👀 db scan - list indexes");
             dbscan_list_indexes_core(&config);
+            ExitCode::SUCCESS
         }
         KubidmdOpt::DbScan {
             commands: DbScanOpt::ListId2Entry,
         } => {
             info!("👀 db scan - list id2entry");
             dbscan_list_id2entry_core(&config);
+            ExitCode::SUCCESS
         }
         KubidmdOpt::DbScan {
             commands: DbScanOpt::ListIndexAnalysis,
         } => {
             info!("👀 db scan - list index analysis");
             dbscan_list_index_analysis_core(&config);
+            ExitCode::SUCCESS
         }
         KubidmdOpt::DbScan {
             commands: DbScanOpt::ListIndex(dopt),
         } => {
             info!("👀 db scan - list index content - {}", dopt.index_name);
             dbscan_list_index_core(&config, dopt.index_name.as_str());
+            ExitCode::SUCCESS
         }
         KubidmdOpt::DbScan {
             commands: DbScanOpt::GetId2Entry(dopt),
         } => {
             info!("👀 db scan - get id2 entry - {}", dopt.id);
             dbscan_get_id2entry_core(&config, dopt.id);
+            ExitCode::SUCCESS
         }
 
         KubidmdOpt::DbScan {
@@ -1702,6 +1716,7 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
             if !dbscan_quarantine_id2entry_core(&config, *id).await {
                 return ExitCode::FAILURE;
             }
+            ExitCode::SUCCESS
         }
 
         KubidmdOpt::DbScan {
@@ -1709,6 +1724,7 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
         } => {
             info!("☣️  db scan - list quarantined");
             dbscan_list_quarantined_core(&config);
+            ExitCode::SUCCESS
         }
 
         KubidmdOpt::DbScan {
@@ -1718,6 +1734,7 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
             if !dbscan_restore_quarantined_core(&config, *id).await {
                 return ExitCode::FAILURE;
             }
+            ExitCode::SUCCESS
         }
 
         KubidmdOpt::DomainSettings {
@@ -1725,6 +1742,7 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
         } => {
             info!("Running in domain name change mode ... this may take a long time ...");
             domain_rename_core(&config).await;
+            ExitCode::SUCCESS
         }
 
         KubidmdOpt::DomainSettings {
@@ -1774,6 +1792,7 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
         } => {
             info!("Running in vacuum mode ...");
             vacuum_server_core(&config);
+            ExitCode::SUCCESS
         }
         KubidmdOpt::Database {
             commands: DbCommands::Recover(ropt),
@@ -1796,19 +1815,22 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
             match pitr_recover_server_core(&config, &target, ropt.dry_run, ropt.region.as_deref())
                 .await
             {
-                Ok(_) if ropt.dry_run => {}
+                Ok(_) if ropt.dry_run => ExitCode::SUCCESS,
                 Ok(outcome) if outcome.archive != RestoreStatus::Complete => {
                     warn!(
                         "Recovery finished: the database was recovered, but the WAL archive was \
                          not updated{}",
                         not_recorded_hint(outcome.archive)
                     );
-                    return ExitCode::from(outcome.archive.exit_code());
+                    ExitCode::from(outcome.archive.exit_code())
                 }
-                Ok(_) => info!("✅ Recovery Success!"),
+                Ok(_) => {
+                    info!("✅ Recovery Success!");
+                    ExitCode::SUCCESS
+                }
                 Err(err) => {
                     error!(%err, "Point-in-time recovery failed");
-                    return ExitCode::FAILURE;
+                    ExitCode::FAILURE
                 }
             }
         }
@@ -1819,6 +1841,7 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
             if !pitr_list_server_core(&config, lopt.region.as_deref()).await {
                 return ExitCode::FAILURE;
             }
+            ExitCode::SUCCESS
         }
         KubidmdOpt::Database {
             commands: DbCommands::ReplicateStatus { detailed, deep },
@@ -1827,10 +1850,12 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
             if !replicate_status_server_core(&config, *detailed, *deep).await {
                 return ExitCode::FAILURE;
             }
+            ExitCode::SUCCESS
         }
-        KubidmdOpt::Scripting { .. } | KubidmdOpt::Maintenance(_) | KubidmdOpt::Version => {}
+        KubidmdOpt::Scripting { .. } | KubidmdOpt::Maintenance(_) | KubidmdOpt::Version => {
+            ExitCode::SUCCESS
+        }
     }
-    ExitCode::SUCCESS
 }
 
 #[cfg(test)]
