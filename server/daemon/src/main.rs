@@ -933,7 +933,8 @@ async fn scripting_command(cmd: ScriptingCommand, config: Configuration) -> Exit
         }
 
         ScriptingCommand::Reload => {
-            let _ = submit_admin_req_json(config.adminbindpath.as_str(), AdminTaskRequest::Reload).await;
+            let _ = submit_admin_req_json(config.adminbindpath.as_str(), AdminTaskRequest::Reload)
+                .await;
         }
 
         ScriptingCommand::HealthCheck {
@@ -1731,8 +1732,9 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
         } => {
             info!("Running domain show ...");
 
-            let _ = submit_admin_req_human(config.adminbindpath.as_str(), AdminTaskRequest::DomainShow)
-                .await;
+            let _ =
+                submit_admin_req_human(config.adminbindpath.as_str(), AdminTaskRequest::DomainShow)
+                    .await;
         }
 
         KubidmdOpt::DomainSettings {
@@ -1752,8 +1754,11 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
         } => {
             info!("Running domain raise ...");
 
-            let _ = submit_admin_req_human(config.adminbindpath.as_str(), AdminTaskRequest::DomainRaise)
-                .await;
+            let _ = submit_admin_req_human(
+                config.adminbindpath.as_str(),
+                AdminTaskRequest::DomainRaise,
+            )
+            .await;
         }
 
         KubidmdOpt::DomainSettings {
