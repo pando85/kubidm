@@ -61,10 +61,6 @@ echo "Generating certificates..."
 # shellcheck disable=SC2086
 cargo run --bin kubidmd $BUILD_MODE cert-generate
 
-echo "Making sure it runs with the DB..."
-# shellcheck disable=SC2086
-cargo run --bin kubidmd $BUILD_MODE scripting recover-account idm_admin
-
 echo "Running the server..."
 # shellcheck disable=SC2086
 cargo run --bin kubidmd $BUILD_MODE server  &
@@ -98,6 +94,10 @@ while true; do
         exit 1
     fi
 done
+
+echo "Testing account recovery with running server..."
+# shellcheck disable=SC2086
+cargo run --bin kubidmd $BUILD_MODE scripting recover-account idm_admin
 
 BUILD_MODE=$BUILD_MODE ../../scripts/setup_dev_environment.sh || kill -9 "${KUBIDMD_PID}"
 
