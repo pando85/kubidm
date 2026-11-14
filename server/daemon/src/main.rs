@@ -917,7 +917,7 @@ fn restore_exit_code(restored: Result<RestoreStatus, OperationError>) -> ExitCod
 async fn scripting_command(cmd: ScriptingCommand, config: Configuration) -> ExitCode {
     match cmd {
         ScriptingCommand::RecoverAccount { name } => {
-            let _ = submit_admin_req_json(
+            return submit_admin_req_json(
                 config.adminbindpath.as_str(),
                 AdminTaskRequest::RecoverAccount {
                     name: name.to_owned(),
@@ -933,7 +933,7 @@ async fn scripting_command(cmd: ScriptingCommand, config: Configuration) -> Exit
         }
 
         ScriptingCommand::Reload => {
-            let _ = submit_admin_req_json(config.adminbindpath.as_str(), AdminTaskRequest::Reload)
+            return submit_admin_req_json(config.adminbindpath.as_str(), AdminTaskRequest::Reload)
                 .await;
         }
 
@@ -1592,7 +1592,7 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
         }
         KubidmdOpt::ShowReplicationCertificate => {
             info!("Running show replication certificate ...");
-            let _ = submit_admin_req_human(
+            return submit_admin_req_human(
                 config.adminbindpath.as_str(),
                 AdminTaskRequest::ShowReplicationCertificate,
             )
@@ -1600,7 +1600,7 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
         }
         KubidmdOpt::ShowReplicationCertificateMetadata => {
             info!("Running show replication certificate metadata ...");
-            let _ = submit_admin_req_human(
+            return submit_admin_req_human(
                 config.adminbindpath.as_str(),
                 AdminTaskRequest::ShowReplicationCertificateMetadata,
             )
@@ -1609,7 +1609,7 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
 
         KubidmdOpt::RenewReplicationCertificate => {
             info!("Running renew replication certificate ...");
-            let _ = submit_admin_req_human(
+            return submit_admin_req_human(
                 config.adminbindpath.as_str(),
                 AdminTaskRequest::RenewReplicationCertificate,
             )
@@ -1619,7 +1619,7 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
             info!("Running refresh replication consumer ...");
             match refresh_replication_consumer_request(*proceed, from.as_deref()) {
                 Ok(req) => {
-                    let _ = submit_admin_req_human(config.adminbindpath.as_str(), req).await;
+                    return submit_admin_req_human(config.adminbindpath.as_str(), req).await;
                 }
                 Err(message) => error!("{message}"),
             }
@@ -1627,7 +1627,7 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
         KubidmdOpt::RecoverAccount { name } => {
             info!("Running account recovery ...");
 
-            let _ = submit_admin_req_human(
+            return submit_admin_req_human(
                 config.adminbindpath.as_str(),
                 AdminTaskRequest::RecoverAccount {
                     name: name.to_owned(),
@@ -1650,7 +1650,7 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
         KubidmdOpt::DisableAccount { name } => {
             info!("Running account disable ...");
 
-            let _ = submit_admin_req_human(
+            return submit_admin_req_human(
                 config.adminbindpath.as_str(),
                 AdminTaskRequest::DisableAccount {
                     name: name.to_owned(),
@@ -1732,9 +1732,11 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
         } => {
             info!("Running domain show ...");
 
-            let _ =
-                submit_admin_req_human(config.adminbindpath.as_str(), AdminTaskRequest::DomainShow)
-                    .await;
+            return submit_admin_req_human(
+                config.adminbindpath.as_str(),
+                AdminTaskRequest::DomainShow,
+            )
+            .await;
         }
 
         KubidmdOpt::DomainSettings {
@@ -1742,7 +1744,7 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
         } => {
             info!("Running domain upgrade check ...");
 
-            let _ = submit_admin_req_human(
+            return submit_admin_req_human(
                 config.adminbindpath.as_str(),
                 AdminTaskRequest::DomainUpgradeCheck,
             )
@@ -1754,7 +1756,7 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
         } => {
             info!("Running domain raise ...");
 
-            let _ = submit_admin_req_human(
+            return submit_admin_req_human(
                 config.adminbindpath.as_str(),
                 AdminTaskRequest::DomainRaise,
             )
@@ -1766,7 +1768,7 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
         } => {
             info!("⚠️  Running domain remigrate ...");
 
-            let _ = submit_admin_req_human(
+            return submit_admin_req_human(
                 config.adminbindpath.as_str(),
                 AdminTaskRequest::DomainRemigrate { level: *level },
             )
