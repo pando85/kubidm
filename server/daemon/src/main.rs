@@ -923,7 +923,7 @@ async fn scripting_command(cmd: ScriptingCommand, config: Configuration) -> Exit
                     name: name.to_owned(),
                 },
             )
-            .await;
+            .await
         }
 
         ScriptingCommand::Backup { path, name } => {
@@ -933,7 +933,7 @@ async fn scripting_command(cmd: ScriptingCommand, config: Configuration) -> Exit
         }
 
         ScriptingCommand::Reload => {
-            submit_admin_req_json(config.adminbindpath.as_str(), AdminTaskRequest::Reload).await;
+            submit_admin_req_json(config.adminbindpath.as_str(), AdminTaskRequest::Reload).await
         }
 
         ScriptingCommand::HealthCheck {
@@ -1595,7 +1595,7 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
                 config.adminbindpath.as_str(),
                 AdminTaskRequest::ShowReplicationCertificate,
             )
-            .await;
+            .await
         }
         KubidmdOpt::ShowReplicationCertificateMetadata => {
             info!("Running show replication certificate metadata ...");
@@ -1603,7 +1603,7 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
                 config.adminbindpath.as_str(),
                 AdminTaskRequest::ShowReplicationCertificateMetadata,
             )
-            .await;
+            .await
         }
 
         KubidmdOpt::RenewReplicationCertificate => {
@@ -1612,15 +1612,16 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
                 config.adminbindpath.as_str(),
                 AdminTaskRequest::RenewReplicationCertificate,
             )
-            .await;
+            .await
         }
         KubidmdOpt::RefreshReplicationConsumer { proceed, from } => {
             info!("Running refresh replication consumer ...");
             match refresh_replication_consumer_request(*proceed, from.as_deref()) {
-                Ok(req) => {
-                    submit_admin_req_human(config.adminbindpath.as_str(), req).await;
+                Ok(req) => submit_admin_req_human(config.adminbindpath.as_str(), req).await,
+                Err(message) => {
+                    error!("{message}");
+                    ExitCode::FAILURE
                 }
-                Err(message) => error!("{message}"),
             }
         }
         KubidmdOpt::RecoverAccount { name } => {
@@ -1632,7 +1633,7 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
                     name: name.to_owned(),
                 },
             )
-            .await;
+            .await
         }
         KubidmdOpt::ApprovalPolicy { commands } => {
             info!("Running approval policy break-glass ...");
@@ -1655,7 +1656,7 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
                     name: name.to_owned(),
                 },
             )
-            .await;
+            .await
         }
         KubidmdOpt::Database {
             commands: DbCommands::Reindex,
@@ -1732,7 +1733,7 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
             info!("Running domain show ...");
 
             submit_admin_req_human(config.adminbindpath.as_str(), AdminTaskRequest::DomainShow)
-                .await;
+                .await
         }
 
         KubidmdOpt::DomainSettings {
@@ -1744,7 +1745,7 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
                 config.adminbindpath.as_str(),
                 AdminTaskRequest::DomainUpgradeCheck,
             )
-            .await;
+            .await
         }
 
         KubidmdOpt::DomainSettings {
@@ -1753,7 +1754,7 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
             info!("Running domain raise ...");
 
             submit_admin_req_human(config.adminbindpath.as_str(), AdminTaskRequest::DomainRaise)
-                .await;
+                .await
         }
 
         KubidmdOpt::DomainSettings {
@@ -1765,7 +1766,7 @@ async fn kubidm_main(config: Configuration, opt: KubidmdParser) -> ExitCode {
                 config.adminbindpath.as_str(),
                 AdminTaskRequest::DomainRemigrate { level: *level },
             )
-            .await;
+            .await
         }
 
         KubidmdOpt::Database {
