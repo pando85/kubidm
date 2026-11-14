@@ -204,10 +204,17 @@ impl QueryServerWriteTransaction<'_> {
         if !self.changed_flags.contains(ChangeFlag::ACP)
             && norm_cand
                 .iter()
-                .chain(pre_candidates.iter().map(|e| e.as_ref()))
-                .any(|e| {
-                    e.attribute_equality(Attribute::Class, &EntryClass::AccessControlProfile.into())
-                        || crate::server::access::profiles::delegation_lateral_reach(e)
+                .zip(pre_candidates.iter().map(|e| e.as_ref()))
+                .any(|(post, pre)| {
+                    post.attribute_equality(
+                        Attribute::Class,
+                        &EntryClass::AccessControlProfile.into(),
+                    ) || pre.attribute_equality(
+                        Attribute::Class,
+                        &EntryClass::AccessControlProfile.into(),
+                    ) || crate::server::access::profiles::delegation_lateral_reach_changed(
+                        pre, post,
+                    )
                 })
         {
             self.changed_flags.insert(ChangeFlag::ACP)
@@ -439,10 +446,17 @@ impl QueryServerWriteTransaction<'_> {
         if !self.changed_flags.contains(ChangeFlag::ACP)
             && norm_cand
                 .iter()
-                .chain(pre_candidates.iter().map(|e| e.as_ref()))
-                .any(|e| {
-                    e.attribute_equality(Attribute::Class, &EntryClass::AccessControlProfile.into())
-                        || crate::server::access::profiles::delegation_lateral_reach(e)
+                .zip(pre_candidates.iter().map(|e| e.as_ref()))
+                .any(|(post, pre)| {
+                    post.attribute_equality(
+                        Attribute::Class,
+                        &EntryClass::AccessControlProfile.into(),
+                    ) || pre.attribute_equality(
+                        Attribute::Class,
+                        &EntryClass::AccessControlProfile.into(),
+                    ) || crate::server::access::profiles::delegation_lateral_reach_changed(
+                        pre, post,
+                    )
                 })
         {
             self.changed_flags.insert(ChangeFlag::ACP)
