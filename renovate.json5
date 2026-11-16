@@ -4,9 +4,7 @@
     'config:recommended',
   ],
   configMigration: true,
-  dependencyDashboard: {
-    enabled: true,
-  },
+  dependencyDashboard: true,
   lockFileMaintenance: {
     enabled: false,
   },
