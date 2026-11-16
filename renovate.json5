@@ -184,7 +184,7 @@
     {
       description: 'Do not refresh the vendored AWS runtime lockfile',
       matchManagers: ['cargo'],
-      matchFileNames: ['patches/aws-runtime-1.7.2/**'],
+      matchFileNames: ['patches/aws-runtime-1.7.2/Cargo.lock', 'patches/aws-runtime-1.7.2/Cargo.toml'],
       matchUpdateTypes: ['lockFileMaintenance'],
       lockFileMaintenance: {
         enabled: false,
