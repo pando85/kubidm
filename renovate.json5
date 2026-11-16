@@ -5,14 +5,15 @@
   ],
   configMigration: true,
   dependencyDashboard: true,
-  // Keep npm and Python lockfiles on the existing dependency-update workflow.
   lockFileMaintenance: {
     enabled: false,
   },
   cargo: {
     lockFileMaintenance: {
       enabled: true,
-      schedule: ['before 4am on monday'],
+      schedule: [
+        'before 4am on monday',
+      ],
       automerge: false,
     },
   },
@@ -94,9 +95,14 @@
     },
     {
       description: 'Automerge stable Cargo patch/minor updates only after CI and 14 days',
-      matchManagers: ['cargo'],
+      matchManagers: [
+        'cargo',
+      ],
       matchCurrentVersion: '!/^0/',
-      matchUpdateTypes: ['patch', 'minor'],
+      matchUpdateTypes: [
+        'patch',
+        'minor',
+      ],
       minimumReleaseAge: '14 days',
       automerge: true,
       automergeType: 'pr',
@@ -151,13 +157,17 @@
     },
     {
       description: 'Manually review all pre-1.0 Cargo dependency updates',
-      matchManagers: ['cargo'],
+      matchManagers: [
+        'cargo',
+      ],
       matchCurrentVersion: '/^0\\./',
       automerge: false,
     },
     {
       description: 'Manually review authentication and cryptography updates',
-      matchManagers: ['cargo'],
+      matchManagers: [
+        'cargo',
+      ],
       matchPackageNames: [
         'argon2',
         'rustls',
@@ -173,19 +183,30 @@
     },
     {
       description: 'Never automerge breaking dependency updates',
-      matchUpdateTypes: ['major'],
+      matchUpdateTypes: [
+        'major',
+      ],
       automerge: false,
     },
     {
       description: 'Review Cargo lockfile maintenance manually; release age is not enforced for transitive dependencies',
-      matchUpdateTypes: ['lockFileMaintenance'],
+      matchUpdateTypes: [
+        'lockFileMaintenance',
+      ],
       automerge: false,
     },
     {
       description: 'Do not refresh the vendored AWS runtime lockfile',
-      matchManagers: ['cargo'],
-      matchFileNames: ['patches/aws-runtime-1.7.2/Cargo.lock', 'patches/aws-runtime-1.7.2/Cargo.toml'],
-      matchUpdateTypes: ['lockFileMaintenance'],
+      matchManagers: [
+        'cargo',
+      ],
+      matchFileNames: [
+        'patches/aws-runtime-1.7.2/Cargo.lock',
+        'patches/aws-runtime-1.7.2/Cargo.toml',
+      ],
+      matchUpdateTypes: [
+        'lockFileMaintenance',
+      ],
       lockFileMaintenance: {
         enabled: false,
       },
