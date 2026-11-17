@@ -1,4 +1,9 @@
-use std::{fs::File, io, path::Path, time::SystemTime};
+use std::{
+    fs::{File, FileTimes, OpenOptions},
+    io,
+    path::Path,
+    time::SystemTime,
+};
 
 /// Touch the file at `file_path`: create it when it does not exist, set its access and
 /// modification times to now otherwise. Fails, without ending the process, when it can do
@@ -9,10 +14,11 @@ pub fn touch_file<P: AsRef<Path>>(file_path: P) -> io::Result<()> {
 
     if file_path.exists() {
         let now = SystemTime::now();
-        let file = File::open(file_path)?;
-        file.set_times(Some(now), Some(now)).inspect_err(|err| {
-            error!(?err, "Failed to write to {}", file_path.display());
-        })?;
+        let file = OpenOptions::new().write(true).open(file_path)?;
+        file.set_times(FileTimes::new().set_accessed(now).set_modified(now))
+            .inspect_err(|err| {
+                error!(?err, "Failed to write to {}", file_path.display());
+            })?;
         debug!(
             "Successfully touched existing file {}, can continue",
             file_path.display()
