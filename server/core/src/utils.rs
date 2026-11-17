@@ -1,4 +1,3 @@
-use filetime::FileTime;
 use std::{fs::File, io, path::Path, time::SystemTime};
 
 /// Touch the file at `file_path`: create it when it does not exist, set its access and
@@ -9,8 +8,9 @@ pub fn touch_file<P: AsRef<Path>>(file_path: P) -> io::Result<()> {
     let file_path: &Path = file_path.as_ref();
 
     if file_path.exists() {
-        let t = FileTime::from_system_time(SystemTime::now());
-        filetime::set_file_times(file_path, t, t).inspect_err(|err| {
+        let now = SystemTime::now();
+        let file = File::open(file_path)?;
+        file.set_times(Some(now), Some(now)).inspect_err(|err| {
             error!(?err, "Failed to write to {}", file_path.display());
         })?;
         debug!(
