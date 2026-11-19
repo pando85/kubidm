@@ -1231,10 +1231,16 @@ impl QueryServerWriteTransaction<'_> {
         // schema is in memory only, the on-disk triggers won't fire now.
         self.force_schema_reload();
 
-        self.schema.extend_in_memory(
-            migration_data::dl_1_13::phase_1_schema_attrs(),
-            migration_data::dl_1_13::phase_2_schema_classes(),
-        )
+        let mut all_attrs = migration_data::dl_1_13::phase_1_schema_attrs();
+        let mut all_classes = migration_data::dl_1_13::phase_2_schema_classes();
+
+        // Kubidm fork-only schema (delegation, step-up reauth, ACP time restrictions,
+        // time-bounded grants, OAuth2 federation, approvals). Chained last so the fork's
+        // overrides win.
+        all_attrs.extend(crate::schema::kubidm_schema_attributes());
+        all_classes.extend(crate::schema::kubidm_schema_classes());
+
+        self.schema.extend_in_memory(all_attrs, all_classes)
     }
 
     /// Migration domain level 1.12 to 1.13
@@ -1292,9 +1298,22 @@ impl QueryServerWriteTransaction<'_> {
             dl_target::phase_6_builtin_non_admin_entries()?,
         )?;
 
+        // Kubidm fork builtin entries (delegated roles, approval admins group). The
+        // upstream entry lists for this level do not contain them, and a database
+        // bootstrapped at this level never ran the earlier ones.
         self.internal_migrate_or_create_batch(
+            "phase 6 - kubidm builtin entries",
+            migration_data::dl14::kubidm_builtin_entries()?,
+        )?;
+
+        self.kubidm_migrate_builtin_acp_batch(
             "phase 7 - builtin access control profiles",
             dl_target::phase_7_builtin_access_control_profiles(),
+        )?;
+
+        self.kubidm_migrate_builtin_acp_batch(
+            "phase 7 - kubidm builtin access control profiles",
+            migration_data::dl14::kubidm_builtin_access_control_profiles(),
         )?;
 
         self.internal_delete_batch("phase 8 - delete UUIDS", dl_target::phase_8_delete_uuids())?;
