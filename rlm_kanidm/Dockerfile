@@ -13,7 +13,6 @@ RUN \
     libopenssl-devel \
     clang \
     make \
-    sccache \
     cargo \
     pkgconf-pkg-config \
     libtalloc-devel \
