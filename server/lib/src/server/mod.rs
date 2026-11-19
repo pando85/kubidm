@@ -2231,7 +2231,6 @@ impl QueryServer {
             schema,
             d_info: self.d_info.read(),
             system_config: self.system_config.read(),
-            feature_config: self.feature_config.read(),
             accesscontrols: self.accesscontrols.read(curtime),
             key_providers: self.key_providers.read(),
             _db_ticket: db_ticket,

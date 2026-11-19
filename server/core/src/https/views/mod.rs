@@ -34,9 +34,9 @@ mod radius;
 mod reauth;
 mod recover;
 mod reset;
+mod signup;
 #[cfg(debug_assertions)]
 mod ui_lab;
-mod signup;
 
 #[derive(Template, WebTemplate)]
 #[template(path = "unrecoverable_error.html")]

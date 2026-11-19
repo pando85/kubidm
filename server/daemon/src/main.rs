@@ -917,7 +917,7 @@ fn restore_exit_code(restored: Result<RestoreStatus, OperationError>) -> ExitCod
 async fn scripting_command(cmd: ScriptingCommand, config: Configuration) -> ExitCode {
     match cmd {
         ScriptingCommand::RecoverAccount { name } => {
-            let _ = submit_admin_req_json(
+            submit_admin_req_json(
                 config.adminbindpath.as_str(),
                 AdminTaskRequest::RecoverAccount {
                     name: name.to_owned(),
@@ -930,11 +930,11 @@ async fn scripting_command(cmd: ScriptingCommand, config: Configuration) -> Exit
             if !backup_server_core(&config, path.as_deref(), name.as_deref()).await {
                 return ExitCode::FAILURE;
             }
+            ExitCode::SUCCESS
         }
 
         ScriptingCommand::Reload => {
-            return submit_admin_req_json(config.adminbindpath.as_str(), AdminTaskRequest::Reload)
-                .await;
+            submit_admin_req_json(config.adminbindpath.as_str(), AdminTaskRequest::Reload).await
         }
 
         ScriptingCommand::HealthCheck {
