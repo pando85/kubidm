@@ -90,7 +90,7 @@ buildx/radiusd: ## Build multi-arch radius docker images and push to docker hub
 buildx/radiusd:
 	@$(CONTAINER_TOOL) buildx build $(CONTAINER_TOOL_ARGS) \
 		--pull $(CONTAINER_BUILDX_ACTION) --platform $(CONTAINER_IMAGE_ARCH) \
-		-f rlm_kubidm/Dockerfile \
+		-f rlm_kanidm/Dockerfile \
 		--progress $(BUILDKIT_PROGRESS) \
 		--label "com.kubidm.git-commit=$(GIT_COMMIT)" \
 		--label "com.kubidm.version=$(CONTAINER_IMAGE_EXT_VERSION)" \
@@ -131,7 +131,7 @@ build/orca:
 build/radiusd_rust:	## Build the radiusd docker image locally
 build/radiusd_rust:
 	@$(CONTAINER_TOOL) build $(CONTAINER_TOOL_ARGS) \
-		-f rlm_kubidm/Dockerfile \
+		-f rlm_kanidm/Dockerfile \
 		--label "com.kubidm.git-commit=$(GIT_COMMIT)" \
 		--label "com.kubidm.version=$(CONTAINER_IMAGE_EXT_VERSION)" \
 		-t $(CONTAINER_IMAGE_BASE)/radius:$(CONTAINER_IMAGE_VERSION) .
@@ -191,7 +191,7 @@ codespell:
 	--skip='./docs/*,./.git' \
 	--skip='*.svg' \
 	--skip='*.br' \
-	--skip='./rlm_python/mods-available/eap' \
+	--skip='./rlm_kanidm/container/mods-available/eap' \
 	--skip='./server/lib/src/constants/system_config.rs' \
 	--skip='./pykubidm/site'
 

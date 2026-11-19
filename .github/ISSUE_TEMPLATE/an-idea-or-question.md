@@ -7,8 +7,7 @@ assignees: ''
 
 ---
 
-- Please review our projects [AI usage policy](https://github.com/kanidm/kanidm/blob/master/book/src/developers/ai_llm_policy.md).
-- Any LLM output or assistance in an issue will result in the issue being automatically closed with no review or action.
+- Please review our projects [AI usage policy](https://github.com/kanidm/kanidm/blob/master/book/src/developers/ai_llm_policy.md) and avoid LLM outputs in feature requests.
 
 ### Is your feature request related to a problem? Please describe
 

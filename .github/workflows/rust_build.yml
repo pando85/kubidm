@@ -1,9 +1,10 @@
 ---
 name: "Linux Build and Test"
 "on":
+  push:
+    branches:
+      - master
   pull_request:
-    paths:
-      - '**.rs'
 
 env:
   SCCACHE_GHA_ENABLED: "true"
