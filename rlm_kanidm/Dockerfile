@@ -34,16 +34,14 @@ RUN cp rlm_kanidm/module/include/clients.h /usr/include/freeradius/
 RUN cp rlm_kanidm/module/include/process.h /usr/include/freeradius/
 RUN cp rlm_kanidm/module/include/listen.h /usr/include/freeradius/
 
-RUN --mount=type=cache,id=cargo,target=/cargo \
-    --mount=type=cache,id=sccache,target=/sccache \
+# No sccache here: with the two platform builds running at once it left serde_core without
+# its build script output in CI. Each platform gets its own private cargo cache instead.
+RUN --mount=type=cache,id=cargo,target=/cargo,sharing=private \
     export CARGO_HOME=/cargo && \
-    export SCCACHE_DIR=/sccache && \
-    export RUSTC_WRAPPER=/usr/bin/sccache && \
     export CC="/usr/bin/clang" && \
     cargo build --locked -p rlm_kanidm --features extern-freeradius-module --lib --release && \
     cargo build --locked -p kanidm_radiusd --bin kanidm_radiusd --release && \
-    cp /src/kubidm/target/release/librlm_kanidm.so /src/kubidm/target/release/rlm_kanidm.so && \
-    sccache -s
+    cp /src/kubidm/target/release/librlm_kanidm.so /src/kubidm/target/release/rlm_kanidm.so
 
 # ======================
 FROM repos AS final
