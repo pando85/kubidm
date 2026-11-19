@@ -76,6 +76,24 @@ If the sync tool fails, you can investigate details in the Kubidmd server output
 
 The sync tool can run "indefinitely" if you wish for Kubidm to always import data from the external source.
 
+## Legacy Credential Portal
+
+If you are using kubidm in parallel with another IDM system, you may wish to link to a legacy web interface for users to manage their credentials. This is possible by configuring the credential portal URL for a specific sync account.
+
+```bash
+kubidm system sync set-credential-portal <sync account name> <url>
+kubidm system sync set-credential-portal ipasync https://legacy.example.com/credentials
+```
+
+This will add a link to the specified URL on the `Profile -> Credentials` page for all person accounts that are synchronised from the specified sync account.
+
+Use to get the currently configured credential portal URL for a sync account:
+
+```bash
+kubidm system sync get-credential-portal <sync account name>
+kubidm system sync get-credential-portal ipasync
+```
+
 ## Yielding Authority of Attributes to Kubidm
 
 By default Kubidm assumes that authority over synchronised entries is retained by the sync tool. This means that
@@ -102,6 +120,14 @@ kubidm system sync set-yield-attributes ipasync passkeys
 # To remove passkeys from being Kubidm controlled.
 kubidm system sync set-yield-attributes ipasync
 ```
+
+To check the currently yielded attributes for a sync account:
+
+```bash
+kubidm system sync get-yield-attributes <sync account name>
+kubidm system sync get-yield-attributes ipasync
+```
+
 
 ## Finalising the Sync Account
 

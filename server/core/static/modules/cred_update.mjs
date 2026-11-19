@@ -67,6 +67,7 @@ function onPasskeyCreated(assertion) {
             new Uint8Array(assertion.response.clientDataJSON),
             true,
         );
+        creationData.response.transports = assertion.response.getTransports();
         creationData.type = assertion.type;
         creationData.extensions = assertion.getClientExtensionResults();
         creationData.extensions.uvm = undefined;

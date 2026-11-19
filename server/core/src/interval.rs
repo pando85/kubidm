@@ -202,7 +202,7 @@ impl IntervalActor {
                     Ok(action) = rx.recv() => {
                         match action {
                             CoreAction::Shutdown => break,
-                            CoreAction::Reload => {}
+                            CoreAction::Reload => continue,
                         }
                     }
                     _ = ticks.tick() => {

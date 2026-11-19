@@ -8,7 +8,7 @@ use kubidmd_lib::{
 };
 use ldap3_proto::{proto::LdapMsg, LdapCodec};
 use sketching::LoggerType;
-use std::{net::SocketAddr, str::FromStr, sync::Arc};
+use std::{io::ErrorKind, net::SocketAddr, str::FromStr, sync::Arc};
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -105,6 +105,7 @@ async fn client_process<STREAM>(
             // I'd really have liked to have put this near the [LdapResponseState::Bind] but due
             // to the handing of `audit` it isn't possible due to borrows, etc.
             Some(LdapResponseState::Unbind) => break,
+            Some(LdapResponseState::NoResponse) => continue,
             Some(LdapResponseState::Disconnect(rmsg)) => {
                 if w.send(rmsg).await.is_err() {
                     break;
@@ -202,7 +203,12 @@ async fn client_tls_accept(
     let tlsstream = match timeout(LDAP_CLIENT_CONN_TIMEOUT, tls_acceptor.accept(stream)).await {
         Ok(Ok(ta)) => ta,
         Ok(Err(err)) => {
-            error!(?err, %client_addr, %connection_addr, "LDAP TLS setup error");
+            match err.kind() {
+                ErrorKind::ConnectionReset => {
+                    debug!(%client_addr, %connection_addr, "Connection reset before we setup TLS")
+                }
+                _ => error!(?err, %client_addr, %connection_addr, "LDAP TLS setup error"),
+            }
             return;
         }
         Err(_) => {

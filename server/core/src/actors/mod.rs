@@ -56,6 +56,7 @@ impl QueryServerWriteV1 {
 pub mod internal;
 #[cfg(test)]
 mod pip_tests;
+pub mod read_action;
 pub mod v1_read;
 pub mod v1_scim;
 pub mod v1_write;
