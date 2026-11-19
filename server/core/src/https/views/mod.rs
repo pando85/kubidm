@@ -34,6 +34,7 @@ mod radius;
 mod reauth;
 mod recover;
 mod reset;
+mod signup;
 #[cfg(debug_assertions)]
 mod ui_lab;
 
@@ -113,6 +114,14 @@ pub fn view_router(state: ServerState) -> Router<ServerState> {
         .route(
             "/recover",
             get(recover::view_recover_get).post(recover::view_recover_post),
+        )
+        .route(
+            "/signup",
+            get(signup::view_signup_get).post(signup::view_signup_post),
+        )
+        .route(
+            "/signup/verify",
+            get(signup::view_signup_verify_get).post(signup::view_signup_verify_post),
         )
         .route(
             "/revoke",

@@ -41,7 +41,7 @@ search for your group name:
 Also, ensure the target user is in the group by running:
 
 ```bash
->  kubidm group list_members example_group
+>  kubidm group list-members example_group
 ```
 
 ## Increase Logging

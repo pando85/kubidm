@@ -53,7 +53,7 @@ jobs:
         with:
           platforms: linux/arm64,linux/amd64
           tags: ghcr.io/${{ needs.set_tag_values.outputs.owner_lc }}/radius:devel,ghcr.io/${{ needs.set_tag_values.outputs.owner_lc }}/radius:${{ needs.set_tag_values.outputs.ref_name}}
-          file: rlm_python/Dockerfile
+          file: rlm_kanidm/Dockerfile
           context: .
           labels: ${{ steps.meta.outputs.labels }}
           annotations: ${{ steps.meta.outputs.annotations }}

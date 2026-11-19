@@ -1,6 +1,6 @@
 use crate::prelude::*;
 
-pub static E_KEY_PROVIDER_INTERNAL_DL6: LazyLock<EntryInitNew> = LazyLock::new(|| {
+pub(crate) fn e_key_provider_internal_dl6() -> EntryInitNew {
     entry_init_fn([
         (Attribute::Class, EntryClass::Object.to_value()),
         (Attribute::Class, EntryClass::KeyProvider.to_value()),
@@ -12,4 +12,4 @@ pub static E_KEY_PROVIDER_INTERNAL_DL6: LazyLock<EntryInitNew> = LazyLock::new(|
             Value::new_utf8s("The default database internal cryptographic key provider."),
         ),
     ])
-});
+}

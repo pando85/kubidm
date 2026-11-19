@@ -1,4 +1,4 @@
-use crate::{prelude::*, value::CredentialType};
+use crate::{entry::EntryInitNew, prelude::*, value::CredentialType};
 
 use kubidm_proto::internal::{Filter, OperationError, UiHint};
 
@@ -9,6 +9,7 @@ pub struct BuiltinGroup {
     pub description: &'static str,
     pub uuid: uuid::Uuid,
     pub members: Vec<uuid::Uuid>,
+    pub member_create_once: Vec<uuid::Uuid>,
     pub entry_managed_by: Option<uuid::Uuid>,
     pub dyngroup: bool,
     pub dyngroup_filter: Option<Filter>,
@@ -34,7 +35,7 @@ impl TryFrom<BuiltinGroup> for EntryInitNew {
             vec![EntryClass::Group.into(), EntryClass::Object.into()],
         );
         if val.dyngroup {
-            if !val.members.is_empty() {
+            if !val.members.is_empty() || !val.member_create_once.is_empty() {
                 return Err(OperationError::InvalidSchemaState(format!(
                     "Builtin dyngroup {} has members specified, this is not allowed",
                     val.name
@@ -61,6 +62,13 @@ impl TryFrom<BuiltinGroup> for EntryInitNew {
         entry.set_ava(
             Attribute::Member,
             val.members
+                .into_iter()
+                .map(Value::ReferN)
+                .collect::<Vec<Value>>(),
+        );
+        entry.set_ava(
+            Attribute::MemberCreateOnce,
+            val.member_create_once
                 .into_iter()
                 .map(Value::ReferN)
                 .collect::<Vec<Value>>(),
@@ -101,7 +109,7 @@ pub static BUILTIN_GROUP_SERVICE_DESK: LazyLock<BuiltinGroup> = LazyLock::new(||
     description: "Builtin Service Desk Group.",
     uuid: UUID_IDM_SERVICE_DESK,
     entry_managed_by: Some(UUID_IDM_ADMINS),
-    members: vec![],
+    members: Vec::with_capacity(0),
     ..Default::default()
 });
 
@@ -190,7 +198,9 @@ pub static BUILTIN_GROUP_PEOPLE_SELF_NAME_WRITE_DL7: LazyLock<BuiltinGroup> =
             "Builtin IDM Group denoting users that can write to their own name attributes.",
         uuid: UUID_IDM_PEOPLE_SELF_NAME_WRITE,
         entry_managed_by: Some(UUID_IDM_ADMINS),
-        members: vec![UUID_IDM_ALL_PERSONS],
+        members: vec![],
+        // We only create this once, on migration we don't want to re-add this.
+        member_create_once: vec![UUID_IDM_ALL_PERSONS],
         ..Default::default()
     });
 
@@ -274,6 +284,20 @@ pub static BUILTIN_GROUP_UNIX_ADMINS: LazyLock<BuiltinGroup> = LazyLock::new(|| 
     ..Default::default()
 });
 
+pub static BUILTIN_GROUP_IDM_UNIX_AUTHENTICATION_READ_V1: LazyLock<BuiltinGroup> =
+    LazyLock::new(|| BuiltinGroup {
+        name: "idm_unix_authentication_read",
+        description:
+            "Builtin IDM group allowing service accounts to read and authenticate unix users.",
+        uuid: UUID_IDM_UNIX_AUTHENTICATION_READ,
+        entry_managed_by: Some(UUID_IDM_UNIX_ADMINS),
+        members: vec![
+            // This is to maintain compatibility right now, but will CHANGE in future.
+            UUID_ANONYMOUS,
+        ],
+        ..Default::default()
+    });
+
 /// Builtin IDM Group for managing client authentication certificates.
 pub static BUILTIN_GROUP_CLIENT_CERTIFICATE_ADMINS_DL7: LazyLock<BuiltinGroup> =
     LazyLock::new(|| BuiltinGroup {
@@ -302,6 +326,45 @@ pub static IDM_PEOPLE_SELF_MAIL_WRITE_DL7: LazyLock<BuiltinGroup> =
         description: "Builtin IDM Group for people accounts to update their own mail.",
         uuid: UUID_IDM_PEOPLE_SELF_MAIL_WRITE,
         members: Vec::with_capacity(0),
+        ..Default::default()
+    });
+
+pub static BUILTIN_GROUP_MESSAGE_ADMINS: LazyLock<BuiltinGroup> = LazyLock::new(|| BuiltinGroup {
+    name: "idm_message_admins",
+    description: "Builtin Message Administration Group.",
+    uuid: UUID_IDM_MESSAGE_ADMINS,
+    entry_managed_by: Some(UUID_IDM_ADMINS),
+    members: vec![UUID_IDM_ADMINS],
+    ..Default::default()
+});
+
+/// Builtin IDM Group for message senders to relay and process queued messages.
+pub static BUILTIN_GROUP_MESSAGE_SENDERS: LazyLock<BuiltinGroup> = LazyLock::new(|| BuiltinGroup {
+    name: "idm_message_senders",
+    description: "Builtin IDM Group for message senders to read and process queued messages.",
+    uuid: UUID_IDM_MESSAGE_SENDERS,
+    entry_managed_by: Some(UUID_IDM_MESSAGE_ADMINS),
+    members: Vec::with_capacity(0),
+    ..Default::default()
+});
+
+pub static BUILTIN_GROUP_OAUTH2_CLIENT_ADMINS: LazyLock<BuiltinGroup> =
+    LazyLock::new(|| BuiltinGroup {
+        name: "idm_oauth2_client_admins",
+        description: "Builtin Domain Trust Administration Group.",
+        uuid: UUID_IDM_OAUTH2_CLIENT_ADMINS,
+        entry_managed_by: Some(UUID_SYSTEM_ADMINS),
+        members: vec![UUID_SYSTEM_ADMINS],
+        ..Default::default()
+    });
+
+pub static BUILTIN_GROUP_OAUTH2_ACCOUNT_ADMINS: LazyLock<BuiltinGroup> =
+    LazyLock::new(|| BuiltinGroup {
+        name: "idm_oauth2_account_admins",
+        description: "Builtin Domain Trust Administration Group.",
+        uuid: UUID_IDM_OAUTH2_ACCOUNT_ADMINS,
+        entry_managed_by: Some(UUID_IDM_ADMINS),
+        members: vec![UUID_IDM_ADMINS],
         ..Default::default()
     });
 
@@ -402,6 +465,10 @@ pub static IDM_HIGH_PRIVILEGE_DL8: LazyLock<BuiltinGroup> = LazyLock::new(|| {
             UUID_IDM_CLIENT_CERTIFICATE_ADMINS,
             UUID_IDM_APPLICATION_ADMINS,
             UUID_IDM_MAIL_ADMINS,
+            UUID_IDM_MESSAGE_ADMINS,
+            UUID_IDM_MESSAGE_SENDERS,
+            UUID_IDM_OAUTH2_CLIENT_ADMINS,
+            UUID_IDM_OAUTH2_ACCOUNT_ADMINS,
             UUID_IDM_HIGH_PRIVILEGE,
         ],
         ..Default::default()

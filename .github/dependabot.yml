@@ -2,17 +2,6 @@
 version: 2
 updates:
   - package-ecosystem: pip
-    directory: "/rlm_python"
-    schedule:
-      interval: weekly
-      time: "06:00"
-      timezone: Australia/Brisbane
-    open-pull-requests-limit: 99
-    groups:
-      all: # group all the things
-        patterns:
-          - "*"
-  - package-ecosystem: pip
     directory: "/pykubidm"
     schedule:
       interval: weekly

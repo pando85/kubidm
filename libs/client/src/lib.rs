@@ -58,6 +58,7 @@ mod application;
 mod approval;
 mod delegation;
 mod domain;
+mod feature;
 mod group;
 mod message;
 mod oauth;

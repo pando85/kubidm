@@ -125,6 +125,23 @@ impl OutputMode {
             }
         }
     }
+
+    pub fn print_vec<T>(self, input: &[T])
+    where
+        T: serde::Serialize + fmt::Debug + fmt::Display,
+    {
+        match self {
+            OutputMode::Json => {
+                println!(
+                    "{}",
+                    serde_json::to_string(&input).unwrap_or(format!("{input:?}"))
+                );
+            }
+            OutputMode::Text => {
+                input.iter().for_each(|ent| println!("{ent}"));
+            }
+        }
+    }
 }
 
 #[derive(Debug, Args, Clone)]
@@ -1381,11 +1398,37 @@ pub enum MessageOpt {
         message_id: Uuid
     },
 
+    #[clap(name = "resend")]
+    /// Mark the message with this message ID as requiring a retransmission.
+    Resend {
+        message_id: Uuid
+    },
+
     #[clap(name = "send-test-message")]
     SendTestMessage {
         /// The account name of the person who this message should be sent to.
         to: String,
     }
+}
+
+#[derive(Debug, Subcommand, Clone)]
+pub enum FeatureOpt {
+    #[clap(name = "list")]
+    /// List all server features
+    List,
+
+    #[clap(name = "enable")]
+    /// Enable this named feature
+    Enable {
+        feature_name: String
+    },
+
+    #[clap(name = "disable")]
+    /// Disable this named feature
+    Disable {
+        feature_name: String
+    },
+
 }
 
 #[derive(Debug, Subcommand, Clone)]
@@ -1405,6 +1448,11 @@ pub enum SynchOpt {
 
         #[clap(name = "url")]
         url: Option<Url>,
+    },
+    /// Get the url to the external credential portal.
+    GetCredentialPortal {
+        #[clap()]
+        account_id: String,
     },
     /// Create a new IDM sync account
     #[clap(name = "create")]
@@ -1440,6 +1488,11 @@ pub enum SynchOpt {
 
         #[clap(name = "attributes")]
         attrs: Vec<String>,
+    },
+    /// Get the list of attributes that have their authority yielded from the sync account.
+    GetYieldAttributes {
+        #[clap()]
+        account_id: String,
     },
     /// Reset the sync cookie of this connector, so that on the next operation of the sync tool
     /// a full refresh of the provider is requested. Kubidm attributes that have been granted
@@ -1594,6 +1647,14 @@ pub enum SystemOpt {
         #[clap(subcommand)]
         commands: MessageOpt,
     },
+
+    #[clap(name = "feature")]
+    /// Manage server feature configuration
+    Feature {
+        #[clap(subcommand)]
+        commands: FeatureOpt,
+    },
+
     #[clap(name = "api")]
     /// API related things
     Api {

@@ -58,11 +58,19 @@
 	<div class="input-group mb-3 justify-content-md-center">
 		<button type="submit" class="btn btn-primary(% if crate::https::views::guide::guided_ui_enabled() %) w-100(% endif %)">(% if crate::https::views::guide::guided_ui_enabled() %)Continue(% else %)Begin(% endif %)</button>
 	</div>
+
 	(% if display_ctx.domain_info.allow_account_recovery() -%)
 	<div class="input-group mb-3 justify-content-md-center">
 		<a href="(( Urls::Recover ))">Recover Account</a>
 	</div>
 	(% endif -%)
+
+	(% if display_ctx.domain_info.allow_account_signup() -%)
+	<div class="input-group mb-3 justify-content-md-center">
+		<a href="(( Urls::Signup ))">Create a New Account</a>
+	</div>
+	(% endif -%)
+
 </form>
 </div>
 (% endblock %)

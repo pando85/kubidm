@@ -2,22 +2,22 @@
 
 > "All services evolve to the point they eventually can send email" - some wise nerd, probably.
 
-Kubidm can be configured to optionally send messages to users. This is important for features such
-as sending credential reset links.
+Kubidm can be configured to optionally send messages to users. This is important for features such as sending credential
+reset links.
 
 ## Architecture
 
-Kubidm maintains a message queue in its database. This allows all servers to queue
-messages to be sent to users. Each queued message is sent *at least* once.
+Kubidm maintains a message queue in its database. This allows all servers to queue messages to be sent to users. Each
+queued message is sent _at least_ once.
 
-`kubidmd` itself does not send the messages, but relies on an external tool, `kubidm-mail-sender`
-to process the mail queue. It is recommended you only run a single instance of the `kubidm-mail-sender`
-to prevent duplicate mail transmission.
+`kubidmd` itself does not send the messages, but relies on an external tool, `kubidm-mail-sender` to process the mail
+queue. It is recommended you only run a single instance of the `kubidm-mail-sender` to prevent duplicate mail
+transmission.
 
 ## Install Kubidm Mail Sender
 
-`kubidm-mail-sender` is part of the `kubidm/tools` container. Alternately it should be provided by
-the `kubidm-server` package if you are using a distribution source.
+`kubidm-mail-sender` is part of the `kubidm/tools` container. Alternately it should be provided by the `kubidm-server`
+package if you are using a distribution source.
 
 ## Mail Sender Service Account
 
@@ -39,7 +39,8 @@ kubidm service-account api-token generate mail-sender "mail sender token" --read
 
 > [!WARNING]
 >
-> The mail-sender service account should only be a member of `idm_message_senders` - never add them to any other group - use another account for other purposes!
+> The mail-sender service account should only be a member of `idm_message_senders` - never add them to any other group -
+> use another account for other purposes!
 
 ## Configuration
 
@@ -71,8 +72,8 @@ docker start kubidm-mail-sender
 
 ## Message Queue Management
 
-The message queue can be managed by members of the group `idm_message_admins`. By default this
-privilege is inherited by `idm_admins`.
+The message queue can be managed by members of the group `idm_message_admins`. By default this privilege is inherited by
+`idm_admins`.
 
 You can insert a test message into the queue with:
 
@@ -82,7 +83,6 @@ kubidm system message-queue send-test-message ellie
 ```
 
 Once inserted, the message can be viewed in the queue.
-
 
 ```bash
 $ kubidm system message-queue list

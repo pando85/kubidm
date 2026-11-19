@@ -12,6 +12,7 @@ CONTAINER_BUILDX_ACTION ?= --push
 # CONTAINER_IMAGE_ARCH is used to specify the architectures for multi-arch docker builds
 CONTAINER_IMAGE_ARCH ?= "linux/amd64,linux/arm64"
 BUILDKIT_PROGRESS ?= plain
+COSIGN_CMD = cosign sign --recursive=true
 
 KUBIDM_FEATURES ?= ""
 
@@ -85,23 +86,11 @@ buildx/kubidm_tools:
 		$(CONTAINER_BUILD_ARGS) .
 
 .PHONY: buildx/radiusd
-buildx/radiusd_py: ## Build multi-arch radius docker images and push to docker hub
-buildx/radiusd_py:
+buildx/radiusd: ## Build multi-arch radius docker images and push to docker hub
+buildx/radiusd:
 	@$(CONTAINER_TOOL) buildx build $(CONTAINER_TOOL_ARGS) \
 		--pull $(CONTAINER_BUILDX_ACTION) --platform $(CONTAINER_IMAGE_ARCH) \
-		-f rlm_python/Dockerfile \
-		--progress $(BUILDKIT_PROGRESS) \
-		--label "com.kubidm.git-commit=$(GIT_COMMIT)" \
-		--label "com.kubidm.version=$(CONTAINER_IMAGE_EXT_VERSION)" \
-		-t $(CONTAINER_IMAGE_BASE)/radius:$(CONTAINER_IMAGE_VERSION) \
-		-t $(CONTAINER_IMAGE_BASE)/radius:$(CONTAINER_IMAGE_EXT_VERSION) .
-
-.PHONY: buildx/radiusd_rust
-buildx/radiusd_rust: ## Build multi-arch radius docker images and push to docker hub
-buildx/radiusd_rust:
-	@$(CONTAINER_TOOL) buildx build $(CONTAINER_TOOL_ARGS) \
-		--pull $(CONTAINER_BUILDX_ACTION) --platform $(CONTAINER_IMAGE_ARCH) \
-		-f rlm_kubidm/Dockerfile \
+		-f rlm_kanidm/Dockerfile \
 		--progress $(BUILDKIT_PROGRESS) \
 		--label "com.kubidm.git-commit=$(GIT_COMMIT)" \
 		--label "com.kubidm.version=$(CONTAINER_IMAGE_EXT_VERSION)" \
@@ -109,7 +98,12 @@ buildx/radiusd_rust:
 		-t $(CONTAINER_IMAGE_BASE)/radius:$(CONTAINER_IMAGE_EXT_VERSION) .
 
 .PHONY: buildx
-buildx: buildx/kubidmd buildx/kubidm_tools buildx/radiusd_rust
+buildx: buildx/kubidmd buildx/kubidm_tools buildx/radiusd
+
+.PHONE: cosign
+cosign:
+	$(COSIGN_CMD) $(CONTAINER_IMAGE_BASE)/server:$(CONTAINER_IMAGE_VERSION)
+	# $(COSIGN_CMD) $(CONTAINER_IMAGE_BASE)/server:$(CONTAINER_IMAGE_EXT_VERSION)
 
 .PHONY: build/kubidmd
 build/kubidmd:	## Build the kubidmd docker image locally
@@ -133,23 +127,11 @@ build/orca:
 		--label "com.kubidm.version=$(CONTAINER_IMAGE_EXT_VERSION)" \
 		$(CONTAINER_BUILD_ARGS) .
 
-
-# TODO remove this once the rust module's confirmed as working
 .PHONY: build/radiusd
-build/radiusd:	## Build the radiusd docker image locally - deprecated
-build/radiusd:
-	@$(CONTAINER_TOOL) build $(CONTAINER_TOOL_ARGS) \
-		-f rlm_python/Dockerfile \
-		--label "com.kubidm.git-commit=$(GIT_COMMIT)" \
-		--label "com.kubidm.version=$(CONTAINER_IMAGE_EXT_VERSION)" \
-		-t $(CONTAINER_IMAGE_BASE)/radius:$(CONTAINER_IMAGE_VERSION) .
-
-
-.PHONY: build/radiusd_rust
 build/radiusd_rust:	## Build the radiusd docker image locally
 build/radiusd_rust:
 	@$(CONTAINER_TOOL) build $(CONTAINER_TOOL_ARGS) \
-		-f rlm_kubidm/Dockerfile \
+		-f rlm_kanidm/Dockerfile \
 		--label "com.kubidm.git-commit=$(GIT_COMMIT)" \
 		--label "com.kubidm.version=$(CONTAINER_IMAGE_EXT_VERSION)" \
 		-t $(CONTAINER_IMAGE_BASE)/radius:$(CONTAINER_IMAGE_VERSION) .
@@ -168,12 +150,6 @@ test/kubidmd:
 		--label "com.kubidm.version=$(CONTAINER_IMAGE_EXT_VERSION)" \
 		$(CONTAINER_BUILD_ARGS) .
 	@$(CONTAINER_TOOL) run --rm $(CONTAINER_IMAGE_BASE)/server:$(CONTAINER_IMAGE_VERSION)-builder cargo test
-
-.PHONY: test/radiusd
-test/radiusd: ## Run a test radius server
-test/radiusd: build/radiusd
-	cd rlm_python && \
-	./run_radius_container.sh
 
 .PHONY: test/radius/e2e
 test/radius/e2e: ## Run end-to-end RADIUS integration tests
@@ -215,7 +191,7 @@ codespell:
 	--skip='./docs/*,./.git' \
 	--skip='*.svg' \
 	--skip='*.br' \
-	--skip='./rlm_python/mods-available/eap' \
+	--skip='./rlm_kanidm/container/mods-available/eap' \
 	--skip='./server/lib/src/constants/system_config.rs' \
 	--skip='./pykubidm/site'
 
