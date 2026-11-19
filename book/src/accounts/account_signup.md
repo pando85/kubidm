@@ -9,7 +9,7 @@ Account signup allows public users to create accounts on your instance. This fea
 Enable the account signup feature
 
 ```
-kanidm system feature enable account_signup_feature -D admin
+kubidm system feature enable account_signup_feature -D admin
 ```
 
 A signup link will now be present on the login screen.

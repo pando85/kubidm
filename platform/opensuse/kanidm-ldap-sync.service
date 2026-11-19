@@ -1,17 +1,17 @@
 # You should not need to edit this file. Instead, use a drop-in file as described in:
-#   /usr/lib/systemd/system/kanidmd.service.d/custom.conf
+#   /usr/lib/systemd/system/kubidmd.service.d/custom.conf
 
 [Unit]
-Description=Kanidm IPA Sync Service
+Description=Kubidm IPA Sync Service
 After=time-sync.target network-online.target
 Wants=time-sync.target network-online.target
 
 [Service]
 Type=exec
 DynamicUser=yes
-LoadCredential=config:/etc/kanidm/ipa-sync
-Environment=KANIDM_IPA_SYNC_CONFIG=%d/config
-ExecStart=/usr/sbin/kanidm-ipa-sync --schedule
+LoadCredential=config:/etc/kubidm/ipa-sync
+Environment=KUBIDM_IPA_SYNC_CONFIG=%d/config
+ExecStart=/usr/sbin/kubidm-ipa-sync --schedule
 
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE

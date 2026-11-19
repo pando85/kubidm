@@ -1,5 +1,5 @@
 use super::QueryServerReadV1;
-use kanidmd_lib::{
+use kubidmd_lib::{
     idm::account_signup::{AccountSignupDisplay, AccountSignupDisplayEvent},
     prelude::OperationError,
 };

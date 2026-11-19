@@ -1,16 +1,16 @@
-uri = "https://example.com" # URL to the Kanidm server
+uri = "https://example.com" # URL to the Kubidm server
 
 # an optional path to the CA certificate for the server URI above
-# ca_path = "/etc/kanidm/cacert.pem"
+# ca_path = "/etc/kubidm/cacert.pem"
 
 auth_token = "ABC..." # Auth token for the service account
-# See: kanidm service-account api-token generate
+# See: kubidm service-account api-token generate
 
 # Default vlans for groups that don't specify one. If commented out, no
 # vlan will be issued in replies.
 radius_default_vlan = 1
 
-# A list of Kanidm groups which must be a member
+# A list of Kubidm groups which must be a member
 # before they can authenticate via RADIUS. The user
 # must be a member of at least one of these groups.
 radius_required_groups = ["radius_access_allowed@idm.example.com"]
@@ -41,7 +41,7 @@ name = "docker"
 ipaddr = "172.17.0.0/16"
 secret = "testing123"
 
-# A mapping between Kanidm groups and VLANS that they are assigned.
+# A mapping between Kubidm groups and VLANS that they are assigned.
 [[radius_groups]]
 spn = "radius_access_allowed@idm.example.com"
 # If commented out, the default vlan will apply (or none if disabled)

@@ -1,7 +1,7 @@
 use crate::OpType;
 
 use crate::{FeatureOpt, KubidmClientParser, OutputMode};
-// use kanidm_proto::scim_v1::{ScimEntryGetQuery};
+// use kubidm_proto::scim_v1::{ScimEntryGetQuery};
 
 impl FeatureOpt {
     pub async fn exec(&self, opt: KubidmClientParser) {
