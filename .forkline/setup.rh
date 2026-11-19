@@ -1,5 +1,32 @@
 #!/usr/bin/env rash
 
+# Runner setup (Forkline ADR-0022): runs after clone, before the agent starts, on every
+# routine/task. Non-fatal, 5-minute budget, log in /tmp/.forkline-setup.log.
+#
+# The runner image (Ubuntu, user `runner` with passwordless sudo) already ships rustup with the
+# stable toolchain (matches rust-toolchain.toml), clang, lld, gcc/g++, make, pkg-config and
+# libssl-dev, so no toolchain install is needed here. Installing the list below is idempotent.
+# Missing system libraries for the workspace build are added here, never ad hoc in a task.
+
+- name: Install workspace build dependencies
+  become: true
+  become_method: sudo
+  apt:
+    name:
+      # .github/workflows/rust_build.yml (cargo build --locked --workspace)
+      - libpam0g-dev
+      - libudev-dev
+      - libssl-dev
+      - libsystemd-dev
+      # .cargo/config.toml linker (clang + lld), bundled rusqlite and aws-lc-sys (cmake)
+      - pkg-config
+      - clang
+      - lld
+      - cmake
+      - build-essential
+    state: present
+    update_cache: true
+
 - name: Install pre-commit
   become: true
   become_method: sudo
