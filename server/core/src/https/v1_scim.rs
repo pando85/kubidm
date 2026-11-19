@@ -845,7 +845,7 @@ async fn scim_message_id_sent_post(
     delete,
     path = "/scim/v1/Message/{id}/_resend",
     responses(
-        (status = 200, content_type=APPLICATION_JSON),
+        (status = 200, description = "Ok", content_type=APPLICATION_JSON),
         ApiResponseWithout200,
     ),
     security(("token_jwt" = [])),
@@ -895,7 +895,7 @@ async fn scim_person_id_message_send_test_get(
     get,
     path = "/scim/v1/Feature",
     responses(
-        (status = 200, content_type=APPLICATION_JSON, body=ScimListResponse),
+        (status = 200, description = "Ok", content_type=APPLICATION_JSON, body=ScimListResponse),
         ApiResponseWithout200,
     ),
     security(("token_jwt" = [])),
