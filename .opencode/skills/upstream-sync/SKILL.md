@@ -153,37 +153,26 @@ truncated (`wc -l`).
 Do this before touching the merge. #587 started on a runner without `libudev`, skipped every local
 check, and opened the PR anyway.
 
+System build dependencies (`libpam0g-dev libudev-dev libssl-dev libsystemd-dev`, plus `pkg-config
+clang lld cmake build-essential` for the `.cargo/config.toml` linker and bundled SQLite) are
+installed by `.forkline/setup.rh`, which the Forkline runner executes after the clone and before you
+start. The preflight only verifies them:
+
 ```bash
 git fetch --unshallow origin 2>/dev/null || git fetch origin          # full history for merge-base
 git remote get-url upstream >/dev/null 2>&1 || git remote add upstream https://github.com/kanidm/kanidm.git
 git fetch upstream
-rustc --version && cargo --version                                      # rust-toolchain.toml: stable; workspace rust-version in Cargo.toml
-cargo fmt --version && cargo clippy --version
-pkg-config --exists libudev openssl && echo ok                          # the failing one in #587 was libudev
+rustc --version && cargo --version && cargo fmt --version && cargo clippy --version
+pkg-config --exists libudev openssl libsystemd && echo ok             # the failing one in #587 was libudev
 command -v clang ld.lld cmake
+cargo check --locked -p kubidm_proto                                    # small; must pass on the unmerged branch
 ```
 
-The workspace links with `clang` and `lld` (`.cargo/config.toml`) and builds SQLite from source
-(`rusqlite` `bundled`), so a C compiler is required too. Where the list comes from:
-`.github/workflows/rust_build.yml` installs `libpam0g-dev libudev-dev libssl-dev libsystemd-dev` on
-GitHub's ubuntu image (which already has `pkg-config`, `clang`, `lld`, `cmake`, a C toolchain), and
-`scripts/install_ubuntu_dependencies.sh` and `book/src/developers/readme.md` add `pkg-config clang
-lld` (and the script `cmake build-essential`) for a bare machine. The clippy job
-(`.github/workflows/clippy.yml`) also installs `libselinux1-dev libtss2-dev libtalloc-dev
-tpm-udev`, and the `Dockerfile`s add `libsqlite3-dev libcap-dev`; try those if a build script still
-fails to find a library. Install what is missing on a Debian/Ubuntu runner (the runner is
-disposable; use `sudo` only if you are not root and the image provides it):
+Record the result. Missing system deps are fixed in `.forkline/setup.rh` (in a separate PR), never
+installed ad hoc in a sync.
 
-```bash
-apt-get update && apt-get install -y libpam0g-dev libudev-dev libssl-dev libsystemd-dev \
-  pkg-config clang lld cmake build-essential
-```
-
-Then prove the toolchain works: `cargo check --locked -p kubidm_proto` (small) must pass on the
-unmerged branch. Record the result.
-
-If the workspace still cannot be built (no network, no package manager, unsupported distro,
-disk or memory): do the merge anyway, push, and open the PR as **DRAFT** with
+If any check fails (or the setup did not run): read `/tmp/.forkline-setup.log` for the reason, do
+the merge anyway, push, and open the PR as **DRAFT** with
 `**Local verification not possible: <exact reason and failing command>**` as the first line of the
 body. Tick no checklist item, list no check as "passed", and say in "Known follow-ups" that nothing
 compiled locally. Never mark such a PR ready for review, even if CI later passes without you
