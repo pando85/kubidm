@@ -241,7 +241,7 @@ md4 = "0.11.0"
 md-5 = "0.11.0"
 nix = { version = "0.32.0", features = ["mount"] }
 nonempty = "0.12.0"
-notify-debouncer-full = { version = "0.7" }
+notify-debouncer-full = { version = "0.8" }
 num_enum = "0.7.6"
 opentelemetry = { version = "0.33.0" }
 opentelemetry-otlp = { version = "0.33.0", default-features = false, features = [

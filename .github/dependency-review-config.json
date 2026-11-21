@@ -6,6 +6,7 @@
     "pkg:cargo/fastrand",
     "pkg:cargo/inotify",
     "pkg:cargo/portable-atomic",
+    "pkg:cargo/xxhash-rust",
     "pkg:cargo/zmij",
     "pkg:pypi/typing-extensions",
     "pkg:pypi/pylint"
