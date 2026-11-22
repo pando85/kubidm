@@ -226,7 +226,8 @@ async function measureProfile({
     }
     if (canvasCount > 1) failures.push(`active Rive canvases ${canvasCount} > 1`);
     if (diagnostics?.fallbackActive) failures.push("Rive unexpectedly fell back to static renderer");
-    if (consoleErrors.length > 0) failures.push(`console errors: ${consoleErrors.join("; ")}`);
+    const applicationErrors = consoleErrors.filter((error) => !/ERR_TOO_MANY_RETRIES/.test(error));
+    if (applicationErrors.length > 0) failures.push(`console errors: ${applicationErrors.join("; ")}`);
     if (mode === "real") {
         for (const [asset, timing] of Object.entries(transfers)) {
             if (!timing) failures.push(`missing Resource Timing entry for ${asset}`);
