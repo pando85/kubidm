@@ -3038,7 +3038,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2f66822aee11ccb28d6a2e63b587254e578fb52a138bd5806b58d8560125592b"
 dependencies = [
  "gix-hash",
- "hashbrown 0.17.1",
+ "hashbrown 0.17.2",
  "parking_lot",
 ]
 
@@ -3521,9 +3521,9 @@ dependencies = [
 
 [[package]]
 name = "hashbrown"
-version = "0.17.1"
+version = "0.17.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+checksum = "735eaa21a6a5ffb2e84362faaeb90c05ba8e19797ca30428478cb6ea3a4921bc"
 dependencies = [
  "allocator-api2",
  "equivalent",
@@ -3538,7 +3538,7 @@ version = "0.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a596f1b20ed2cc5ecac41a164aaebc7258057060f06c0cf7a2ba3991ee7990fb"
 dependencies = [
- "hashbrown 0.17.1",
+ "hashbrown 0.17.2",
 ]
 
 [[package]]
@@ -3950,7 +3950,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cc4e190f5d26ca7051642629da2c52fc03bde85a03197c99408dcd291734c855"
 dependencies = [
  "equivalent",
- "hashbrown 0.17.1",
+ "hashbrown 0.17.2",
  "serde",
  "serde_core",
 ]
@@ -4354,7 +4354,7 @@ dependencies = [
  "chrono",
  "clap",
  "cron",
- "hashbrown 0.17.1",
+ "hashbrown 0.17.2",
  "kubidm_client",
  "kubidm_lib_file_permissions",
  "kubidm_proto",
@@ -4616,7 +4616,7 @@ dependencies = [
  "dyn-clone",
  "flate2",
  "futures",
- "hashbrown 0.17.1",
+ "hashbrown 0.17.2",
  "hex",
  "idlset",
  "image",
@@ -4929,7 +4929,7 @@ version = "0.18.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ef9ac18847474e638e3702b76c65d4eb93428471a74778ef0f1be711717f89b5"
 dependencies = [
- "hashbrown 0.17.1",
+ "hashbrown 0.17.2",
 ]
 
 [[package]]
@@ -4938,7 +4938,7 @@ version = "0.19.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "83be4da409554841af087163ad187608824ad8ca8713d8e124c8e0f704a2f92f"
 dependencies = [
- "hashbrown 0.17.1",
+ "hashbrown 0.17.2",
 ]
 
 [[package]]
@@ -5558,7 +5558,7 @@ dependencies = [
  "clap",
  "crossbeam",
  "csv",
- "hashbrown 0.17.1",
+ "hashbrown 0.17.2",
  "idlset",
  "kubidm_build_profiles",
  "kubidm_client",
@@ -6384,7 +6384,7 @@ dependencies = [
  "ahash",
  "fluent-uri",
  "getrandom 0.3.4",
- "hashbrown 0.17.1",
+ "hashbrown 0.17.2",
  "itoa",
  "micromap",
  "parking_lot",
@@ -7348,7 +7348,7 @@ dependencies = [
  "dhat",
  "dialoguer",
  "futures",
- "hashbrown 0.17.1",
+ "hashbrown 0.17.2",
  "kanidm-hsm-crypto",
  "kubidm_build_profiles",
  "kubidm_client",
