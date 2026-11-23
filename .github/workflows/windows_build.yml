@@ -35,8 +35,25 @@ jobs:
         continue-on-error: true
       - name: Fallback if sccache unavailable
         run: |
+          $sccache_available = $true
           if (-not (Get-Command sccache -ErrorAction SilentlyContinue)) {
-            Write-Host "sccache not available, disabling RUSTC_WRAPPER"
+            $sccache_available = $false
+          } else {
+            # Test if sccache can actually start its server
+            try {
+              $output = sccache --start-server 2>&1
+              if ($LASTEXITCODE -ne 0) {
+                Write-Host "sccache --start-server failed: $output"
+                $sccache_available = $false
+              }
+            } catch {
+              Write-Host "sccache --start-server threw exception: $_"
+              $sccache_available = $false
+            }
+          }
+
+          if (-not $sccache_available) {
+            Write-Host "sccache not available or not working, disabling RUSTC_WRAPPER"
             "RUSTC_WRAPPER=" >> $env:GITHUB_ENV
           }
         shell: pwsh
