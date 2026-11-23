@@ -24,8 +24,8 @@ jobs:
         continue-on-error: true
       - name: Fallback if sccache unavailable
         run: |
-          if ! command -v sccache &>/dev/null; then
-            echo "sccache not available, disabling RUSTC_WRAPPER"
+          if ! command -v sccache &>/dev/null || ! sccache --show-stats &>/dev/null; then
+            echo "sccache not available or not working, disabling RUSTC_WRAPPER"
             echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
           fi
       - name: Install dependencies
@@ -54,8 +54,8 @@ jobs:
         continue-on-error: true
       - name: Fallback if sccache unavailable
         run: |
-          if ! command -v sccache &>/dev/null; then
-            echo "sccache not available, disabling RUSTC_WRAPPER"
+          if ! command -v sccache &>/dev/null || ! sccache --show-stats &>/dev/null; then
+            echo "sccache not available or not working, disabling RUSTC_WRAPPER"
             echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
           fi
       - name: "Run cargo fmt"
