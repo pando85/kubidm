@@ -1521,7 +1521,7 @@ dependencies = [
  "crossbeam-queue",
  "crossbeam-utils",
  "foldhash",
- "lru 0.19.1",
+ "lru 0.19.2",
  "smallvec",
  "sptr",
  "tokio",
@@ -4934,9 +4934,9 @@ dependencies = [
 
 [[package]]
 name = "lru"
-version = "0.19.1"
+version = "0.19.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "83be4da409554841af087163ad187608824ad8ca8713d8e124c8e0f704a2f92f"
+checksum = "d4e2a1b977b42ee8b53a2a4adbd1183431c493f1d1960b7ccd893e2f0b9407ba"
 dependencies = [
  "hashbrown 0.17.2",
 ]
@@ -7359,7 +7359,7 @@ dependencies = [
  "kubidmd_core",
  "kubidmd_testkit",
  "libc",
- "lru 0.19.1",
+ "lru 0.19.2",
  "nix",
  "notify-debouncer-full",
  "prctl",
