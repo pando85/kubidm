@@ -26,7 +26,11 @@ WORKDIR /src/kubidm/
 # TEMPORARY
 RUN cp rlm_kanidm/module/include/automask.h /usr/include/freeradius/
 RUN cp rlm_kanidm/module/include/connection.h /usr/include/freeradius/
-RUN cp rlm_kanidm/module/include/dlist.h /usr/include/freeradius/
+# Tumbleweed's FreeRADIUS 3.2.10 devel RPM omits this upstream header.
+# Do not overwrite it when the package ships its own version.
+RUN if [ ! -f /usr/include/freeradius/dlist.h ]; then \
+        cp rlm_kanidm/module/include/dlist.h /usr/include/freeradius/; \
+    fi
 RUN cp rlm_kanidm/module/include/log.h /usr/include/freeradius/
 RUN cp rlm_kanidm/module/include/xlat.h /usr/include/freeradius/
 RUN cp rlm_kanidm/module/include/tmpl.h /usr/include/freeradius/

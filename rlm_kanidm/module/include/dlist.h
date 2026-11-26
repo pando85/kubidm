@@ -1,27 +1,78 @@
 /*
- * Minimal stub for freeradius/dlist.h
+ *   This program is free software; you can redistribute it and/or modify
+ *   it under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation; either version 2 of the License, or
+ *   (at your option) any later version.
  *
- * This file is a workaround for openSUSE Tumbleweed's freeradius-server-devel
- * package which includes radiusd.h that references dlist.h, but doesn't provide it.
+ *   This program is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
  *
- * The actual dlist.h from FreeRADIUS provides doubly-linked list macros, but
- * this module doesn't use them. We only need to define the fr_dlist_t type
- * which is used in radiusd.h.
+ *   You should have received a copy of the GNU General Public License
+ *   along with this program; if not, write to the Free Software
+ *   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
-
-#ifndef _FR_DLIST_H
-#define _FR_DLIST_H
 
 /**
- * Doubly-linked list entry.
+ * $Id$
  *
- * This is a minimal definition sufficient for radiusd.h which uses fr_dlist_t
- * as a struct member. The full FreeRADIUS implementation includes additional
- * macros and functions, but they are not needed by this module.
+ * @file dlist.h
+ * @brief doubly linked lists
+ *
+ * @copyright 2023 Network RADIUS SAS (legal@networkradius.com)
  */
-typedef struct fr_dlist_s {
-	struct fr_dlist_s *next;
-	struct fr_dlist_s *prev;
-} fr_dlist_t;
 
-#endif /* _FR_DLIST_H */
+#ifndef RADIUS_DLIST_H
+#define RADIUS_DLIST_H
+
+RCSIDH(dlist_h, "$Id$")
+
+/*
+ *	We have an internal cache, keyed by (mac + ssid).
+ *
+ *	It returns the PMK and PSK for the user.
+ */
+typedef struct fr_dlist_s fr_dlist_t;
+
+struct fr_dlist_s {
+	fr_dlist_t	*prev;
+	fr_dlist_t	*next;
+};
+
+static inline void fr_dlist_entry_init(fr_dlist_t *entry)
+{
+	entry->prev = entry->next = entry;
+}
+
+static inline bool fr_dlist_empty(fr_dlist_t *head)
+{
+	return ((head->prev == head) && (head->next == head));
+}
+
+static inline CC_HINT(nonnull) void fr_dlist_entry_unlink(fr_dlist_t *entry)
+{
+	entry->prev->next = entry->next;
+	entry->next->prev = entry->prev;
+	entry->prev = entry->next = entry;
+}
+
+static inline CC_HINT(nonnull) void fr_dlist_insert_tail(fr_dlist_t *head, fr_dlist_t *entry)
+{
+	entry->next = head;
+	entry->prev = head->prev;
+	head->prev->next = entry;
+	head->prev = entry;
+}
+
+static inline CC_HINT(nonnull) fr_dlist_t *fr_dlist_pop_head(fr_dlist_t *head)
+{
+	fr_dlist_t *entry = head->next;
+
+	if (entry == head) return NULL;
+
+	fr_dlist_entry_unlink(entry);
+	return entry;
+}
+
+#endif	/* RADIUS_DLIST_H */
