@@ -683,17 +683,12 @@ fn parse_argon(hash_value: &str) -> Result<Password, PasswordError> {
                 PasswordError::ParsingFailed
             })?;
 
-            let salt = salt
-                .and_then(|s| {
-                    let mut salt_arr = [0u8; 64];
-                    s.decode_b64(&mut salt_arr)
-                        .ok()
-                        .map(|salt_bytes| salt_bytes.to_owned())
-                })
-                .ok_or_else(|| {
-                    error!("Failed to access salt");
-                    PasswordError::ParsingFailed
-                })?;
+            // Since `phc` 0.6 the salt field of the PHC string is decoded and validated while
+            // parsing it, so `Salt` already holds the salt bytes.
+            let salt = salt.map(|s| s.as_ref().to_vec()).ok_or_else(|| {
+                error!("Failed to access salt");
+                PasswordError::ParsingFailed
+            })?;
 
             let key = hash.map(|h| h.as_bytes().into()).ok_or_else(|| {
                 error!("Failed to access key");
