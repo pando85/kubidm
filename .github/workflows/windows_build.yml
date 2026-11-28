@@ -55,6 +55,17 @@ jobs:
           if (-not $sccache_available) {
             Write-Host "sccache not available or not working, disabling RUSTC_WRAPPER"
             "RUSTC_WRAPPER=" >> $env:GITHUB_ENV
+          } else {
+            try {
+              $null = sccache --show-stats 2>&1
+              if ($LASTEXITCODE -ne 0) {
+                Write-Host "sccache not working, disabling RUSTC_WRAPPER"
+                "RUSTC_WRAPPER=" >> $env:GITHUB_ENV
+              }
+            } catch {
+              Write-Host "sccache check failed, disabling RUSTC_WRAPPER"
+              "RUSTC_WRAPPER=" >> $env:GITHUB_ENV
+            }
           }
 
           # The runner appends 'exit $LASTEXITCODE' to every pwsh step, so a failing sccache
