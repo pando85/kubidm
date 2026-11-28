@@ -27,8 +27,19 @@ jobs:
         continue-on-error: true
       - name: Fallback if sccache unavailable
         run: |
+          sccache_available=true
           if ! command -v sccache &>/dev/null; then
-            echo "sccache not available, disabling RUSTC_WRAPPER"
+            sccache_available=false
+          else
+            # Test if sccache can actually start its server
+            if ! sccache --start-server 2>&1; then
+              echo "sccache --start-server failed"
+              sccache_available=false
+            fi
+          fi
+
+          if [ "$sccache_available" = false ]; then
+            echo "sccache not available or not working, disabling RUSTC_WRAPPER"
             echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
           fi
       - name: Install deps
