@@ -32,6 +32,7 @@ RUN cp rlm_kanidm/module/include/tmpl.h /usr/include/freeradius/
 RUN cp rlm_kanidm/module/include/clients.h /usr/include/freeradius/
 RUN cp rlm_kanidm/module/include/process.h /usr/include/freeradius/
 RUN cp rlm_kanidm/module/include/listen.h /usr/include/freeradius/
+RUN cp rlm_kanidm/module/include/dlist.h /usr/include/freeradius/
 
 # No sccache here: with the two platform builds running at once it left serde_core without
 # its build script output in CI. Each platform gets its own private cargo cache instead.
