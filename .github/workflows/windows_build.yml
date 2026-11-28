@@ -35,8 +35,25 @@ jobs:
         continue-on-error: true
       - name: Fallback if sccache unavailable
         run: |
+          $sccache_available = $true
           if (-not (Get-Command sccache -ErrorAction SilentlyContinue)) {
-            Write-Host "sccache not available, disabling RUSTC_WRAPPER"
+            $sccache_available = $false
+          } else {
+            # Test if sccache can actually start its server
+            try {
+              $output = sccache --start-server 2>&1
+              if ($LASTEXITCODE -ne 0) {
+                Write-Host "sccache --start-server failed: $output"
+                $sccache_available = $false
+              }
+            } catch {
+              Write-Host "sccache --start-server threw exception: $_"
+              $sccache_available = $false
+            }
+          }
+
+          if (-not $sccache_available) {
+            Write-Host "sccache not available or not working, disabling RUSTC_WRAPPER"
             "RUSTC_WRAPPER=" >> $env:GITHUB_ENV
           } else {
             try {
@@ -50,6 +67,11 @@ jobs:
               "RUSTC_WRAPPER=" >> $env:GITHUB_ENV
             }
           }
+
+          # The runner appends 'exit $LASTEXITCODE' to every pwsh step, so a failing sccache
+          # probe would fail this job even though we handled it above. The probe is best-effort:
+          # always report success and let the build run without the cache instead.
+          exit 0
         shell: pwsh
       - run: cargo build --locked -p kubidm_client -p kubidm_tools --bin kubidm
       # yamllint disable-line rule:line-length
